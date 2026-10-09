@@ -17,6 +17,7 @@ def register(context: Any) -> None:
 
     interaction: logging.Logger = context.interaction_logger
     debug: logging.Logger = context.debug_logger
+    dispatcher = getattr(context, "dispatcher", None)
 
     @router.callback_query(F.data.startswith(f"{CONFIRM_PREFIX}:"))
     async def on_confirm(cb: CallbackQuery) -> None:  # noqa: D401
@@ -67,4 +68,7 @@ def register(context: Any) -> None:
             role, cb.from_user.id, cb.from_user.username, participant["name"],
         )
         await cb.answer("Принято!")
+
+    if dispatcher is not None:
+        dispatcher.include_router(router)
 
