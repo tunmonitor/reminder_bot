@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Локальные секреты и настройки (см. ТЗ 1.2)
+reminder_bot_credentials.env
+credentials.env
+reminder_bot_templates.json
+templates.json
+reminder_bot_schedule_config.json
+schedule_config.json
+
+# Персистентные бэкапы логов
+reminder_bot_logs_backup/
+logs_backup/
+
+# Служебное
+.run_state/
+*.log
+

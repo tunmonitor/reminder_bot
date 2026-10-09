@@ -1,0 +1,125 @@
+name: CI/CD Pipeline flow
+
+on:
+  push:
+    branches:
+      - test
+      - main
+  pull_request:
+    branches:
+      - test
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-and-test:
+    runs-on: [self-hosted, raspberry]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # =================================================================
+      # 🧪 СЦЕНАРИЙ ДЛЯ ТЕСТОВОГО ОКРУЖЕНИЯ (ВЕТКА test И PR НА test)
+      # =================================================================
+      - name: Deploy and Test on Test Environment
+        if: github.ref == 'refs/heads/test' || github.base_ref == 'test'
+        run: |
+          TARGET_TEST_DIR="/mnt/external_data/reminder_bot/test"
+          mkdir -p "$TARGET_TEST_DIR"
+          
+          echo "🔄 Синхронизация кода в тестовое окружение..."
+          rsync -av --delete \
+            --exclude='.git*' \
+            --exclude='credentials.env' \
+            --exclude='templates.json' \
+            --exclude='schedule_config.json' \
+            --exclude='logs_backup/' \
+            --exclude='__pycache__/' \
+            --exclude='venv/' \
+            ./ "$TARGET_TEST_DIR/"
+          
+          cd "$TARGET_TEST_DIR"
+          chmod +x manage.sh
+          
+          echo "🛑 Остановка старой копии тестового бота (если была)..."
+          ./manage.sh stop || true
+          
+          # Настройка виртуального окружения для тестовой папки
+          if [ ! -d "venv" ]; then
+            python3 -m venv venv
+            source venv/bin/activate
+            pip install --upgrade pip
+            pip install aiogram aiohttp openpyxl apscheduler pytz
+          fi
+          
+          echo "🚀 Запуск тестового бота..."
+          env RUNNER_TRACKING_ID=0 ./manage.sh start
+          
+          # Ожидание инициализации aiogram и проверки токена
+          sleep 4
+          
+          echo "🔍 Интеллектуальная проверка статуса тестового бота..."
+          if ./manage.sh status | grep -q "Статус: БОТ РАБОТАЕТ"; then
+              echo "✅ Тест пройден успешно! Бот стабилен в фоне тестового окружения."
+              
+              # Вытягиваем логи из RAM-диска для сохранения в артефактах GitHub
+              SHM_LOG_DIR="/dev/shm/church_bot"
+              cp "$SHM_LOG_DIR/interaction.log" ${{ github.workspace }}/test_interaction.log || true
+              cp "$SHM_LOG_DIR/debug.log" ${{ github.workspace }}/test_debug.log || true
+          else
+              echo "❌ Ошибка старта бота! Сборка и тесты провалены."
+              SHM_LOG_DIR="/dev/shm/church_bot"
+              echo "=== ПОСЛЕДНИЕ СТРОКИ DEBUG ЛОГА ==="
+              tail -n 20 "$SHM_LOG_DIR/debug.log" || true
+              exit 1
+          fi
+
+      - name: Upload Test Logs to GitHub Artifacts
+        if: (github.ref == 'refs/heads/test' || github.base_ref == 'test') && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-environment-logs
+          path: |
+            ${{ github.workspace }}/test_interaction.log
+            ${{ github.workspace }}/test_debug.log
+          retention-days: 3
+
+      # =================================================================
+      # 🚀 СЦЕНАРИЙ ДЛЯ БОЕВОГО ОКРУЖЕНИЯ (ВЕТКА main И PR НА main)
+      # =================================================================
+      - name: Deploy to Production Environment
+        if: github.ref == 'refs/heads/main' || github.base_ref == 'main'
+        run: |
+          TARGET_PROD_DIR="/home/pi/app/reminder_bot/prod"
+          mkdir -p "$TARGET_PROD_DIR"
+          
+          echo "📦 Синхронизация стабильного кода в PRODUCTION..."
+          rsync -av --delete \
+            --exclude='.git*' \
+            --exclude='credentials.env' \
+            --exclude='templates.json' \
+            --exclude='schedule_config.json' \
+            --exclude='logs_backup/' \
+            --exclude='__pycache__/' \
+            --exclude='venv/' \
+            ./ "$TARGET_PROD_DIR/"
+          
+          cd "$TARGET_PROD_DIR"
+          chmod +x manage.sh
+          
+          # Настройка виртуального окружения для prod папки
+          if [ ! -d "venv" ]; then
+            python3 -m venv venv
+            source venv/bin/activate
+            pip install --upgrade pip
+            pip install aiogram aiohttp openpyxl apscheduler pytz
+          fi
+          
+          echo "🔄 Автоматический перезапуск боевого бота..."
+          env RUNNER_TRACKING_ID=0 ./manage.sh restart
+          
+          sleep 3
+          ./manage.sh status
