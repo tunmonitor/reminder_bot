@@ -5,7 +5,6 @@ import argparse
 import asyncio
 import logging
 import os
-import stat
 import sys
 import uuid
 from datetime import date, datetime
@@ -16,22 +15,15 @@ from .config import load_credentials, load_templates
 from .excel_parser import parse_people, parse_schedule, resolve_assignments
 from .logger import setup_loggers
 from .notifier import build_general_message, build_personal_message
+from .secure_fs import open_private_directory
 from .yandex_disk import download_public
 
 DEFAULT_OUTPUT_DIR = Path("/dev/shm/reminder_bot/debug")
 
 
 def _secure_output_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    info = path.lstat()
-    if not stat.S_ISDIR(info.st_mode):
-        raise RuntimeError(f"Каталог отладки не является обычным каталогом: {path}")
-    if info.st_uid != os.getuid():
-        raise PermissionError(f"Каталог отладки принадлежит другому пользователю: {path}")
-    if stat.S_IMODE(info.st_mode) & 0o077:
-        raise PermissionError(
-            f"Каталог отладки доступен группе или другим пользователям: {path}"
-        )
+    directory_fd = open_private_directory(path, create=True)
+    os.close(directory_fd)
 
 
 def _target_date(value: str | None, timezone: str) -> date:

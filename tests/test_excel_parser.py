@@ -65,6 +65,33 @@ class ExcelParserTest(unittest.TestCase):
             },
         )
 
+    def test_empty_duplicate_role_does_not_override_or_reject_assignment(self):
+        workbook = Workbook()
+        schedule = workbook.active
+        schedule.title = "ОКТЯБРЬ26"
+        schedule.append(["11 октября"])
+        schedule.append(["ХКЦ", "Алексей"])
+        schedule.append(["ХКЦ", None])
+        workbook.save(self.path)
+
+        assignments = parse_schedule(
+            self.path, date(2026, 10, 11), self.debug_logger
+        )
+
+        self.assertEqual(assignments, {"Ответственный": "Алексей"})
+
+    def test_conflicting_non_empty_duplicate_role_is_rejected(self):
+        workbook = Workbook()
+        schedule = workbook.active
+        schedule.title = "ОКТЯБРЬ26"
+        schedule.append(["11 октября"])
+        schedule.append(["ХКЦ", "Алексей"])
+        schedule.append(["ХКЦ", "Павел"])
+        workbook.save(self.path)
+
+        with self.assertRaisesRegex(RuntimeError, "указана несколько раз"):
+            parse_schedule(self.path, date(2026, 10, 11), self.debug_logger)
+
     def test_parses_task_sections_anywhere_and_uses_last_filled_person_row(self):
         self._make_workbook()
 

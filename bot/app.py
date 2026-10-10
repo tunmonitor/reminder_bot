@@ -20,6 +20,7 @@ if __package__:
     from .handlers import register
     from .logger import setup_loggers
     from .notifier import _notify_admin, send_assignments
+    from .secure_fs import open_private_directory
     from .scheduler import build_scheduler
     from .state import StateCache
     from .yandex_disk import download_public
@@ -30,6 +31,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
     from bot.handlers import register
     from bot.logger import setup_loggers
     from bot.notifier import _notify_admin, send_assignments
+    from bot.secure_fs import open_private_directory
     from bot.scheduler import build_scheduler
     from bot.state import StateCache
     from bot.yandex_disk import download_public
@@ -58,36 +60,12 @@ def _current_process_starttime() -> str:
 
 
 def _open_directory_without_symlinks(path: Path) -> int:
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    directory_fd = os.open("/" if path.is_absolute() else ".", flags)
-    try:
-        for component in path.parts:
-            if component in ("/", "."):
-                continue
-            if component == "..":
-                raise ValueError(f"Путь к PID-каталогу не должен содержать '..': {path}")
-            next_fd = os.open(component, flags, dir_fd=directory_fd)
-            os.close(directory_fd)
-            directory_fd = next_fd
-        return directory_fd
-    except BaseException:
-        os.close(directory_fd)
-        raise
+    return open_private_directory(path)
 
 
 def _write_pid(path: Path) -> None:
     directory_fd = _open_directory_without_symlinks(path.parent)
     try:
-        directory_stat = os.fstat(directory_fd)
-        if directory_stat.st_uid != os.geteuid():
-            raise PermissionError(
-                f"Каталог PID-файла должен принадлежать текущему пользователю: {path.parent}"
-            )
-        if stat.S_IMODE(directory_stat.st_mode) & 0o022:
-            raise PermissionError(
-                f"Каталог PID-файла не должен быть доступен на запись группе или другим: {path.parent}"
-            )
-
         pid_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
         pid_fd = os.open(path.name, pid_flags, 0o600, dir_fd=directory_fd)
         try:
@@ -261,8 +239,9 @@ async def _process_upcoming_sunday(
 async def run(args: CliArgs) -> None:
     shm_dir = Path(args.shm_dir)
     log_dir = Path(args.log_dir)
-    shm_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
+    for directory in (shm_dir, log_dir):
+        directory_fd = open_private_directory(directory, create=True)
+        os.close(directory_fd)
 
     interaction_logger, debug_logger = setup_loggers(log_dir)
     credentials = load_credentials()

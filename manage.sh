@@ -112,6 +112,18 @@ secure_log_file_for_backup() {
     chmod 600 "$file"
 }
 
+secure_private_file() {
+    local file=$1
+    local links
+    if has_symlink_path_component "$file" ||
+       [ ! -f "$file" ] || [ -L "$file" ] || [ ! -O "$file" ]; then
+        return 1
+    fi
+    links=$(stat -c '%h' -- "$file") || return 1
+    [ "$links" -eq 1 ] || return 1
+    chmod 600 "$file"
+}
+
 is_project_pythonpath() {
     local pid=$1
     local environment_entry
@@ -412,13 +424,39 @@ cmd_start() {
         echo "❌ Путь к каталогу PID-файла изменился или содержит символическую ссылку: $SHM_DIR" >&2
         exit 1
     fi
+    if has_symlink_path_component "$LOG_DIR"; then
+        echo "❌ Путь к каталогу логов не должен содержать символические ссылки или '..': $LOG_DIR" >&2
+        exit 1
+    fi
     mkdir -p "$LOG_DIR" || exit 1
+    if has_symlink_path_component "$LOG_DIR" || [ ! -d "$LOG_DIR" ] || [ ! -O "$LOG_DIR" ]; then
+        echo "❌ Каталог логов должен быть обычным каталогом текущего пользователя: $LOG_DIR" >&2
+        exit 1
+    fi
     chmod 700 "$SHM_DIR" || exit 1
+    chmod 700 "$LOG_DIR" || exit 1
     ensure_backup_dir || exit 1
 
+    if [ -e "$NOHUP_LOG" ] || [ -L "$NOHUP_LOG" ]; then
+        if ! secure_private_file "$NOHUP_LOG"; then
+            echo "❌ Файл системного лога небезопасен: $NOHUP_LOG" >&2
+            exit 1
+        fi
+        : > "$NOHUP_LOG" || exit 1
+    else
+        (umask 077; set -o noclobber; : > "$NOHUP_LOG") || {
+            echo "❌ Не удалось безопасно создать системный лог: $NOHUP_LOG" >&2
+            exit 1
+        }
+    fi
+
     # Проверка активного PID-файла
-    if [ -f "$PID_FILE" ]; then
+    if [ -f "$PID_FILE" ] || [ -L "$PID_FILE" ]; then
         local saved_pid saved_starttime
+        if ! secure_private_file "$PID_FILE"; then
+            echo "❌ PID-файл небезопасен: $PID_FILE" >&2
+            exit 1
+        fi
         saved_pid=$(cut -d: -f1 "$PID_FILE" 2>/dev/null)
         saved_starttime=$(cut -d: -f2 "$PID_FILE" 2>/dev/null)
         if is_valid_process "$saved_pid" "$saved_starttime"; then
@@ -445,29 +483,47 @@ cmd_start() {
         nohup "$PYTHON_EXEC" -u "$BOT_SCRIPT" \
         --shm-dir "$SHM_DIR" \
         --log-dir "$LOG_DIR" \
-        > "$NOHUP_LOG" 2>&1 &
+        >> "$NOHUP_LOG" 2>&1 &
     local new_pid=$!
 
-    sleep 0.5
     local new_starttime
     new_starttime=$(get_process_starttime "$new_pid")
     if [ -z "$new_starttime" ]; then
         echo "❌ Не удалось получить время старта процесса $new_pid"
-        rm -f "$PID_FILE"
         exit 1
     fi
 
-    echo "$new_pid:$new_starttime" > "$PID_FILE"
+    local pid_file_ready=0
+    local waited=0
+    local saved_pid saved_starttime
+    while [ "$waited" -lt 30 ]; do
+        if [ -f "$PID_FILE" ] || [ -L "$PID_FILE" ]; then
+            if secure_private_file "$PID_FILE"; then
+                saved_pid=$(cut -d: -f1 "$PID_FILE" 2>/dev/null)
+                saved_starttime=$(cut -d: -f2 "$PID_FILE" 2>/dev/null)
+                if [ "$saved_pid" = "$new_pid" ] &&
+                   [ "$saved_starttime" = "$new_starttime" ]; then
+                    pid_file_ready=1
+                    break
+                fi
+            fi
+        fi
+        is_valid_process "$new_pid" "$new_starttime" || break
+        sleep 0.1
+        waited=$((waited + 1))
+    done
 
-    sleep 1
-    if is_valid_process "$new_pid" "$new_starttime"; then
+    if [ "$pid_file_ready" -eq 1 ] &&
+       is_valid_process "$new_pid" "$new_starttime"; then
         echo "✅ Бот успешно запущен (PID $new_pid) [$ENV_NAME]."
         echo "📄 interaction.log: $LOG_FILE"
         echo "📄 debug.log:       $DEBUG_LOG_FILE"
         exit 0
     else
         echo "❌ Ошибка старта! Проверьте $NOHUP_LOG"
-        rm -f "$PID_FILE"
+        if is_valid_process "$new_pid" "$new_starttime"; then
+            kill_with_wait "$new_pid" "$new_starttime" 3 "процесс с неудачным запуском"
+        fi
         exit 1
     fi
 }
@@ -482,25 +538,27 @@ cmd_stop() {
     do_backup
 
     # 2. Остановка по PID-файлу
-    if [ -f "$PID_FILE" ]; then
+    if [ -f "$PID_FILE" ] || [ -L "$PID_FILE" ]; then
         local saved_pid saved_starttime
+        if ! secure_private_file "$PID_FILE"; then
+            echo "❌ PID-файл небезопасен: $PID_FILE" >&2
+            return 1
+        fi
         saved_pid=$(cut -d: -f1 "$PID_FILE" 2>/dev/null)
         saved_starttime=$(cut -d: -f2 "$PID_FILE" 2>/dev/null)
         if [ -n "$saved_pid" ]; then
             if is_valid_process "$saved_pid" "$saved_starttime"; then
                 if kill_with_wait "$saved_pid" "$saved_starttime" 10 "бот из PID-файла"; then
-                    rm -f "$PID_FILE"
+                    :
                 else
                     echo "❌ Не удалось остановить процесс из PID-файла"
                     return 1
                 fi
             else
-                echo "⚠️ PID-файл есть, но процесс $saved_pid не соответствует starttime или стал зомби. Удаляем файл."
-                rm -f "$PID_FILE"
+                echo "⚠️ PID-файл есть, но процесс $saved_pid не соответствует starttime или стал зомби."
             fi
         else
-            echo "⚠️ Некорректный PID-файл, удаляем."
-            rm -f "$PID_FILE"
+            echo "⚠️ Некорректный PID-файл."
         fi
     fi
 
@@ -511,7 +569,7 @@ cmd_stop() {
         echo "🔍 Найдены legacy-процессы: $legacy_pids"
         for pid in $legacy_pids; do
             # Пропускаем PID, который уже обработан через PID-файл
-            if [ -f "$PID_FILE" ]; then
+            if [ -f "$PID_FILE" ] && secure_private_file "$PID_FILE"; then
                 local file_pid
                 file_pid=$(cut -d: -f1 "$PID_FILE" 2>/dev/null)
                 if [ "$pid" == "$file_pid" ]; then
@@ -528,7 +586,6 @@ cmd_stop() {
         echo "ℹ️ Legacy-процессы не найдены"
     fi
 
-    rm -f "$PID_FILE"
     echo "✅ Все процессы остановлены"
     return 0
 }
@@ -550,8 +607,12 @@ cmd_restart() {
 # Команда status (для CI требуется ровно "БОТ РАБОТАЕТ")
 # --------------------------------------------
 cmd_status() {
-    if [ -f "$PID_FILE" ]; then
+    if [ -f "$PID_FILE" ] || [ -L "$PID_FILE" ]; then
         local saved_pid saved_starttime
+        if ! secure_private_file "$PID_FILE"; then
+            echo "❌ PID-файл небезопасен: $PID_FILE" >&2
+            return 1
+        fi
         saved_pid=$(cut -d: -f1 "$PID_FILE" 2>/dev/null)
         saved_starttime=$(cut -d: -f2 "$PID_FILE" 2>/dev/null)
         if [ -n "$saved_pid" ] && is_valid_process "$saved_pid" "$saved_starttime"; then
@@ -560,8 +621,7 @@ cmd_status() {
             return 0
         else
             echo "БОТ ОСТАНОВЛЕН"
-            echo "   PID-файл есть, но процесс мёртв/зомби/переиспользован. Удаляем." >&2
-            rm -f "$PID_FILE"
+            echo "   PID-файл есть, но процесс мёртв/зомби/переиспользован." >&2
             return 1
         fi
     else
@@ -598,15 +658,18 @@ cmd_logs() {
         follow_flag="-f"
     fi
 
-    if [ -f "$LOG_FILE" ]; then
+    if [ -f "$LOG_FILE" ] && secure_private_file "$LOG_FILE"; then
         if [ -n "$follow_flag" ]; then
             tail -n 10 -f "$LOG_FILE"
         else
             tail -n 10 "$LOG_FILE"
         fi
+    elif [ -e "$LOG_FILE" ] || [ -L "$LOG_FILE" ]; then
+        echo "❌ Файл лога небезопасен для чтения: $LOG_FILE" >&2
+        return 1
     else
         echo "❌ Лог не найден: $LOG_FILE"
-        exit 1
+        return 1
     fi
 }
 
@@ -620,15 +683,18 @@ cmd_debug_logs() {
         follow_flag="-f"
     fi
 
-    if [ -f "$DEBUG_LOG_FILE" ]; then
+    if [ -f "$DEBUG_LOG_FILE" ] && secure_private_file "$DEBUG_LOG_FILE"; then
         if [ -n "$follow_flag" ]; then
             tail -n 15 -f "$DEBUG_LOG_FILE"
         else
             tail -n 15 "$DEBUG_LOG_FILE"
         fi
+    elif [ -e "$DEBUG_LOG_FILE" ] || [ -L "$DEBUG_LOG_FILE" ]; then
+        echo "❌ Debug-лог небезопасен для чтения: $DEBUG_LOG_FILE" >&2
+        return 1
     else
         echo "❌ Лог не найден: $DEBUG_LOG_FILE"
-        exit 1
+        return 1
     fi
 }
 

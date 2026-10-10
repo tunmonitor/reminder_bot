@@ -3,10 +3,35 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from bot.notifier import send_assignments
+from bot.notifier import (
+    build_general_message,
+    build_personal_message,
+    send_assignments,
+)
 
 
 class PartialNotificationTest(unittest.TestCase):
+    def test_dynamic_html_fields_are_escaped(self):
+        templates = {
+            "general": "Ответственный: @{tg_responsible}",
+            "roles": {"Ответственный": "{name}"},
+        }
+
+        group_text = build_general_message(
+            {"Ответственный": {"username": "<b>alex</b>"}},
+            templates,
+            "11.10.2026",
+        )
+        personal_text = build_personal_message(
+            "Ответственный",
+            {"name": "<b>Алексей</b>"},
+            templates,
+            "11.10.2026",
+        )
+
+        self.assertEqual(group_text, "Ответственный: @&lt;b&gt;alex&lt;/b&gt;")
+        self.assertEqual(personal_text, "&lt;b&gt;Алексей&lt;/b&gt;")
+
     def test_sends_group_and_available_participant_with_missing_roles(self):
         async def send():
             bot = SimpleNamespace(

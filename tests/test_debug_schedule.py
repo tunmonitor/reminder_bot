@@ -65,6 +65,31 @@ class DebugScheduleTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(PermissionError, "доступен группе"):
                 debug_schedule._secure_output_dir(output_dir)
 
+    async def test_rejects_symlinked_output_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "target"
+            target.mkdir(mode=0o700)
+            output_dir = Path(temp_dir) / "linked"
+            output_dir.symlink_to(target, target_is_directory=True)
+
+            with self.assertRaises(OSError):
+                debug_schedule._secure_output_dir(output_dir)
+
+            self.assertEqual(list(target.iterdir()), [])
+
+    async def test_rejects_symlinked_output_directory_parent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir(mode=0o700)
+            linked_parent = root / "linked"
+            linked_parent.symlink_to(target, target_is_directory=True)
+
+            with self.assertRaises(OSError):
+                debug_schedule._secure_output_dir(linked_parent / "debug")
+
+            self.assertFalse((target / "debug").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

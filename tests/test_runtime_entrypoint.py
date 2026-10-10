@@ -88,7 +88,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 shm_dir = Path(tmp_dir) / "shm"
                 log_dir = Path(tmp_dir) / "logs"
                 shm_dir.mkdir(mode=0o700)
-                log_dir.mkdir()
+                log_dir.mkdir(mode=0o700)
                 pid_file = shm_dir / "reminder_bot_bot.pid"
                 from bot.app import _current_process_starttime
                 pid_file.write_text(
@@ -166,7 +166,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 shm_dir = Path(tmp_dir) / "shm"
                 log_dir = Path(tmp_dir) / "logs"
                 shm_dir.mkdir(mode=0o700)
-                log_dir.mkdir()
+                log_dir.mkdir(mode=0o700)
                 bot = SimpleNamespace(session=SimpleNamespace(close=AsyncMock()))
                 dispatcher = SimpleNamespace()
                 scheduler = SimpleNamespace(start=MagicMock(), shutdown=MagicMock())
@@ -282,6 +282,29 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 _write_pid(pid_path)
 
             self.assertFalse(pid_path.exists())
+
+    def test_run_rejects_symlinked_runtime_directory(self):
+        from bot import app
+
+        async def run_bot():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                root = Path(tmp_dir)
+                target = root / "target"
+                target.mkdir(mode=0o700)
+                linked = root / "linked"
+                linked.symlink_to(target, target_is_directory=True)
+
+                with self.assertRaises(OSError):
+                    await app.run(
+                        SimpleNamespace(
+                            shm_dir=str(linked),
+                            log_dir=str(root / "logs"),
+                        )
+                    )
+
+                self.assertFalse((target / "reminder_bot_bot.pid").exists())
+
+        asyncio.run(run_bot())
 
     def test_log_files_are_private(self):
         from bot.logger import setup_loggers

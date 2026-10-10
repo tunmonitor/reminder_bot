@@ -208,7 +208,7 @@ def parse_schedule(path: Path, target: date,
             if task_row is None:
                 continue
             role, name = task_row
-            if role in found and found[role] != name:
+            if name and role in found and found[role] != name:
                 raise RuntimeError(
                     f"Роль «{role}» указана несколько раз на дату {target:%d.%m.%Y}"
                 )

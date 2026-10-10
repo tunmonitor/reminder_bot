@@ -27,15 +27,18 @@ def build_general_message(
 ) -> str:
     return templates["general"].format(
         sunday_date=sunday_str,
-        tg_responsible=assignments.get("Ответственный", {}).get(
-            "username", "не найден"
-        ) or "не указан",
-        tg_leader=assignments.get("Ведущий", {}).get(
-            "username", "не найден"
-        ) or "не указан",
-        tg_preacher=assignments.get("Проповедник", {}).get(
-            "username", "не найден"
-        ) or "не указан",
+        tg_responsible=html.escape(
+            assignments.get("Ответственный", {}).get("username", "не найден")
+            or "не указан"
+        ),
+        tg_leader=html.escape(
+            assignments.get("Ведущий", {}).get("username", "не найден")
+            or "не указан"
+        ),
+        tg_preacher=html.escape(
+            assignments.get("Проповедник", {}).get("username", "не найден")
+            or "не указан"
+        ),
     )
 
 
@@ -46,7 +49,7 @@ def build_personal_message(
     sunday_str: str,
 ) -> str:
     return templates["roles"][role].format(
-        name=info["name"], sunday_date=sunday_str,
+        name=html.escape(info["name"]), sunday_date=sunday_str,
     )
 
 
