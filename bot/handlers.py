@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from aiogram import F, Router
+from aiogram import F, Dispatcher, Router
 from aiogram.types import CallbackQuery
 
 from .notifier import CONFIRM_PREFIX
@@ -12,12 +12,11 @@ from .notifier import CONFIRM_PREFIX
 router = Router()
 
 
-def register(context: Any) -> None:
+def register(dispatcher: Dispatcher, context: Any) -> None:
     """Регистрирует хэндлер, замыкая его на context."""
 
     interaction: logging.Logger = context.interaction_logger
     debug: logging.Logger = context.debug_logger
-    dispatcher = getattr(context, "dispatcher", None)
 
     @router.callback_query(F.data.startswith(f"{CONFIRM_PREFIX}:"))
     async def on_confirm(cb: CallbackQuery) -> None:  # noqa: D401
@@ -69,6 +68,4 @@ def register(context: Any) -> None:
         )
         await cb.answer("Принято!")
 
-    if dispatcher is not None:
-        dispatcher.include_router(router)
-
+    dispatcher.include_router(router)

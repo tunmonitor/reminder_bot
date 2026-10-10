@@ -21,9 +21,11 @@ BOT_SCRIPT="$PROJECT_DIR/reminder_bot.py"
 LEGACY_BOT_SCRIPT="$BOT_SCRIPT"
 
 # --------------------------------------------
-# Определяем Python (venv приоритетно)
+# Определяем Python (/home/pi/.venv приоритетно)
 # --------------------------------------------
-if [ -x "$PROJECT_DIR/.venv/bin/python3" ]; then
+if [ -x "/home/pi/.venv/bin/python3" ]; then
+    PYTHON_EXEC="/home/pi/.venv/bin/python3"
+elif [ -x "$PROJECT_DIR/.venv/bin/python3" ]; then
     PYTHON_EXEC="$PROJECT_DIR/.venv/bin/python3"
 elif [ -x "$PROJECT_DIR/venv/bin/python3" ]; then
     PYTHON_EXEC="$PROJECT_DIR/venv/bin/python3"
@@ -38,11 +40,12 @@ fi
 # --------------------------------------------
 SHM_BASE="${SHM_BASE:-/dev/shm/reminder_bot}"
 SHM_DIR="${SHM_DIR:-$SHM_BASE/$ENV_NAME}"
+LOG_DIR="${LOG_DIR:-$SHM_DIR}"
 
 PID_FILE="$SHM_DIR/reminder_bot_bot.pid"
-LOG_FILE="$SHM_DIR/reminder_bot_interaction.log"
-DEBUG_LOG_FILE="$SHM_DIR/reminder_bot_debug.log"
-NOHUP_LOG="$SHM_DIR/sys_nohup.log"
+LOG_FILE="$LOG_DIR/reminder_bot_interaction.log"
+DEBUG_LOG_FILE="$LOG_DIR/reminder_bot_debug.log"
+NOHUP_LOG="$LOG_DIR/sys_nohup.log"
 
 # Персистентные бэкапы логов на SD-карте
 BACKUP_DIR="$PROJECT_DIR/logs_backup"
@@ -224,9 +227,9 @@ cmd_start() {
     echo "🚀 Запуск бота ($ENV_NAME)..."
 
     mkdir -p "$SHM_DIR"
+    mkdir -p "$LOG_DIR"
     mkdir -p "$BACKUP_DIR"
-    chmod 775 "$SHM_BASE" 2>/dev/null || true
-    chmod 775 "$SHM_DIR" 2>/dev/null || true
+    chmod 700 "$SHM_BASE" "$SHM_DIR"
 
     # Проверка активного PID-файла
     if [ -f "$PID_FILE" ]; then
@@ -256,7 +259,7 @@ cmd_start() {
         RUNNER_TRACKING_ID="${RUNNER_TRACKING_ID:-0}" \
         nohup "$PYTHON_EXEC" -u "$BOT_SCRIPT" \
         --shm-dir "$SHM_DIR" \
-        --log-dir "$SHM_DIR" \
+        --log-dir "$LOG_DIR" \
         > "$NOHUP_LOG" 2>&1 &
     local new_pid=$!
 
@@ -407,8 +410,21 @@ cmd_backup() {
 # Просмотр логов
 # --------------------------------------------
 cmd_logs() {
+    local follow_flag=""
+    if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != "--follow" ]; }; then
+        echo "Использование: $0 logs [--follow]" >&2
+        return 2
+    fi
+    if [ "$#" -eq 1 ]; then
+        follow_flag="-f"
+    fi
+
     if [ -f "$LOG_FILE" ]; then
-        tail -n 10 -f "$LOG_FILE"
+        if [ -n "$follow_flag" ]; then
+            tail -n 10 -f "$LOG_FILE"
+        else
+            tail -n 10 "$LOG_FILE"
+        fi
     else
         echo "❌ Лог не найден: $LOG_FILE"
         exit 1
@@ -416,8 +432,21 @@ cmd_logs() {
 }
 
 cmd_debug_logs() {
+    local follow_flag=""
+    if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != "--follow" ]; }; then
+        echo "Использование: $0 debug-logs [--follow]" >&2
+        return 2
+    fi
+    if [ "$#" -eq 1 ]; then
+        follow_flag="-f"
+    fi
+
     if [ -f "$DEBUG_LOG_FILE" ]; then
-        tail -n 15 -f "$DEBUG_LOG_FILE"
+        if [ -n "$follow_flag" ]; then
+            tail -n 15 -f "$DEBUG_LOG_FILE"
+        else
+            tail -n 15 "$DEBUG_LOG_FILE"
+        fi
     else
         echo "❌ Лог не найден: $DEBUG_LOG_FILE"
         exit 1
@@ -452,16 +481,18 @@ case "$1" in
         cmd_backup
         ;;
     logs)
-        cmd_logs
+        shift
+        cmd_logs "$@"
         ;;
     debug-logs)
-        cmd_debug_logs
+        shift
+        cmd_debug_logs "$@"
         ;;
     clear-logs)
         cmd_clear_logs
         ;;
     *)
-        echo "📋 Использование: $0 {start|stop|restart|status|backup|logs|debug-logs|clear-logs}"
+        echo "📋 Использование: $0 {start|stop|restart|status|backup|logs [--follow]|debug-logs [--follow]|clear-logs}"
         echo "   ENV определяется автоматически по имени каталога ($ENV_NAME)."
         exit 1
         ;;

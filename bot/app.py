@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import stat
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,7 +14,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
-try:
+if __package__:
     from .cli import CliArgs
     from .config import get_tz, load_credentials, load_schedule, load_templates
     from .excel_parser import parse_people, parse_schedule, resolve_assignments
@@ -23,7 +24,7 @@ try:
     from .scheduler import build_scheduler
     from .state import StateCache
     from .yandex_disk import download_public
-except ImportError:  # pragma: no cover - поддержка запуска файла напрямую
+else:  # pragma: no cover - поддержка запуска файла напрямую
     from bot.cli import CliArgs
     from bot.config import get_tz, load_credentials, load_schedule, load_templates
     from bot.excel_parser import parse_people, parse_schedule, resolve_assignments
@@ -47,9 +48,42 @@ def _pid_path(shm_dir: Path) -> Path:
     return shm_dir / "reminder_bot_bot.pid"
 
 
+def _current_process_starttime() -> str:
+    stat_fields = (
+        Path("/proc/self/stat")
+        .read_text(encoding="utf-8")
+        .rsplit(")", 1)[1]
+        .split()
+    )
+    return stat_fields[19]
+
+
 def _write_pid(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(str(os.getpid()), encoding="utf-8")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_fd = os.open(path.parent, directory_flags)
+    try:
+        directory_stat = os.fstat(directory_fd)
+        if directory_stat.st_uid != os.geteuid():
+            raise PermissionError(
+                f"Каталог PID-файла должен принадлежать текущему пользователю: {path.parent}"
+            )
+        if stat.S_IMODE(directory_stat.st_mode) & 0o022:
+            raise PermissionError(
+                f"Каталог PID-файла не должен быть доступен на запись группе или другим: {path.parent}"
+            )
+
+        pid_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        pid_fd = os.open(path.name, pid_flags, 0o600, dir_fd=directory_fd)
+        try:
+            os.fchmod(pid_fd, 0o600)
+            with os.fdopen(pid_fd, "w", encoding="utf-8") as pid_file:
+                pid_fd = -1
+                pid_file.write(f"{os.getpid()}:{_current_process_starttime()}")
+        finally:
+            if pid_fd >= 0:
+                os.close(pid_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def _build_state(assignments: dict[str, dict]) -> dict:
@@ -139,13 +173,12 @@ async def run(args: CliArgs) -> None:
     dp = Dispatcher(storage=MemoryStorage())
     context = SimpleNamespace(
         bot=bot,
-        dispatcher=dp,
         group_chat_id=credentials.group_chat_id,
         state_cache=state_cache,
         interaction_logger=interaction_logger,
         debug_logger=debug_logger,
     )
-    register(context)
+    register(dp, context)
 
     async def scheduled_job() -> None:
         await _process_upcoming_sunday(
@@ -166,12 +199,20 @@ async def run(args: CliArgs) -> None:
         debug_logger=debug_logger,
     )
 
-    async def shutdown() -> None:
+    shutdown_task: asyncio.Task[None] | None = None
+
+    async def perform_shutdown() -> None:
         scheduler.shutdown(wait=False)
         await bot.session.close()
         pid_file = _pid_path(shm_dir)
         if pid_file.exists():
             pid_file.unlink()
+
+    async def shutdown() -> None:
+        nonlocal shutdown_task
+        if shutdown_task is None:
+            shutdown_task = asyncio.create_task(perform_shutdown())
+        await asyncio.shield(shutdown_task)
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
