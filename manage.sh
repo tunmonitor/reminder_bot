@@ -18,7 +18,6 @@
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_NAME="$(basename "$PROJECT_DIR")"          # test | prod
 BOT_SCRIPT="$PROJECT_DIR/reminder_bot.py"
-LEGACY_BOT_SCRIPT="$BOT_SCRIPT"
 
 # --------------------------------------------
 # Определяем Python (/home/pi/.venv приоритетно)
@@ -49,6 +48,148 @@ NOHUP_LOG="$LOG_DIR/sys_nohup.log"
 
 # Персистентные бэкапы логов на SD-карте
 BACKUP_DIR="$PROJECT_DIR/logs_backup"
+
+ensure_backup_dir() {
+    if [ -L "$BACKUP_DIR" ]; then
+        echo "❌ Каталог бэкапов не должен быть символической ссылкой: $BACKUP_DIR" >&2
+        return 1
+    fi
+    mkdir -p "$BACKUP_DIR" || return 1
+    if [ ! -d "$BACKUP_DIR" ] || [ ! -O "$BACKUP_DIR" ]; then
+        echo "❌ Каталог бэкапов должен принадлежать текущему пользователю: $BACKUP_DIR" >&2
+        return 1
+    fi
+    chmod 700 "$BACKUP_DIR"
+}
+
+is_safe_backup_file() {
+    local file=$1
+    local mode
+    local links
+    if [ ! -f "$file" ] || [ -L "$file" ] || [ ! -O "$file" ]; then
+        return 1
+    fi
+    mode=$(stat -c '%a' -- "$file") || return 1
+    links=$(stat -c '%h' -- "$file") || return 1
+    [[ "$mode" =~ ^[0-7]+$ ]] || return 1
+    [ "$links" -eq 1 ] || return 1
+    (( (8#$mode & 022) == 0 ))
+}
+
+has_symlink_path_component() {
+    local path=$1
+    local current="/"
+    local component
+    local -a components=()
+
+    if [[ "$path" != /* ]]; then
+        current=$PWD
+    fi
+    IFS='/' read -r -a components <<< "$path"
+    for component in "${components[@]}"; do
+        case "$component" in
+            ""|".")
+                continue
+                ;;
+            "..")
+                return 0
+                ;;
+        esac
+        current="${current%/}/$component"
+        [ -L "$current" ] && return 0
+    done
+    return 1
+}
+
+secure_log_file_for_backup() {
+    local file=$1
+    local links
+    if [ ! -f "$file" ] || [ -L "$file" ] || [ ! -O "$file" ]; then
+        return 1
+    fi
+    links=$(stat -c '%h' -- "$file") || return 1
+    [ "$links" -eq 1 ] || return 1
+    chmod 600 "$file"
+}
+
+is_project_pythonpath() {
+    local pid=$1
+    local environment_entry
+    local pythonpath
+    local -a environment=()
+
+    mapfile -d '' -t environment < "/proc/$pid/environ" 2>/dev/null || return 1
+    for environment_entry in "${environment[@]}"; do
+        if [[ "$environment_entry" == PYTHONPATH=* ]]; then
+            pythonpath=${environment_entry#PYTHONPATH=}
+            case ":$pythonpath:" in
+                *":$PROJECT_DIR:"*)
+                    return 0
+                    ;;
+            esac
+        fi
+    done
+    return 1
+}
+
+is_legacy_bot_process() {
+    local pid=$1
+    local cwd
+    local entrypoint_index=1
+    local -a argv=()
+
+    mapfile -d '' -t argv < "/proc/$pid/cmdline" 2>/dev/null || return 1
+    [ "${#argv[@]}" -gt 0 ] || return 1
+    [[ "${argv[0]##*/}" == python* ]] || return 1
+    cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || return 1
+
+    while [ "$entrypoint_index" -lt "${#argv[@]}" ]; do
+        case "${argv[entrypoint_index]}" in
+            -m)
+                [ "${argv[entrypoint_index + 1]:-}" = "bot.reminder_bot" ] &&
+                    { [ "$cwd" = "$PROJECT_DIR" ] || is_project_pythonpath "$pid"; }
+                return $?
+                ;;
+            -X|-W)
+                entrypoint_index=$((entrypoint_index + 2))
+                ;;
+            -X*|-W*)
+                entrypoint_index=$((entrypoint_index + 1))
+                ;;
+            -B|-E|-I|-O|-OO|-s|-S|-u)
+                entrypoint_index=$((entrypoint_index + 1))
+                ;;
+            -*)
+                return 1
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    [ "$entrypoint_index" -lt "${#argv[@]}" ] || return 1
+    case "${argv[entrypoint_index]}" in
+        "$BOT_SCRIPT"|"$PROJECT_DIR/bot/reminder_bot.py")
+            return 0
+            ;;
+        reminder_bot.py|./reminder_bot.py|bot/reminder_bot.py|./bot/reminder_bot.py)
+            [ "$cwd" = "$PROJECT_DIR" ] && return 0
+            ;;
+    esac
+    return 1
+}
+
+find_legacy_pids() {
+    local cmdline_file pid
+    for cmdline_file in /proc/[0-9]*/cmdline; do
+        pid=${cmdline_file#/proc/}
+        pid=${pid%/cmdline}
+        if is_legacy_bot_process "$pid"; then
+            printf '%s\n' "$pid"
+        fi
+    done
+}
 
 # --------------------------------------------
 # Функция получения времени старта процесса (тик из /proc/<pid>/stat)
@@ -195,10 +336,22 @@ stop_legacy_process() {
 # Бэкап лога взаимодействий на SD-карту
 # --------------------------------------------
 do_backup() {
-    mkdir -p "$BACKUP_DIR"
+    ensure_backup_dir || return 1
     if [ -s "$LOG_FILE" ]; then
+        if ! secure_log_file_for_backup "$LOG_FILE" ||
+           ! is_safe_backup_file "$LOG_FILE"; then
+            echo "❌ Файл лога небезопасен для резервного копирования: $LOG_FILE" >&2
+            return 1
+        fi
         local backup_file="$BACKUP_DIR/reminder_bot_interaction_$(date +%F).log"
-        cp -a "$LOG_FILE" "$backup_file"
+        local backup_tmp
+        backup_tmp=$(mktemp "$BACKUP_DIR/.reminder_bot_interaction.XXXXXX") || return 1
+        if ! cp -- "$LOG_FILE" "$backup_tmp" ||
+           ! chmod 600 "$backup_tmp" ||
+           ! mv -fT -- "$backup_tmp" "$backup_file"; then
+            rm -f -- "$backup_tmp"
+            return 1
+        fi
         echo "💾 Бэкап создан: $backup_file"
     else
         echo "ℹ️ Нет данных для бэкапа ($LOG_FILE пуст или отсутствует)."
@@ -212,11 +365,35 @@ restore_latest_log() {
     if [ -s "$LOG_FILE" ]; then
         return 0
     fi
-    local latest
-    latest=$(ls -1t "$BACKUP_DIR"/reminder_bot_interaction_*.log 2>/dev/null | head -n 1)
+    ensure_backup_dir || return 1
+    local latest=""
+    local candidate
+    local found_backup=0
+    for candidate in "$BACKUP_DIR"/reminder_bot_interaction_*.log; do
+        if [ ! -e "$candidate" ] && [ ! -L "$candidate" ]; then
+            continue
+        fi
+        found_backup=1
+        if ! is_safe_backup_file "$candidate"; then
+            echo "⚠️ Пропускаем небезопасный файл бэкапа: $candidate" >&2
+            continue
+        fi
+        if [ -z "$latest" ] || [ "$candidate" -nt "$latest" ]; then
+            latest=$candidate
+        fi
+    done
     if [ -n "$latest" ]; then
-        cp -a "$latest" "$LOG_FILE"
+        local restore_tmp
+        restore_tmp=$(mktemp "$LOG_DIR/.reminder_bot_restore.XXXXXX") || return 1
+        if ! install -m 600 -- "$latest" "$restore_tmp" ||
+           ! mv -fT -- "$restore_tmp" "$LOG_FILE"; then
+            rm -f -- "$restore_tmp"
+            return 1
+        fi
         echo "♻️ Восстановлен interaction.log из $latest"
+    elif [ "$found_backup" -eq 1 ]; then
+        echo "❌ Не найден безопасный файл для восстановления лога." >&2
+        return 1
     fi
 }
 
@@ -226,10 +403,18 @@ restore_latest_log() {
 cmd_start() {
     echo "🚀 Запуск бота ($ENV_NAME)..."
 
-    mkdir -p "$SHM_DIR"
-    mkdir -p "$LOG_DIR"
-    mkdir -p "$BACKUP_DIR"
-    chmod 700 "$SHM_BASE" "$SHM_DIR"
+    if has_symlink_path_component "$SHM_DIR"; then
+        echo "❌ Путь к каталогу PID-файла не должен содержать символические ссылки или '..': $SHM_DIR" >&2
+        exit 1
+    fi
+    mkdir -p "$SHM_DIR" || exit 1
+    if has_symlink_path_component "$SHM_DIR"; then
+        echo "❌ Путь к каталогу PID-файла изменился или содержит символическую ссылку: $SHM_DIR" >&2
+        exit 1
+    fi
+    mkdir -p "$LOG_DIR" || exit 1
+    chmod 700 "$SHM_DIR" || exit 1
+    ensure_backup_dir || exit 1
 
     # Проверка активного PID-файла
     if [ -f "$PID_FILE" ]; then
@@ -246,7 +431,7 @@ cmd_start() {
     fi
 
     # Восстанавливаем последний лог из бэкапа, если ОЗУ чистая
-    restore_latest_log
+    restore_latest_log || exit 1
 
     if [ ! -f "$BOT_SCRIPT" ]; then
         echo "❌ Не найден основной файл бота: $BOT_SCRIPT"
@@ -321,7 +506,7 @@ cmd_stop() {
 
     # 3. Поиск и остановка legacy-процессов (запуск без PID-файла)
     local legacy_pids
-    legacy_pids=$(pgrep -f "python.*$LEGACY_BOT_SCRIPT" 2>/dev/null)
+    legacy_pids=$(find_legacy_pids)
     if [ -n "$legacy_pids" ]; then
         echo "🔍 Найдены legacy-процессы: $legacy_pids"
         for pid in $legacy_pids; do
@@ -334,15 +519,9 @@ cmd_stop() {
                 fi
             fi
 
-            local cmdline
-            cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
-            if [[ "$cmdline" == *"$LEGACY_BOT_SCRIPT"* ]]; then
-                if ! stop_legacy_process "$pid" "legacy-процесс $pid"; then
-                    echo "❌ Не удалось остановить legacy-процесс $pid"
-                    return 1
-                fi
-            else
-                echo "ℹ️ Процесс $pid не относится к этому боту (пропускаем)."
+            if ! stop_legacy_process "$pid" "legacy-процесс $pid"; then
+                echo "❌ Не удалось остановить legacy-процесс $pid"
+                return 1
             fi
         done
     else
@@ -387,7 +566,7 @@ cmd_status() {
         fi
     else
         local legacy_pid
-        legacy_pid=$(pgrep -f "python.*$LEGACY_BOT_SCRIPT" 2>/dev/null | head -n 1)
+        legacy_pid=$(find_legacy_pids | sed -n '1p')
         if [ -n "$legacy_pid" ]; then
             echo "БОТ ОСТАНОВЛЕН"
             echo "   Найден legacy-процесс (PID $legacy_pid) без PID-файла. Рекомендуется выполнить stop." >&2
@@ -455,7 +634,13 @@ cmd_debug_logs() {
 
 cmd_clear_logs() {
     for f in "$LOG_FILE" "$DEBUG_LOG_FILE" "$NOHUP_LOG"; do
-        [ -f "$f" ] && true > "$f"
+        if [ -e "$f" ] || [ -L "$f" ]; then
+            if ! secure_log_file_for_backup "$f"; then
+                echo "❌ Файл лога небезопасен для очистки: $f" >&2
+                return 1
+            fi
+            : > "$f"
+        fi
     done
     echo "🧹 Логи очищены."
     exit 0

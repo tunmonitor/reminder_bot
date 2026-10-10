@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import signal
 import stat
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -17,20 +16,20 @@ from aiogram.fsm.storage.memory import MemoryStorage
 if __package__:
     from .cli import CliArgs
     from .config import get_tz, load_credentials, load_schedule, load_templates
-    from .excel_parser import parse_people, parse_schedule, resolve_assignments
+    from .excel_parser import ROLES, parse_people, parse_schedule, resolve_assignments
     from .handlers import register
     from .logger import setup_loggers
-    from .notifier import send_assignments
+    from .notifier import _notify_admin, send_assignments
     from .scheduler import build_scheduler
     from .state import StateCache
     from .yandex_disk import download_public
 else:  # pragma: no cover - поддержка запуска файла напрямую
     from bot.cli import CliArgs
     from bot.config import get_tz, load_credentials, load_schedule, load_templates
-    from bot.excel_parser import parse_people, parse_schedule, resolve_assignments
+    from bot.excel_parser import ROLES, parse_people, parse_schedule, resolve_assignments
     from bot.handlers import register
     from bot.logger import setup_loggers
-    from bot.notifier import send_assignments
+    from bot.notifier import _notify_admin, send_assignments
     from bot.scheduler import build_scheduler
     from bot.state import StateCache
     from bot.yandex_disk import download_public
@@ -58,9 +57,26 @@ def _current_process_starttime() -> str:
     return stat_fields[19]
 
 
+def _open_directory_without_symlinks(path: Path) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_fd = os.open("/" if path.is_absolute() else ".", flags)
+    try:
+        for component in path.parts:
+            if component in ("/", "."):
+                continue
+            if component == "..":
+                raise ValueError(f"Путь к PID-каталогу не должен содержать '..': {path}")
+            next_fd = os.open(component, flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
 def _write_pid(path: Path) -> None:
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    directory_fd = os.open(path.parent, directory_flags)
+    directory_fd = _open_directory_without_symlinks(path.parent)
     try:
         directory_stat = os.fstat(directory_fd)
         if directory_stat.st_uid != os.geteuid():
@@ -84,6 +100,62 @@ def _write_pid(path: Path) -> None:
                 os.close(pid_fd)
     finally:
         os.close(directory_fd)
+
+
+def _existing_pid_process_status(path: Path) -> tuple[str, bool] | None:
+    directory_fd = _open_directory_without_symlinks(path.parent)
+    try:
+        try:
+            pid_fd = os.open(
+                path.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=directory_fd,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return None
+        try:
+            pid_stat = os.fstat(pid_fd)
+            if (
+                not stat.S_ISREG(pid_stat.st_mode)
+                or pid_stat.st_uid != os.geteuid()
+                or pid_stat.st_nlink != 1
+                or stat.S_IMODE(pid_stat.st_mode) & 0o022
+            ):
+                return None
+            content_bytes = os.read(pid_fd, 129)
+            if len(content_bytes) > 128:
+                return None
+            content = content_bytes.decode("ascii").strip()
+        except UnicodeDecodeError:
+            return None
+        finally:
+            os.close(pid_fd)
+    finally:
+        os.close(directory_fd)
+
+    pid, separator, starttime = content.partition(":")
+    if not separator or not pid.isdigit() or not starttime.isdigit():
+        return None
+
+    try:
+        process_fields = (
+            Path(f"/proc/{pid}/stat")
+            .read_text(encoding="utf-8")
+            .rsplit(")", 1)[1]
+            .split()
+        )
+    except FileNotFoundError:
+        return pid, False
+    except PermissionError:
+        return None
+    running = (
+        len(process_fields) > 19
+        and process_fields[0] != "Z"
+        and process_fields[19] == starttime
+    )
+    return pid, running
 
 
 def _build_state(assignments: dict[str, dict]) -> dict:
@@ -123,10 +195,44 @@ async def _process_upcoming_sunday(
     xlsx_path = shm_dir / "reminder_bot_current.xlsx"
     debug_logger.info("Подготовка рассылки на %s", sunday_iso)
 
-    await download_public(credentials.yandex_public_url, xlsx_path, debug_logger)
-    schedule = parse_schedule(xlsx_path, sunday_date, debug_logger)
-    people = parse_people(xlsx_path, debug_logger)
-    assignments = resolve_assignments(schedule, people)
+    try:
+        await download_public(credentials.yandex_public_url, xlsx_path, debug_logger)
+        schedule = parse_schedule(xlsx_path, sunday_date, debug_logger)
+        people = parse_people(xlsx_path, debug_logger)
+        assignment_issues = [
+            f"На {sunday_date:%d.%m.%Y} не найдено назначение для роли «{role}»"
+            for role in ROLES
+            if role not in schedule
+        ]
+        assignments = resolve_assignments(
+            schedule, people, debug_logger, assignment_issues
+        )
+    except Exception as exc:
+        debug_logger.exception(
+            "Не удалось подготовить расписание на %s", sunday_iso
+        )
+        await _notify_admin(
+            bot,
+            credentials.admin_tg_id,
+            (
+                f"Не удалось загрузить или разобрать расписание "
+                f"на {sunday_date:%d.%m.%Y}: {type(exc).__name__}: {exc}"
+            ),
+            debug_logger,
+        )
+        raise
+
+    if assignment_issues:
+        await _notify_admin(
+            bot,
+            credentials.admin_tg_id,
+            (
+                f"Неполные данные расписания на {sunday_date:%d.%m.%Y}. "
+                "Рассылка продолжится для найденных участников. "
+                + "; ".join(assignment_issues)
+            ),
+            debug_logger,
+        )
 
     state = _build_state(assignments)
     state["sunday_date"] = sunday_iso
@@ -164,7 +270,26 @@ async def run(args: CliArgs) -> None:
     tz = get_tz(credentials.timezone)
     state_cache = StateCache(shm_dir / "reminder_state_cache.json")
 
-    _write_pid(_pid_path(shm_dir))
+    pid_file = _pid_path(shm_dir)
+    try:
+        _write_pid(pid_file)
+    except FileExistsError as exc:
+        existing_process = _existing_pid_process_status(pid_file)
+        if existing_process is None:
+            status = "Содержимое PID-файла не удалось безопасно проверить."
+        elif existing_process[1]:
+            status = f"Процесс с PID {existing_process[0]} уже запущен."
+        else:
+            status = (
+                f"PID-файл устарел (PID {existing_process[0]} "
+                "не соответствует живому процессу)."
+            )
+        message = (
+            f"PID-файл уже существует: {pid_file}. {status} "
+            "Удалите его вручную, если он устарел."
+        )
+        debug_logger.error(message)
+        raise FileExistsError(message) from exc
 
     bot = Bot(
         token=credentials.bot_token,
@@ -214,16 +339,9 @@ async def run(args: CliArgs) -> None:
             shutdown_task = asyncio.create_task(perform_shutdown())
         await asyncio.shield(shutdown_task)
 
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown()))
-        except NotImplementedError:  # pragma: no cover - Windows/limited platforms
-            pass
-
     try:
         scheduler.start()
-        await dp.start_polling(bot)
+        await dp.start_polling(bot, close_bot_session=False)
     finally:
         await shutdown()
 

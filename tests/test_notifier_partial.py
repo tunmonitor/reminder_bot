@@ -1,0 +1,81 @@
+import asyncio
+import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from bot.notifier import send_assignments
+
+
+class PartialNotificationTest(unittest.TestCase):
+    def test_sends_group_and_available_participant_with_missing_roles(self):
+        async def send():
+            bot = SimpleNamespace(
+                send_message=AsyncMock(
+                    side_effect=[
+                        SimpleNamespace(message_id=10),
+                        SimpleNamespace(message_id=11, chat=SimpleNamespace(id=12345)),
+                    ]
+                )
+            )
+            assignments = {
+                "Ответственный": {
+                    "name": "Алексей",
+                    "username": "alex",
+                    "tg_id": 12345,
+                }
+            }
+            state = {
+                "participants": {
+                    "Ответственный": {
+                        "message_id": None,
+                        "chat_id": None,
+                    }
+                }
+            }
+            debug_logger = MagicMock()
+            templates = {
+                "general": (
+                    "Дата {sunday_date}: "
+                    "ответственный @{tg_responsible}; "
+                    "ведущий @{tg_leader}; проповедник @{tg_preacher}"
+                ),
+                "roles": {
+                    "Ответственный": "{name}, {sunday_date}",
+                },
+            }
+
+            with patch("bot.notifier.asyncio.sleep", new=AsyncMock()):
+                await send_assignments(
+                    bot=bot,
+                    group_chat_id=-100,
+                    admin_id=67890,
+                    assignments=assignments,
+                    state=state,
+                    templates=templates,
+                    sunday_str="11.10.2026",
+                    sunday_iso="2026-10-11",
+                    interaction_logger=MagicMock(),
+                    debug_logger=debug_logger,
+                )
+
+            first_call = bot.send_message.await_args_list[0]
+            group_text = first_call.args[1]
+            self.assertIn("@alex", group_text)
+            self.assertIn("@не найден", group_text)
+            self.assertEqual(len(bot.send_message.await_args_list), 2)
+            self.assertEqual(
+                bot.send_message.await_args_list[1].args,
+                (12345, "Алексей, 11.10.2026"),
+            )
+            self.assertEqual(state["participants"]["Ответственный"]["message_id"], 11)
+            debug_messages = [
+                call.args[0] for call in debug_logger.debug.call_args_list
+            ]
+            self.assertIn("Подготовлено сообщение в групповой чат:\n%s", debug_messages)
+            self.assertIn("Подготовлено личное сообщение: роль=%s, tg_id=%s, username=@%s\n%s", debug_messages)
+
+        asyncio.run(send())
+
+
+if __name__ == "__main__":
+    unittest.main()

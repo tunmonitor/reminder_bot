@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 
 from aiogram import Bot
@@ -19,10 +20,40 @@ def build_confirm_kb(role: str, sunday_iso: str) -> InlineKeyboardMarkup:
     ]])
 
 
+def build_general_message(
+    assignments: dict[str, dict],
+    templates: dict,
+    sunday_str: str,
+) -> str:
+    return templates["general"].format(
+        sunday_date=sunday_str,
+        tg_responsible=assignments.get("Ответственный", {}).get(
+            "username", "не найден"
+        ) or "не указан",
+        tg_leader=assignments.get("Ведущий", {}).get(
+            "username", "не найден"
+        ) or "не указан",
+        tg_preacher=assignments.get("Проповедник", {}).get(
+            "username", "не найден"
+        ) or "не указан",
+    )
+
+
+def build_personal_message(
+    role: str,
+    info: dict,
+    templates: dict,
+    sunday_str: str,
+) -> str:
+    return templates["roles"][role].format(
+        name=info["name"], sunday_date=sunday_str,
+    )
+
+
 async def _notify_admin(bot: Bot, admin_id: int, text: str,
                         debug_logger: logging.Logger) -> None:
     try:
-        await bot.send_message(admin_id, f"⚠️ {text}")
+        await bot.send_message(admin_id, html.escape(f"⚠️ {text}"))
     except Exception:  # noqa: BLE001
         debug_logger.exception("Не удалось уведомить администратора")
 
@@ -41,12 +72,8 @@ async def send_assignments(
 ) -> None:
     """Отправляет общее сообщение и ЛС. Обновляет state на месте."""
     # --- 1) Общее сообщение в группу ---
-    general_text = templates["general"].format(
-        sunday_date=sunday_str,
-        tg_responsible=assignments["Ответственный"]["username"],
-        tg_leader=assignments["Ведущий"]["username"],
-        tg_preacher=assignments["Проповедник"]["username"],
-    )
+    general_text = build_general_message(assignments, templates, sunday_str)
+    debug_logger.debug("Подготовлено сообщение в групповой чат:\n%s", general_text)
     try:
         general_msg = await bot.send_message(group_chat_id, general_text)
     except TelegramAPIError as exc:
@@ -63,8 +90,10 @@ async def send_assignments(
 
     # --- 2) Персональные ЛС ---
     for role, info in assignments.items():
-        text = templates["roles"][role].format(
-            name=info["name"], sunday_date=sunday_str,
+        text = build_personal_message(role, info, templates, sunday_str)
+        debug_logger.debug(
+            "Подготовлено личное сообщение: роль=%s, tg_id=%s, username=@%s\n%s",
+            role, info["tg_id"], info["username"], text,
         )
         try:
             msg = await bot.send_message(
