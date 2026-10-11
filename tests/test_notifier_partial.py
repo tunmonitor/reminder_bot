@@ -196,6 +196,118 @@ class PartialNotificationTest(unittest.TestCase):
 
         asyncio.run(send())
 
+    def test_group_state_save_failure_does_not_skip_personal_delivery(self):
+        async def send():
+            assignments = {
+                "Ответственный": {
+                    "name": "Алексей", "username": "alex", "tg_id": 12345,
+                }
+            }
+            state = {
+                "general_sent": False,
+                "general_message_id": None,
+                "general_text": None,
+                "participants": {"Ответственный": {"delivered": False}},
+            }
+            bot = SimpleNamespace(
+                send_message=AsyncMock(
+                    side_effect=[
+                        SimpleNamespace(message_id=10),
+                        SimpleNamespace(message_id=11, chat=SimpleNamespace(id=12345)),
+                    ]
+                ),
+                edit_message_text=AsyncMock(),
+            )
+            persist = MagicMock(side_effect=[OSError("disk full"), None])
+            templates = {
+                "general": "Ответственный: @{tg_responsible}",
+                "roles": {"Ответственный": "{name}"},
+            }
+
+            with patch("bot.notifier._notify_admin", new=AsyncMock()) as notify_admin, patch(
+                "bot.notifier.asyncio.sleep", new=AsyncMock()
+            ):
+                result = await send_assignments(
+                    bot=bot,
+                    group_chat_id=-100,
+                    admin_id=67890,
+                    assignments=assignments,
+                    state=state,
+                    templates=templates,
+                    sunday_str="11.10.2026",
+                    sunday_iso="2026-10-11",
+                    interaction_logger=MagicMock(),
+                    debug_logger=MagicMock(),
+                    save_state=persist,
+                )
+
+            self.assertFalse(result)
+            self.assertTrue(state["general_sent"])
+            self.assertTrue(state["participants"]["Ответственный"]["delivered"])
+            self.assertEqual(bot.send_message.await_count, 2)
+            notify_admin.assert_awaited_once()
+            persist.assert_has_calls([unittest.mock.call(), unittest.mock.call()])
+
+        asyncio.run(send())
+
+    def test_personal_state_save_failure_does_not_skip_next_recipient(self):
+        async def send():
+            assignments = {
+                role: {"name": name, "username": role, "tg_id": tg_id}
+                for role, name, tg_id in (
+                    ("Ответственный", "Алексей", 12345),
+                    ("Ведущий", "Павел", 23456),
+                )
+            }
+            state = {
+                "general_sent": False,
+                "participants": {
+                    role: {"delivered": False} for role in assignments
+                },
+            }
+            bot = SimpleNamespace(
+                send_message=AsyncMock(
+                    side_effect=[
+                        SimpleNamespace(message_id=10),
+                        SimpleNamespace(message_id=11, chat=SimpleNamespace(id=12345)),
+                        SimpleNamespace(message_id=12, chat=SimpleNamespace(id=23456)),
+                    ]
+                ),
+                edit_message_text=AsyncMock(),
+            )
+            persist = MagicMock(side_effect=[None, OSError("disk full"), None])
+
+            with patch("bot.notifier._notify_admin", new=AsyncMock()) as notify_admin, patch(
+                "bot.notifier.asyncio.sleep", new=AsyncMock()
+            ):
+                result = await send_assignments(
+                    bot=bot,
+                    group_chat_id=-100,
+                    admin_id=67890,
+                    assignments=assignments,
+                    state=state,
+                    templates={
+                        "general": "@{tg_responsible} @{tg_leader}",
+                        "roles": {
+                            "Ответственный": "{name}",
+                            "Ведущий": "{name}",
+                        },
+                    },
+                    sunday_str="11.10.2026",
+                    sunday_iso="2026-10-11",
+                    interaction_logger=MagicMock(),
+                    debug_logger=MagicMock(),
+                    save_state=persist,
+                )
+
+            self.assertFalse(result)
+            self.assertTrue(state["participants"]["Ответственный"]["delivered"])
+            self.assertTrue(state["participants"]["Ведущий"]["delivered"])
+            self.assertEqual(bot.send_message.await_count, 3)
+            notify_admin.assert_awaited_once()
+
+        asyncio.run(send())
+
     def test_group_fallback_is_not_rendered_as_a_fake_mention(self):
         message = build_general_message(
             {"Ответственный": {"username": ""}},

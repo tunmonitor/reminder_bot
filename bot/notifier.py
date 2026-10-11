@@ -73,9 +73,26 @@ async def send_assignments(
     save_state: Callable[[], None] | None = None,
 ) -> bool:
     """Отправляет общее сообщение и ЛС. Обновляет state на месте."""
+    delivery_state_persisted = True
+
+    async def persist_progress() -> None:
+        nonlocal delivery_state_persisted
+        if save_state is None:
+            return
+        try:
+            save_state()
+        except OSError as exc:
+            delivery_state_persisted = False
+            debug_logger.exception("Не удалось сохранить прогресс рассылки")
+            await _notify_admin(
+                bot,
+                admin_id,
+                f"Не удалось сохранить прогресс рассылки: {exc}",
+                debug_logger,
+            )
+
     # --- 1) Общее сообщение в группу ---
     general_text = build_general_message(assignments, templates, sunday_str)
-    general_delivery_complete = True
     debug_logger.debug("Подготовлено сообщение в групповой чат:\n%s", general_text)
     if state.get("general_sent"):
         if state.get("general_text") != general_text:
@@ -86,7 +103,7 @@ async def send_assignments(
                     message_id=state["general_message_id"],
                 )
             except TelegramAPIError as exc:
-                general_delivery_complete = False
+                delivery_state_persisted = False
                 debug_logger.exception("Не удалось обновить сообщение в группе")
                 await _notify_admin(
                     bot,
@@ -96,8 +113,7 @@ async def send_assignments(
                 )
             else:
                 state["general_text"] = general_text
-                if save_state is not None:
-                    save_state()
+                await persist_progress()
                 interaction_logger.info(
                     "Обновлено общее уведомление в чате %s (msg_id=%s)",
                     group_chat_id, state["general_message_id"],
@@ -114,8 +130,7 @@ async def send_assignments(
         state["general_message_id"] = general_msg.message_id
         state["general_sent"] = True
         state["general_text"] = general_text
-        if save_state is not None:
-            save_state()
+        await persist_progress()
         interaction_logger.info(
             "Общее уведомление отправлено в чат %s (msg_id=%s)",
             group_chat_id, general_msg.message_id,
@@ -139,8 +154,7 @@ async def send_assignments(
             participant_state["message_id"] = msg.message_id
             participant_state["chat_id"] = msg.chat.id
             participant_state["delivered"] = True
-            if save_state is not None:
-                save_state()
+            await persist_progress()
             interaction_logger.info(
                 "ЛС отправлено: role=%s tg_id=%s username=@%s",
                 role, info["tg_id"], info["username"],
@@ -157,4 +171,4 @@ async def send_assignments(
 
         await asyncio.sleep(RATE_LIMIT_DELAY)   # защита от 429
 
-    return general_delivery_complete
+    return delivery_state_persisted

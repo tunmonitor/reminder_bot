@@ -158,6 +158,42 @@ class ExcelParserTest(unittest.TestCase):
             "Проповедник": "Иван",
         })
 
+    def test_parses_multiple_legacy_assignments_from_one_row(self):
+        workbook = Workbook()
+        schedule = workbook.active
+        schedule.title = "График"
+        schedule.append(["11 октября"])
+        schedule.append([
+            "ХКЦ: Алексей",
+            "Ведущий; Павел",
+            "Проповедует: Иван",
+        ])
+        workbook.save(self.path)
+
+        assignments = parse_schedule(
+            self.path, date(2026, 10, 11), self.debug_logger
+        )
+
+        self.assertEqual(assignments, {
+            "Ведущий": "Павел",
+            "Ответственный": "Алексей",
+            "Проповедник": "Иван",
+        })
+
+    def test_legacy_role_cell_is_not_used_as_neighboring_role_name(self):
+        workbook = Workbook()
+        schedule = workbook.active
+        schedule.title = "График"
+        schedule.append(["11 октября"])
+        schedule.append(["Ответственный", "Ведущий: Павел"])
+        workbook.save(self.path)
+
+        assignments = parse_schedule(
+            self.path, date(2026, 10, 11), self.debug_logger
+        )
+
+        self.assertEqual(assignments, {"Ведущий": "Павел"})
+
     def test_parses_legacy_semicolon_contacts_and_decorated_ids_only(self):
         workbook = Workbook()
         people = workbook.active

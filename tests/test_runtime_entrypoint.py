@@ -269,6 +269,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                                 timezone="UTC",
                                 bot_token="token",
                                 group_chat_id=1,
+                                admin_tg_id=2,
                             ),
                         )
                     )
@@ -362,7 +363,12 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     stack.enter_context(patch.object(
                         app,
                         "load_credentials",
-                        return_value=SimpleNamespace(timezone="UTC", bot_token="token", group_chat_id=1),
+                        return_value=SimpleNamespace(
+                            timezone="UTC",
+                            bot_token="token",
+                            group_chat_id=1,
+                            admin_tg_id=2,
+                        ),
                     ))
                     stack.enter_context(patch.object(app, "load_templates", return_value={}))
                     stack.enter_context(patch.object(app, "get_tz", return_value=ZoneInfo("UTC")))

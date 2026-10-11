@@ -8,9 +8,24 @@ from typing import Any
 from aiogram import F, Dispatcher, Router
 from aiogram.types import CallbackQuery
 
-from .notifier import CONFIRM_PREFIX
+from .notifier import CONFIRM_PREFIX, _notify_admin
 
 router = Router()
+
+
+async def _persist_confirmation(context: Any, debug: logging.Logger) -> bool:
+    try:
+        context.state_cache.save()
+    except OSError as exc:
+        debug.exception("Не удалось сохранить состояние подтверждения")
+        await _notify_admin(
+            context.bot,
+            context.admin_id,
+            f"Не удалось сохранить состояние подтверждения: {exc}",
+            debug,
+        )
+        return False
+    return True
 
 
 def register(dispatcher: Dispatcher, context: Any) -> None:
@@ -71,7 +86,7 @@ async def _confirm_locked(
     first_confirmation = not participant.get("confirmed")
     if first_confirmation:
         participant["confirmed"] = True
-        context.state_cache.save()
+        await _persist_confirmation(context, debug)
 
         if cb.message and cb.message.text:
             try:
@@ -93,19 +108,28 @@ async def _confirm_locked(
             debug.exception("Не удалось отправить апдейт в группу")
         else:
             participant["group_update_sent"] = True
-            try:
-                context.state_cache.save()
-            except Exception:
-                participant["group_update_sent"] = False
-                raise
+            participant["group_update_persisted"] = await _persist_confirmation(
+                context, debug
+            )
+    elif not participant.get("group_update_persisted", True):
+        participant["group_update_persisted"] = await _persist_confirmation(
+            context, debug
+        )
 
     interaction.info(
         "Подтверждение: role=%s tg_id=%s username=@%s name=%s",
         role, cb.from_user.id, cb.from_user.username, participant["name"],
     )
-    if participant.get("group_update_sent"):
+    if participant.get("group_update_sent") and participant.get(
+        "group_update_persisted", True
+    ):
         await cb.answer(
             "Принято!" if first_confirmation else "Вы уже подтвердили участие!"
+        )
+    elif participant.get("group_update_sent"):
+        await cb.answer(
+            "Уведомление отправлено, но состояние не удалось сохранить. "
+            "Нажмите кнопку повторно для повтора сохранения."
         )
     else:
         await cb.answer(

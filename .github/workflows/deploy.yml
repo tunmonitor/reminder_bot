@@ -124,7 +124,8 @@ jobs:
               echo "Ошибка развертывания; пытаемся снова запустить бота." >&2
               (
                 cd "$TARGET_DIR"
-                SHM_DIR="$SHM_DIR" LOG_DIR="$LOG_DIR" ./manage.sh start
+                SHM_DIR="$SHM_DIR" LOG_DIR="$LOG_DIR" RUNNER_TRACKING_ID=0 \
+                    ./manage.sh start
               ) || echo "Не удалось автоматически запустить бота." >&2
             fi
             exit "$result"

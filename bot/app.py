@@ -354,6 +354,7 @@ async def run(args: CliArgs) -> None:
         context = SimpleNamespace(
             bot=bot,
             group_chat_id=credentials.group_chat_id,
+            admin_id=credentials.admin_tg_id,
             state_cache=state_cache,
             interaction_logger=interaction_logger,
             debug_logger=debug_logger,

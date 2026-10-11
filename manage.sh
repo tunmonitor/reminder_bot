@@ -479,7 +479,7 @@ cmd_start() {
     cd "$PROJECT_DIR" || exit 1
 
     PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-        RUNNER_TRACKING_ID="${RUNNER_TRACKING_ID:-0}" \
+        RUNNER_TRACKING_ID=0 \
         nohup "$PYTHON_EXEC" -u "$BOT_SCRIPT" \
         --shm-dir "$SHM_DIR" \
         --log-dir "$LOG_DIR" \

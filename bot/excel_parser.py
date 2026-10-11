@@ -172,26 +172,38 @@ def _parse_task_row(row) -> tuple[str, str] | None:
     return role, name
 
 
-def _parse_legacy_task_row(row) -> tuple[str, str] | None:
+def _legacy_role_cell(value) -> tuple[str, str] | None:
+    task = _clean(value)
+    if not task:
+        return None
+    role_text, separator, inline_name = task.partition(";")
+    if not separator:
+        role_text, separator, inline_name = task.partition(":")
+    role = _canonical_role(role_text if separator else task)
+    if role is None:
+        return None
+    return role, inline_name.strip() if separator else ""
+
+
+def _parse_legacy_task_row(row) -> list[tuple[str, str]]:
+    assignments = []
     for index, value in enumerate(row):
-        task = _clean(value)
-        if not task:
+        parsed_role = _legacy_role_cell(value)
+        if parsed_role is None:
             continue
-        role_text, separator, inline_name = task.partition(";")
-        if not separator:
-            role_text, separator, inline_name = task.partition(":")
-        role = _canonical_role(role_text if separator else task)
-        if role is None:
-            continue
-        name = inline_name.strip() if separator else ""
+        role, name = parsed_role
         if not name:
-            name = next(
-                (_clean(candidate) for candidate in row[index + 1:] if _clean(candidate)),
-                "",
-            )
+            for candidate in row[index + 1:]:
+                candidate_text = _clean(candidate)
+                if not candidate_text:
+                    continue
+                if _legacy_role_cell(candidate_text) is not None:
+                    break
+                name = candidate_text
+                break
         if name:
-            return role, name
-    return None
+            assignments.append((role, name))
+    return assignments
 
 
 def parse_schedule(path: Path, target: date,
@@ -229,21 +241,19 @@ def parse_schedule(path: Path, target: date,
         for row in rows[target_row + 1:]:
             if row and _cell_date(row[0], target.year) is not None:
                 break
-            task_row = (
-                _parse_legacy_task_row(row)
-                if is_legacy_sheet
-                else _parse_task_row(row)
-            )
-            if task_row is None:
-                continue
-            role, name = task_row
-            if name and role in found and found[role] != name:
-                raise RuntimeError(
-                    f"Роль «{role}» указана несколько раз на дату {target:%d.%m.%Y}"
-                )
-            if name:
-                found[role] = name
-                debug_logger.debug("Найдено: %s = %s", role, name)
+            if is_legacy_sheet:
+                task_rows = _parse_legacy_task_row(row)
+            else:
+                task_row = _parse_task_row(row)
+                task_rows = [task_row] if task_row is not None else []
+            for role, name in task_rows:
+                if name and role in found and found[role] != name:
+                    raise RuntimeError(
+                        f"Роль «{role}» указана несколько раз на дату {target:%d.%m.%Y}"
+                    )
+                if name:
+                    found[role] = name
+                    debug_logger.debug("Найдено: %s = %s", role, name)
 
         missing = [role for role in ROLES if role not in found]
         if missing:
