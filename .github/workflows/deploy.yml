@@ -87,12 +87,34 @@ jobs:
 
           mkdir -p "$TARGET_DIR"
 
-          if [ ! -x "$TARGET_DIR/venv/bin/python3" ]; then
-            python3 -m venv "$TARGET_DIR/venv"
+          VENV_DIR="$TARGET_DIR/venv"
+          REQ_FILE="$GITHUB_WORKSPACE/requirements.txt"
+          REQ_HASH_FILE="$VENV_DIR/.requirements.sha256"
+
+          if [ ! -x "$VENV_DIR/bin/python3" ]; then
+            echo "venv отсутствует — создаём..."
+            python3 -m venv "$VENV_DIR"
           fi
-          BOT_PYTHON="$TARGET_DIR/venv/bin/python3"
-          echo "Установка зависимостей из проверенного commit..."
-          "$BOT_PYTHON" -m pip install -r "$GITHUB_WORKSPACE/requirements.txt"
+
+          BOT_PYTHON="$VENV_DIR/bin/python3"
+          CURRENT_HASH=$(sha256sum "$REQ_FILE" | awk '{print $1}')
+
+          NEED_INSTALL=0
+          if [ ! -f "$REQ_HASH_FILE" ]; then
+            echo "Хеш requirements.txt не сохранён — установим зависимости..."
+            NEED_INSTALL=1
+          elif [ "$(cat "$REQ_HASH_FILE")" != "$CURRENT_HASH" ]; then
+            echo "requirements.txt изменился — обновляем зависимости..."
+            NEED_INSTALL=1
+          else
+            echo "requirements.txt не менялся — pip install пропущен."
+          fi
+
+          if [ "$NEED_INSTALL" -eq 1 ]; then
+            "$BOT_PYTHON" -m pip install --upgrade pip
+            "$BOT_PYTHON" -m pip install -r "$REQ_FILE"
+            echo "$CURRENT_HASH" > "$REQ_HASH_FILE"
+          fi
 
           bot_stopped=0
           deploy_succeeded=0
