@@ -494,9 +494,9 @@ cmd_start() {
     fi
 
     local pid_file_ready=0
-    local waited=0
+    local waited_tenths=0
     local saved_pid saved_starttime
-    while [ "$waited" -lt 30 ]; do
+    while [ "$waited_tenths" -lt 300 ]; do
         if [ -f "$PID_FILE" ] || [ -L "$PID_FILE" ]; then
             if secure_private_file "$PID_FILE"; then
                 saved_pid=$(cut -d: -f1 "$PID_FILE" 2>/dev/null)
@@ -510,7 +510,7 @@ cmd_start() {
         fi
         is_valid_process "$new_pid" "$new_starttime" || break
         sleep 0.1
-        waited=$((waited + 1))
+        waited_tenths=$((waited_tenths + 1))
     done
 
     if [ "$pid_file_ready" -eq 1 ] &&

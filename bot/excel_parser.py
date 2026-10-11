@@ -282,9 +282,13 @@ def parse_people(path: Path,
 
             username = _clean(cells[1].value) if len(cells) > 1 else ""
             tg_id = _telegram_id(cells[2].value if len(cells) > 2 else None)
+            existing = people[current_role].get(first, {})
             people[current_role][first] = {
-                "username": username.lstrip("@").strip(),
-                "tg_id": tg_id,
+                "username": username.lstrip("@").strip()
+                or existing.get("username", ""),
+                "tg_id": (
+                    tg_id if tg_id is not None else existing.get("tg_id")
+                ),
             }
 
         debug_logger.debug(

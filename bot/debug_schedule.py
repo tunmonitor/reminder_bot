@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import logging
 import os
 import sys
 import uuid
@@ -44,34 +43,34 @@ async def run_check(target: date | None, output_dir: Path) -> Path:
     _secure_output_dir(output_dir)
 
     path = output_dir / f"schedule-{selected_date:%Y%m%d}-{uuid.uuid4().hex}.xlsx"
-    _, logger = setup_loggers(output_dir)
+    _, debug_logger = setup_loggers(output_dir)
 
     await download_public(
-        credentials.yandex_public_url, path, logger, attempts=1, interval=0
+        credentials.yandex_public_url, path, debug_logger, attempts=1, interval=0
     )
     os.chmod(path, 0o600)
     print(f"Скачанный файл сохранён: {path}")
     print(f"Размер файла: {path.stat().st_size} байт")
 
-    schedule = parse_schedule(path, selected_date, logger)
-    people = parse_people(path, logger)
+    schedule = parse_schedule(path, selected_date, debug_logger)
+    people = parse_people(path, debug_logger)
     issues = [
         f"Не найдено назначение для роли «{role}»"
         for role in ("Ответственный", "Ведущий", "Проповедник")
         if role not in schedule
     ]
-    assignments = resolve_assignments(schedule, people, logger, issues)
+    assignments = resolve_assignments(schedule, people, debug_logger, issues)
     templates = load_templates()
     sunday_str = selected_date.strftime("%d.%m.%Y")
 
-    logger.info(
+    debug_logger.info(
         "=== Имитация рассылки на %s; отправка в Telegram отключена ===",
         sunday_str,
     )
     for issue in issues:
-        logger.warning("Предупреждение, которое получит администратор: %s", issue)
+        debug_logger.warning("Предупреждение, которое получит администратор: %s", issue)
     general_text = build_general_message(assignments, templates, sunday_str)
-    logger.info(
+    debug_logger.info(
         "Подготовлено сообщение в групповой чат (без отправки):\n%s",
         general_text,
     )
@@ -79,12 +78,12 @@ async def run_check(target: date | None, output_dir: Path) -> Path:
         personal_text = build_personal_message(
             role, info, templates, sunday_str
         )
-        logger.info(
+        debug_logger.info(
             "Подготовлено личное сообщение (без отправки): "
             "роль=%s, tg_id=%s, username=@%s\n%s",
             role, info["tg_id"], info["username"], personal_text,
         )
-    logger.info("=== Имитация рассылки завершена ===")
+    debug_logger.info("=== Имитация рассылки завершена ===")
 
     print(f"Парсинг расписания на {sunday_str}: OK")
     print(

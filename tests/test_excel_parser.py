@@ -126,6 +126,22 @@ class ExcelParserTest(unittest.TestCase):
             "Ответственный", "Ведущий", "Проповедник"
         )})
 
+    def test_partial_duplicate_contact_does_not_clear_telegram_id(self):
+        workbook = Workbook()
+        people = workbook.active
+        people.title = "Списки"
+        people.append(["ХКЦ"])
+        people.append(["Алексей", "alex", 181601986])
+        people.append(["Алексей", "alexander", None])
+        workbook.save(self.path)
+
+        parsed_people = parse_people(self.path, self.debug_logger)
+
+        self.assertEqual(
+            parsed_people["Ответственный"]["Алексей"],
+            {"username": "alexander", "tg_id": 181601986},
+        )
+
     def test_selected_person_without_telegram_id_fails_explicitly(self):
         self._make_workbook()
 

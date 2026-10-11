@@ -56,7 +56,7 @@ def build_personal_message(
 async def _notify_admin(bot: Bot, admin_id: int, text: str,
                         debug_logger: logging.Logger) -> None:
     try:
-        await bot.send_message(admin_id, html.escape(f"⚠️ {text}"))
+        await bot.send_message(admin_id, f"⚠️ {text}", parse_mode=None)
     except Exception:  # noqa: BLE001
         debug_logger.exception("Не удалось уведомить администратора")
 

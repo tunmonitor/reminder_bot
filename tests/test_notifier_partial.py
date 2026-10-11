@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from bot.notifier import (
+    _notify_admin,
     build_general_message,
     build_personal_message,
     send_assignments,
@@ -11,6 +12,25 @@ from bot.notifier import (
 
 
 class PartialNotificationTest(unittest.TestCase):
+    def test_admin_warning_uses_plain_text_parse_mode(self):
+        async def notify():
+            bot = SimpleNamespace(send_message=AsyncMock())
+
+            await _notify_admin(
+                bot,
+                12345,
+                "Ошибка: <untrusted diagnostic>",
+                MagicMock(),
+            )
+
+            bot.send_message.assert_awaited_once_with(
+                12345,
+                "⚠️ Ошибка: <untrusted diagnostic>",
+                parse_mode=None,
+            )
+
+        asyncio.run(notify())
+
     def test_dynamic_html_fields_are_escaped(self):
         templates = {
             "general": "Ответственный: @{tg_responsible}",
