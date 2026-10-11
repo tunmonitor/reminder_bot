@@ -7,6 +7,122 @@ from bot.handlers import register, router
 
 
 class ConfirmationHandlerTest(unittest.TestCase):
+    def test_admin_test_command_sends_only_to_group_and_admin(self):
+        async def run():
+            context = SimpleNamespace(
+                interaction_logger=MagicMock(),
+                debug_logger=MagicMock(),
+                admin_id=67890,
+                group_chat_id=-100,
+                bot=SimpleNamespace(send_message=AsyncMock()),
+            )
+            dispatcher = SimpleNamespace(include_router=MagicMock())
+            register(dispatcher, context)
+            handler = router.message.handlers[-1].callback
+            message = SimpleNamespace(
+                from_user=SimpleNamespace(id=67890),
+                chat=SimpleNamespace(type="private"),
+                answer=AsyncMock(),
+            )
+
+            await handler(message)
+
+            self.assertEqual(context.bot.send_message.await_count, 2)
+            self.assertEqual(
+                context.bot.send_message.await_args_list[0].args[0], -100
+            )
+            group_text = context.bot.send_message.await_args_list[0].args[1]
+            self.assertIn("ТЕСТ бота", group_text)
+            self.assertIn("не запускалась", group_text)
+            self.assertEqual(
+                context.bot.send_message.await_args_list[1].args[0], 67890
+            )
+            report = context.bot.send_message.await_args_list[1].args[1]
+            self.assertIn("Групповой чат: ✅ отправлено", report)
+            self.assertIn("участникам не отправлялись", report)
+            message.answer.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_test_command_rejects_non_admin_and_non_private_chat(self):
+        async def run():
+            context = SimpleNamespace(
+                interaction_logger=MagicMock(),
+                debug_logger=MagicMock(),
+                admin_id=67890,
+                group_chat_id=-100,
+                bot=SimpleNamespace(send_message=AsyncMock()),
+            )
+            dispatcher = SimpleNamespace(include_router=MagicMock())
+            register(dispatcher, context)
+            handler = router.message.handlers[-1].callback
+
+            unauthorized = SimpleNamespace(
+                from_user=SimpleNamespace(id=12345),
+                chat=SimpleNamespace(type="private"),
+                answer=AsyncMock(),
+            )
+            await handler(unauthorized)
+            unauthorized.answer.assert_awaited_once_with(
+                "Команда доступна только администратору."
+            )
+
+            group_chat = SimpleNamespace(
+                from_user=SimpleNamespace(id=67890),
+                chat=SimpleNamespace(type="group"),
+                answer=AsyncMock(),
+            )
+            await handler(group_chat)
+            group_chat.answer.assert_awaited_once_with(
+                "Запустите эту команду в личном чате с ботом."
+            )
+            context.bot.send_message.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_group_test_failure_is_reported_to_admin(self):
+        async def run():
+            from aiogram.exceptions import TelegramAPIError
+
+            context = SimpleNamespace(
+                interaction_logger=MagicMock(),
+                debug_logger=MagicMock(),
+                admin_id=67890,
+                group_chat_id=-100,
+                bot=SimpleNamespace(
+                    send_message=AsyncMock(
+                        side_effect=[
+                            TelegramAPIError(
+                                method=MagicMock(), message="group unavailable"
+                            ),
+                            None,
+                        ]
+                    )
+                ),
+            )
+            dispatcher = SimpleNamespace(include_router=MagicMock())
+            register(dispatcher, context)
+            handler = router.message.handlers[-1].callback
+            message = SimpleNamespace(
+                from_user=SimpleNamespace(id=67890),
+                chat=SimpleNamespace(type="private"),
+                answer=AsyncMock(),
+            )
+
+            await handler(message)
+
+            self.assertEqual(context.bot.send_message.await_count, 2)
+            self.assertEqual(
+                context.bot.send_message.await_args_list[1].args[0], 67890
+            )
+            self.assertIn(
+                "ошибка (TelegramAPIError)",
+                context.bot.send_message.await_args_list[1].args[1],
+            )
+            context.debug_logger.exception.assert_called_once()
+
+        asyncio.run(run())
+
     def test_failed_group_update_can_be_retried_on_duplicate_callback(self):
         async def run():
             participant = {

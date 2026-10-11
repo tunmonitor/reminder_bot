@@ -6,7 +6,10 @@ import logging
 from typing import Any
 
 from aiogram import F, Dispatcher, Router
-from aiogram.types import CallbackQuery
+from aiogram.enums import ChatType
+from aiogram.exceptions import TelegramAPIError
+from aiogram.filters import Command
+from aiogram.types import CallbackQuery, Message
 
 from .notifier import CONFIRM_PREFIX, _notify_admin
 
@@ -33,6 +36,49 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     interaction: logging.Logger = context.interaction_logger
     debug: logging.Logger = context.debug_logger
+
+    @router.message(Command("test_notify"))
+    async def on_test_notify(message: Message) -> None:
+        if not message.from_user or message.from_user.id != context.admin_id:
+            await message.answer("Команда доступна только администратору.")
+            return
+        if message.chat.type != ChatType.PRIVATE:
+            await message.answer("Запустите эту команду в личном чате с ботом.")
+            return
+
+        group_result = "✅ отправлено"
+        try:
+            await context.bot.send_message(
+                context.group_chat_id,
+                "🔧 ТЕСТ бота: проверка доставки в групповой чат. "
+                "Обычная рассылка участникам не запускалась.",
+                parse_mode=None,
+            )
+        except TelegramAPIError as exc:
+            group_result = f"❌ ошибка ({type(exc).__name__})"
+            debug.exception("Тестовая отправка в группу не удалась")
+
+        report = (
+            "🔧 Тест доставки завершён.\n"
+            f"Групповой чат: {group_result}.\n"
+            "Личные сообщения участникам не отправлялись."
+        )
+        try:
+            await context.bot.send_message(
+                context.admin_id, report, parse_mode=None
+            )
+        except TelegramAPIError:
+            debug.exception("Не удалось отправить результат теста администратору")
+            await message.answer(
+                "Не удалось отправить отчёт отдельным сообщением. "
+                f"Результат для группы: {group_result}."
+            )
+        else:
+            interaction.info(
+                "Тест уведомлений запущен администратором tg_id=%s; группа: %s",
+                message.from_user.id,
+                group_result,
+            )
 
     @router.callback_query(F.data.startswith(f"{CONFIRM_PREFIX}:"))
     async def on_confirm(cb: CallbackQuery) -> None:  # noqa: D401
