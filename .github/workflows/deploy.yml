@@ -118,18 +118,10 @@ jobs:
           chmod +x "$TARGET_DIR/manage.sh"
 
           cd "$TARGET_DIR"
-          if [ -x "/home/pi/.venv/bin/python3" ]; then
-            BOT_PYTHON="/home/pi/.venv/bin/python3"
-          elif [ -x "$TARGET_DIR/.venv/bin/python3" ]; then
-            BOT_PYTHON="$TARGET_DIR/.venv/bin/python3"
-          elif [ -x "$TARGET_DIR/venv/bin/python3" ]; then
-            BOT_PYTHON="$TARGET_DIR/venv/bin/python3"
-          elif [ -x "$HOME/.venv/bin/python3" ]; then
-            BOT_PYTHON="$HOME/.venv/bin/python3"
-          else
+          if [ ! -x "$TARGET_DIR/venv/bin/python3" ]; then
             python3 -m venv "$TARGET_DIR/venv"
-            BOT_PYTHON="$TARGET_DIR/venv/bin/python3"
           fi
+          BOT_PYTHON="$TARGET_DIR/venv/bin/python3"
 
           echo "Установка зависимостей из requirements.txt..."
           "$BOT_PYTHON" -m pip install -r "$TARGET_DIR/requirements.txt"

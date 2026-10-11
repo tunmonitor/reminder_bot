@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 import stat
+from contextlib import suppress
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -140,11 +141,15 @@ def _build_state(assignments: dict[str, dict]) -> dict:
     return {
         "sunday_date": None,
         "general_message_id": None,
+        "general_sent": False,
+        "general_text": None,
+        "complete": False,
         "participants": {
             role: {
                 "name": info["name"],
                 "username": info["username"],
                 "tg_id": info["tg_id"],
+                "delivered": False,
                 "confirmed": False,
                 "message_id": None,
                 "chat_id": None,
@@ -152,6 +157,29 @@ def _build_state(assignments: dict[str, dict]) -> dict:
             for role, info in assignments.items()
         },
     }
+
+
+def _merge_week_state(previous: dict | None, current: dict) -> dict:
+    if not previous or previous.get("sunday_date") != current["sunday_date"]:
+        return current
+
+    current["general_message_id"] = previous.get("general_message_id")
+    current["general_sent"] = previous.get(
+        "general_sent", previous.get("general_message_id") is not None
+    )
+    current["general_text"] = previous.get("general_text")
+    old_participants = previous.get("participants", {})
+    for role, participant in current["participants"].items():
+        old = old_participants.get(role, {})
+        if old.get("tg_id") == participant["tg_id"]:
+            participant["delivered"] = old.get(
+                "delivered", old.get("message_id") is not None
+            )
+            participant["message_id"] = old.get("message_id")
+            participant["chat_id"] = old.get("chat_id")
+            participant["confirmed"] = old.get("confirmed", False)
+            participant["group_update_sent"] = old.get("group_update_sent", False)
+    return current
 
 
 async def _process_upcoming_sunday(
@@ -214,6 +242,7 @@ async def _process_upcoming_sunday(
 
     state = _build_state(assignments)
     state["sunday_date"] = sunday_iso
+    state = _merge_week_state(state_cache.state, state)
     state_cache.replace(state)
 
     try:
@@ -228,9 +257,30 @@ async def _process_upcoming_sunday(
             sunday_iso=sunday_iso,
             interaction_logger=interaction_logger,
             debug_logger=debug_logger,
+            save_state=state_cache.save,
+        )
+        state["complete"] = (
+            not assignment_issues
+            and state.get("general_sent") is True
+            and all(
+                participant.get("delivered") is True
+                for participant in state["participants"].values()
+                if participant.get("tg_id")
+            )
+            and all(
+                participant.get("tg_id")
+                for participant in state["participants"].values()
+            )
         )
         state_cache.save()
-        interaction_logger.info("Рассылка для %s успешно завершена", sunday_iso)
+        if state["complete"]:
+            interaction_logger.info("Рассылка для %s успешно завершена", sunday_iso)
+        else:
+            interaction_logger.info(
+                "Рассылка для %s частично выполнена; незавершённые отправки "
+                "будут повторены при следующем запуске",
+                sunday_iso,
+            )
     except Exception:
         debug_logger.exception("Не удалось отправить рассылку для %s", sunday_iso)
         raise
@@ -285,16 +335,23 @@ async def run(args: CliArgs) -> None:
     register(dp, context)
 
     async def scheduled_job() -> None:
-        await _process_upcoming_sunday(
-            bot=bot,
-            credentials=credentials,
-            templates=templates,
-            state_cache=state_cache,
-            shm_dir=shm_dir,
-            interaction_logger=interaction_logger,
-            debug_logger=debug_logger,
-            tz=tz,
-        )
+        task = asyncio.current_task()
+        if task is not None:
+            active_jobs.add(task)
+        try:
+            await _process_upcoming_sunday(
+                bot=bot,
+                credentials=credentials,
+                templates=templates,
+                state_cache=state_cache,
+                shm_dir=shm_dir,
+                interaction_logger=interaction_logger,
+                debug_logger=debug_logger,
+                tz=tz,
+            )
+        finally:
+            if task is not None:
+                active_jobs.discard(task)
 
     scheduler = build_scheduler(
         tz=tz,
@@ -304,8 +361,20 @@ async def run(args: CliArgs) -> None:
     )
 
     shutdown_task: asyncio.Task[None] | None = None
+    active_jobs: set[asyncio.Task[None]] = set()
 
     async def perform_shutdown() -> None:
+        scheduler.pause()
+        await asyncio.sleep(0)
+        current_jobs = tuple(active_jobs)
+        if current_jobs:
+            _done, pending = await asyncio.wait(
+                current_jobs, timeout=30,
+            )
+            if pending:
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
         scheduler.shutdown(wait=False)
         await bot.session.close()
         pid_file = _pid_path(shm_dir)

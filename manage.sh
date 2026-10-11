@@ -20,14 +20,14 @@ ENV_NAME="$(basename "$PROJECT_DIR")"          # test | prod
 BOT_SCRIPT="$PROJECT_DIR/reminder_bot.py"
 
 # --------------------------------------------
-# Определяем Python (/home/pi/.venv приоритетно)
+# Используем изолированное Python-окружение этого экземпляра бота
 # --------------------------------------------
-if [ -x "/home/pi/.venv/bin/python3" ]; then
-    PYTHON_EXEC="/home/pi/.venv/bin/python3"
+if [ -x "$PROJECT_DIR/venv/bin/python3" ]; then
+    PYTHON_EXEC="$PROJECT_DIR/venv/bin/python3"
 elif [ -x "$PROJECT_DIR/.venv/bin/python3" ]; then
     PYTHON_EXEC="$PROJECT_DIR/.venv/bin/python3"
-elif [ -x "$PROJECT_DIR/venv/bin/python3" ]; then
-    PYTHON_EXEC="$PROJECT_DIR/venv/bin/python3"
+elif [ -x "/home/pi/.venv/bin/python3" ]; then
+    PYTHON_EXEC="/home/pi/.venv/bin/python3"
 elif [ -x "$HOME/.venv/bin/python3" ]; then
     PYTHON_EXEC="$HOME/.venv/bin/python3"
 else

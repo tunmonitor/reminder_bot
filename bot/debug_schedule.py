@@ -75,6 +75,8 @@ async def run_check(target: date | None, output_dir: Path) -> Path:
         general_text,
     )
     for role, info in assignments.items():
+        if not info.get("tg_id"):
+            continue
         personal_text = build_personal_message(
             role, info, templates, sunday_str
         )
@@ -87,7 +89,8 @@ async def run_check(target: date | None, output_dir: Path) -> Path:
 
     print(f"Парсинг расписания на {sunday_str}: OK")
     print(
-        f"Для имитации подготовлено: группа + {len(assignments)} личных "
+        f"Для имитации подготовлено: группа + "
+        f"{sum(bool(info.get('tg_id')) for info in assignments.values())} личных "
         f"сообщений; предупреждений: {len(issues)}"
     )
     if issues:

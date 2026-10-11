@@ -14,6 +14,104 @@ from zoneinfo import ZoneInfo
 
 
 class ReminderBotEntrypointTest(unittest.TestCase):
+    def test_corrected_schedule_retries_only_new_deliveries(self):
+        from bot import app
+        from bot.state import StateCache
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                cache = StateCache(Path(tmp_dir) / "state.json")
+                bot = SimpleNamespace(
+                    send_message=AsyncMock(
+                        side_effect=[
+                            SimpleNamespace(message_id=10),
+                            SimpleNamespace(message_id=11, chat=SimpleNamespace(id=101)),
+                            SimpleNamespace(message_id=12, chat=SimpleNamespace(id=102)),
+                            SimpleNamespace(message_id=13, chat=SimpleNamespace(id=103)),
+                        ]
+                    ),
+                    edit_message_text=AsyncMock(),
+                )
+                credentials = SimpleNamespace(
+                    admin_tg_id=12345,
+                    group_chat_id=-100,
+                    yandex_public_url="https://example.invalid/schedule",
+                )
+                partial = {"Ответственный": "Алексей"}
+                complete = {
+                    "Ответственный": "Алексей",
+                    "Ведущий": "Павел",
+                    "Проповедник": "Иван",
+                }
+                contacts = {
+                    "Ответственный": {
+                        "Алексей": {"username": "alex", "tg_id": 101}
+                    },
+                    "Ведущий": {
+                        "Павел": {"username": "pavel", "tg_id": 102}
+                    },
+                    "Проповедник": {
+                        "Иван": {"username": "ivan", "tg_id": 103}
+                    },
+                }
+                with ExitStack() as stack:
+                    stack.enter_context(
+                        patch.object(
+                            app, "_next_sunday_in_tz",
+                            return_value=date(2026, 10, 11),
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(app, "download_public", new=AsyncMock())
+                    )
+                    parse_schedule = stack.enter_context(
+                        patch.object(
+                            app, "parse_schedule", side_effect=[partial, complete]
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(app, "parse_people", return_value=contacts)
+                    )
+                    stack.enter_context(
+                        patch.object(app, "_notify_admin", new=AsyncMock())
+                    )
+                    stack.enter_context(
+                        patch("bot.notifier.asyncio.sleep", new=AsyncMock())
+                    )
+                    for _ in range(3):
+                        await app._process_upcoming_sunday(
+                            bot=bot,
+                            credentials=credentials,
+                            templates={
+                                "general": (
+                                    "Ответственный: @{tg_responsible}; "
+                                    "Ведущий: @{tg_leader}; "
+                                    "Проповедник: @{tg_preacher}"
+                                ),
+                                "roles": {
+                                    role: "{name}"
+                                    for role in complete
+                                },
+                            },
+                            state_cache=cache,
+                            shm_dir=Path(tmp_dir),
+                            interaction_logger=MagicMock(),
+                            debug_logger=MagicMock(),
+                            tz=ZoneInfo("UTC"),
+                        )
+
+                self.assertEqual(parse_schedule.call_count, 2)
+                self.assertEqual(bot.send_message.await_count, 4)
+                bot.edit_message_text.assert_awaited_once()
+                self.assertTrue(cache.state["complete"])
+                self.assertTrue(cache.matches_week("2026-10-11"))
+                self.assertEqual(
+                    cache.state["participants"]["Ответственный"]["message_id"],
+                    11,
+                )
+
+        asyncio.run(process())
+
     def test_missing_assignment_data_notifies_admin_and_continues_partial_send(self):
         from bot import app
 
@@ -23,7 +121,12 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 admin_tg_id=12345,
                 yandex_public_url="https://example.invalid/schedule",
             )
-            state_cache = SimpleNamespace(matches_week=MagicMock(return_value=False))
+            state_cache = SimpleNamespace(
+                matches_week=MagicMock(return_value=False),
+                state=None,
+                replace=MagicMock(),
+                save=MagicMock(),
+            )
             debug_logger = MagicMock()
 
             with ExitStack() as stack:
@@ -57,7 +160,6 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 )
                 stack.enter_context(patch.object(app, "_notify_admin", new=AsyncMock()))
                 stack.enter_context(patch.object(app, "send_assignments", new=AsyncMock()))
-                stack.enter_context(patch.object(app, "_build_state", return_value={}))
 
                 await app._process_upcoming_sunday(
                     bot=bot,
@@ -78,7 +180,10 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 self.assertIn("отсутствует Telegram_ID", args[2])
                 app.send_assignments.assert_awaited_once()
                 sent_assignments = app.send_assignments.await_args.kwargs["assignments"]
-                self.assertEqual(list(sent_assignments), ["Ответственный"])
+                self.assertEqual(
+                    list(sent_assignments), ["Ответственный", "Ведущий"]
+                )
+                self.assertIsNone(sent_assignments["Ведущий"]["tg_id"])
 
     def test_existing_pid_file_stops_startup_with_clear_error(self):
         from bot import app
@@ -169,7 +274,11 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 log_dir.mkdir(mode=0o700)
                 bot = SimpleNamespace(session=SimpleNamespace(close=AsyncMock()))
                 dispatcher = SimpleNamespace()
-                scheduler = SimpleNamespace(start=MagicMock(), shutdown=MagicMock())
+                scheduler = SimpleNamespace(
+                    start=MagicMock(),
+                    pause=MagicMock(),
+                    shutdown=MagicMock(),
+                )
 
                 async def start_polling(_bot, **_kwargs):
                     return None
@@ -194,6 +303,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     stack.enter_context(patch.object(app, "build_scheduler", return_value=scheduler))
                     await app.run(SimpleNamespace(shm_dir=str(shm_dir), log_dir=str(log_dir)))
 
+                scheduler.pause.assert_called_once_with()
                 scheduler.shutdown.assert_called_once_with(wait=False)
                 bot.session.close.assert_awaited_once()
                 dispatcher.start_polling.assert_awaited_once_with(

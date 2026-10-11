@@ -111,6 +111,51 @@ class ExcelParserTest(unittest.TestCase):
         self.assertEqual(assignments["Проповедник"]["tg_id"], 123456789)
         self.assertNotIn("Не назначать", people["Ведущий"])
 
+    def test_parses_legacy_sheet_names_and_role_labels(self):
+        workbook = Workbook()
+        schedule = workbook.active
+        schedule.title = "График"
+        schedule.append(["11 октября"])
+        schedule.append(["Ответственный", "Алексей"])
+        schedule.append(["Проповедник", "Иван"])
+        people = workbook.create_sheet("Список")
+        people.append(["Ответственный"])
+        people.append(["Алексей", "alex", 181601986])
+        people.append(["Проповедник"])
+        people.append(["Иван", "ivan", 123456789])
+        workbook.save(self.path)
+
+        schedule_data = parse_schedule(
+            self.path, date(2026, 10, 11), self.debug_logger
+        )
+        contacts = parse_people(self.path, self.debug_logger)
+        assignments = resolve_assignments(schedule_data, contacts)
+
+        self.assertEqual(schedule_data, {
+            "Ответственный": "Алексей",
+            "Проповедник": "Иван",
+        })
+        self.assertEqual(assignments["Ответственный"]["tg_id"], 181601986)
+        self.assertEqual(assignments["Проповедник"]["tg_id"], 123456789)
+
+    def test_partial_resolution_keeps_username_without_telegram_id(self):
+        issues = []
+        assignments = resolve_assignments(
+            {"Ответственный": "Алексей"},
+            {
+                "Ответственный": {
+                    "Алексей": {"username": "alex", "tg_id": None}
+                }
+            },
+            issues=issues,
+        )
+
+        self.assertEqual(
+            assignments["Ответственный"],
+            {"name": "Алексей", "username": "alex", "tg_id": None},
+        )
+        self.assertTrue(any("отсутствует Telegram_ID" in issue for issue in issues))
+
     def test_parses_people_when_read_only_cell_has_no_font(self):
         workbook = Workbook()
         people = workbook.active

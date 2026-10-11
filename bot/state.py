@@ -4,9 +4,11 @@
 {
   "sunday_date": "2026-11-08",
   "general_message_id": 123,
+  "general_sent": true,
   "participants": {
       "Ответственный": {"name": "...", "username": "...", "tg_id": 1,
-                        "confirmed": false, "message_id": 10, "chat_id": 1},
+                        "delivered": true, "confirmed": false,
+                        "message_id": 10, "chat_id": 1},
       "Ведущий":        {...},
       "Проповедник":    {...}
   }
@@ -55,4 +57,8 @@ class StateCache:
             self.path.unlink()
 
     def matches_week(self, sunday_iso: str) -> bool:
-        return bool(self.state) and self.state.get("sunday_date") == sunday_iso
+        return (
+            bool(self.state)
+            and self.state.get("sunday_date") == sunday_iso
+            and self.state.get("complete") is True
+        )

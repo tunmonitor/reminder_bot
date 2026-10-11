@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+from collections.abc import Callable
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
@@ -25,21 +26,18 @@ def build_general_message(
     templates: dict,
     sunday_str: str,
 ) -> str:
-    return templates["general"].format(
-        sunday_date=sunday_str,
-        tg_responsible=html.escape(
-            assignments.get("Ответственный", {}).get("username", "не найден")
-            or "не указан"
-        ),
-        tg_leader=html.escape(
-            assignments.get("Ведущий", {}).get("username", "не найден")
-            or "не указан"
-        ),
-        tg_preacher=html.escape(
-            assignments.get("Проповедник", {}).get("username", "не найден")
-            or "не указан"
-        ),
-    )
+    template = templates["general"]
+    mentions = {}
+    for role, placeholder in (
+        ("Ответственный", "tg_responsible"),
+        ("Ведущий", "tg_leader"),
+        ("Проповедник", "tg_preacher"),
+    ):
+        username = assignments.get(role, {}).get("username")
+        mention = f"@{username}" if username else "не найден"
+        template = template.replace(f"@{{{placeholder}}}", f"{{{placeholder}}}")
+        mentions[placeholder] = html.escape(mention)
+    return template.format(sunday_date=sunday_str, **mentions)
 
 
 def build_personal_message(
@@ -72,27 +70,49 @@ async def send_assignments(
     sunday_iso: str,
     interaction_logger: logging.Logger,
     debug_logger: logging.Logger,
+    save_state: Callable[[], None] | None = None,
 ) -> None:
     """Отправляет общее сообщение и ЛС. Обновляет state на месте."""
     # --- 1) Общее сообщение в группу ---
     general_text = build_general_message(assignments, templates, sunday_str)
     debug_logger.debug("Подготовлено сообщение в групповой чат:\n%s", general_text)
     try:
-        general_msg = await bot.send_message(group_chat_id, general_text)
+        if state.get("general_sent"):
+            if state.get("general_text") != general_text:
+                await bot.edit_message_text(
+                    general_text,
+                    chat_id=group_chat_id,
+                    message_id=state["general_message_id"],
+                )
+                state["general_text"] = general_text
+                if save_state is not None:
+                    save_state()
+                interaction_logger.info(
+                    "Обновлено общее уведомление в чате %s (msg_id=%s)",
+                    group_chat_id, state["general_message_id"],
+                )
+        else:
+            general_msg = await bot.send_message(group_chat_id, general_text)
+            state["general_message_id"] = general_msg.message_id
+            state["general_sent"] = True
+            state["general_text"] = general_text
+            if save_state is not None:
+                save_state()
+            interaction_logger.info(
+                "Общее уведомление отправлено в чат %s (msg_id=%s)",
+                group_chat_id, general_msg.message_id,
+            )
     except TelegramAPIError as exc:
-        debug_logger.exception("Не удалось отправить сообщение в группу")
+        debug_logger.exception("Не удалось отправить или обновить сообщение в группе")
         await _notify_admin(bot, admin_id,
                             f"Ошибка отправки в группу: {exc}", debug_logger)
         raise
 
-    state["general_message_id"] = general_msg.message_id
-    interaction_logger.info(
-        "Общее уведомление отправлено в чат %s (msg_id=%s)",
-        group_chat_id, general_msg.message_id,
-    )
-
     # --- 2) Персональные ЛС ---
     for role, info in assignments.items():
+        participant_state = state["participants"][role]
+        if not info.get("tg_id") or participant_state.get("delivered"):
+            continue
         text = build_personal_message(role, info, templates, sunday_str)
         debug_logger.debug(
             "Подготовлено личное сообщение: роль=%s, tg_id=%s, username=@%s\n%s",
@@ -103,8 +123,11 @@ async def send_assignments(
                 info["tg_id"], text,
                 reply_markup=build_confirm_kb(role, sunday_iso),
             )
-            state["participants"][role]["message_id"] = msg.message_id
-            state["participants"][role]["chat_id"] = msg.chat.id
+            participant_state["message_id"] = msg.message_id
+            participant_state["chat_id"] = msg.chat.id
+            participant_state["delivered"] = True
+            if save_state is not None:
+                save_state()
             interaction_logger.info(
                 "ЛС отправлено: role=%s tg_id=%s username=@%s",
                 role, info["tg_id"], info["username"],

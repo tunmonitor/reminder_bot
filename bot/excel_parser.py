@@ -33,11 +33,13 @@ _MONTH_NAMES = {
     "декабря": 12, "декабрь": 12,
 }
 _ROLE_ALIASES = {
+    "ответственный": "Ответственный",
     "хкц": "Ответственный",
     "ведущий": "Ведущий",
     "ведет": "Ведущий",
     "проповедует": "Проповедник",
     "проповедет": "Проповедник",
+    "проповедник": "Проповедник",
 }
 _MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 
@@ -319,6 +321,7 @@ def resolve_assignments(schedule: dict[str, str],
                 )
             if issues is not None:
                 issues.append(message)
+                result[role] = {"name": name, "username": "", "tg_id": None}
                 continue
             raise RuntimeError(message)
         info = bucket[name]
@@ -332,6 +335,11 @@ def resolve_assignments(schedule: dict[str, str],
                 )
             if issues is not None:
                 issues.append(message)
+                result[role] = {
+                    "name": name,
+                    "username": info.get("username", ""),
+                    "tg_id": None,
+                }
                 continue
             raise RuntimeError(message)
         result[role] = {
