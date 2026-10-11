@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 from typing import Any
 
 from aiogram import F, Dispatcher, Router
-from aiogram.types import CallbackQuery
+from aiogram.enums import ChatType, ParseMode
+from aiogram.exceptions import TelegramAPIError
+from aiogram.filters import Command
+from aiogram.types import CallbackQuery, Message
 
 from .notifier import CONFIRM_PREFIX, _notify_admin
 
@@ -33,6 +37,110 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     interaction: logging.Logger = context.interaction_logger
     debug: logging.Logger = context.debug_logger
+
+    @router.message(Command("test_notify"))
+    async def on_test_notify(message: Message) -> None:
+        if not message.from_user or message.from_user.id != context.admin_id:
+            return
+        if message.chat.type != ChatType.PRIVATE:
+            return
+
+        group_result = "✅ отправлено"
+        try:
+            await context.bot.send_message(
+                context.group_chat_id,
+                "🔧 ТЕСТ бота: проверка доставки в групповой чат. "
+                "Обычная рассылка участникам не запускалась.",
+                parse_mode=None,
+            )
+        except TelegramAPIError as exc:
+            group_result = f"❌ ошибка ({type(exc).__name__})"
+            debug.exception("Тестовая отправка в группу не удалась")
+
+        try:
+            previews = await context.prepare_test_previews()
+        except Exception as exc:  # noqa: BLE001
+            debug.exception("Не удалось подготовить предпросмотр рассылки")
+            previews = None
+            schedule_result = (
+                f"Предпросмотр расписания не подготовлен "
+                f"({type(exc).__name__})."
+            )
+        else:
+            schedule_result = (
+                f"Предпросмотр расписания на "
+                f"{previews['sunday_date']:%d.%m.%Y} подготовлен."
+            )
+
+        report_lines = [
+            "🔧 Проверка доставки завершена.",
+            f"Тестовое сообщение в группу: {group_result}.",
+            schedule_result,
+            "Личные сообщения участникам не отправлялись.",
+        ]
+        if previews and previews["issues"]:
+            report_lines.append(
+                "Предупреждения: " + "; ".join(previews["issues"])
+            )
+        report = "\n".join(report_lines)
+        preview_failures = []
+        try:
+            await context.bot.send_message(
+                context.admin_id, report, parse_mode=None
+            )
+        except TelegramAPIError:
+            debug.exception("Не удалось отправить результат теста администратору")
+            preview_failures.append("итоговый отчёт")
+
+        if previews:
+            preview_messages = [
+                (
+                    "👁 Предпросмотр сообщения для группы "
+                    f"на {previews['sunday_date']:%d.%m.%Y}:\n\n"
+                    f"{previews['group_text']}",
+                    "сообщение для группы",
+                ),
+                *[
+                    (
+                        "👁 Предпросмотр личного сообщения "
+                        f"({role}, {html.escape(name)}):\n\n{text}",
+                        f"личное сообщение для роли «{role}»",
+                    )
+                    for role, name, text in previews["personal_messages"]
+                ],
+            ]
+            for preview_text, description in preview_messages:
+                try:
+                    await context.bot.send_message(
+                        context.admin_id,
+                        preview_text,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramAPIError:
+                    debug.exception(
+                        "Не удалось отправить предпросмотр: %s", description
+                    )
+                    preview_failures.append(description)
+
+        if preview_failures:
+            try:
+                await message.answer(
+                    "Не удалось отправить администратору: "
+                    + ", ".join(preview_failures),
+                    parse_mode=None,
+                )
+            except TelegramAPIError:
+                debug.exception(
+                    "Не удалось сообщить администратору об ошибке предпросмотра"
+                )
+
+        interaction.info(
+            "Тест уведомлений запущен администратором tg_id=%s; "
+            "группа: %s; предпросмотр: %s",
+            message.from_user.id,
+            group_result,
+            "готов" if previews else "ошибка",
+        )
 
     @router.callback_query(F.data.startswith(f"{CONFIRM_PREFIX}:"))
     async def on_confirm(cb: CallbackQuery) -> None:  # noqa: D401
