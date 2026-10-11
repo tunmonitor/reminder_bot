@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 import stat
+import tempfile
 from contextlib import suppress
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -20,7 +21,12 @@ if __package__:
     from .excel_parser import ROLES, parse_people, parse_schedule, resolve_assignments
     from .handlers import register
     from .logger import setup_loggers
-    from .notifier import _notify_admin, send_assignments
+    from .notifier import (
+        _notify_admin,
+        build_general_message,
+        build_personal_message,
+        send_assignments,
+    )
     from .secure_fs import open_private_directory
     from .scheduler import build_scheduler
     from .state import StateCache
@@ -31,7 +37,12 @@ else:  # pragma: no cover - поддержка запуска файла нап�
     from bot.excel_parser import ROLES, parse_people, parse_schedule, resolve_assignments
     from bot.handlers import register
     from bot.logger import setup_loggers
-    from bot.notifier import _notify_admin, send_assignments
+    from bot.notifier import (
+        _notify_admin,
+        build_general_message,
+        build_personal_message,
+        send_assignments,
+    )
     from bot.secure_fs import open_private_directory
     from bot.scheduler import build_scheduler
     from bot.state import StateCache
@@ -221,6 +232,64 @@ def _merge_week_state(previous: dict | None, current: dict) -> dict:
     return current
 
 
+async def _prepare_test_notification_previews(
+    credentials,
+    templates: dict,
+    shm_dir: Path,
+    tz,
+    debug_logger,
+) -> dict:
+    sunday_date = _next_sunday_in_tz(tz)
+    debug_dir = shm_dir / "debug"
+    directory_fd = open_private_directory(debug_dir, create=True)
+    os.close(directory_fd)
+
+    file_fd, file_name = tempfile.mkstemp(
+        prefix=f"schedule-{sunday_date:%Y%m%d}-",
+        suffix=".xlsx",
+        dir=debug_dir,
+    )
+    os.close(file_fd)
+    xlsx_path = Path(file_name)
+    try:
+        await download_public(
+            credentials.yandex_public_url,
+            xlsx_path,
+            debug_logger,
+            attempts=1,
+            interval=0,
+        )
+        schedule = parse_schedule(xlsx_path, sunday_date, debug_logger)
+        people = parse_people(xlsx_path, debug_logger)
+        issues = [
+            f"На {sunday_date:%d.%m.%Y} не найдено назначение для роли «{role}»"
+            for role in ROLES
+            if role not in schedule
+        ]
+        assignments = resolve_assignments(
+            schedule, people, debug_logger, issues
+        )
+        sunday_str = sunday_date.strftime("%d.%m.%Y")
+        return {
+            "sunday_date": sunday_date,
+            "group_text": build_general_message(
+                assignments, templates, sunday_str
+            ),
+            "personal_messages": [
+                (
+                    role,
+                    info["name"],
+                    build_personal_message(role, info, templates, sunday_str),
+                )
+                for role, info in assignments.items()
+                if info.get("tg_id")
+            ],
+            "issues": issues,
+        }
+    finally:
+        xlsx_path.unlink(missing_ok=True)
+
+
 async def _process_upcoming_sunday(
     bot: Bot,
     credentials,
@@ -360,6 +429,13 @@ async def run(args: CliArgs) -> None:
             debug_logger=debug_logger,
             confirmation_locks={},
         )
+
+        async def prepare_test_previews() -> dict:
+            return await _prepare_test_notification_previews(
+                credentials, templates, shm_dir, tz, debug_logger
+            )
+
+        context.prepare_test_previews = prepare_test_previews
         register(dp, context)
 
         async def scheduled_job() -> None:

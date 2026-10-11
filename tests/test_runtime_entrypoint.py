@@ -14,6 +14,91 @@ from zoneinfo import ZoneInfo
 
 
 class ReminderBotEntrypointTest(unittest.TestCase):
+    def test_test_notification_previews_use_upcoming_assignments(self):
+        from bot import app
+
+        async def prepare():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                shm_dir = Path(tmp_dir) / "shm"
+                shm_dir.mkdir(mode=0o700)
+                target = date(2026, 10, 18)
+                credentials = SimpleNamespace(
+                    yandex_public_url="https://example.invalid/schedule"
+                )
+                schedule = {
+                    "Ответственный": "Алексей",
+                    "Ведущий": "Павел",
+                }
+                people = {
+                    "Ответственный": {
+                        "Алексей": {"username": "alex", "tg_id": 12345}
+                    },
+                    "Ведущий": {
+                        "Павел": {"username": "pavel", "tg_id": None}
+                    },
+                }
+                templates = {
+                    "general": (
+                        "{sunday_date}: @{tg_responsible}; "
+                        "@{tg_leader}; @{tg_preacher}"
+                    ),
+                    "roles": {
+                        "Ответственный": "{name}, {sunday_date}",
+                        "Ведущий": "{name}, {sunday_date}",
+                    },
+                }
+                logger = MagicMock()
+
+                async def fake_download(_url, path, _logger, **_kwargs):
+                    path.write_bytes(b"test workbook")
+                    return path
+
+                with ExitStack() as stack:
+                    stack.enter_context(
+                        patch.object(
+                            app, "_next_sunday_in_tz", return_value=target
+                        )
+                    )
+                    download = stack.enter_context(
+                        patch.object(
+                            app,
+                            "download_public",
+                            new=AsyncMock(side_effect=fake_download),
+                        )
+                    )
+                    parse_schedule = stack.enter_context(
+                        patch.object(app, "parse_schedule", return_value=schedule)
+                    )
+                    parse_people = stack.enter_context(
+                        patch.object(app, "parse_people", return_value=people)
+                    )
+
+                    previews = await app._prepare_test_notification_previews(
+                        credentials,
+                        templates,
+                        shm_dir,
+                        ZoneInfo("UTC"),
+                        logger,
+                    )
+
+                download.assert_awaited_once()
+                parse_schedule.assert_called_once()
+                parse_people.assert_called_once()
+                self.assertEqual(previews["sunday_date"], target)
+                self.assertEqual(
+                    previews["group_text"],
+                    "18.10.2026: @alex; @pavel; не найден",
+                )
+                self.assertEqual(
+                    previews["personal_messages"],
+                    [("Ответственный", "Алексей", "Алексей, 18.10.2026")],
+                )
+                self.assertTrue(any("Ведущий" in issue for issue in previews["issues"]))
+                self.assertTrue(any("Проповедник" in issue for issue in previews["issues"]))
+                self.assertEqual(list((shm_dir / "debug").iterdir()), [])
+
+        asyncio.run(prepare())
+
     def test_scheduler_initialization_failure_closes_bot_without_pid(self):
         from bot import app
 

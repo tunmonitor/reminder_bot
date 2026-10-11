@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 from typing import Any
 
 from aiogram import F, Dispatcher, Router
-from aiogram.enums import ChatType
+from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
@@ -56,27 +57,90 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             group_result = f"❌ ошибка ({type(exc).__name__})"
             debug.exception("Тестовая отправка в группу не удалась")
 
-        report = (
-            "🔧 Тест доставки завершён.\n"
-            f"Групповой чат: {group_result}.\n"
-            "Личные сообщения участникам не отправлялись."
-        )
+        try:
+            previews = await context.prepare_test_previews()
+        except Exception as exc:  # noqa: BLE001
+            debug.exception("Не удалось подготовить предпросмотр рассылки")
+            previews = None
+            schedule_result = (
+                f"Предпросмотр расписания не подготовлен "
+                f"({type(exc).__name__})."
+            )
+        else:
+            schedule_result = (
+                f"Предпросмотр расписания на "
+                f"{previews['sunday_date']:%d.%m.%Y} подготовлен."
+            )
+
+        report_lines = [
+            "🔧 Проверка доставки завершена.",
+            f"Тестовое сообщение в группу: {group_result}.",
+            schedule_result,
+            "Личные сообщения участникам не отправлялись.",
+        ]
+        if previews and previews["issues"]:
+            report_lines.append(
+                "Предупреждения: " + "; ".join(previews["issues"])
+            )
+        report = "\n".join(report_lines)
+        preview_failures = []
         try:
             await context.bot.send_message(
                 context.admin_id, report, parse_mode=None
             )
         except TelegramAPIError:
             debug.exception("Не удалось отправить результат теста администратору")
-            await message.answer(
-                "Не удалось отправить отчёт отдельным сообщением. "
-                f"Результат для группы: {group_result}."
-            )
-        else:
-            interaction.info(
-                "Тест уведомлений запущен администратором tg_id=%s; группа: %s",
-                message.from_user.id,
-                group_result,
-            )
+            preview_failures.append("итоговый отчёт")
+
+        if previews:
+            preview_messages = [
+                (
+                    "👁 Предпросмотр сообщения для группы "
+                    f"на {previews['sunday_date']:%d.%m.%Y}:\n\n"
+                    f"{previews['group_text']}",
+                    "сообщение для группы",
+                ),
+                *[
+                    (
+                        "👁 Предпросмотр личного сообщения "
+                        f"({role}, {html.escape(name)}):\n\n{text}",
+                        f"личное сообщение для роли «{role}»",
+                    )
+                    for role, name, text in previews["personal_messages"]
+                ],
+            ]
+            for preview_text, description in preview_messages:
+                try:
+                    await context.bot.send_message(
+                        context.admin_id,
+                        preview_text,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramAPIError:
+                    debug.exception(
+                        "Не удалось отправить предпросмотр: %s", description
+                    )
+                    preview_failures.append(description)
+
+        if preview_failures:
+            try:
+                await message.answer(
+                    "Не удалось отправить администратору: "
+                    + ", ".join(preview_failures),
+                    parse_mode=None,
+                )
+            except TelegramAPIError:
+                debug.exception(
+                    "Не удалось сообщить администратору об ошибке предпросмотра"
+                )
+
+        interaction.info(
+            "Тест уведомлений запущен администратором tg_id=%s; "
+            "группа: %s; предпросмотр: %s",
+            message.from_user.id,
+            group_result,
+            "готов" if previews else "ошибка",
+        )
 
     @router.callback_query(F.data.startswith(f"{CONFIRM_PREFIX}:"))
     async def on_confirm(cb: CallbackQuery) -> None:  # noqa: D401
