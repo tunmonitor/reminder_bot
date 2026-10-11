@@ -535,7 +535,10 @@ cmd_stop() {
     echo "🛑 Остановка бота ($ENV_NAME)..."
 
     # 1. Бэкап перед остановкой
-    do_backup
+    if ! do_backup; then
+        echo "❌ Не удалось сохранить лог; бот оставлен работающим." >&2
+        return 1
+    fi
 
     # 2. Остановка по PID-файлу
     if [ -f "$PID_FILE" ] || [ -L "$PID_FILE" ]; then
@@ -548,7 +551,7 @@ cmd_stop() {
         saved_starttime=$(cut -d: -f2 "$PID_FILE" 2>/dev/null)
         if [ -n "$saved_pid" ]; then
             if is_valid_process "$saved_pid" "$saved_starttime"; then
-                if kill_with_wait "$saved_pid" "$saved_starttime" 10 "бот из PID-файла"; then
+                if kill_with_wait "$saved_pid" "$saved_starttime" 35 "бот из PID-файла"; then
                     :
                 else
                     echo "❌ Не удалось остановить процесс из PID-файла"

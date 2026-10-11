@@ -14,6 +14,57 @@ from zoneinfo import ZoneInfo
 
 
 class ReminderBotEntrypointTest(unittest.TestCase):
+    def test_scheduler_initialization_failure_closes_bot_without_pid(self):
+        from bot import app
+
+        async def run_bot():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                shm_dir = Path(tmp_dir) / "shm"
+                log_dir = Path(tmp_dir) / "logs"
+                shm_dir.mkdir(mode=0o700)
+                log_dir.mkdir(mode=0o700)
+                bot = SimpleNamespace(session=SimpleNamespace(close=AsyncMock()))
+                with ExitStack() as stack:
+                    stack.enter_context(
+                        patch.object(
+                            app,
+                            "setup_loggers",
+                            return_value=(MagicMock(), MagicMock()),
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            app,
+                            "load_credentials",
+                            return_value=SimpleNamespace(
+                                timezone="UTC", bot_token="token", group_chat_id=1
+                            ),
+                        )
+                    )
+                    stack.enter_context(patch.object(app, "load_templates", return_value={}))
+                    stack.enter_context(patch.object(app, "get_tz", return_value=ZoneInfo("UTC")))
+                    stack.enter_context(patch.object(app, "StateCache"))
+                    stack.enter_context(patch.object(app, "load_schedule", return_value=[]))
+                    stack.enter_context(patch.object(app, "Bot", return_value=bot))
+                    stack.enter_context(patch.object(app, "Dispatcher"))
+                    stack.enter_context(patch.object(app, "register"))
+                    stack.enter_context(
+                        patch.object(
+                            app,
+                            "build_scheduler",
+                            side_effect=RuntimeError("invalid scheduler"),
+                        )
+                    )
+                    with self.assertRaisesRegex(RuntimeError, "invalid scheduler"):
+                        await app.run(
+                            SimpleNamespace(
+                                shm_dir=str(shm_dir), log_dir=str(log_dir)
+                            )
+                        )
+
+                bot.session.close.assert_awaited_once()
+                self.assertFalse((shm_dir / "reminder_bot_bot.pid").exists())
+
     def test_corrected_schedule_retries_only_new_deliveries(self):
         from bot import app
         from bot.state import StateCache
@@ -214,12 +265,31 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                         patch.object(
                             app,
                             "load_credentials",
-                            return_value=SimpleNamespace(timezone="UTC"),
+                            return_value=SimpleNamespace(
+                                timezone="UTC",
+                                bot_token="token",
+                                group_chat_id=1,
+                            ),
                         )
                     )
                     stack.enter_context(patch.object(app, "load_templates", return_value={}))
                     stack.enter_context(patch.object(app, "get_tz", return_value=ZoneInfo("UTC")))
                     stack.enter_context(patch.object(app, "StateCache"))
+                    stack.enter_context(patch.object(
+                        app,
+                        "Bot",
+                        return_value=SimpleNamespace(
+                            session=SimpleNamespace(close=AsyncMock())
+                        ),
+                    ))
+                    stack.enter_context(patch.object(app, "Dispatcher"))
+                    stack.enter_context(patch.object(app, "register"))
+                    stack.enter_context(patch.object(app, "load_schedule", return_value=[]))
+                    stack.enter_context(patch.object(
+                        app,
+                        "build_scheduler",
+                        return_value=SimpleNamespace(running=False),
+                    ))
                     with self.assertRaisesRegex(FileExistsError, "PID-файл уже существует"):
                         await app.run(
                             SimpleNamespace(shm_dir=str(shm_dir), log_dir=str(log_dir))
@@ -275,6 +345,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 bot = SimpleNamespace(session=SimpleNamespace(close=AsyncMock()))
                 dispatcher = SimpleNamespace()
                 scheduler = SimpleNamespace(
+                    running=True,
                     start=MagicMock(),
                     pause=MagicMock(),
                     shutdown=MagicMock(),

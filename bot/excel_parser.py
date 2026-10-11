@@ -172,6 +172,28 @@ def _parse_task_row(row) -> tuple[str, str] | None:
     return role, name
 
 
+def _parse_legacy_task_row(row) -> tuple[str, str] | None:
+    for index, value in enumerate(row):
+        task = _clean(value)
+        if not task:
+            continue
+        role_text, separator, inline_name = task.partition(";")
+        if not separator:
+            role_text, separator, inline_name = task.partition(":")
+        role = _canonical_role(role_text if separator else task)
+        if role is None:
+            continue
+        name = inline_name.strip() if separator else ""
+        if not name:
+            name = next(
+                (_clean(candidate) for candidate in row[index + 1:] if _clean(candidate)),
+                "",
+            )
+        if name:
+            return role, name
+    return None
+
+
 def parse_schedule(path: Path, target: date,
                    debug_logger: logging.Logger) -> dict[str, str]:
     """Возвращает назначения трёх ролей для даты target."""
@@ -181,6 +203,7 @@ def parse_schedule(path: Path, target: date,
         worksheet, sheet_name = _find_sheet(
             workbook, expected_sheet, legacy_names=("График",)
         )
+        is_legacy_sheet = sheet_name is not None and _normalized(sheet_name) == "график"
         debug_logger.debug(
             "Открыт %s, листы=%s, лист расписания=%s",
             path, workbook.sheetnames, sheet_name,
@@ -206,7 +229,11 @@ def parse_schedule(path: Path, target: date,
         for row in rows[target_row + 1:]:
             if row and _cell_date(row[0], target.year) is not None:
                 break
-            task_row = _parse_task_row(row)
+            task_row = (
+                _parse_legacy_task_row(row)
+                if is_legacy_sheet
+                else _parse_task_row(row)
+            )
             if task_row is None:
                 continue
             role, name = task_row
@@ -230,7 +257,7 @@ def parse_schedule(path: Path, target: date,
         workbook.close()
 
 
-def _telegram_id(value) -> int | None:
+def _telegram_id(value, allow_decorated: bool = False) -> int | None:
     if isinstance(value, bool) or value is None:
         return None
     if isinstance(value, int):
@@ -238,6 +265,14 @@ def _telegram_id(value) -> int | None:
     if isinstance(value, float):
         return int(value) if value.is_integer() and value > 0 else None
     text = _clean(value)
+    if allow_decorated:
+        decorated = re.fullmatch(
+            r"(?:TG[_ ]?ID|TELEGRAM[_ ]?ID)\s*[:=#-]\s*(\d+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if decorated:
+            text = decorated.group(1)
     return int(text) if text.isdigit() and int(text) > 0 else None
 
 
@@ -251,6 +286,7 @@ def parse_people(path: Path,
         )
         if worksheet is None:
             raise RuntimeError("Лист 'Списки' не найден")
+        is_legacy_sheet = _normalized(sheet_name) == "список"
 
         worksheet.reset_dimensions()
         people: dict[str, dict[str, dict]] = {role: {} for role in ROLES}
@@ -282,10 +318,42 @@ def parse_people(path: Path,
             if current_role is None or not first:
                 continue
 
-            username = _clean(cells[1].value) if len(cells) > 1 else ""
-            tg_id = _telegram_id(cells[2].value if len(cells) > 2 else None)
-            existing = people[current_role].get(first, {})
-            people[current_role][first] = {
+            raw_values = [
+                _clean(cell.value) if cell is not None else ""
+                for cell in cells[:3]
+            ]
+            if is_legacy_sheet and any(";" in value for value in raw_values):
+                legacy_values = [
+                    part.strip()
+                    for value in raw_values
+                    for part in value.split(";")
+                    if part.strip()
+                ]
+                name = legacy_values[0] if legacy_values else first
+                id_value = next(
+                    (
+                        value for value in legacy_values
+                        if _telegram_id(value, allow_decorated=True) is not None
+                    ),
+                    None,
+                )
+                username = next(
+                    (
+                        value for value in legacy_values[1:]
+                        if _telegram_id(value, allow_decorated=True) is None
+                    ),
+                    "",
+                )
+                tg_id = _telegram_id(id_value, allow_decorated=True)
+            else:
+                name = first
+                username = raw_values[1] if len(raw_values) > 1 else ""
+                tg_id = _telegram_id(
+                    raw_values[2] if len(raw_values) > 2 else None,
+                    allow_decorated=is_legacy_sheet,
+                )
+            existing = people[current_role].get(name, {})
+            people[current_role][name] = {
                 "username": username.lstrip("@").strip()
                 or existing.get("username", ""),
                 "tg_id": (

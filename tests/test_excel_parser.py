@@ -138,6 +138,58 @@ class ExcelParserTest(unittest.TestCase):
         self.assertEqual(assignments["Ответственный"]["tg_id"], 181601986)
         self.assertEqual(assignments["Проповедник"]["tg_id"], 123456789)
 
+    def test_parses_legacy_schedule_inline_and_non_first_column_roles(self):
+        workbook = Workbook()
+        schedule = workbook.active
+        schedule.title = "График"
+        schedule.append(["11 октября"])
+        schedule.append(["ХКЦ: Алексей"])
+        schedule.append([None, "Ведущий", "Павел"])
+        schedule.append([None, None, "Проповедник; Иван"])
+        workbook.save(self.path)
+
+        assignments = parse_schedule(
+            self.path, date(2026, 10, 11), self.debug_logger
+        )
+
+        self.assertEqual(assignments, {
+            "Ответственный": "Алексей",
+            "Ведущий": "Павел",
+            "Проповедник": "Иван",
+        })
+
+    def test_parses_legacy_semicolon_contacts_and_decorated_ids_only(self):
+        workbook = Workbook()
+        people = workbook.active
+        people.title = "Список"
+        people.append(["ХКЦ"])
+        people.append(["Алексей; @alex; TG_ID: 123456789"])
+        people.append(["Мария", "@maria", "Telegram_ID: 234567891"])
+        workbook.save(self.path)
+
+        parsed = parse_people(self.path, self.debug_logger)
+
+        self.assertEqual(
+            parsed["Ответственный"]["Алексей"],
+            {"username": "alex", "tg_id": 123456789},
+        )
+        self.assertEqual(
+            parsed["Ответственный"]["Мария"],
+            {"username": "maria", "tg_id": 234567891},
+        )
+
+    def test_tabular_contacts_reject_decorated_telegram_ids(self):
+        workbook = Workbook()
+        people = workbook.active
+        people.title = "Списки"
+        people.append(["ХКЦ"])
+        people.append(["Алексей", "alex", "TG_ID: 123456789"])
+        workbook.save(self.path)
+
+        parsed = parse_people(self.path, self.debug_logger)
+
+        self.assertIsNone(parsed["Ответственный"]["Алексей"]["tg_id"])
+
     def test_partial_resolution_keeps_username_without_telegram_id(self):
         issues = []
         assignments = resolve_assignments(

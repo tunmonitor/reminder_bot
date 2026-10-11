@@ -25,6 +25,7 @@ jobs:
       - name: Получение кода
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - name: Настройка Python
@@ -86,8 +87,31 @@ jobs:
 
           mkdir -p "$TARGET_DIR"
 
+          if [ ! -x "$TARGET_DIR/venv/bin/python3" ]; then
+            python3 -m venv "$TARGET_DIR/venv"
+          fi
+          BOT_PYTHON="$TARGET_DIR/venv/bin/python3"
+          echo "Установка зависимостей из проверенного commit..."
+          "$BOT_PYTHON" -m pip install -r "$GITHUB_WORKSPACE/requirements.txt"
+
+          bot_stopped=0
+          deploy_succeeded=0
+          restart_after_failure() {
+            result=$?
+            if [ "$bot_stopped" -eq 1 ] && [ "$deploy_succeeded" -eq 0 ]; then
+              echo "Ошибка развертывания; пытаемся снова запустить бота." >&2
+              (
+                cd "$TARGET_DIR"
+                SHM_DIR="$SHM_DIR" LOG_DIR="$LOG_DIR" ./manage.sh start
+              ) || echo "Не удалось автоматически запустить бота." >&2
+            fi
+            exit "$result"
+          }
+          trap restart_after_failure EXIT
+
           echo "Остановка текущего бота перед синхронизацией файлов..."
           if [ -f "$TARGET_DIR/manage.sh" ]; then
+            bot_stopped=1
             (
               cd "$TARGET_DIR"
               SHM_DIR="$SHM_DIR" LOG_DIR="$LOG_DIR" bash ./manage.sh stop
@@ -118,16 +142,10 @@ jobs:
           chmod +x "$TARGET_DIR/manage.sh"
 
           cd "$TARGET_DIR"
-          if [ ! -x "$TARGET_DIR/venv/bin/python3" ]; then
-            python3 -m venv "$TARGET_DIR/venv"
-          fi
-          BOT_PYTHON="$TARGET_DIR/venv/bin/python3"
-
-          echo "Установка зависимостей из requirements.txt..."
-          "$BOT_PYTHON" -m pip install -r "$TARGET_DIR/requirements.txt"
-
           echo "Запуск бота..."
           SHM_DIR="$SHM_DIR" LOG_DIR="$LOG_DIR" RUNNER_TRACKING_ID=0 ./manage.sh start
 
           echo "Проверка состояния бота..."
           SHM_DIR="$SHM_DIR" LOG_DIR="$LOG_DIR" ./manage.sh status
+          bot_stopped=0
+          deploy_succeeded=1

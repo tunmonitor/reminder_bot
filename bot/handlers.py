@@ -1,6 +1,7 @@
 """Обработчик нажатия инлайн-кнопки «Принял, буду»."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -25,60 +26,89 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await cb.answer("Некорректные данные кнопки")
             return
         _, sunday_iso, role = parts
-
         state = context.state_cache.state
-        if not state or state.get("sunday_date") != sunday_iso:
-            await cb.answer("Это уведомление устарело")
-            return
-
-        participant = state.get("participants", {}).get(role)
+        participant = (
+            state.get("participants", {}).get(role)
+            if state and state.get("sunday_date") == sunday_iso
+            else None
+        )
         if not participant or participant.get("tg_id") != cb.from_user.id:
-            await cb.answer("Вы не назначены на эту роль")
+            await _confirm_locked(cb, context, sunday_iso, role, interaction, debug)
             return
 
-        first_confirmation = not participant.get("confirmed")
-        if first_confirmation:
-            participant["confirmed"] = True
-            context.state_cache.save()
+        locks = getattr(context, "confirmation_locks", None)
+        if locks is None:
+            locks = {}
+            context.confirmation_locks = locks
+        for key in tuple(locks):
+            if key[0] != sunday_iso and not locks[key].locked():
+                del locks[key]
+        lock = locks.setdefault((sunday_iso, role), asyncio.Lock())
+        async with lock:
+            await _confirm_locked(cb, context, sunday_iso, role, interaction, debug)
 
-            if cb.message and cb.message.text:
-                try:
-                    await cb.message.edit_text(
-                        cb.message.text + "\n\n✅ Подтверждено",
-                        parse_mode=None,
-                    )
-                except Exception:  # noqa: BLE001
-                    debug.exception("Не удалось отредактировать ЛС")
+    dispatcher.include_router(router)
 
-        if not participant.get("group_update_sent"):
+
+async def _confirm_locked(
+    cb: CallbackQuery,
+    context: Any,
+    sunday_iso: str,
+    role: str,
+    interaction: logging.Logger,
+    debug: logging.Logger,
+) -> None:
+    state = context.state_cache.state
+    if not state or state.get("sunday_date") != sunday_iso:
+        await cb.answer("Это уведомление устарело")
+        return
+
+    participant = state.get("participants", {}).get(role)
+    if not participant or participant.get("tg_id") != cb.from_user.id:
+        await cb.answer("Вы не назначены на эту роль")
+        return
+
+    first_confirmation = not participant.get("confirmed")
+    if first_confirmation:
+        participant["confirmed"] = True
+        context.state_cache.save()
+
+        if cb.message and cb.message.text:
             try:
-                await context.bot.send_message(
-                    context.group_chat_id,
-                    f"🔔 Участник {participant['name']} подтвердил роль {role}",
+                await cb.message.edit_text(
+                    cb.message.text + "\n\n✅ Подтверждено",
                     parse_mode=None,
                 )
             except Exception:  # noqa: BLE001
-                debug.exception("Не удалось отправить апдейт в группу")
-            else:
-                participant["group_update_sent"] = True
-                try:
-                    context.state_cache.save()
-                except Exception:
-                    participant["group_update_sent"] = False
-                    raise
+                debug.exception("Не удалось отредактировать ЛС")
 
-        interaction.info(
-            "Подтверждение: role=%s tg_id=%s username=@%s name=%s",
-            role, cb.from_user.id, cb.from_user.username, participant["name"],
-        )
-        if participant.get("group_update_sent"):
-            await cb.answer(
-                "Принято!" if first_confirmation else "Вы уже подтвердили участие!"
+    if not participant.get("group_update_sent"):
+        try:
+            await context.bot.send_message(
+                context.group_chat_id,
+                f"🔔 Участник {participant['name']} подтвердил роль {role}",
+                parse_mode=None,
             )
+        except Exception:  # noqa: BLE001
+            debug.exception("Не удалось отправить апдейт в группу")
         else:
-            await cb.answer(
-                "Подтверждение сохранено, но уведомление не отправлено. "
-                "Нажмите кнопку повторно для повтора."
-            )
+            participant["group_update_sent"] = True
+            try:
+                context.state_cache.save()
+            except Exception:
+                participant["group_update_sent"] = False
+                raise
 
-    dispatcher.include_router(router)
+    interaction.info(
+        "Подтверждение: role=%s tg_id=%s username=@%s name=%s",
+        role, cb.from_user.id, cb.from_user.username, participant["name"],
+    )
+    if participant.get("group_update_sent"):
+        await cb.answer(
+            "Принято!" if first_confirmation else "Вы уже подтвердили участие!"
+        )
+    else:
+        await cb.answer(
+            "Подтверждение сохранено, но уведомление не отправлено. "
+            "Нажмите кнопку повторно для повтора."
+        )

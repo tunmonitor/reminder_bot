@@ -66,17 +66,56 @@ def _open_directory_without_symlinks(path: Path) -> int:
 
 def _write_pid(path: Path) -> None:
     directory_fd = _open_directory_without_symlinks(path.parent)
+    pid_fd = -1
+    created = False
     try:
         pid_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
         pid_fd = os.open(path.name, pid_flags, 0o600, dir_fd=directory_fd)
+        created = True
         try:
             os.fchmod(pid_fd, 0o600)
             with os.fdopen(pid_fd, "w", encoding="utf-8") as pid_file:
                 pid_fd = -1
                 pid_file.write(f"{os.getpid()}:{_current_process_starttime()}")
+        except BaseException:
+            if created:
+                os.unlink(path.name, dir_fd=directory_fd)
+            raise
+    finally:
+        if pid_fd >= 0:
+            os.close(pid_fd)
+        os.close(directory_fd)
+
+
+def _remove_pid_if_owned(path: Path) -> None:
+    directory_fd = _open_directory_without_symlinks(path.parent)
+    try:
+        try:
+            pid_fd = os.open(
+                path.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=directory_fd,
+            )
+        except FileNotFoundError:
+            return
+        try:
+            pid_stat = os.fstat(pid_fd)
+            if (
+                not stat.S_ISREG(pid_stat.st_mode)
+                or pid_stat.st_uid != os.geteuid()
+                or stat.S_IMODE(pid_stat.st_mode) != 0o600
+            ):
+                return
+            with os.fdopen(pid_fd, "r", encoding="utf-8") as pid_file:
+                pid_fd = -1
+                if pid_file.read().strip() != (
+                    f"{os.getpid()}:{_current_process_starttime()}"
+                ):
+                    return
         finally:
             if pid_fd >= 0:
                 os.close(pid_fd)
+        os.unlink(path.name, dir_fd=directory_fd)
     finally:
         os.close(directory_fd)
 
@@ -246,7 +285,7 @@ async def _process_upcoming_sunday(
     state_cache.replace(state)
 
     try:
-        await send_assignments(
+        general_delivery_complete = await send_assignments(
             bot=bot,
             group_chat_id=credentials.group_chat_id,
             admin_id=credentials.admin_tg_id,
@@ -261,6 +300,7 @@ async def _process_upcoming_sunday(
         )
         state["complete"] = (
             not assignment_issues
+            and general_delivery_complete
             and state.get("general_sent") is True
             and all(
                 participant.get("delivered") is True
@@ -298,100 +338,99 @@ async def run(args: CliArgs) -> None:
     templates = load_templates()
     tz = get_tz(credentials.timezone)
     state_cache = StateCache(shm_dir / "reminder_state_cache.json")
-
+    jobs = load_schedule()
     pid_file = _pid_path(shm_dir)
-    try:
-        _write_pid(pid_file)
-    except FileExistsError as exc:
-        existing_process = _existing_pid_process_status(pid_file)
-        if existing_process is None:
-            status = "Содержимое PID-файла не удалось безопасно проверить."
-        elif existing_process[1]:
-            status = f"Процесс с PID {existing_process[0]} уже запущен."
-        else:
-            status = (
-                f"PID-файл устарел (PID {existing_process[0]} "
-                "не соответствует живому процессу)."
-            )
-        message = (
-            f"PID-файл уже существует: {pid_file}. {status} "
-            "Удалите его вручную, если он устарел."
-        )
-        debug_logger.error(message)
-        raise FileExistsError(message) from exc
-
-    bot = Bot(
-        token=credentials.bot_token,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-    dp = Dispatcher(storage=MemoryStorage())
-    context = SimpleNamespace(
-        bot=bot,
-        group_chat_id=credentials.group_chat_id,
-        state_cache=state_cache,
-        interaction_logger=interaction_logger,
-        debug_logger=debug_logger,
-    )
-    register(dp, context)
-
-    async def scheduled_job() -> None:
-        task = asyncio.current_task()
-        if task is not None:
-            active_jobs.add(task)
-        try:
-            await _process_upcoming_sunday(
-                bot=bot,
-                credentials=credentials,
-                templates=templates,
-                state_cache=state_cache,
-                shm_dir=shm_dir,
-                interaction_logger=interaction_logger,
-                debug_logger=debug_logger,
-                tz=tz,
-            )
-        finally:
-            if task is not None:
-                active_jobs.discard(task)
-
-    scheduler = build_scheduler(
-        tz=tz,
-        jobs=load_schedule(),
-        callback=scheduled_job,
-        debug_logger=debug_logger,
-    )
-
-    shutdown_task: asyncio.Task[None] | None = None
+    bot = None
+    scheduler = None
+    pid_created = False
     active_jobs: set[asyncio.Task[None]] = set()
 
-    async def perform_shutdown() -> None:
-        scheduler.pause()
-        await asyncio.sleep(0)
-        current_jobs = tuple(active_jobs)
-        if current_jobs:
-            _done, pending = await asyncio.wait(
-                current_jobs, timeout=30,
-            )
-            if pending:
-                for task in pending:
-                    task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-        scheduler.shutdown(wait=False)
-        await bot.session.close()
-        pid_file = _pid_path(shm_dir)
-        if pid_file.exists():
-            pid_file.unlink()
-
-    async def shutdown() -> None:
-        nonlocal shutdown_task
-        if shutdown_task is None:
-            shutdown_task = asyncio.create_task(perform_shutdown())
-        await asyncio.shield(shutdown_task)
-
     try:
+        bot = Bot(
+            token=credentials.bot_token,
+            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        )
+        dp = Dispatcher(storage=MemoryStorage())
+        context = SimpleNamespace(
+            bot=bot,
+            group_chat_id=credentials.group_chat_id,
+            state_cache=state_cache,
+            interaction_logger=interaction_logger,
+            debug_logger=debug_logger,
+            confirmation_locks={},
+        )
+        register(dp, context)
+
+        async def scheduled_job() -> None:
+            task = asyncio.current_task()
+            if task is not None:
+                active_jobs.add(task)
+            try:
+                await _process_upcoming_sunday(
+                    bot=bot,
+                    credentials=credentials,
+                    templates=templates,
+                    state_cache=state_cache,
+                    shm_dir=shm_dir,
+                    interaction_logger=interaction_logger,
+                    debug_logger=debug_logger,
+                    tz=tz,
+                )
+            finally:
+                if task is not None:
+                    active_jobs.discard(task)
+
+        scheduler = build_scheduler(
+            tz=tz,
+            jobs=jobs,
+            callback=scheduled_job,
+            debug_logger=debug_logger,
+        )
+
+        try:
+            _write_pid(pid_file)
+            pid_created = True
+        except FileExistsError as exc:
+            existing_process = _existing_pid_process_status(pid_file)
+            if existing_process is None:
+                status = "Содержимое PID-файла не удалось безопасно проверить."
+            elif existing_process[1]:
+                status = f"Процесс с PID {existing_process[0]} уже запущен."
+            else:
+                status = (
+                    f"PID-файл устарел (PID {existing_process[0]} "
+                    "не соответствует живому процессу)."
+                )
+            message = (
+                f"PID-файл уже существует: {pid_file}. {status} "
+                "Удалите его вручную, если он устарел."
+            )
+            debug_logger.error(message)
+            raise FileExistsError(message) from exc
+
         scheduler.start()
         await dp.start_polling(bot, close_bot_session=False)
     finally:
-        await shutdown()
+        try:
+            if scheduler is not None and scheduler.running:
+                scheduler.pause()
+                await asyncio.sleep(0)
+                if active_jobs:
+                    _done, pending = await asyncio.wait(
+                        tuple(active_jobs), timeout=30,
+                    )
+                    if pending:
+                        for task in pending:
+                            task.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                scheduler.shutdown(wait=False)
+        finally:
+            try:
+                if bot is not None:
+                    await bot.session.close()
+            finally:
+                if pid_created:
+                    _remove_pid_if_owned(pid_file)
 
 
 __all__ = ["run"]

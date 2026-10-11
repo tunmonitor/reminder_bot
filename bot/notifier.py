@@ -71,19 +71,30 @@ async def send_assignments(
     interaction_logger: logging.Logger,
     debug_logger: logging.Logger,
     save_state: Callable[[], None] | None = None,
-) -> None:
+) -> bool:
     """Отправляет общее сообщение и ЛС. Обновляет state на месте."""
     # --- 1) Общее сообщение в группу ---
     general_text = build_general_message(assignments, templates, sunday_str)
+    general_delivery_complete = True
     debug_logger.debug("Подготовлено сообщение в групповой чат:\n%s", general_text)
-    try:
-        if state.get("general_sent"):
-            if state.get("general_text") != general_text:
+    if state.get("general_sent"):
+        if state.get("general_text") != general_text:
+            try:
                 await bot.edit_message_text(
                     general_text,
                     chat_id=group_chat_id,
                     message_id=state["general_message_id"],
                 )
+            except TelegramAPIError as exc:
+                general_delivery_complete = False
+                debug_logger.exception("Не удалось обновить сообщение в группе")
+                await _notify_admin(
+                    bot,
+                    admin_id,
+                    f"Ошибка обновления сообщения в группе: {exc}",
+                    debug_logger,
+                )
+            else:
                 state["general_text"] = general_text
                 if save_state is not None:
                     save_state()
@@ -91,22 +102,24 @@ async def send_assignments(
                     "Обновлено общее уведомление в чате %s (msg_id=%s)",
                     group_chat_id, state["general_message_id"],
                 )
-        else:
+    else:
+        try:
             general_msg = await bot.send_message(group_chat_id, general_text)
-            state["general_message_id"] = general_msg.message_id
-            state["general_sent"] = True
-            state["general_text"] = general_text
-            if save_state is not None:
-                save_state()
-            interaction_logger.info(
-                "Общее уведомление отправлено в чат %s (msg_id=%s)",
-                group_chat_id, general_msg.message_id,
+        except TelegramAPIError as exc:
+            debug_logger.exception("Не удалось отправить сообщение в группу")
+            await _notify_admin(
+                bot, admin_id, f"Ошибка отправки в группу: {exc}", debug_logger
             )
-    except TelegramAPIError as exc:
-        debug_logger.exception("Не удалось отправить или обновить сообщение в группе")
-        await _notify_admin(bot, admin_id,
-                            f"Ошибка отправки в группу: {exc}", debug_logger)
-        raise
+            raise
+        state["general_message_id"] = general_msg.message_id
+        state["general_sent"] = True
+        state["general_text"] = general_text
+        if save_state is not None:
+            save_state()
+        interaction_logger.info(
+            "Общее уведомление отправлено в чат %s (msg_id=%s)",
+            group_chat_id, general_msg.message_id,
+        )
 
     # --- 2) Персональные ЛС ---
     for role, info in assignments.items():
@@ -143,3 +156,5 @@ async def send_assignments(
             )
 
         await asyncio.sleep(RATE_LIMIT_DELAY)   # защита от 429
+
+    return general_delivery_complete

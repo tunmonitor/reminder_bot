@@ -262,6 +262,62 @@ class PartialNotificationTest(unittest.TestCase):
 
         asyncio.run(send())
 
+    def test_failed_group_edit_does_not_block_personal_delivery(self):
+        from aiogram.exceptions import TelegramAPIError
+
+        async def send():
+            assignments = {
+                "Ответственный": {
+                    "name": "Алексей", "username": "alex", "tg_id": 12345,
+                }
+            }
+            state = {
+                "general_sent": True,
+                "general_message_id": 10,
+                "general_text": "старый текст",
+                "participants": {
+                    "Ответственный": {"tg_id": 12345, "delivered": False}
+                },
+            }
+            bot = SimpleNamespace(
+                edit_message_text=AsyncMock(
+                    side_effect=TelegramAPIError(
+                        method=MagicMock(), message="message missing"
+                    )
+                ),
+                send_message=AsyncMock(
+                    return_value=SimpleNamespace(
+                        message_id=11, chat=SimpleNamespace(id=12345)
+                    )
+                ),
+            )
+            with patch("bot.notifier._notify_admin", new=AsyncMock()), patch(
+                "bot.notifier.asyncio.sleep", new=AsyncMock()
+            ):
+                group_complete = await send_assignments(
+                    bot=bot,
+                    group_chat_id=-100,
+                    admin_id=67890,
+                    assignments=assignments,
+                    state=state,
+                    templates={
+                        "general": "Ответственный: @{tg_responsible}",
+                        "roles": {"Ответственный": "{name}"},
+                    },
+                    sunday_str="11.10.2026",
+                    sunday_iso="2026-10-11",
+                    interaction_logger=MagicMock(),
+                    debug_logger=MagicMock(),
+                )
+
+            bot.edit_message_text.assert_awaited_once()
+            bot.send_message.assert_awaited_once()
+            self.assertFalse(group_complete)
+            self.assertTrue(state["participants"]["Ответственный"]["delivered"])
+            self.assertEqual(state["general_text"], "старый текст")
+
+        asyncio.run(send())
+
 
 if __name__ == "__main__":
     unittest.main()
