@@ -40,10 +40,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     @router.message(Command("test_notify"))
     async def on_test_notify(message: Message) -> None:
         if not message.from_user or message.from_user.id != context.admin_id:
-            await message.answer("Команда доступна только администратору.")
             return
         if message.chat.type != ChatType.PRIVATE:
-            await message.answer("Запустите эту команду в личном чате с ботом.")
             return
 
         group_result = "✅ отправлено"

@@ -63,9 +63,7 @@ class ConfirmationHandlerTest(unittest.TestCase):
                 answer=AsyncMock(),
             )
             await handler(unauthorized)
-            unauthorized.answer.assert_awaited_once_with(
-                "Команда доступна только администратору."
-            )
+            unauthorized.answer.assert_not_awaited()
 
             group_chat = SimpleNamespace(
                 from_user=SimpleNamespace(id=67890),
@@ -73,9 +71,7 @@ class ConfirmationHandlerTest(unittest.TestCase):
                 answer=AsyncMock(),
             )
             await handler(group_chat)
-            group_chat.answer.assert_awaited_once_with(
-                "Запустите эту команду в личном чате с ботом."
-            )
+            group_chat.answer.assert_not_awaited()
             context.bot.send_message.assert_not_awaited()
 
         asyncio.run(run())
