@@ -6,8 +6,10 @@ venv/
 *.egg-info/
 
 # Локальные секреты и настройки (см. ТЗ 1.2)
+/test/
 reminder_bot_credentials.env
 credentials.env
+*.env.temp
 reminder_bot_templates.json
 templates.json
 reminder_bot_schedule_config.json
@@ -20,4 +22,4 @@ logs_backup/
 # Служебное
 .run_state/
 *.log
-
+qodo_review.md

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
+from collections.abc import Callable
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
@@ -19,10 +21,40 @@ def build_confirm_kb(role: str, sunday_iso: str) -> InlineKeyboardMarkup:
     ]])
 
 
+def build_general_message(
+    assignments: dict[str, dict],
+    templates: dict,
+    sunday_str: str,
+) -> str:
+    template = templates["general"]
+    mentions = {}
+    for role, placeholder in (
+        ("Ответственный", "tg_responsible"),
+        ("Ведущий", "tg_leader"),
+        ("Проповедник", "tg_preacher"),
+    ):
+        username = assignments.get(role, {}).get("username")
+        mention = f"@{username}" if username else "не найден"
+        template = template.replace(f"@{{{placeholder}}}", f"{{{placeholder}}}")
+        mentions[placeholder] = html.escape(mention)
+    return template.format(sunday_date=sunday_str, **mentions)
+
+
+def build_personal_message(
+    role: str,
+    info: dict,
+    templates: dict,
+    sunday_str: str,
+) -> str:
+    return templates["roles"][role].format(
+        name=html.escape(info["name"]), sunday_date=sunday_str,
+    )
+
+
 async def _notify_admin(bot: Bot, admin_id: int, text: str,
                         debug_logger: logging.Logger) -> None:
     try:
-        await bot.send_message(admin_id, f"⚠️ {text}")
+        await bot.send_message(admin_id, f"⚠️ {text}", parse_mode=None)
     except Exception:  # noqa: BLE001
         debug_logger.exception("Не удалось уведомить администратора")
 
@@ -38,41 +70,91 @@ async def send_assignments(
     sunday_iso: str,
     interaction_logger: logging.Logger,
     debug_logger: logging.Logger,
-) -> None:
+    save_state: Callable[[], None] | None = None,
+) -> bool:
     """Отправляет общее сообщение и ЛС. Обновляет state на месте."""
-    # --- 1) Общее сообщение в группу ---
-    general_text = templates["general"].format(
-        sunday_date=sunday_str,
-        tg_responsible=assignments["Ответственный"]["username"],
-        tg_leader=assignments["Ведущий"]["username"],
-        tg_preacher=assignments["Проповедник"]["username"],
-    )
-    try:
-        general_msg = await bot.send_message(group_chat_id, general_text)
-    except TelegramAPIError as exc:
-        debug_logger.exception("Не удалось отправить сообщение в группу")
-        await _notify_admin(bot, admin_id,
-                            f"Ошибка отправки в группу: {exc}", debug_logger)
-        raise
+    delivery_state_persisted = True
 
-    state["general_message_id"] = general_msg.message_id
-    interaction_logger.info(
-        "Общее уведомление отправлено в чат %s (msg_id=%s)",
-        group_chat_id, general_msg.message_id,
-    )
+    async def persist_progress() -> None:
+        nonlocal delivery_state_persisted
+        if save_state is None:
+            return
+        try:
+            save_state()
+        except OSError as exc:
+            delivery_state_persisted = False
+            debug_logger.exception("Не удалось сохранить прогресс рассылки")
+            await _notify_admin(
+                bot,
+                admin_id,
+                f"Не удалось сохранить прогресс рассылки: {exc}",
+                debug_logger,
+            )
+
+    # --- 1) Общее сообщение в группу ---
+    general_text = build_general_message(assignments, templates, sunday_str)
+    debug_logger.debug("Подготовлено сообщение в групповой чат:\n%s", general_text)
+    if state.get("general_sent"):
+        if state.get("general_text") != general_text:
+            try:
+                await bot.edit_message_text(
+                    general_text,
+                    chat_id=group_chat_id,
+                    message_id=state["general_message_id"],
+                )
+            except TelegramAPIError as exc:
+                delivery_state_persisted = False
+                debug_logger.exception("Не удалось обновить сообщение в группе")
+                await _notify_admin(
+                    bot,
+                    admin_id,
+                    f"Ошибка обновления сообщения в группе: {exc}",
+                    debug_logger,
+                )
+            else:
+                state["general_text"] = general_text
+                await persist_progress()
+                interaction_logger.info(
+                    "Обновлено общее уведомление в чате %s (msg_id=%s)",
+                    group_chat_id, state["general_message_id"],
+                )
+    else:
+        try:
+            general_msg = await bot.send_message(group_chat_id, general_text)
+        except TelegramAPIError as exc:
+            debug_logger.exception("Не удалось отправить сообщение в группу")
+            await _notify_admin(
+                bot, admin_id, f"Ошибка отправки в группу: {exc}", debug_logger
+            )
+            raise
+        state["general_message_id"] = general_msg.message_id
+        state["general_sent"] = True
+        state["general_text"] = general_text
+        await persist_progress()
+        interaction_logger.info(
+            "Общее уведомление отправлено в чат %s (msg_id=%s)",
+            group_chat_id, general_msg.message_id,
+        )
 
     # --- 2) Персональные ЛС ---
     for role, info in assignments.items():
-        text = templates["roles"][role].format(
-            name=info["name"], sunday_date=sunday_str,
+        participant_state = state["participants"][role]
+        if not info.get("tg_id") or participant_state.get("delivered"):
+            continue
+        text = build_personal_message(role, info, templates, sunday_str)
+        debug_logger.debug(
+            "Подготовлено личное сообщение: роль=%s, tg_id=%s, username=@%s\n%s",
+            role, info["tg_id"], info["username"], text,
         )
         try:
             msg = await bot.send_message(
                 info["tg_id"], text,
                 reply_markup=build_confirm_kb(role, sunday_iso),
             )
-            state["participants"][role]["message_id"] = msg.message_id
-            state["participants"][role]["chat_id"] = msg.chat.id
+            participant_state["message_id"] = msg.message_id
+            participant_state["chat_id"] = msg.chat.id
+            participant_state["delivered"] = True
+            await persist_progress()
             interaction_logger.info(
                 "ЛС отправлено: role=%s tg_id=%s username=@%s",
                 role, info["tg_id"], info["username"],
@@ -88,3 +170,5 @@ async def send_assignments(
             )
 
         await asyncio.sleep(RATE_LIMIT_DELAY)   # защита от 429
+
+    return delivery_state_persisted

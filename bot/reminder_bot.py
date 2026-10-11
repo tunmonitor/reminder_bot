@@ -8,8 +8,12 @@
 import asyncio
 import sys
 
-from bot.app import run
-from bot.cli import parse_args
+try:
+    from .app import run
+    from .cli import parse_args
+except ImportError:  # pragma: no cover - для запуска как обычного сценария
+    from bot.app import run
+    from bot.cli import parse_args
 
 
 def main(argv=None) -> int:

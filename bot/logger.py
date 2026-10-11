@@ -7,6 +7,8 @@ debug.log       — технический трек (DEBUG) + дублирова
 from __future__ import annotations
 
 import logging
+import os
+import stat
 import sys
 from pathlib import Path
 
@@ -15,6 +17,42 @@ DEBUG_LOG = "reminder_bot_debug.log"
 
 _FMT = "%(asctime)s | %(levelname)-7s | %(message)s"
 _DATEFMT = "%Y-%m-%d %H:%M:%S"
+
+
+class _ClosingStreamHandler(logging.StreamHandler):
+    def close(self) -> None:
+        stream = self.stream
+        super().close()
+        if stream not in (sys.stdout, sys.stderr):
+            stream.close()
+
+
+class _InteractionInfoFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno == logging.INFO
+
+
+def _file_handler(path: Path, formatter: logging.Formatter) -> logging.Handler:
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW
+    file_fd = os.open(path, flags, 0o600)
+    try:
+        file_stat = os.fstat(file_fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise PermissionError(f"Файл лога должен быть обычным файлом: {path}")
+        if file_stat.st_uid != os.geteuid() or file_stat.st_nlink != 1:
+            raise PermissionError(
+                f"Файл лога должен принадлежать текущему пользователю и не иметь hardlink: {path}"
+            )
+        os.fchmod(file_fd, 0o600)
+        stream = os.fdopen(file_fd, "a", encoding="utf-8")
+        file_fd = -1
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+
+    handler = _ClosingStreamHandler(stream)
+    handler.setFormatter(formatter)
+    return handler
 
 
 def setup_loggers(log_dir: Path) -> tuple[logging.Logger, logging.Logger]:
@@ -26,18 +64,23 @@ def setup_loggers(log_dir: Path) -> tuple[logging.Logger, logging.Logger]:
     interaction = logging.getLogger("reminder_bot.interaction")
     interaction.setLevel(logging.INFO)
     interaction.propagate = False
+    old_handlers = set(interaction.handlers)
+    debug = logging.getLogger("reminder_bot.debug")
+    old_handlers.update(debug.handlers)
+    for handler in old_handlers:
+        handler.close()
     interaction.handlers.clear()
-    ih = logging.FileHandler(log_dir / INTERACTION_LOG, encoding="utf-8")
-    ih.setFormatter(formatter)
+
+    ih = _file_handler(log_dir / INTERACTION_LOG, formatter)
+    ih.setLevel(logging.INFO)
+    ih.addFilter(_InteractionInfoFilter())
     interaction.addHandler(ih)
 
     # --- debug ---
-    debug = logging.getLogger("reminder_bot.debug")
     debug.setLevel(logging.DEBUG)
     debug.propagate = False
     debug.handlers.clear()
-    dh = logging.FileHandler(log_dir / DEBUG_LOG, encoding="utf-8")
-    dh.setFormatter(formatter)
+    dh = _file_handler(log_dir / DEBUG_LOG, formatter)
     debug.addHandler(dh)
     debug.addHandler(ih)                     # INFO-события дублируются в debug
     sh = logging.StreamHandler(sys.stderr)
