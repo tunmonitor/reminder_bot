@@ -1,125 +1,141 @@
-name: CI/CD Pipeline flow
+name: CI/CD бота-напоминателя
 
 on:
-  push:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
     branches:
       - test
       - main
-  pull_request:
+  push:
     branches:
-      - test
       - main
 
 permissions:
   contents: read
 
 jobs:
-  deploy-and-test:
-    runs-on: [self-hosted, raspberry]
-    
+  unit-tests:
+    name: Модульные тесты
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Получение кода
         uses: actions/checkout@v4
-
-      # =================================================================
-      # 🧪 СЦЕНАРИЙ ДЛЯ ТЕСТОВОГО ОКРУЖЕНИЯ (ВЕТКА test И PR НА test)
-      # =================================================================
-      - name: Deploy and Test on Test Environment
-        if: github.ref == 'refs/heads/test' || github.base_ref == 'test'
-        run: |
-          TARGET_TEST_DIR="/mnt/external_data/reminder_bot/test"
-          mkdir -p "$TARGET_TEST_DIR"
-          
-          echo "🔄 Синхронизация кода в тестовое окружение..."
-          rsync -av --delete \
-            --exclude='.git*' \
-            --exclude='credentials.env' \
-            --exclude='templates.json' \
-            --exclude='schedule_config.json' \
-            --exclude='logs_backup/' \
-            --exclude='__pycache__/' \
-            --exclude='venv/' \
-            ./ "$TARGET_TEST_DIR/"
-          
-          cd "$TARGET_TEST_DIR"
-          chmod +x manage.sh
-          
-          echo "🛑 Остановка старой копии тестового бота (если была)..."
-          ./manage.sh stop || true
-          
-          # Настройка виртуального окружения для тестовой папки
-          if [ ! -d "venv" ]; then
-            python3 -m venv venv
-            source venv/bin/activate
-            pip install --upgrade pip
-            pip install aiogram aiohttp openpyxl apscheduler pytz
-          fi
-          
-          echo "🚀 Запуск тестового бота..."
-          env RUNNER_TRACKING_ID=0 ./manage.sh start
-          
-          # Ожидание инициализации aiogram и проверки токена
-          sleep 4
-          
-          echo "🔍 Интеллектуальная проверка статуса тестового бота..."
-          if ./manage.sh status | grep -q "Статус: БОТ РАБОТАЕТ"; then
-              echo "✅ Тест пройден успешно! Бот стабилен в фоне тестового окружения."
-              
-              # Вытягиваем логи из RAM-диска для сохранения в артефактах GitHub
-              SHM_LOG_DIR="/dev/shm/church_bot"
-              cp "$SHM_LOG_DIR/interaction.log" ${{ github.workspace }}/test_interaction.log || true
-              cp "$SHM_LOG_DIR/debug.log" ${{ github.workspace }}/test_debug.log || true
-          else
-              echo "❌ Ошибка старта бота! Сборка и тесты провалены."
-              SHM_LOG_DIR="/dev/shm/church_bot"
-              echo "=== ПОСЛЕДНИЕ СТРОКИ DEBUG ЛОГА ==="
-              tail -n 20 "$SHM_LOG_DIR/debug.log" || true
-              exit 1
-          fi
-
-      - name: Upload Test Logs to GitHub Artifacts
-        if: (github.ref == 'refs/heads/test' || github.base_ref == 'test') && always()
-        uses: actions/upload-artifact@v4
         with:
-          name: test-environment-logs
-          path: |
-            ${{ github.workspace }}/test_interaction.log
-            ${{ github.workspace }}/test_debug.log
-          retention-days: 3
+          persist-credentials: false
 
-      # =================================================================
-      # 🚀 СЦЕНАРИЙ ДЛЯ БОЕВОГО ОКРУЖЕНИЯ (ВЕТКА main И PR НА main)
-      # =================================================================
-      - name: Deploy to Production Environment
-        if: github.ref == 'refs/heads/main' || github.base_ref == 'main'
+      - name: Настройка Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Установка зависимостей
+        run: python -m pip install -r requirements.txt
+
+      - name: Запуск модульных тестов
+        run: python -m unittest discover -s tests
+
+  deploy:
+    name: Развертывание тестовой или рабочей версии
+    needs: unit-tests
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.base_ref == 'test' &&
+       github.head_ref == 'dev' &&
+       !github.event.pull_request.draft &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: [self-hosted, tunmonitor]
+    concurrency:
+      group: reminder-bot-deploy-${{ github.event_name == 'pull_request' && github.base_ref || github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Получение версии для развертывания
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Развертывание и запуск бота
+        shell: bash
         run: |
-          TARGET_PROD_DIR="/home/pi/app/reminder_bot/prod"
-          mkdir -p "$TARGET_PROD_DIR"
-          
-          echo "📦 Синхронизация стабильного кода в PRODUCTION..."
-          rsync -av --delete \
-            --exclude='.git*' \
-            --exclude='credentials.env' \
-            --exclude='templates.json' \
-            --exclude='schedule_config.json' \
-            --exclude='logs_backup/' \
-            --exclude='__pycache__/' \
-            --exclude='venv/' \
-            ./ "$TARGET_PROD_DIR/"
-          
-          cd "$TARGET_PROD_DIR"
-          chmod +x manage.sh
-          
-          # Настройка виртуального окружения для prod папки
-          if [ ! -d "venv" ]; then
-            python3 -m venv venv
-            source venv/bin/activate
-            pip install --upgrade pip
-            pip install aiogram aiohttp openpyxl apscheduler pytz
+          set -euo pipefail
+
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            if [ "$GITHUB_BASE_REF" != "test" ] || [ "$GITHUB_HEAD_REF" != "dev" ]; then
+              echo "В тестовое окружение можно развернуть только PR из dev в test." >&2
+              exit 1
+            fi
+            TARGET_DIR="/mnt/external_data/reminder_bot/test"
+            SHM_DIR="/dev/shm/reminder_bot/test"
+            echo "Развертывается проверяемый commit из dev в тестовое окружение."
+          elif [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            TARGET_DIR="/home/pi/app/reminder_bot/prod"
+            SHM_DIR="/dev/shm/reminder_bot/prod"
+            echo "Развертывается commit из main в рабочее окружение."
+          else
+            echo "Неподдерживаемое событие развертывания: $GITHUB_EVENT_NAME $GITHUB_REF" >&2
+            exit 1
           fi
-          
-          echo "🔄 Автоматический перезапуск боевого бота..."
-          env RUNNER_TRACKING_ID=0 ./manage.sh restart
-          
-          sleep 3
-          ./manage.sh status
+          LOG_DIR="$SHM_DIR"
+
+          mkdir -p "$TARGET_DIR"
+
+          echo "Остановка текущего бота перед синхронизацией файлов..."
+          if [ -f "$TARGET_DIR/manage.sh" ]; then
+            (
+              cd "$TARGET_DIR"
+              SHM_DIR="$SHM_DIR" LOG_DIR="$LOG_DIR" bash ./manage.sh stop
+            )
+          fi
+
+          echo "Синхронизация кода проекта в $TARGET_DIR..."
+          rsync -a --checksum --delete \
+            --exclude='/.git/' \
+            --exclude='/.env' \
+            --exclude='/.env.*' \
+            --exclude='/credentials.env' \
+            --exclude='/reminder_bot_credentials.env' \
+            --exclude='/templates.json' \
+            --exclude='/reminder_bot_templates.json' \
+            --exclude='/schedule_config.json' \
+            --exclude='/reminder_bot_schedule_config.json' \
+            --exclude='/logs_backup/' \
+            --exclude='/reminder_bot_logs_backup/' \
+            --exclude='*.log' \
+            --exclude='/__pycache__/' \
+            --exclude='/venv/' \
+            --exclude='/.venv/' \
+            --exclude='/test/' \
+            --exclude='/qodo_review.md' \
+            ./ "$TARGET_DIR/"
+
+          chmod +x "$TARGET_DIR/manage.sh"
+
+          cd "$TARGET_DIR"
+          if [ -x "/home/pi/.venv/bin/python3" ]; then
+            BOT_PYTHON="/home/pi/.venv/bin/python3"
+          elif [ -x "$TARGET_DIR/.venv/bin/python3" ]; then
+            BOT_PYTHON="$TARGET_DIR/.venv/bin/python3"
+          elif [ -x "$TARGET_DIR/venv/bin/python3" ]; then
+            BOT_PYTHON="$TARGET_DIR/venv/bin/python3"
+          elif [ -x "$HOME/.venv/bin/python3" ]; then
+            BOT_PYTHON="$HOME/.venv/bin/python3"
+          else
+            python3 -m venv "$TARGET_DIR/venv"
+            BOT_PYTHON="$TARGET_DIR/venv/bin/python3"
+          fi
+
+          echo "Установка зависимостей из requirements.txt..."
+          "$BOT_PYTHON" -m pip install -r "$TARGET_DIR/requirements.txt"
+
+          echo "Запуск бота..."
+          SHM_DIR="$SHM_DIR" LOG_DIR="$LOG_DIR" RUNNER_TRACKING_ID=0 ./manage.sh start
+
+          echo "Проверка состояния бота..."
+          SHM_DIR="$SHM_DIR" LOG_DIR="$LOG_DIR" ./manage.sh status

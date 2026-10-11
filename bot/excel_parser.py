@@ -269,7 +269,7 @@ def parse_people(path: Path,
                 first
                 and not has_extra_values
                 and first_cell is not None
-                and first_cell.font.bold
+                and getattr(getattr(first_cell, "font", None), "bold", False)
             ):
                 current_role = None
                 debug_logger.debug(

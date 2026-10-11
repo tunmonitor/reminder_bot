@@ -4,10 +4,11 @@ import unittest
 import zipfile
 from datetime import date
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from xml.etree import ElementTree
 
 from openpyxl import Workbook
+from openpyxl.cell.read_only import ReadOnlyCell
 from openpyxl.styles import Border, Font, Side
 
 from bot.excel_parser import parse_people, parse_schedule, resolve_assignments
@@ -109,6 +110,21 @@ class ExcelParserTest(unittest.TestCase):
         self.assertEqual(assignments["Ответственный"]["username"], "alebzor")
         self.assertEqual(assignments["Проповедник"]["tg_id"], 123456789)
         self.assertNotIn("Не назначать", people["Ведущий"])
+
+    def test_parses_people_when_read_only_cell_has_no_font(self):
+        workbook = Workbook()
+        people = workbook.active
+        people.title = "Списки"
+        people.append(["Неизвестная задача"])
+        people["A1"].font = Font(bold=True)
+        workbook.save(self.path)
+
+        with patch.object(ReadOnlyCell, "font", new=property(lambda _cell: None)):
+            parsed_people = parse_people(self.path, self.debug_logger)
+
+        self.assertEqual(parsed_people, {role: {} for role in (
+            "Ответственный", "Ведущий", "Проповедник"
+        )})
 
     def test_selected_person_without_telegram_id_fails_explicitly(self):
         self._make_workbook()
