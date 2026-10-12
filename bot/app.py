@@ -17,7 +17,13 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 if __package__:
     from .cli import CliArgs
-    from .config import get_tz, load_credentials, load_schedule, load_templates
+    from .config import (
+        get_tz,
+        load_credentials,
+        load_schedule,
+        load_templates,
+        service_registry_path,
+    )
     from .excel_parser import ROLES, parse_people, parse_schedule, resolve_assignments
     from .handlers import register
     from .logger import setup_loggers
@@ -29,11 +35,18 @@ if __package__:
     )
     from .secure_fs import open_private_directory
     from .scheduler import build_scheduler
+    from .service_registry import ServiceRegistry
     from .state import StateCache
     from .yandex_disk import download_public
 else:  # pragma: no cover - поддержка запуска файла напрямую
     from bot.cli import CliArgs
-    from bot.config import get_tz, load_credentials, load_schedule, load_templates
+    from bot.config import (
+        get_tz,
+        load_credentials,
+        load_schedule,
+        load_templates,
+        service_registry_path,
+    )
     from bot.excel_parser import ROLES, parse_people, parse_schedule, resolve_assignments
     from bot.handlers import register
     from bot.logger import setup_loggers
@@ -45,6 +58,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
     )
     from bot.secure_fs import open_private_directory
     from bot.scheduler import build_scheduler
+    from bot.service_registry import ServiceRegistry
     from bot.state import StateCache
     from bot.yandex_disk import download_public
 
@@ -407,6 +421,17 @@ async def run(args: CliArgs) -> None:
     templates = load_templates()
     tz = get_tz(credentials.timezone)
     state_cache = StateCache(shm_dir / "reminder_state_cache.json")
+    service_registry = ServiceRegistry(service_registry_path())
+    try:
+        service_registry.initialize(
+            credentials.admin_tg_id, credentials.group_chat_id
+        )
+    except Exception:
+        debug_logger.exception(
+            "Не удалось инициализировать реестр служений; "
+            "продолжаем запуск существующих напоминаний без него"
+        )
+        service_registry = None
     jobs = load_schedule()
     pid_file = _pid_path(shm_dir)
     bot = None
@@ -428,6 +453,7 @@ async def run(args: CliArgs) -> None:
             interaction_logger=interaction_logger,
             debug_logger=debug_logger,
             confirmation_locks={},
+            service_registry=service_registry,
         )
 
         async def prepare_test_previews() -> dict:

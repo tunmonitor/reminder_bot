@@ -88,6 +88,22 @@ def load_credentials() -> Credentials:
     )
 
 
+def service_registry_path() -> Path:
+    env_path = _first_existing(
+        PROJECT_DIR / "reminder_bot_credentials.env",
+        PROJECT_DIR / "credentials.env",
+    )
+    file_data = _parse_env_file(env_path) if env_path else {}
+    configured_path = (
+        file_data.get("REMINDER_BOT_DB_PATH")
+        or os.environ.get("REMINDER_BOT_DB_PATH")
+    )
+    if configured_path:
+        path = Path(configured_path).expanduser()
+        return path if path.is_absolute() else PROJECT_DIR / path
+    return PROJECT_DIR / ".runtime" / "reminder_bot.sqlite3"
+
+
 # ----------------------------
 # Templates
 # ----------------------------
@@ -123,4 +139,3 @@ def load_schedule() -> list[dict]:
 
 def get_tz(name: str) -> ZoneInfo:
     return ZoneInfo(name)
-
