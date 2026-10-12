@@ -152,6 +152,7 @@ jobs:
             --exclude='/reminder_bot_templates.json' \
             --exclude='/schedule_config.json' \
             --exclude='/reminder_bot_schedule_config.json' \
+            --exclude='/.runtime/' \
             --exclude='/logs_backup/' \
             --exclude='/reminder_bot_logs_backup/' \
             --exclude='*.log' \

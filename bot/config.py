@@ -99,7 +99,8 @@ def service_registry_path() -> Path:
         or os.environ.get("REMINDER_BOT_DB_PATH")
     )
     if configured_path:
-        return Path(configured_path).expanduser()
+        path = Path(configured_path).expanduser()
+        return path if path.is_absolute() else PROJECT_DIR / path
     return PROJECT_DIR / ".runtime" / "reminder_bot.sqlite3"
 
 

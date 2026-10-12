@@ -447,6 +447,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 log_dir.mkdir(mode=0o700)
                 bot = SimpleNamespace(session=SimpleNamespace(close=AsyncMock()))
                 dispatcher = SimpleNamespace()
+                debug_logger = MagicMock()
                 scheduler = SimpleNamespace(
                     running=True,
                     start=MagicMock(),
@@ -460,7 +461,11 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 dispatcher.start_polling = AsyncMock(side_effect=start_polling)
                 with ExitStack() as stack:
                     stack.enter_context(
-                        patch.object(app, "setup_loggers", return_value=(MagicMock(), MagicMock()))
+                        patch.object(
+                            app,
+                            "setup_loggers",
+                            return_value=(MagicMock(), debug_logger),
+                        )
                     )
                     stack.enter_context(patch.object(
                         app,
@@ -482,7 +487,14 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     stack.enter_context(patch.object(app, "StateCache"))
                     stack.enter_context(patch.object(app, "Bot", return_value=bot))
                     stack.enter_context(patch.object(app, "Dispatcher", return_value=dispatcher))
-                    stack.enter_context(patch.object(app, "register"))
+                    register = stack.enter_context(patch.object(app, "register"))
+                    stack.enter_context(
+                        patch.object(
+                            app.ServiceRegistry,
+                            "initialize",
+                            side_effect=PermissionError("invalid registry permissions"),
+                        )
+                    )
                     stack.enter_context(patch.object(app, "load_schedule", return_value=[]))
                     stack.enter_context(patch.object(app, "build_scheduler", return_value=scheduler))
                     await app.run(SimpleNamespace(shm_dir=str(shm_dir), log_dir=str(log_dir)))
@@ -493,6 +505,8 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 dispatcher.start_polling.assert_awaited_once_with(
                     bot, close_bot_session=False
                 )
+                self.assertIsNone(register.call_args.args[1].service_registry)
+                debug_logger.exception.assert_called_once()
                 self.assertFalse((shm_dir / "reminder_bot_bot.pid").exists())
 
         asyncio.run(run_bot())

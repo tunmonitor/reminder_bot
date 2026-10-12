@@ -1,4 +1,5 @@
 import stat
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -40,8 +41,21 @@ class ServiceRegistryTest(unittest.TestCase):
         services = {service["id"]: service for service in self.registry.list_services()}
         self.assertTrue(self.registry.is_super_admin(1001))
         self.assertFalse(self.registry.is_super_admin(2002))
-        self.assertEqual(services["assembly"]["group_chat_id"], -10001)
+        self.assertEqual(services["assembly"]["group_chat_id"], -19999)
         self.assertEqual(services["sound"]["group_chat_id"], -10002)
+
+    def test_no_op_admin_changes_do_not_create_audit_entries(self):
+        self.registry.add_service_admin(1001, "sound", 3003)
+        self.registry.add_service_admin(1001, "sound", 3003)
+        self.registry.remove_service_admin(1001, "sound", 9999)
+
+        with sqlite3.connect(self.path) as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM configuration_audit "
+                "WHERE action IN ('service_admin_added', 'service_admin_removed')"
+            ).fetchone()[0]
+
+        self.assertEqual(count, 1)
 
     def test_only_super_admin_can_manage_service_admins_and_contacts(self):
         with self.assertRaises(PermissionError):

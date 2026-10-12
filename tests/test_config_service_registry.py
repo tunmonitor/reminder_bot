@@ -37,8 +37,19 @@ class ServiceRegistryPathTest(unittest.TestCase):
             ):
                 self.assertEqual(
                     config.service_registry_path(),
-                    Path("./persistent/service.sqlite3"),
+                    project_dir / "persistent" / "service.sqlite3",
                 )
+
+    def test_relative_registry_path_from_environment_is_project_relative(self):
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            config, "PROJECT_DIR", Path(tmp_dir)
+        ), patch.dict(
+            os.environ, {"REMINDER_BOT_DB_PATH": "./persistent/service.sqlite3"}
+        ):
+            self.assertEqual(
+                config.service_registry_path(),
+                Path(tmp_dir) / "persistent" / "service.sqlite3",
+            )
 
 
 if __name__ == "__main__":

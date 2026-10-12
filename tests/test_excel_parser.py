@@ -81,6 +81,7 @@ class ExcelParserTest(unittest.TestCase):
             "Компьютер", "Трансляция Б", None, "Порядок Б",
         ])
         schedule.append(["Проповедует", "Ответственный В"])
+        schedule.append(["Ответственный; Ответственный inline", None])
         schedule.append([None, None, None, None, None, None, None, None,
                          None, None, None, None, date(2026, 10, 25)])
         schedule.append([
@@ -113,6 +114,7 @@ class ExcelParserTest(unittest.TestCase):
                 ("Ответственный", "Ответственный А"),
                 ("Ведущий", "Ответственный Б"),
                 ("Проповедник", "Ответственный В"),
+                ("Ответственный", "Ответственный inline"),
             ],
         )
         self.assertEqual(
@@ -155,6 +157,32 @@ class ExcelParserTest(unittest.TestCase):
             for event in events
             for item in event.assignments
         ])
+
+    def test_service_events_exclude_dates_outside_requested_month_and_year(self):
+        workbook = Workbook()
+        schedule = workbook.active
+        schedule.title = "ОКТЯБРЬ26"
+        schedule.append(["СОБРАНИЕ", None, "ДРУГОЕ"])
+        schedule.append([date(2026, 10, 11), None])
+        schedule.append(["ХКЦ; Inline value", "Октябрьский ответственный"])
+        schedule.append([date(2026, 11, 1), None])
+        schedule.append(["ХКЦ", "Ноябрьский ответственный"])
+        schedule.append([date(2027, 10, 2), None])
+        schedule.append(["ХКЦ", "Следующего года"])
+        workbook.save(self.path)
+
+        parsed = parse_service_events(
+            self.path, date(2026, 10, 1), self.debug_logger
+        )
+
+        self.assertEqual(len(parsed["assembly"]), 1)
+        self.assertEqual(
+            parsed["assembly"][0].event_date, date(2026, 10, 11)
+        )
+        self.assertEqual(
+            [item.name for item in parsed["assembly"][0].assignments],
+            ["Октябрьский ответственный"],
+        )
 
     def test_parses_month_sheet_and_schedule_blocks_case_insensitively(self):
         self._make_workbook()

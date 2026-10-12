@@ -99,6 +99,10 @@ class ServiceRegistry:
                         int(is_assembly),
                     ),
                 )
+            connection.execute(
+                "UPDATE services SET group_chat_id = ? WHERE id = 'assembly'",
+                (assembly_group_chat_id,),
+            )
 
             has_super_admin = connection.execute(
                 "SELECT 1 FROM super_admins LIMIT 1"
@@ -194,17 +198,18 @@ class ServiceRegistry:
         with self._connection() as connection:
             self._require_super_admin(connection, actor_id)
             self._require_service(connection, service_id)
-            connection.execute(
+            cursor = connection.execute(
                 "INSERT INTO service_admins "
                 "(service_id, telegram_id, created_by, created_at) "
                 "VALUES (?, ?, ?, ?) "
                 "ON CONFLICT(service_id, telegram_id) DO NOTHING",
                 (service_id, telegram_id, actor_id, _utc_now()),
             )
-            self._audit(
-                connection, actor_id, "service_admin_added", service_id,
-                {"telegram_id": telegram_id},
-            )
+            if cursor.rowcount:
+                self._audit(
+                    connection, actor_id, "service_admin_added", service_id,
+                    {"telegram_id": telegram_id},
+                )
 
     def remove_service_admin(
         self,
@@ -217,15 +222,16 @@ class ServiceRegistry:
         with self._connection() as connection:
             self._require_super_admin(connection, actor_id)
             self._require_service(connection, service_id)
-            connection.execute(
+            cursor = connection.execute(
                 "DELETE FROM service_admins "
                 "WHERE service_id = ? AND telegram_id = ?",
                 (service_id, telegram_id),
             )
-            self._audit(
-                connection, actor_id, "service_admin_removed", service_id,
-                {"telegram_id": telegram_id},
-            )
+            if cursor.rowcount:
+                self._audit(
+                    connection, actor_id, "service_admin_removed", service_id,
+                    {"telegram_id": telegram_id},
+                )
 
     def set_group_chat(
         self,

@@ -422,9 +422,16 @@ async def run(args: CliArgs) -> None:
     tz = get_tz(credentials.timezone)
     state_cache = StateCache(shm_dir / "reminder_state_cache.json")
     service_registry = ServiceRegistry(service_registry_path())
-    service_registry.initialize(
-        credentials.admin_tg_id, credentials.group_chat_id
-    )
+    try:
+        service_registry.initialize(
+            credentials.admin_tg_id, credentials.group_chat_id
+        )
+    except Exception:
+        debug_logger.exception(
+            "Не удалось инициализировать реестр служений; "
+            "продолжаем запуск существующих напоминаний без него"
+        )
+        service_registry = None
     jobs = load_schedule()
     pid_file = _pid_path(shm_dir)
     bot = None

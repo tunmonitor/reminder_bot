@@ -355,6 +355,8 @@ def parse_service_events(
                     if event_index + 1 < len(event_rows)
                     else len(rows)
                 )
+                if (event_date.year, event_date.month) != (month.year, month.month):
+                    continue
                 assignments = []
                 for row in rows[row_index + 1:next_row]:
                     if service.assignment_layout == "single":
@@ -375,9 +377,16 @@ def parse_service_events(
                         if len(row) > start_column + 1
                         else ""
                     )
+                    task_label, separator, inline_name = task_text.partition(";")
+                    if not name and separator:
+                        name = inline_name.strip()
                     if not name:
                         continue
-                    task = _canonical_role(task_text) or task_text or service.name
+                    task = (
+                        _canonical_role(task_label.strip())
+                        or task_label.strip()
+                        or service.name
+                    )
                     assignments.append(ServiceAssignment(task=task, name=name))
 
                 result[service.id].append(
