@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import re
 import zipfile
+from dataclasses import dataclass
 from io import BytesIO
 from datetime import date, datetime
 from pathlib import Path
@@ -12,7 +13,22 @@ from xml.etree import ElementTree
 from openpyxl import load_workbook
 from openpyxl.styles.borders import Side
 
+from .services import SERVICES, ServiceDefinition
+
 ROLES = ("Ответственный", "Ведущий", "Проповедник")
+
+
+@dataclass(frozen=True)
+class ServiceAssignment:
+    task: str
+    name: str
+
+
+@dataclass(frozen=True)
+class ServiceEvent:
+    service_id: str
+    event_date: date
+    assignments: tuple[ServiceAssignment, ...]
 
 _MONTH_SHEETS = (
     "ЯНВАРЬ", "ФЕВРАЛЬ", "МАРТ", "АПРЕЛЬ", "МАЙ", "ИЮНЬ",
@@ -263,6 +279,120 @@ def parse_schedule(path: Path, target: date,
             )
         debug_logger.debug("Итог парсинга '%s': %s", sheet_name, found)
         return found
+    finally:
+        workbook.close()
+
+
+def parse_service_events(
+    path: Path,
+    month: date,
+    debug_logger: logging.Logger,
+) -> dict[str, list[ServiceEvent]]:
+    """Читает события и назначения включённых служений с месячного листа."""
+    workbook = _load_workbook(path, debug_logger)
+    try:
+        expected_sheet = _schedule_sheet_name(month)
+        worksheet, sheet_name = _find_sheet(workbook, expected_sheet)
+        if worksheet is None:
+            raise RuntimeError(f"Лист расписания '{expected_sheet}' не найден")
+
+        worksheet.reset_dimensions()
+        rows = list(worksheet.iter_rows(values_only=True))
+        if not rows:
+            raise RuntimeError(f"Лист расписания '{sheet_name}' пуст")
+
+        aliases = {
+            _normalized(alias): service
+            for service in SERVICES
+            for alias in service.aliases
+        }
+        headers = []
+        service_columns: dict[str, int] = {}
+        for column, value in enumerate(rows[0]):
+            header = _clean(value)
+            if not header:
+                continue
+            headers.append(column)
+            service = aliases.get(_normalized(header))
+            if service is None:
+                continue
+            if service.id in service_columns:
+                raise RuntimeError(
+                    f"Заголовок служения «{service.name}» указан несколько раз "
+                    f"на листе '{sheet_name}'"
+                )
+            service_columns[service.id] = column
+
+        result: dict[str, list[ServiceEvent]] = {
+            service.id: [] for service in SERVICES
+        }
+        for service in SERVICES:
+            start_column = service_columns.get(service.id)
+            if start_column is None:
+                debug_logger.warning(
+                    "На листе '%s' не найдено служение '%s'",
+                    sheet_name, service.name,
+                )
+                continue
+            next_headers = [column for column in headers if column > start_column]
+            end_column = min(next_headers) - 1 if next_headers else len(rows[0]) - 1
+            if service.assignment_layout == "pairs" and end_column < start_column + 1:
+                raise RuntimeError(
+                    f"Для служения «{service.name}» на листе '{sheet_name}' "
+                    "не хватает столбца ответственного"
+                )
+
+            event_rows = [
+                (row_index, event_date)
+                for row_index, row in enumerate(rows)
+                if len(row) > start_column
+                and (event_date := _cell_date(row[start_column], month.year))
+                is not None
+            ]
+            for event_index, (row_index, event_date) in enumerate(event_rows):
+                next_row = (
+                    event_rows[event_index + 1][0]
+                    if event_index + 1 < len(event_rows)
+                    else len(rows)
+                )
+                assignments = []
+                for row in rows[row_index + 1:next_row]:
+                    if service.assignment_layout == "single":
+                        name = _clean(row[start_column]) if len(row) > start_column else ""
+                        if name and _cell_date(name, month.year) is None:
+                            assignments.append(
+                                ServiceAssignment(task=service.name, name=name)
+                            )
+                        continue
+
+                    task_text = (
+                        _clean(row[start_column])
+                        if len(row) > start_column
+                        else ""
+                    )
+                    name = (
+                        _clean(row[start_column + 1])
+                        if len(row) > start_column + 1
+                        else ""
+                    )
+                    if not name:
+                        continue
+                    task = _canonical_role(task_text) or task_text or service.name
+                    assignments.append(ServiceAssignment(task=task, name=name))
+
+                result[service.id].append(
+                    ServiceEvent(
+                        service_id=service.id,
+                        event_date=event_date,
+                        assignments=tuple(assignments),
+                    )
+                )
+                debug_logger.debug(
+                    "Прочитано служение '%s' на %s: назначений=%s",
+                    service.name, event_date, len(assignments),
+                )
+
+        return result
     finally:
         workbook.close()
 

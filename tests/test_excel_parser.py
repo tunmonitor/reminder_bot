@@ -11,7 +11,12 @@ from openpyxl import Workbook
 from openpyxl.cell.read_only import ReadOnlyCell
 from openpyxl.styles import Border, Font, Side
 
-from bot.excel_parser import parse_people, parse_schedule, resolve_assignments
+from bot.excel_parser import (
+    parse_people,
+    parse_schedule,
+    parse_service_events,
+    resolve_assignments,
+)
 
 
 class ExcelParserTest(unittest.TestCase):
@@ -49,6 +54,107 @@ class ExcelParserTest(unittest.TestCase):
         people.append(["Аркадий"])
         people.append(["Алексей", "alebzor", 181601986])
         workbook.save(self.path)
+
+    def test_parses_service_events_from_horizontal_monthly_blocks(self):
+        workbook = Workbook()
+        schedule = workbook.active
+        schedule.title = "ОКТЯБРЬ26"
+        schedule.append([
+            "СОБРАНИЕ", None, "ЗВУК", None, "СПЕВКА", "СЛАЙДЫ",
+            "ТРАНСЛЯЦИЯ", None, "ОРГ. ПОРЯДКА", None, "КУХНЯ", None,
+            "КОФЕ", None, "ДЕТСКОЕ",
+        ])
+        schedule.append([
+            date(2026, 10, 11), None, date(2026, 10, 12), None,
+            date(2026, 10, 13), date(2026, 10, 14), date(2026, 10, 15),
+            None, date(2026, 10, 16), None, date(2026, 10, 17), None,
+            date(2026, 10, 18),
+        ])
+        schedule.append([
+            "ХКЦ", "Ответственный А", "Микшер", "Звук А", "Спевка А",
+            "Слайды А", "Камера", "Трансляция А", "Организация",
+            "Порядок А", "Кухня", "Кухня А", "Кофе", "Кофе А",
+            "Посторонний блок",
+        ])
+        schedule.append([
+            "Ведущий", "Ответственный Б", None, "Звук Б", None, None,
+            "Компьютер", "Трансляция Б", None, "Порядок Б",
+        ])
+        schedule.append(["Проповедует", "Ответственный В"])
+        schedule.append([None, None, None, None, None, None, None, None,
+                         None, None, None, None, date(2026, 10, 25)])
+        schedule.append([
+            None, None, None, None, None, None, None, None, None, None,
+            None, None, "Кофе", "Кофе В",
+        ])
+        schedule.append([
+            date(2026, 10, 18), None, date(2026, 10, 19), None,
+            date(2026, 10, 20), date(2026, 10, 21), date(2026, 10, 22),
+            None, date(2026, 10, 23), None, date(2026, 10, 24), None,
+            date(2026, 10, 26),
+        ])
+        schedule.append([
+            "ХКЦ", "Ответственный Г", "Микшер", "Звук В", "Спевка Б",
+            "Слайды Б", "Камера", "Трансляция В", "Организация",
+            "Порядок В", "Кухня", "Кухня Б", "Кофе", "Кофе Г",
+        ])
+        workbook.save(self.path)
+
+        parsed = parse_service_events(
+            self.path, date(2026, 10, 1), self.debug_logger
+        )
+
+        self.assertEqual(
+            parsed["assembly"][0].event_date, date(2026, 10, 11)
+        )
+        self.assertEqual(
+            [(item.task, item.name) for item in parsed["assembly"][0].assignments],
+            [
+                ("Ответственный", "Ответственный А"),
+                ("Ведущий", "Ответственный Б"),
+                ("Проповедник", "Ответственный В"),
+            ],
+        )
+        self.assertEqual(
+            [(item.task, item.name) for item in parsed["sound"][0].assignments],
+            [("Микшер", "Звук А"), ("Звук", "Звук Б")],
+        )
+        self.assertEqual(
+            [(item.task, item.name) for item in parsed["rehearsal"][0].assignments],
+            [("Спевка", "Спевка А")],
+        )
+        self.assertEqual(
+            parsed["slides"][0].assignments[0].name, "Слайды А"
+        )
+        self.assertEqual(
+            [(item.task, item.name) for item in parsed["broadcast"][0].assignments],
+            [("Камера", "Трансляция А"), ("Компьютер", "Трансляция Б")],
+        )
+        self.assertEqual(
+            parsed["order"][0].assignments[0].name, "Порядок А"
+        )
+        self.assertEqual(
+            parsed["kitchen"][0].assignments[0].name, "Кухня А"
+        )
+        self.assertEqual(len(parsed["coffee"]), 3)
+        self.assertEqual(
+            [item.name for item in parsed["coffee"][0].assignments],
+            ["Кофе А"],
+        )
+        self.assertEqual(
+            [item.name for item in parsed["coffee"][1].assignments],
+            ["Кофе В"],
+        )
+        self.assertEqual(
+            [item.name for item in parsed["coffee"][2].assignments],
+            ["Кофе Г"],
+        )
+        self.assertNotIn("Посторонний блок", [
+            item.name
+            for events in parsed.values()
+            for event in events
+            for item in event.assignments
+        ])
 
     def test_parses_month_sheet_and_schedule_blocks_case_insensitively(self):
         self._make_workbook()

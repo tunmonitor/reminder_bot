@@ -122,8 +122,18 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                             app,
                             "load_credentials",
                             return_value=SimpleNamespace(
-                                timezone="UTC", bot_token="token", group_chat_id=1
+                                timezone="UTC",
+                                bot_token="token",
+                                group_chat_id=1,
+                                admin_tg_id=2,
                             ),
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            app,
+                            "service_registry_path",
+                            return_value=Path(tmp_dir) / "service-registry.sqlite3",
                         )
                     )
                     stack.enter_context(patch.object(app, "load_templates", return_value={}))
@@ -358,6 +368,13 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                             ),
                         )
                     )
+                    stack.enter_context(
+                        patch.object(
+                            app,
+                            "service_registry_path",
+                            return_value=Path(tmp_dir) / "service-registry.sqlite3",
+                        )
+                    )
                     stack.enter_context(patch.object(app, "load_templates", return_value={}))
                     stack.enter_context(patch.object(app, "get_tz", return_value=ZoneInfo("UTC")))
                     stack.enter_context(patch.object(app, "StateCache"))
@@ -454,6 +471,11 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                             group_chat_id=1,
                             admin_tg_id=2,
                         ),
+                    ))
+                    stack.enter_context(patch.object(
+                        app,
+                        "service_registry_path",
+                        return_value=Path(tmp_dir) / "service-registry.sqlite3",
                     ))
                     stack.enter_context(patch.object(app, "load_templates", return_value={}))
                     stack.enter_context(patch.object(app, "get_tz", return_value=ZoneInfo("UTC")))
@@ -571,6 +593,13 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                         SimpleNamespace(
                             shm_dir=str(linked),
                             log_dir=str(root / "logs"),
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            app,
+                            "service_registry_path",
+                            return_value=Path(tmp_dir) / "service-registry.sqlite3",
                         )
                     )
 
