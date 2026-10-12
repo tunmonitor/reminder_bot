@@ -365,14 +365,21 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "12345 | alex",
                 )
             )
+            await handlers[4].callback(
+                self.message(67890, "/service_chat assembly -10077 off")
+            )
 
             self.assertEqual(self.registry.list_service_admins("sound"), [12345])
+            self.assertEqual(self.context.group_chat_id, -10077)
             service = next(
                 service for service in self.registry.list_services()
                 if service["id"] == "sound"
             )
             self.assertEqual(service["group_chat_id"], -10022)
             self.assertTrue(service["enabled"])
+            assembly = self.registry.get_service("assembly")
+            self.assertEqual(assembly["group_chat_id"], -10077)
+            self.assertFalse(assembly["enabled"])
             self.assertEqual(
                 self.registry.get_responsible_contact(
                     "sound", "Микшер", "Алексей Иванов"
@@ -429,6 +436,57 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
             message.answer.assert_not_awaited()
             self.assertEqual(self.registry.list_service_admins("sound"), [])
+
+        asyncio.run(run())
+
+    def test_management_commands_report_unavailable_registry(self):
+        async def run():
+            context = SimpleNamespace(
+                interaction_logger=MagicMock(),
+                debug_logger=MagicMock(),
+                service_registry=None,
+            )
+            dispatcher = SimpleNamespace(include_router=MagicMock())
+            register(dispatcher, context)
+            admin_router = dispatcher.include_router.call_args_list[0].args[0]
+
+            for handler_index, command in (
+                (0, "/services"),
+                (2, "/service_admin_add sound 12345"),
+            ):
+                message = self.message(67890, command)
+                await admin_router.message.handlers[handler_index].callback(
+                    message
+                )
+                self.assertIn(
+                    "реестр настроек служений недоступен",
+                    message.answer.await_args.args[0].lower(),
+                )
+
+        asyncio.run(run())
+
+    def test_service_settings_response_is_split_to_telegram_safe_chunks(self):
+        async def run():
+            for index in range(60):
+                self.registry.set_responsible_contact(
+                    67890,
+                    "sound",
+                    "Микшер",
+                    f"Ответственный {index} " + "И" * 90,
+                    10000 + index,
+                )
+            message = self.message(67890, "/service_settings sound")
+
+            await self.admin_router.message.handlers[1].callback(message)
+
+            self.assertGreater(message.answer.await_count, 1)
+            chunks = [
+                call.args[0] for call in message.answer.await_args_list
+            ]
+            self.assertTrue(
+                all(len(chunk.encode("utf-16-le")) // 2 <= 4000 for chunk in chunks)
+            )
+            self.assertIn("Ответственный 59", "".join(chunks))
 
         asyncio.run(run())
 

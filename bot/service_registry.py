@@ -99,11 +99,6 @@ class ServiceRegistry:
                         int(is_assembly),
                     ),
                 )
-            connection.execute(
-                "UPDATE services SET group_chat_id = ? WHERE id = 'assembly'",
-                (assembly_group_chat_id,),
-            )
-
             has_super_admin = connection.execute(
                 "SELECT 1 FROM super_admins LIMIT 1"
             ).fetchone()
@@ -171,6 +166,16 @@ class ServiceRegistry:
             }
             for row in rows
         ]
+
+    def get_service(self, service_id: str) -> dict | None:
+        return next(
+            (
+                service
+                for service in self.list_services()
+                if service["id"] == service_id
+            ),
+            None,
+        )
 
     def is_super_admin(self, telegram_id: int) -> bool:
         with self._connection() as connection:

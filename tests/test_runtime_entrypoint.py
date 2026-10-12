@@ -258,6 +258,119 @@ class ReminderBotEntrypointTest(unittest.TestCase):
 
         asyncio.run(process())
 
+    def test_disabled_assembly_skips_scheduled_delivery(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -100)
+                registry.set_group_chat(1001, "assembly", -100, enabled=False)
+                bot = SimpleNamespace(send_message=AsyncMock())
+                credentials = SimpleNamespace(
+                    admin_tg_id=1001,
+                    group_chat_id=-100,
+                    yandex_public_url="https://example.invalid/schedule",
+                )
+                with ExitStack() as stack:
+                    download = stack.enter_context(
+                        patch.object(app, "download_public", new=AsyncMock())
+                    )
+                    send = stack.enter_context(
+                        patch.object(app, "send_assignments", new=AsyncMock())
+                    )
+                    interaction_logger = MagicMock()
+                    await app._process_upcoming_sunday(
+                        bot=bot,
+                        credentials=credentials,
+                        templates={},
+                        state_cache=MagicMock(),
+                        shm_dir=Path(tmp_dir),
+                        interaction_logger=interaction_logger,
+                        debug_logger=MagicMock(),
+                        tz=ZoneInfo("UTC"),
+                        service_registry=registry,
+                    )
+
+                download.assert_not_awaited()
+                send.assert_not_awaited()
+                interaction_logger.info.assert_called_once()
+
+        asyncio.run(process())
+
+    def test_scheduled_assembly_delivery_uses_registry_chat_id(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -100)
+                registry.set_group_chat(1001, "assembly", -10055, enabled=True)
+                state_cache = SimpleNamespace(
+                    state=None,
+                    matches_week=MagicMock(return_value=False),
+                    replace=MagicMock(),
+                    save=MagicMock(),
+                )
+                credentials = SimpleNamespace(
+                    admin_tg_id=1001,
+                    group_chat_id=-100,
+                    yandex_public_url="https://example.invalid/schedule",
+                )
+                assignments = {
+                    "Ответственный": "Алексей",
+                    "Ведущий": "Павел",
+                    "Проповедник": "Иван",
+                }
+                people = {
+                    role: {
+                        name: {"username": "", "tg_id": index}
+                    }
+                    for index, (role, name) in enumerate(assignments.items(), 1)
+                }
+                with ExitStack() as stack:
+                    stack.enter_context(
+                        patch.object(
+                            app, "_next_sunday_in_tz",
+                            return_value=date(2026, 10, 18),
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(app, "download_public", new=AsyncMock())
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            app, "parse_schedule", return_value=assignments
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(app, "parse_people", return_value=people)
+                    )
+                    send_assignments = stack.enter_context(
+                        patch.object(
+                            app, "send_assignments", new=AsyncMock(return_value=False)
+                        )
+                    )
+                    await app._process_upcoming_sunday(
+                        bot=SimpleNamespace(),
+                        credentials=credentials,
+                        templates={"general": "", "roles": {}},
+                        state_cache=state_cache,
+                        shm_dir=Path(tmp_dir),
+                        interaction_logger=MagicMock(),
+                        debug_logger=MagicMock(),
+                        tz=ZoneInfo("UTC"),
+                        service_registry=registry,
+                    )
+
+                self.assertEqual(
+                    send_assignments.await_args.kwargs["group_chat_id"], -10055
+                )
+
+        asyncio.run(process())
+
     def test_missing_assignment_data_notifies_admin_and_continues_partial_send(self):
         from bot import app
 

@@ -18,6 +18,22 @@ from .notifier import CONFIRM_PREFIX, _notify_admin
 
 router = Router()
 
+def _telegram_text_chunks(text: str, limit: int = 4000) -> list[str]:
+    chunks = []
+    current = []
+    current_units = 0
+    for character in text:
+        character_units = len(character.encode("utf-16-le")) // 2
+        if current and current_units + character_units > limit:
+            chunks.append("".join(current))
+            current = []
+            current_units = 0
+        current.append(character)
+        current_units += character_units
+    if current:
+        chunks.append("".join(current))
+    return chunks or [""]
+
 
 async def _persist_confirmation(context: Any, debug: logging.Logger) -> bool:
     try:
@@ -68,8 +84,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if (
             not message.from_user
             or message.chat.type != ChatType.PRIVATE
-            or service_registry() is None
         ):
+            return
+        if service_registry() is None:
+            await message.answer(
+                "Реестр настроек служений недоступен. "
+                "Попробуйте позже или сообщите супер-администратору.",
+                parse_mode=None,
+            )
             return
         try:
             response = operation(message.from_user.id)
@@ -83,15 +105,22 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 parse_mode=None,
             )
             return
-        await message.answer(response, parse_mode=None)
+        for chunk in _telegram_text_chunks(response):
+            await message.answer(chunk, parse_mode=None)
 
     @admin_router.message(Command("services"))
     async def on_services(message: Message) -> None:
         if (
             not message.from_user
             or message.chat.type != ChatType.PRIVATE
-            or service_registry() is None
         ):
+            return
+        if service_registry() is None:
+            await message.answer(
+                "Реестр настроек служений недоступен. "
+                "Попробуйте позже или сообщите супер-администратору.",
+                parse_mode=None,
+            )
             return
 
         registry = service_registry()
@@ -127,7 +156,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "Не удалось прочитать реестр служений.", parse_mode=None
             )
             return
-        await message.answer("\n".join(lines), parse_mode=None)
+        for chunk in _telegram_text_chunks("\n".join(lines)):
+            await message.answer(chunk, parse_mode=None)
 
     @admin_router.message(Command("service_settings"))
     async def on_service_settings(message: Message) -> None:
@@ -247,13 +277,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         def update_chat(actor_id: int) -> str:
             if raw_enabled not in {"on", "off"}:
                 raise ValueError("Последний параметр должен быть on или off.")
+            chat_id = int(raw_chat_id)
             registry = service_registry()
             registry.set_group_chat(
                 actor_id,
                 service_id,
-                int(raw_chat_id),
+                chat_id,
                 enabled=raw_enabled == "on",
             )
+            if service_id == "assembly":
+                context.group_chat_id = chat_id
             return "Групповой чат и статус служения сохранены."
 
         await run_registry_command(message, update_chat)

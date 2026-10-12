@@ -313,7 +313,28 @@ async def _process_upcoming_sunday(
     interaction_logger,
     debug_logger,
     tz,
+    service_registry=None,
 ) -> None:
+    delivery_group_chat_id = credentials.group_chat_id
+    if service_registry is not None:
+        assembly = service_registry.get_service("assembly")
+        if assembly is None:
+            raise RuntimeError("В реестре не настроено служение «Собрание»")
+        if not assembly["enabled"]:
+            interaction_logger.info(
+                "Рассылка «Собрания» пропущена: служение отключено в реестре"
+            )
+            return
+        delivery_group_chat_id = assembly["group_chat_id"]
+        if delivery_group_chat_id is None:
+            await _notify_admin(
+                bot,
+                credentials.admin_tg_id,
+                "Рассылка «Собрания» не выполнена: не задан ID группового чата.",
+                debug_logger,
+            )
+            return
+
     sunday_date = _next_sunday_in_tz(tz)
     sunday_iso = sunday_date.isoformat()
     if state_cache.matches_week(sunday_iso):
@@ -370,7 +391,7 @@ async def _process_upcoming_sunday(
     try:
         general_delivery_complete = await send_assignments(
             bot=bot,
-            group_chat_id=credentials.group_chat_id,
+            group_chat_id=delivery_group_chat_id,
             admin_id=credentials.admin_tg_id,
             assignments=assignments,
             state=state,
@@ -422,10 +443,14 @@ async def run(args: CliArgs) -> None:
     tz = get_tz(credentials.timezone)
     state_cache = StateCache(shm_dir / "reminder_state_cache.json")
     service_registry = ServiceRegistry(service_registry_path())
+    registry_context_group_chat_id = credentials.group_chat_id
     try:
         service_registry.initialize(
             credentials.admin_tg_id, credentials.group_chat_id
         )
+        assembly = service_registry.get_service("assembly")
+        if assembly and assembly["group_chat_id"] is not None:
+            registry_context_group_chat_id = assembly["group_chat_id"]
     except Exception:
         debug_logger.exception(
             "Не удалось инициализировать реестр служений; "
@@ -447,7 +472,7 @@ async def run(args: CliArgs) -> None:
         dp = Dispatcher(storage=MemoryStorage())
         context = SimpleNamespace(
             bot=bot,
-            group_chat_id=credentials.group_chat_id,
+            group_chat_id=registry_context_group_chat_id,
             admin_id=credentials.admin_tg_id,
             state_cache=state_cache,
             interaction_logger=interaction_logger,
@@ -478,6 +503,7 @@ async def run(args: CliArgs) -> None:
                     interaction_logger=interaction_logger,
                     debug_logger=debug_logger,
                     tz=tz,
+                    service_registry=service_registry,
                 )
             finally:
                 if task is not None:
