@@ -261,6 +261,27 @@ class ServiceRegistry:
                 {"group_chat_id": group_chat_id, "enabled": enabled},
             )
 
+    def set_service_enabled(
+        self, actor_id: int, service_id: str, enabled: bool
+    ) -> None:
+        _validate_positive_id(actor_id, "actor_id")
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled должен быть логическим значением")
+        with self._connection() as connection:
+            self._require_super_admin(connection, actor_id)
+            self._require_service(connection, service_id)
+            connection.execute(
+                "UPDATE services SET enabled = ? WHERE id = ?",
+                (int(enabled), service_id),
+            )
+            self._audit(
+                connection,
+                actor_id,
+                "service_enabled_updated",
+                service_id,
+                {"enabled": enabled},
+            )
+
     def set_notification_settings(
         self,
         actor_id: int,

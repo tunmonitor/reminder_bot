@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import itertools
 import json
 import logging
 import sqlite3
@@ -16,7 +17,12 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
+    KeyboardButtonRequestChat,
+    KeyboardButtonRequestUsers,
     Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 
 from .notifier import CONFIRM_PREFIX, _notify_admin
@@ -62,6 +68,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     debug: logging.Logger = context.debug_logger
     admin_router = Router()
     pending_inputs: dict[int, tuple[str, str]] = {}
+    pending_shares: dict[int, tuple[int, str, str]] = {}
+    pending_admin_confirmations: dict[
+        tuple[int, str, int], tuple[str, str]
+    ] = {}
+    share_request_ids = itertools.count(1)
 
     def service_registry():
         registry = getattr(context, "service_registry", None)
@@ -112,6 +123,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 if service["personal_templates"]
                 else "не заданы"
             ),
+            "Чтобы изменить дни, время или тексты, нажмите кнопку "
+            "«Изменить настройки уведомлений» ниже.",
         ]
         if registry.is_super_admin(actor_id):
             admins = registry.list_service_admins(service_id)
@@ -155,12 +168,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         lambda user_id: settings_text(
                             registry, user_id, service_id
                         ),
+                        reply_markup=settings_keyboard(service_id),
                     )
                     return
                 if not registry.is_super_admin(actor_id):
                     raise PermissionError(
                         "Эта команда доступна только супер-администратору."
                     )
+                if operation == "service_admin_add":
+                    await offer_registered_admins(
+                        message, actor_id, service_id
+                    )
+                    return
                 await ask_for_service_parameters(
                     message,
                     actor_id,
@@ -181,6 +200,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 if not services:
                     raise PermissionError(
                         "У вас нет прав администратора ни для одного служения."
+                    )
+            elif operation == "service_admin_add":
+                if not is_super_admin:
+                    raise PermissionError(
+                        "Эта команда доступна только супер-администратору."
                     )
             elif not is_super_admin:
                 raise PermissionError(
@@ -208,10 +232,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ]
         )
         descriptions = {
-            "service_settings": "Выберите служение, настройки которого нужно посмотреть.",
-            "service_admin_add": "Выберите служение, затем укажите Telegram ID нового администратора.",
+            "service_settings": "Выберите служение, чтобы посмотреть его настройки. В сообщении настроек будет кнопка перехода к изменению.",
+            "service_admin_add": "Выберите служение, затем выберите пользователя кнопкой Telegram и подтвердите назначение.",
             "service_admin_remove": "Выберите служение, затем укажите Telegram ID администратора для удаления.",
-            "service_chat": "Выберите служение, затем укажите ID группового чата и on/off.",
+            "service_chat": "Выберите служение, затем укажите групповой чат кнопкой Telegram. Для отключения используйте /service_chat <service_id> off.",
             "service_contact": "Выберите служение, затем данные ответственного и его Telegram ID.",
             "service_notify": "Выберите служение, затем дни, время и тексты уведомлений.",
         }
@@ -228,18 +252,47 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         service_id: str,
         label: str,
     ) -> None:
+        if operation == "service_chat":
+            request_id = next(share_request_ids)
+            pending_shares[request_id] = (
+                actor_id, "service_chat", service_id
+            )
+            keyboard = ReplyKeyboardMarkup(
+                keyboard=[
+                    [
+                        KeyboardButton(
+                            text="Выбрать групповой чат",
+                            request_chat=KeyboardButtonRequestChat(
+                                request_id=request_id,
+                                chat_is_channel=False,
+                                bot_is_member=True,
+                                request_title=True,
+                                request_username=True,
+                            ),
+                        )
+                    ]
+                ],
+                resize_keyboard=True,
+                one_time_keyboard=True,
+            )
+            await message.answer(
+                f"{label}: нажмите кнопку и выберите группу, в которой "
+                "бот уже состоит. После выбора служение будет включено.",
+                reply_markup=keyboard,
+                parse_mode=None,
+            )
+            return
+
         prompts = {
             "service_admin_add": (
-                f"{label}: введите Telegram ID пользователя, "
-                "которого нужно назначить администратором."
+                f"{label}: выберите пользователя кнопкой Telegram."
             ),
             "service_admin_remove": (
                 f"{label}: введите Telegram ID администратора, которого "
                 "нужно снять."
             ),
             "service_chat": (
-                f"{label}: введите ID группового чата и on/off через пробел. "
-                "Например: -1001234567890 on"
+                f"{label}: выберите групповой чат кнопкой Telegram."
             ),
             "service_contact": (
                 f"{label}: введите задачу | имя ответственного | Telegram ID "
@@ -254,7 +307,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         pending_inputs[actor_id] = (operation, service_id)
         await message.answer(prompts[operation], parse_mode=None)
 
-    async def run_registry_command(message: Message, operation) -> None:
+    async def run_registry_command(
+        message: Message,
+        operation,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> None:
         if (
             not message.from_user
             or message.chat.type != ChatType.PRIVATE
@@ -279,8 +336,63 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 parse_mode=None,
             )
             return
-        for chunk in _telegram_text_chunks(response):
-            await message.answer(chunk, parse_mode=None)
+        chunks = _telegram_text_chunks(response)
+        for index, chunk in enumerate(chunks):
+            await message.answer(
+                chunk,
+                parse_mode=None,
+                reply_markup=reply_markup if index == len(chunks) - 1 else None,
+            )
+
+    def settings_keyboard(service_id: str) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Изменить настройки уведомлений",
+                        callback_data=f"service:edit_notify:{service_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="К списку служений",
+                        callback_data="service:back_to_services:list",
+                    )
+                ],
+            ]
+        )
+
+    async def offer_registered_admins(
+        message: Message, actor_id: int, service_id: str
+    ) -> None:
+        request_id = next(share_request_ids)
+        pending_shares[request_id] = (
+            actor_id, "service_admin_add", service_id
+        )
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[
+                [
+                    KeyboardButton(
+                        text="Выбрать пользователя",
+                        request_users=KeyboardButtonRequestUsers(
+                            request_id=request_id,
+                            user_is_bot=False,
+                            max_quantity=1,
+                            request_name=True,
+                            request_username=True,
+                        ),
+                    )
+                ]
+            ],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        await message.answer(
+            "Нажмите кнопку и выберите пользователя в Telegram. "
+            "Проверьте выбор — назначение подтвердите на следующем шаге.",
+            reply_markup=keyboard,
+            parse_mode=None,
+        )
 
     @admin_router.message(Command("services"))
     async def on_services(message: Message) -> None:
@@ -409,10 +521,36 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await request_service_input(message, "service_chat")
             return
         if len(parts) == 2:
+            if parts[1] == "off":
+                await message.answer(
+                    "Укажите служение для отключения: "
+                    "/service_chat <service_id> off",
+                    parse_mode=None,
+                )
+                return
             await request_service_input(message, "service_chat", parts[1])
             return
+        if len(parts) == 3 and parts[2] == "off":
+            service_id = parts[1]
+
+            def disable_service(actor_id: int) -> str:
+                registry = service_registry()
+                registry.set_service_enabled(actor_id, service_id, False)
+                if service_id == "assembly":
+                    context.group_chat_id = registry.get_service(
+                        service_id
+                    )["group_chat_id"]
+                return "Служение отключено; сохранённый групповой чат не изменён."
+
+            await run_registry_command(message, disable_service)
+            return
         if len(parts) != 4:
-            await message.answer("Не хватает параметров. Запустите команду ещё раз.", parse_mode=None)
+            await message.answer(
+                "Формат: /service_chat <service_id> <chat_id> <on|off>. "
+                "Чтобы выбрать чат кнопкой, используйте /service_chat "
+                "<service_id>.",
+                parse_mode=None,
+            )
             return
         service_id, raw_chat_id, raw_enabled = parts[1:]
 
@@ -522,12 +660,35 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or message.chat.type != ChatType.PRIVATE
         ):
             return
-        if pending_inputs.pop(message.from_user.id, None) is None:
+        had_request = pending_inputs.pop(message.from_user.id, None) is not None
+        for request_id, pending in list(pending_shares.items()):
+            if pending[0] == message.from_user.id:
+                pending_shares.pop(request_id, None)
+                had_request = True
+        for key in list(pending_admin_confirmations):
+            if key[0] == message.from_user.id:
+                pending_admin_confirmations.pop(key, None)
+                had_request = True
+        if not had_request:
             await message.answer(
                 "Нет активного запроса параметров.", parse_mode=None
             )
             return
-        await message.answer("Ввод команды отменён.", parse_mode=None)
+        await message.answer(
+            "Текущий запрос отменён.",
+            parse_mode=None,
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+    @admin_router.message(Command("start"))
+    async def on_start(message: Message) -> None:
+        if not message.from_user or message.chat.type != ChatType.PRIVATE:
+            return
+        await message.answer(
+            "Здравствуйте! Для управления служениями используйте команды "
+            "из меню бота.",
+            parse_mode=None,
+        )
 
     @admin_router.callback_query(F.data.startswith("service:"))
     async def on_service_selected(callback: CallbackQuery) -> None:
@@ -543,8 +704,49 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await callback.answer("Некорректный выбор служения.")
             return
         _, operation, service_id = callback_parts
+        if operation == "back_to_services":
+            registry = service_registry()
+            if registry is None:
+                await callback.message.answer(
+                    "Реестр настроек служений недоступен.",
+                    parse_mode=None,
+                )
+            else:
+                is_super_admin = registry.is_super_admin(
+                    callback.from_user.id
+                )
+                services = registry.list_services()
+                services = [
+                    service for service in services
+                    if is_super_admin
+                    or registry.is_service_admin(
+                        callback.from_user.id, service["id"]
+                    )
+                ]
+                keyboard = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text=service_label(service),
+                                callback_data=(
+                                    "service:service_settings:"
+                                    f"{service['id']}"
+                                ),
+                            )
+                        ]
+                        for service in services
+                    ]
+                )
+                await callback.message.answer(
+                    "Выберите служение, чтобы посмотреть его настройки.",
+                    reply_markup=keyboard,
+                    parse_mode=None,
+                )
+            await callback.answer()
+            return
         if operation not in {
             "service_settings",
+            "edit_notify",
             "service_admin_add",
             "service_admin_remove",
             "service_chat",
@@ -569,20 +771,50 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 response = settings_text(
                     registry, callback.from_user.id, service_id
                 )
-                for chunk in _telegram_text_chunks(response):
-                    await callback.message.answer(chunk, parse_mode=None)
+                chunks = _telegram_text_chunks(response)
+                for index, chunk in enumerate(chunks):
+                    await callback.message.answer(
+                        chunk,
+                        parse_mode=None,
+                        reply_markup=(
+                            settings_keyboard(service_id)
+                            if index == len(chunks) - 1
+                            else None
+                        ),
+                    )
+            elif operation == "edit_notify":
+                if not is_service_admin(
+                    callback.from_user.id, service_id
+                ):
+                    raise PermissionError(
+                        "Настройки доступны только администратору этого служения."
+                    )
+                await ask_for_service_parameters(
+                    callback.message,
+                    callback.from_user.id,
+                    "service_notify",
+                    service_id,
+                    service_label(service),
+                )
             else:
                 if not registry.is_super_admin(callback.from_user.id):
                     raise PermissionError(
                         "Эта команда доступна только супер-администратору."
                     )
-                await ask_for_service_parameters(
-                    callback.message,
-                    callback.from_user.id,
-                    operation,
-                    service_id,
-                    service_label(service),
-                )
+                if operation == "service_admin_add":
+                    await offer_registered_admins(
+                        callback.message,
+                        callback.from_user.id,
+                        service_id,
+                    )
+                else:
+                    await ask_for_service_parameters(
+                        callback.message,
+                        callback.from_user.id,
+                        operation,
+                        service_id,
+                        service_label(service),
+                    )
         except (PermissionError, ValueError) as exc:
             await callback.message.answer(str(exc), parse_mode=None)
         except sqlite3.Error:
@@ -591,6 +823,185 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "Не удалось прочитать реестр служений.", parse_mode=None
             )
         await callback.answer()
+
+    @admin_router.callback_query(
+        F.data.startswith("service_admin_confirm:")
+        | F.data.startswith("service_admin_cancel:")
+    )
+    async def on_shared_admin_confirmation(callback: CallbackQuery) -> None:
+        if (
+            not callback.from_user
+            or not callback.message
+            or callback.message.chat.type != ChatType.PRIVATE
+        ):
+            await callback.answer()
+            return
+        parts = callback.data.split(":")
+        if len(parts) != 3:
+            await callback.answer("Некорректное подтверждение.")
+            return
+        action, service_id, raw_user_id = parts
+        user_id = int(raw_user_id)
+        key = (callback.from_user.id, service_id, user_id)
+        selected_user = pending_admin_confirmations.get(key)
+        if selected_user is None:
+            await callback.answer("Запрос устарел. Начните команду заново.")
+            return
+        pending_admin_confirmations.pop(key, None)
+        if action == "service_admin_cancel":
+            await callback.message.answer("Назначение отменено.", parse_mode=None)
+            await callback.answer()
+            return
+        registry = service_registry()
+        if registry is None:
+            await callback.message.answer(
+                "Реестр настроек служений недоступен.",
+                parse_mode=None,
+            )
+            await callback.answer()
+            return
+        try:
+            registry.add_service_admin(callback.from_user.id, service_id, user_id)
+        except (PermissionError, ValueError) as exc:
+            await callback.message.answer(str(exc), parse_mode=None)
+        except sqlite3.Error:
+            debug.exception("Не удалось назначить администратора служения")
+            await callback.message.answer(
+                "Не удалось назначить администратора из-за ошибки базы.",
+                parse_mode=None,
+            )
+        else:
+            first_name, username = selected_user
+            display_name = first_name or f"Пользователь {user_id}"
+            await callback.message.answer(
+                f"{display_name} (ID {user_id}"
+                + (f", @{username}" if username else "")
+                + ") назначен администратором служения.",
+                parse_mode=None,
+            )
+        await callback.answer()
+
+    @admin_router.message(F.users_shared)
+    async def on_users_shared(message: Message) -> None:
+        if (
+            not message.from_user
+            or message.chat.type != ChatType.PRIVATE
+            or not message.users_shared
+        ):
+            return
+        request_id = message.users_shared.request_id
+        pending = pending_shares.pop(request_id, None)
+        if (
+            pending is None
+            or pending[0] != message.from_user.id
+            or pending[1] != "service_admin_add"
+        ):
+            await message.answer(
+                "Выбор пользователя не соответствует активному запросу. "
+                "Запустите команду назначения заново.",
+                parse_mode=None,
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+        if len(message.users_shared.users) != 1:
+            await message.answer(
+                "Нужно выбрать ровно одного пользователя.",
+                parse_mode=None,
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+        selected_user = message.users_shared.users[0]
+        user_id = selected_user.user_id
+        key = (message.from_user.id, pending[2], user_id)
+        pending_admin_confirmations[key] = (
+            selected_user.first_name,
+            selected_user.username or "",
+        )
+        display_name = selected_user.first_name or f"Пользователь {user_id}"
+        username = (
+            f" (@{selected_user.username})" if selected_user.username else ""
+        )
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Подтвердить",
+                        callback_data=(
+                            f"service_admin_confirm:{pending[2]}:{user_id}"
+                        ),
+                    ),
+                    InlineKeyboardButton(
+                        text="Отмена",
+                        callback_data=(
+                            f"service_admin_cancel:{pending[2]}:{user_id}"
+                        ),
+                    ),
+                ]
+            ]
+        )
+        await message.answer(
+            f"Назначить администратором пользователя {display_name}"
+            f"{username} (ID {user_id})?",
+            reply_markup=keyboard,
+            parse_mode=None,
+        )
+
+    @admin_router.message(F.chat_shared)
+    async def on_chat_shared(message: Message) -> None:
+        if (
+            not message.from_user
+            or message.chat.type != ChatType.PRIVATE
+            or not message.chat_shared
+        ):
+            return
+        pending = pending_shares.pop(message.chat_shared.request_id, None)
+        if (
+            pending is None
+            or pending[0] != message.from_user.id
+            or pending[1] != "service_chat"
+        ):
+            await message.answer(
+                "Выбор чата не соответствует активному запросу. "
+                "Запустите /service_chat заново.",
+                parse_mode=None,
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+        registry = service_registry()
+        if registry is None:
+            await message.answer(
+                "Реестр настроек служений недоступен.",
+                parse_mode=None,
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+        shared_chat = message.chat_shared
+        try:
+            registry.set_group_chat(
+                message.from_user.id,
+                pending[2],
+                shared_chat.chat_id,
+                enabled=True,
+            )
+        except (PermissionError, ValueError) as exc:
+            await message.answer(str(exc), parse_mode=None)
+            return
+        except sqlite3.Error:
+            debug.exception("Не удалось сохранить выбранный групповой чат")
+            await message.answer(
+                "Не удалось сохранить групповой чат из-за ошибки базы данных.",
+                parse_mode=None,
+            )
+            return
+        if pending[2] == "assembly":
+            context.group_chat_id = shared_chat.chat_id
+        title = shared_chat.title or str(shared_chat.chat_id)
+        await message.answer(
+            f"Для служения сохранён чат «{title}» "
+            f"(ID {shared_chat.chat_id}); служение включено.",
+            parse_mode=None,
+            reply_markup=ReplyKeyboardRemove(),
+        )
 
     @admin_router.message(F.text)
     async def on_service_parameter(message: Message) -> None:

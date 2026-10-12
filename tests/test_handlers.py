@@ -346,6 +346,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             from_user=SimpleNamespace(id=actor_id),
             chat=SimpleNamespace(type=chat_type),
             text=text,
+            users_shared=None,
+            chat_shared=None,
             answer=AsyncMock(),
         )
 
@@ -411,7 +413,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             await handler(allowed)
             allowed.answer.assert_awaited_once_with(
-                "Настройки уведомлений сохранены.", parse_mode=None
+                "Настройки уведомлений сохранены.",
+                parse_mode=None,
+                reply_markup=None,
             )
             service = next(
                 service for service in self.registry.list_services()
@@ -560,16 +564,143 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 answer=AsyncMock(),
             )
             await self.admin_router.callback_query.handlers[0].callback(callback)
-            self.assertIn(
-                "Telegram ID",
-                callback.message.answer.await_args.args[0],
+            self.assertIn("выберите пользователя", callback.message.answer.await_args.args[0])
+            keyboard = callback.message.answer.await_args.kwargs["reply_markup"]
+            request = keyboard.keyboard[0][0].request_users
+            self.assertEqual(request.max_quantity, 1)
+            self.assertFalse(request.user_is_bot)
+
+            self.assertEqual(self.registry.list_service_admins("assembly"), [])
+
+        asyncio.run(run())
+
+    def test_shared_user_is_confirmed_before_becoming_service_admin(self):
+        async def run():
+            command = self.message(67890, "/service_admin_add")
+            await self.admin_router.message.handlers[2].callback(command)
+            service_keyboard = command.answer.await_args.kwargs["reply_markup"]
+            assembly_button = service_keyboard.inline_keyboard[0][0]
+            selected_service_message = self.message(
+                67890, "service selection", chat_type="private"
+            )
+            service_callback = SimpleNamespace(
+                data=assembly_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=selected_service_message,
+                answer=AsyncMock(),
+            )
+            await self.admin_router.callback_query.handlers[0].callback(
+                service_callback
             )
 
-            incoming = self.message(67890, "24680")
-            await self.admin_router.message.handlers[-1].callback(incoming)
-            self.assertEqual(self.registry.list_service_admins("assembly"), [24680])
-            incoming.answer.assert_awaited_once_with(
-                "Администратор служения назначен.", parse_mode=None
+            user_keyboard = selected_service_message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            request_id = user_keyboard.keyboard[0][0].request_users.request_id
+            share_message = self.message(67890, None)
+            share_message.users_shared = SimpleNamespace(
+                request_id=request_id,
+                users=[
+                    SimpleNamespace(
+                        user_id=24680,
+                        first_name="Анна",
+                        username="candidate",
+                    )
+                ],
+            )
+            await self.admin_router.message.handlers[9].callback(
+                share_message
+            )
+            self.assertEqual(self.registry.list_service_admins("assembly"), [])
+            confirmation = share_message.answer.await_args.kwargs["reply_markup"]
+            confirm_button = confirmation.inline_keyboard[0][0]
+            self.assertIn("Анна", share_message.answer.await_args.args[0])
+            self.assertIn("@candidate", share_message.answer.await_args.args[0])
+
+            admin_callback = SimpleNamespace(
+                data=confirm_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.admin_router.callback_query.handlers[1].callback(
+                admin_callback
+            )
+            self.assertEqual(
+                self.registry.list_service_admins("assembly"), [24680]
+            )
+            self.assertIn(
+                "24680",
+                admin_callback.message.answer.await_args.args[0],
+            )
+
+        asyncio.run(run())
+
+    def test_shared_group_chat_is_saved_and_service_can_be_disabled(self):
+        async def run():
+            command = self.message(67890, "/service_chat sound")
+            await self.admin_router.message.handlers[4].callback(command)
+            keyboard = command.answer.await_args.kwargs["reply_markup"]
+            request = keyboard.keyboard[0][0].request_chat
+            self.assertFalse(request.chat_is_channel)
+            self.assertTrue(request.bot_is_member)
+
+            shared_chat = self.message(67890, None)
+            shared_chat.chat_shared = SimpleNamespace(
+                request_id=request.request_id,
+                chat_id=-1002233,
+                title="Звук",
+                username=None,
+            )
+            await self.admin_router.message.handlers[10].callback(shared_chat)
+            sound = self.registry.get_service("sound")
+            self.assertEqual(sound["group_chat_id"], -1002233)
+            self.assertTrue(sound["enabled"])
+            self.assertIn("-1002233", shared_chat.answer.await_args.args[0])
+
+            disable = self.message(67890, "/service_chat sound off")
+            await self.admin_router.message.handlers[4].callback(disable)
+            sound = self.registry.get_service("sound")
+            self.assertEqual(sound["group_chat_id"], -1002233)
+            self.assertFalse(sound["enabled"])
+
+        asyncio.run(run())
+
+    def test_settings_message_has_next_action_button(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 24680)
+            selection_message = self.message(
+                67890, "/service_settings sound"
+            )
+            await self.admin_router.message.handlers[1].callback(
+                selection_message
+            )
+            keyboard = selection_message.answer.await_args.kwargs["reply_markup"]
+            edit_button = keyboard.inline_keyboard[0][0]
+            self.assertEqual(
+                edit_button.callback_data, "service:edit_notify:sound"
+            )
+            self.assertIn(
+                "изменить дни",
+                selection_message.answer.await_args.args[0].lower(),
+            )
+
+            callback = SimpleNamespace(
+                data=edit_button.callback_data,
+                from_user=SimpleNamespace(id=24680),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.admin_router.callback_query.handlers[0].callback(callback)
+            self.assertIn(
+                "число дней",
+                callback.message.answer.await_args.args[0],
             )
 
         asyncio.run(run())

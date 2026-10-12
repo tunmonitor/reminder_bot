@@ -54,6 +54,15 @@ class ServiceRegistryTest(unittest.TestCase):
         self.assertEqual(assembly["group_chat_id"], -10055)
         self.assertFalse(assembly["enabled"])
 
+    def test_disabling_service_preserves_its_group_chat(self):
+        self.registry.set_group_chat(1001, "sound", -10055, enabled=True)
+
+        self.registry.set_service_enabled(1001, "sound", False)
+
+        sound = self.registry.get_service("sound")
+        self.assertEqual(sound["group_chat_id"], -10055)
+        self.assertFalse(sound["enabled"])
+
     def test_no_op_admin_changes_do_not_create_audit_entries(self):
         self.registry.add_service_admin(1001, "sound", 3003)
         self.registry.add_service_admin(1001, "sound", 3003)

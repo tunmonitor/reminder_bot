@@ -505,6 +505,10 @@ async def run(args: CliArgs) -> None:
                             description="Отменить ввод параметров",
                         ),
                         BotCommand(
+                            command="start",
+                            description="Зарегистрироваться для назначения администратором",
+                        ),
+                        BotCommand(
                             command="test_notify",
                             description="Проверить доставку уведомлений",
                         ),
