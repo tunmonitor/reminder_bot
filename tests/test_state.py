@@ -33,6 +33,31 @@ class StateCacheTest(unittest.TestCase):
             self.assertTrue(cache.matches_week("2026-10-11", -1001))
             self.assertFalse(cache.matches_week("2026-10-11", -1002))
 
+    def test_legacy_completed_week_uses_credentials_chat_for_migration(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache = StateCache(Path(tmp_dir) / "state.json")
+            cache.replace({
+                "sunday_date": "2026-10-11",
+                "complete": True,
+                "participants": {},
+            })
+
+            self.assertFalse(cache.matches_week("2026-10-11", -1002))
+            self.assertTrue(
+                cache.matches_week(
+                    "2026-10-11",
+                    -1001,
+                    legacy_group_chat_id=-1001,
+                )
+            )
+            self.assertFalse(
+                cache.matches_week(
+                    "2026-10-11",
+                    -1002,
+                    legacy_group_chat_id=-1001,
+                )
+            )
+
     def test_merge_preserves_delivered_messages_and_refreshes_changed_id(self):
         previous = _build_state({
             "Ответственный": {
@@ -110,6 +135,49 @@ class StateCacheTest(unittest.TestCase):
         self.assertTrue(merged["participants"]["Ответственный"]["delivered"])
         self.assertEqual(
             merged["participants"]["Ответственный"]["group_chat_id"], -1001
+        )
+
+    def test_merge_legacy_incomplete_week_uses_credentials_chat(self):
+        previous = {
+            "sunday_date": "2026-10-11",
+            "general_sent": True,
+            "general_message_id": 50,
+            "general_text": "legacy",
+            "complete": False,
+            "group_chat_id": None,
+            "participants": {
+                "Ответственный": {
+                    "tg_id": 12345,
+                    "delivered": True,
+                    "message_id": 51,
+                    "chat_id": 12345,
+                    "confirmed": False,
+                }
+            },
+        }
+        current = _build_state({
+            "Ответственный": {
+                "name": "Алексей", "username": "alex", "tg_id": 12345,
+            },
+        }, group_chat_id=-1002)
+        current["sunday_date"] = "2026-10-11"
+
+        merged = _merge_week_state(
+            previous,
+            current,
+            group_chat_id=-1002,
+            legacy_group_chat_id=-1001,
+        )
+
+        self.assertFalse(merged["general_sent"])
+        self.assertIsNone(merged["general_message_id"])
+        self.assertEqual(merged["group_chat_id"], -1002)
+        self.assertTrue(
+            merged["participants"]["Ответственный"]["delivered"]
+        )
+        self.assertEqual(
+            merged["participants"]["Ответственный"]["group_chat_id"],
+            -1001,
         )
 
 

@@ -59,15 +59,20 @@ class StateCache:
             self.path.unlink()
 
     def matches_week(
-        self, sunday_iso: str, group_chat_id: int | None = None
+        self,
+        sunday_iso: str,
+        group_chat_id: int | None = None,
+        legacy_group_chat_id: int | None = None,
     ) -> bool:
+        if not self.state or self.state.get("sunday_date") != sunday_iso:
+            return False
+        saved_chat_id = self.state.get("group_chat_id")
+        if saved_chat_id is None:
+            saved_chat_id = legacy_group_chat_id
         return (
-            bool(self.state)
-            and self.state.get("sunday_date") == sunday_iso
-            and self.state.get("complete") is True
+            self.state.get("complete") is True
             and (
                 group_chat_id is None
-                or self.state.get("group_chat_id", group_chat_id)
-                == group_chat_id
+                or saved_chat_id == group_chat_id
             )
         )

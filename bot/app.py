@@ -232,13 +232,16 @@ def _merge_week_state(
     previous: dict | None,
     current: dict,
     group_chat_id: int | None = None,
+    legacy_group_chat_id: int | None = None,
 ) -> dict:
     if not previous or previous.get("sunday_date") != current["sunday_date"]:
         return current
 
     if group_chat_id is None:
         group_chat_id = current.get("group_chat_id")
-    old_group_chat_id = previous.get("group_chat_id", group_chat_id)
+    old_group_chat_id = previous.get("group_chat_id")
+    if old_group_chat_id is None:
+        old_group_chat_id = legacy_group_chat_id
     current["group_chat_id"] = group_chat_id
     same_group_chat = old_group_chat_id == group_chat_id
     if same_group_chat:
@@ -256,8 +259,10 @@ def _merge_week_state(
             )
             participant["message_id"] = old.get("message_id")
             participant["chat_id"] = old.get("chat_id")
-            participant["group_chat_id"] = old.get(
-                "group_chat_id", old_group_chat_id
+            participant["group_chat_id"] = (
+                old.get("group_chat_id")
+                if old.get("group_chat_id") is not None
+                else old_group_chat_id
             )
             participant["confirmed"] = old.get("confirmed", False)
             participant["group_update_sent"] = old.get("group_update_sent", False)
@@ -355,7 +360,11 @@ async def _process_upcoming_sunday(
 
     sunday_date = _next_sunday_in_tz(tz)
     sunday_iso = sunday_date.isoformat()
-    if state_cache.matches_week(sunday_iso, delivery_group_chat_id):
+    if state_cache.matches_week(
+        sunday_iso,
+        delivery_group_chat_id,
+        legacy_group_chat_id=credentials.group_chat_id,
+    ):
         interaction_logger.info("Рассылка для %s уже отправлена", sunday_iso)
         return
 
@@ -404,7 +413,10 @@ async def _process_upcoming_sunday(
     state = _build_state(assignments, delivery_group_chat_id)
     state["sunday_date"] = sunday_iso
     state = _merge_week_state(
-        state_cache.state, state, delivery_group_chat_id
+        state_cache.state,
+        state,
+        delivery_group_chat_id,
+        legacy_group_chat_id=credentials.group_chat_id,
     )
     state_cache.replace(state)
 

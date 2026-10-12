@@ -19,6 +19,18 @@ class ConfirmationHandlerTest(unittest.TestCase):
                 debug_logger=MagicMock(),
                 admin_id=67890,
                 group_chat_id=-100,
+                service_registry=SimpleNamespace(
+                    list_services=MagicMock(
+                        return_value=[
+                            {
+                                "id": "assembly",
+                                "name": "Собрание",
+                                "group_chat_id": -100,
+                                "enabled": True,
+                            }
+                        ]
+                    )
+                ),
                 bot=SimpleNamespace(send_message=AsyncMock()),
                 prepare_test_previews=AsyncMock(
                     return_value={
@@ -41,6 +53,24 @@ class ConfirmationHandlerTest(unittest.TestCase):
             )
 
             await handler(message)
+
+            selection = message.answer.await_args.kwargs["reply_markup"]
+            button = selection.inline_keyboard[0][0]
+            admin_router = dispatcher.include_router.call_args_list[0].args[0]
+            service_handler = next(
+                item.callback for item in admin_router.callback_query.handlers
+                if item.callback.__name__ == "on_service_selected"
+            )
+            callback = SimpleNamespace(
+                data=button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await service_handler(callback)
 
             self.assertEqual(context.bot.send_message.await_count, 4)
             self.assertEqual(
@@ -66,7 +96,7 @@ class ConfirmationHandlerTest(unittest.TestCase):
             self.assertIn("Ответственный, Алексей", personal_preview.args[1])
             self.assertIn("Алексей, будь готов", personal_preview.args[1])
             context.prepare_test_previews.assert_awaited_once()
-            message.answer.assert_not_awaited()
+            self.assertIn("Выберите служение", message.answer.await_args.args[0])
 
         asyncio.run(run())
 
@@ -112,6 +142,18 @@ class ConfirmationHandlerTest(unittest.TestCase):
                 debug_logger=MagicMock(),
                 admin_id=67890,
                 group_chat_id=-100,
+                service_registry=SimpleNamespace(
+                    list_services=MagicMock(
+                        return_value=[
+                            {
+                                "id": "assembly",
+                                "name": "Собрание",
+                                "group_chat_id": -100,
+                                "enabled": True,
+                            }
+                        ]
+                    )
+                ),
                 bot=SimpleNamespace(
                     send_message=AsyncMock(
                         side_effect=[
@@ -142,6 +184,25 @@ class ConfirmationHandlerTest(unittest.TestCase):
             )
 
             await handler(message)
+
+            button = message.answer.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard[0][0]
+            admin_router = dispatcher.include_router.call_args_list[0].args[0]
+            service_handler = next(
+                item.callback for item in admin_router.callback_query.handlers
+                if item.callback.__name__ == "on_service_selected"
+            )
+            callback = SimpleNamespace(
+                data=button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await service_handler(callback)
 
             self.assertEqual(context.bot.send_message.await_count, 3)
             self.assertEqual(
@@ -297,6 +358,65 @@ class ConfirmationHandlerTest(unittest.TestCase):
             self.assertFalse(participant["group_update_sent"])
             context.bot.send_message.assert_not_awaited()
             self.assertIn("служение отключено", callback.answer.await_args.args[0])
+
+        asyncio.run(run())
+
+    def test_failed_confirmation_save_is_reported_and_retried_when_disabled(self):
+        async def run():
+            participant = {
+                "name": "Алексей",
+                "tg_id": 12345,
+                "confirmed": False,
+                "group_update_sent": False,
+                "group_chat_id": -1001,
+            }
+            context = SimpleNamespace(
+                interaction_logger=MagicMock(),
+                debug_logger=MagicMock(),
+                admin_id=67890,
+                state_cache=SimpleNamespace(
+                    state={
+                        "sunday_date": "2026-10-11",
+                        "group_chat_id": -1001,
+                        "participants": {"Ответственный": participant},
+                    },
+                    save=MagicMock(
+                        side_effect=[OSError("disk full"), None]
+                    ),
+                ),
+                service_registry=SimpleNamespace(
+                    get_service=MagicMock(return_value={"enabled": False})
+                ),
+                bot=SimpleNamespace(send_message=AsyncMock()),
+                group_chat_id=-1001,
+            )
+            dispatcher = SimpleNamespace(include_router=MagicMock())
+            register(dispatcher, context)
+            handler = router.callback_query.handlers[-1].callback
+
+            def make_callback():
+                return SimpleNamespace(
+                    data="cfm:2026-10-11:Ответственный",
+                    from_user=SimpleNamespace(id=12345, username="alex"),
+                    message=None,
+                    answer=AsyncMock(),
+                )
+
+            with patch("bot.handlers._notify_admin", new=AsyncMock()):
+                first = make_callback()
+                await handler(first)
+                self.assertIn("Не удалось сохранить", first.answer.await_args.args[0])
+                self.assertTrue(participant["confirmed"])
+                self.assertFalse(participant["confirmation_persisted"])
+
+                second = make_callback()
+                await handler(second)
+
+            self.assertIn("служение отключено", second.answer.await_args.args[0])
+            self.assertNotIn("confirmation_persisted", participant)
+            self.assertFalse(participant["group_update_sent"])
+            context.bot.send_message.assert_not_awaited()
+            self.assertEqual(context.state_cache.save.call_count, 2)
 
         asyncio.run(run())
 
@@ -522,6 +642,14 @@ class ServiceManagementHandlerTest(unittest.TestCase):
     def test_service_admin_can_use_guided_notification_setup(self):
         async def run():
             self.registry.add_service_admin(67890, "sound", 12345)
+            self.registry.set_notification_settings(
+                67890,
+                "sound",
+                reminder_days=2,
+                reminder_time="17:00",
+                group_template="Текст группы",
+                personal_templates={"Микшер": "Старый текст"},
+            )
             message = self.message(12345, "/service_notify")
 
             await self.admin_router.message.handlers[6].callback(message)
@@ -546,9 +674,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 ),
                 answer=AsyncMock(),
             )
-            await self.admin_router.callback_query.handlers[0].callback(callback)
+            await self.admin_router.callback_query.handlers[3].callback(callback)
             self.assertIn(
-                "число дней",
+                "число от 0 до 6",
                 callback.message.answer.await_args.args[0],
             )
 
@@ -557,12 +685,263 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 for handler in self.admin_router.message.handlers
                 if handler.callback.__name__ == "on_service_parameter"
             )
-            parameters = self.message(
-                12345, '3 17:00 | Звук: {name} | {"Микшер":"{name}"}'
+            async def send_step(text):
+                step_message = self.message(12345, text)
+                await staged_input(step_message)
+                return step_message
+
+            invalid_days = await send_step("7")
+            self.assertIn("от 0 до 6", invalid_days.answer.await_args.args[0])
+            await send_step("3")
+            await send_step("17:15")
+            choose_message = await send_step("Новая групповая строка")
+            keyboard = choose_message.answer.await_args.kwargs["reply_markup"]
+            buttons = [
+                button for row in keyboard.inline_keyboard for button in row
+            ]
+            self.assertIn("Микшер", [button.text for button in buttons])
+            template_button = next(button for button in buttons if button.text == "Микшер")
+            task_callback = SimpleNamespace(
+                data=template_button.callback_data,
+                from_user=SimpleNamespace(id=12345),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
             )
-            await staged_input(parameters)
+            await self.admin_router.callback_query.handlers[1].callback(
+                task_callback
+            )
+            self.assertIn(
+                "индивидуальный текст",
+                task_callback.message.answer.await_args.args[0],
+            )
+            choose_finish = await send_step("Текст для микшера {name}")
+            finish_button = next(
+                button
+                for row in choose_finish.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.text == "Завершить и сохранить"
+            )
+            finish_callback = SimpleNamespace(
+                data=finish_button.callback_data,
+                from_user=SimpleNamespace(id=12345),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.admin_router.callback_query.handlers[1].callback(
+                finish_callback
+            )
+            service = self.registry.get_service("sound")
+            self.assertEqual(service["reminder_days"], 3)
+            self.assertEqual(service["reminder_time"], "17:15")
             self.assertEqual(
-                self.registry.get_service("sound")["reminder_days"], 3
+                service["group_template"], "Новая групповая строка"
+            )
+            self.assertEqual(
+                service["personal_templates"],
+                {"Микшер": "Текст для микшера {name}"},
+            )
+
+        asyncio.run(run())
+
+    def test_service_contact_uses_task_choice_and_native_user_picker(self):
+        async def run():
+            self.registry.set_responsible_contact(
+                67890, "sound", "Микшер", "Старый ответственный", 11111
+            )
+            command = self.message(67890, "/service_contact sound")
+            await self.admin_router.message.handlers[5].callback(command)
+            task_button = command.answer.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard[0][0]
+            self.assertEqual(task_button.text, "Микшер")
+
+            task_callback = SimpleNamespace(
+                data=task_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            task_handler = next(
+                handler.callback
+                for handler in self.admin_router.callback_query.handlers
+                if handler.callback.__name__ == "on_task_choice"
+            )
+            await task_handler(task_callback)
+            user_button = task_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ].keyboard[0][0]
+            self.assertIsNotNone(user_button.request_users)
+
+            share_message = self.message(67890, None)
+            share_message.users_shared = SimpleNamespace(
+                request_id=user_button.request_users.request_id,
+                users=[
+                    SimpleNamespace(
+                        user_id=22222,
+                        first_name="Новый",
+                        username="new_user",
+                    )
+                ],
+            )
+            user_handler = next(
+                handler.callback
+                for handler in self.admin_router.message.handlers
+                if handler.callback.__name__ == "on_users_shared"
+            )
+            await user_handler(share_message)
+            confirmation = share_message.answer.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard[0][0]
+            self.assertIn("Микшер", share_message.answer.await_args.args[0])
+
+            confirm_callback = SimpleNamespace(
+                data=confirmation.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            confirm_handler = next(
+                handler.callback
+                for handler in self.admin_router.callback_query.handlers
+                if handler.callback.__name__ == "on_shared_admin_confirmation"
+            )
+            await confirm_handler(confirm_callback)
+            self.assertEqual(
+                self.registry.get_responsible_contact(
+                    "sound", "Микшер", "Новый"
+                ),
+                {"telegram_id": 22222, "username": "new_user"},
+            )
+
+        asyncio.run(run())
+
+    def test_service_chat_offers_disable_button_instead_of_command_syntax(self):
+        async def run():
+            self.registry.set_group_chat(
+                67890, "sound", -100222, enabled=True
+            )
+            command = self.message(67890, "/service_chat")
+            await self.admin_router.message.handlers[4].callback(command)
+            service_button = next(
+                button
+                for row in command.answer.await_args.kwargs[
+                "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.text == "ЗВУК"
+            )
+            service_callback = SimpleNamespace(
+                data=service_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            service_handler = next(
+                handler.callback
+                for handler in self.admin_router.callback_query.handlers
+                if handler.callback.__name__ == "on_service_selected"
+            )
+            await service_handler(service_callback)
+            action_keyboard = service_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            disable_button = next(
+                button
+                for row in action_keyboard.inline_keyboard
+                for button in row
+                if button.text == "Отключить служение"
+            )
+            disable_callback = SimpleNamespace(
+                data=disable_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await service_handler(disable_callback)
+            sound = self.registry.get_service("sound")
+            self.assertFalse(sound["enabled"])
+            self.assertEqual(sound["group_chat_id"], -100222)
+
+        asyncio.run(run())
+
+    def test_test_notify_first_selects_service_group_chat(self):
+        async def run():
+            self.registry.set_group_chat(
+                67890, "sound", -100333, enabled=True
+            )
+            context = SimpleNamespace(
+                interaction_logger=MagicMock(),
+                debug_logger=MagicMock(),
+                admin_id=67890,
+                group_chat_id=-100,
+                service_registry=self.registry,
+                bot=SimpleNamespace(send_message=AsyncMock()),
+                prepare_test_previews=AsyncMock(
+                    return_value={
+                        "sunday_date": date(2026, 10, 18),
+                        "group_text": "Предпросмотр группы",
+                        "personal_messages": [],
+                        "issues": [],
+                    }
+                ),
+            )
+            dispatcher = SimpleNamespace(include_router=MagicMock())
+            register(dispatcher, context)
+            admin_router = dispatcher.include_router.call_args_list[0].args[0]
+
+            test_handler = router.message.handlers[-1].callback
+            command = self.message(67890, "/test_notify")
+            await test_handler(command)
+            selection = command.answer.await_args.kwargs["reply_markup"]
+            service_button = next(
+                button
+                for row in selection.inline_keyboard
+                for button in row
+                if button.text == "ЗВУК"
+            )
+
+            callback = SimpleNamespace(
+                data=service_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            service_handler = next(
+                handler.callback
+                for handler in admin_router.callback_query.handlers
+                if handler.callback.__name__ == "on_service_selected"
+            )
+            await service_handler(callback)
+
+            self.assertEqual(
+                context.bot.send_message.await_args_list[0].args[0], -100333
+            )
+            self.assertIn(
+                "Предпросмотр расписания",
+                context.bot.send_message.await_args_list[1].args[1],
             )
 
         asyncio.run(run())
@@ -673,7 +1052,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 ),
                 answer=AsyncMock(),
             )
-            await self.admin_router.callback_query.handlers[0].callback(callback)
+            await self.admin_router.callback_query.handlers[3].callback(callback)
             self.assertIn(
                 "ЗВУК",
                 callback.message.answer.await_args.args[0],
@@ -699,7 +1078,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 ),
                 answer=AsyncMock(),
             )
-            await self.admin_router.callback_query.handlers[0].callback(callback)
+            await self.admin_router.callback_query.handlers[3].callback(callback)
             self.assertIn("выберите пользователя", callback.message.answer.await_args.args[0])
             keyboard = callback.message.answer.await_args.kwargs["reply_markup"]
             request = keyboard.keyboard[0][0].request_users
@@ -806,7 +1185,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 answer=AsyncMock(),
             )
 
-            await self.admin_router.callback_query.handlers[0].callback(callback)
+            await self.admin_router.callback_query.handlers[3].callback(callback)
 
             self.assertEqual(
                 callback.message.answer.await_args.args[0],
@@ -832,7 +1211,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 message=selected_service_message,
                 answer=AsyncMock(),
             )
-            await self.admin_router.callback_query.handlers[0].callback(
+            await self.admin_router.callback_query.handlers[3].callback(
                 service_callback
             )
 
@@ -869,7 +1248,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 ),
                 answer=AsyncMock(),
             )
-            await self.admin_router.callback_query.handlers[1].callback(
+            await self.admin_router.callback_query.handlers[4].callback(
                 admin_callback
             )
             self.assertEqual(
@@ -940,9 +1319,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 ),
                 answer=AsyncMock(),
             )
-            await self.admin_router.callback_query.handlers[0].callback(callback)
+            await self.admin_router.callback_query.handlers[3].callback(callback)
             self.assertIn(
-                "число дней",
+                "число от 0 до 6",
                 callback.message.answer.await_args.args[0],
             )
 
