@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
+import sqlite3
 from typing import Any
 
 from aiogram import F, Dispatcher, Router
@@ -37,6 +39,297 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     interaction: logging.Logger = context.interaction_logger
     debug: logging.Logger = context.debug_logger
+    admin_router = Router()
+
+    def service_registry():
+        registry = getattr(context, "service_registry", None)
+        if registry is None:
+            return None
+        return registry
+
+    def is_service_admin(actor_id: int, service_id: str) -> bool:
+        registry = service_registry()
+        return bool(
+            registry
+            and (
+                registry.is_super_admin(actor_id)
+                or registry.is_service_admin(actor_id, service_id)
+            )
+        )
+
+    def service_by_id(registry: Any, service_id: str) -> dict | None:
+        return next(
+            (service for service in registry.list_services()
+             if service["id"] == service_id),
+            None,
+        )
+
+    async def run_registry_command(message: Message, operation) -> None:
+        if (
+            not message.from_user
+            or message.chat.type != ChatType.PRIVATE
+            or service_registry() is None
+        ):
+            return
+        try:
+            response = operation(message.from_user.id)
+        except (PermissionError, ValueError) as exc:
+            await message.answer(str(exc), parse_mode=None)
+            return
+        except sqlite3.Error:
+            debug.exception("Ошибка выполнения команды управления служениями")
+            await message.answer(
+                "Не удалось выполнить команду из-за ошибки базы настроек.",
+                parse_mode=None,
+            )
+            return
+        await message.answer(response, parse_mode=None)
+
+    @admin_router.message(Command("services"))
+    async def on_services(message: Message) -> None:
+        if (
+            not message.from_user
+            or message.chat.type != ChatType.PRIVATE
+            or service_registry() is None
+        ):
+            return
+
+        registry = service_registry()
+        try:
+            is_super_admin = registry.is_super_admin(message.from_user.id)
+            services = registry.list_services()
+            visible = [
+                service for service in services
+                if is_super_admin
+                or registry.is_service_admin(
+                    message.from_user.id, service["id"]
+                )
+            ]
+            if not visible:
+                return
+
+            lines = ["Служения:"]
+            for service in visible:
+                state = "включено" if service["enabled"] else "выключено"
+                lines.append(
+                    f"{service['id']} — {service['name']}: {state}"
+                )
+                if is_super_admin:
+                    admins = registry.list_service_admins(service["id"])
+                    lines.append(
+                        "  чат: "
+                        f"{service['group_chat_id'] or 'не задан'}; "
+                        f"админы: {', '.join(map(str, admins)) or 'нет'}"
+                    )
+        except sqlite3.Error:
+            debug.exception("Не удалось прочитать список служений")
+            await message.answer(
+                "Не удалось прочитать реестр служений.", parse_mode=None
+            )
+            return
+        await message.answer("\n".join(lines), parse_mode=None)
+
+    @admin_router.message(Command("service_settings"))
+    async def on_service_settings(message: Message) -> None:
+        if not message.from_user or message.chat.type != ChatType.PRIVATE:
+            return
+        parts = (message.text or "").split()
+        if len(parts) != 2:
+            await message.answer(
+                "Формат: /service_settings <service_id>", parse_mode=None
+            )
+            return
+
+        service_id = parts[1]
+
+        def show_settings(actor_id: int) -> str:
+            registry = service_registry()
+            if registry is None or not is_service_admin(actor_id, service_id):
+                raise PermissionError(
+                    "Настройки доступны только администратору этого служения."
+                )
+            service = service_by_id(registry, service_id)
+            if service is None:
+                raise ValueError(f"Неизвестное служение: {service_id}")
+            lines = [
+                f"{service['name']} ({service['id']})",
+                f"Статус: {'включено' if service['enabled'] else 'выключено'}",
+                f"Групповой чат: {service['group_chat_id'] or 'не задан'}",
+                f"Напоминание: за {service['reminder_days']} дн. "
+                f"в {service['reminder_time']}",
+                "Шаблон группы: "
+                f"{service['group_template'] or 'не задан'}",
+                "Личные шаблоны: "
+                + (
+                    json.dumps(
+                        service["personal_templates"], ensure_ascii=False
+                    )
+                    if service["personal_templates"]
+                    else "не заданы"
+                ),
+            ]
+            if registry.is_super_admin(actor_id):
+                admins = registry.list_service_admins(service_id)
+                contacts = registry.list_responsible_contacts(
+                    actor_id, service_id
+                )
+                lines.append(
+                    f"Администраторы: {', '.join(map(str, admins)) or 'нет'}"
+                )
+                lines.append("Привязки ответственных:")
+                lines.extend(
+                    f"  {item['task']} — {item['name']}: "
+                    f"{item['telegram_id']}"
+                    + (f" (@{item['username']})" if item["username"] else "")
+                    for item in contacts
+                )
+                if not contacts:
+                    lines.append("  нет")
+            return "\n".join(lines)
+
+        await run_registry_command(message, show_settings)
+
+    @admin_router.message(Command("service_admin_add"))
+    async def on_service_admin_add(message: Message) -> None:
+        if not message.from_user or message.chat.type != ChatType.PRIVATE:
+            return
+        parts = (message.text or "").split()
+        if len(parts) != 3:
+            await message.answer(
+                "Формат: /service_admin_add <service_id> <telegram_id>",
+                parse_mode=None,
+            )
+            return
+        service_id, raw_telegram_id = parts[1:]
+
+        def add_admin(actor_id: int) -> str:
+            telegram_id = int(raw_telegram_id)
+            registry = service_registry()
+            registry.add_service_admin(actor_id, service_id, telegram_id)
+            return "Администратор служения добавлен (или уже был назначен)."
+
+        await run_registry_command(message, add_admin)
+
+    @admin_router.message(Command("service_admin_remove"))
+    async def on_service_admin_remove(message: Message) -> None:
+        if not message.from_user or message.chat.type != ChatType.PRIVATE:
+            return
+        parts = (message.text or "").split()
+        if len(parts) != 3:
+            await message.answer(
+                "Формат: /service_admin_remove <service_id> <telegram_id>",
+                parse_mode=None,
+            )
+            return
+        service_id, raw_telegram_id = parts[1:]
+
+        def remove_admin(actor_id: int) -> str:
+            telegram_id = int(raw_telegram_id)
+            registry = service_registry()
+            registry.remove_service_admin(actor_id, service_id, telegram_id)
+            return "Администратор служения удалён (если он был назначен)."
+
+        await run_registry_command(message, remove_admin)
+
+    @admin_router.message(Command("service_chat"))
+    async def on_service_chat(message: Message) -> None:
+        if not message.from_user or message.chat.type != ChatType.PRIVATE:
+            return
+        parts = (message.text or "").split()
+        if len(parts) != 4:
+            await message.answer(
+                "Формат: /service_chat <service_id> <chat_id> <on|off>",
+                parse_mode=None,
+            )
+            return
+        service_id, raw_chat_id, raw_enabled = parts[1:]
+
+        def update_chat(actor_id: int) -> str:
+            if raw_enabled not in {"on", "off"}:
+                raise ValueError("Последний параметр должен быть on или off.")
+            registry = service_registry()
+            registry.set_group_chat(
+                actor_id,
+                service_id,
+                int(raw_chat_id),
+                enabled=raw_enabled == "on",
+            )
+            return "Групповой чат и статус служения сохранены."
+
+        await run_registry_command(message, update_chat)
+
+    @admin_router.message(Command("service_contact"))
+    async def on_service_contact(message: Message) -> None:
+        if not message.from_user or message.chat.type != ChatType.PRIVATE:
+            return
+        payload = (message.text or "").partition(" ")[2].strip()
+        parts = payload.split("|")
+        prefix_parts = parts[0].strip().split(maxsplit=1) if parts else []
+        details = [field.strip() for field in parts[1:]]
+        if len(prefix_parts) != 2 or len(details) not in {2, 3}:
+            await message.answer(
+                "Формат: /service_contact <service_id> "
+                "<задача> | <имя> | <telegram_id> [| <username>]",
+                parse_mode=None,
+            )
+            return
+        service_id, task = prefix_parts
+        name, raw_telegram_id, *username = details
+
+        def set_contact(actor_id: int) -> str:
+            registry = service_registry()
+            registry.set_responsible_contact(
+                actor_id,
+                service_id,
+                task,
+                name,
+                int(raw_telegram_id),
+                username[0] if username else "",
+            )
+            return "Привязка ответственного сохранена."
+
+        await run_registry_command(message, set_contact)
+
+    @admin_router.message(Command("service_notify"))
+    async def on_service_notify(message: Message) -> None:
+        if not message.from_user or message.chat.type != ChatType.PRIVATE:
+            return
+        payload = (message.text or "").partition(" ")[2]
+        fields = [field.strip() for field in payload.split("|", 2)]
+        if len(fields) != 3:
+            await message.answer(
+                "Формат: /service_notify <service_id> <дни> <HH:MM> | "
+                "<текст группы> | <JSON личных шаблонов>",
+                parse_mode=None,
+            )
+            return
+        settings, group_template, raw_templates = fields
+        settings_parts = settings.split(maxsplit=2)
+        if len(settings_parts) != 3:
+            await message.answer(
+                "Перед первым | укажите service_id, число дней и время.",
+                parse_mode=None,
+            )
+            return
+        service_id, raw_days, reminder_time = settings_parts
+
+        def set_notifications(actor_id: int) -> str:
+            try:
+                personal_templates = json.loads(raw_templates)
+            except json.JSONDecodeError as exc:
+                raise ValueError("Личные шаблоны должны быть корректным JSON.") from exc
+            registry = service_registry()
+            registry.set_notification_settings(
+                actor_id,
+                service_id,
+                reminder_days=int(raw_days),
+                reminder_time=reminder_time,
+                group_template=group_template,
+                personal_templates=personal_templates,
+            )
+            return "Настройки уведомлений сохранены."
+
+        await run_registry_command(message, set_notifications)
 
     @router.message(Command("test_notify"))
     async def on_test_notify(message: Message) -> None:
@@ -170,6 +463,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         async with lock:
             await _confirm_locked(cb, context, sunday_iso, role, interaction, debug)
 
+    dispatcher.include_router(admin_router)
     dispatcher.include_router(router)
 
 

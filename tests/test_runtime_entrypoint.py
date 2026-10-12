@@ -707,7 +707,13 @@ class ReminderBotEntrypointTest(unittest.TestCase):
 
         handlers.register(dp, context)
 
-        dp.include_router.assert_called_once_with(handlers.router)
+        self.assertEqual(dp.include_router.call_count, 2)
+        self.assertIs(
+            dp.include_router.call_args_list[-1].args[0], handlers.router
+        )
+        self.assertIsNot(
+            dp.include_router.call_args_list[0].args[0], handlers.router
+        )
 
     def test_register_requires_dispatcher(self):
         from bot import handlers

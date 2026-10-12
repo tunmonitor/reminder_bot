@@ -367,6 +367,21 @@ class ServiceRegistry:
             ).fetchone()
         return dict(row) if row else None
 
+    def list_responsible_contacts(
+        self, actor_id: int, service_id: str
+    ) -> list[dict]:
+        _validate_positive_id(actor_id, "actor_id")
+        with self._connection() as connection:
+            self._require_super_admin(connection, actor_id)
+            self._require_service(connection, service_id)
+            rows = connection.execute(
+                "SELECT task, name, telegram_id, username "
+                "FROM responsible_contacts WHERE service_id = ? "
+                "ORDER BY task, name",
+                (service_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def list_service_admins(self, service_id: str) -> list[int]:
         with self._connection() as connection:
             self._require_service(connection, service_id)

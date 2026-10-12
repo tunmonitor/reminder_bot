@@ -1,10 +1,13 @@
 import asyncio
+import tempfile
 import unittest
 from datetime import date
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from bot.handlers import register, router
+from bot.service_registry import ServiceRegistry
 
 
 class ConfirmationHandlerTest(unittest.TestCase):
@@ -313,6 +316,119 @@ class ConfirmationHandlerTest(unittest.TestCase):
             self.assertEqual(context.bot.send_message.await_count, 1)
             self.assertTrue(participant["group_update_sent"])
             self.assertEqual(second.answer.await_args.args[0], "Вы уже подтвердили участие!")
+
+        asyncio.run(run())
+
+
+class ServiceManagementHandlerTest(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.registry = ServiceRegistry(
+            Path(self.temp_dir.name) / "registry.sqlite3"
+        )
+        self.registry.initialize(67890, -100)
+        self.context = SimpleNamespace(
+            interaction_logger=MagicMock(),
+            debug_logger=MagicMock(),
+            admin_id=67890,
+            group_chat_id=-100,
+            service_registry=self.registry,
+            bot=SimpleNamespace(send_message=AsyncMock()),
+        )
+        self.dispatcher = SimpleNamespace(include_router=MagicMock())
+        register(self.dispatcher, self.context)
+        self.admin_router = self.dispatcher.include_router.call_args_list[0].args[0]
+
+    @staticmethod
+    def message(actor_id, text, chat_type="private"):
+        return SimpleNamespace(
+            from_user=SimpleNamespace(id=actor_id),
+            chat=SimpleNamespace(type=chat_type),
+            text=text,
+            answer=AsyncMock(),
+        )
+
+    def test_super_admin_can_configure_chat_admin_and_contact(self):
+        async def run():
+            handlers = self.admin_router.message.handlers
+            await handlers[2].callback(
+                self.message(67890, "/service_admin_add sound 12345")
+            )
+            await handlers[4].callback(
+                self.message(67890, "/service_chat sound -10022 on")
+            )
+            await handlers[5].callback(
+                self.message(
+                    67890,
+                    "/service_contact sound Микшер | Алексей Иванов | "
+                    "12345 | alex",
+                )
+            )
+
+            self.assertEqual(self.registry.list_service_admins("sound"), [12345])
+            service = next(
+                service for service in self.registry.list_services()
+                if service["id"] == "sound"
+            )
+            self.assertEqual(service["group_chat_id"], -10022)
+            self.assertTrue(service["enabled"])
+            self.assertEqual(
+                self.registry.get_responsible_contact(
+                    "sound", "Микшер", "Алексей Иванов"
+                ),
+                {"telegram_id": 12345, "username": "alex"},
+            )
+
+        asyncio.run(run())
+
+    def test_service_admin_can_only_change_own_notification_settings(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 12345)
+            handler = self.admin_router.message.handlers[6].callback
+
+            forbidden = self.message(
+                12345,
+                '/service_notify slides 2 17:30 | Текст группы | {}',
+            )
+            await handler(forbidden)
+            self.assertIn(
+                "администратору служения",
+                forbidden.answer.await_args.args[0],
+            )
+
+            allowed = self.message(
+                12345,
+                '/service_notify sound 2 17:30 | Звук: {name} | '
+                '{"Микшер": "{name}, проверьте звук"}',
+            )
+            await handler(allowed)
+            allowed.answer.assert_awaited_once_with(
+                "Настройки уведомлений сохранены.", parse_mode=None
+            )
+            service = next(
+                service for service in self.registry.list_services()
+                if service["id"] == "sound"
+            )
+            self.assertEqual(service["reminder_days"], 2)
+            self.assertEqual(service["reminder_time"], "17:30")
+            self.assertEqual(service["group_template"], "Звук: {name}")
+            self.assertEqual(
+                service["personal_templates"],
+                {"Микшер": "{name}, проверьте звук"},
+            )
+
+        asyncio.run(run())
+
+    def test_management_commands_are_silent_outside_private_chat(self):
+        async def run():
+            message = self.message(
+                67890, "/service_admin_add sound 12345", chat_type="group"
+            )
+            await self.admin_router.message.handlers[2].callback(message)
+
+            message.answer.assert_not_awaited()
+            self.assertEqual(self.registry.list_service_admins("sound"), [])
 
         asyncio.run(run())
 
