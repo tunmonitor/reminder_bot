@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import tempfile
 import unittest
 from datetime import date
@@ -209,6 +210,93 @@ class ConfirmationHandlerTest(unittest.TestCase):
                 "Нажмите кнопку повторно",
                 callback.answer.await_args_list[0].args[0],
             )
+
+        asyncio.run(run())
+
+    def test_confirmation_uses_chat_associated_with_original_reminder(self):
+        async def run():
+            participant = {
+                "name": "Алексей",
+                "tg_id": 12345,
+                "confirmed": False,
+                "group_update_sent": False,
+                "group_chat_id": -1001,
+            }
+            context = SimpleNamespace(
+                interaction_logger=MagicMock(),
+                debug_logger=MagicMock(),
+                state_cache=SimpleNamespace(
+                    state={
+                        "sunday_date": "2026-10-11",
+                        "group_chat_id": -1002,
+                        "participants": {"Ответственный": participant},
+                    },
+                    save=MagicMock(),
+                ),
+                service_registry=SimpleNamespace(
+                    get_service=MagicMock(return_value={"enabled": True})
+                ),
+                bot=SimpleNamespace(send_message=AsyncMock()),
+                group_chat_id=-1002,
+            )
+            dispatcher = SimpleNamespace(include_router=MagicMock())
+            register(dispatcher, context)
+            callback = SimpleNamespace(
+                data="cfm:2026-10-11:Ответственный",
+                from_user=SimpleNamespace(id=12345, username="alex"),
+                message=None,
+                answer=AsyncMock(),
+            )
+
+            await router.callback_query.handlers[-1].callback(callback)
+
+            self.assertEqual(
+                context.bot.send_message.await_args.args[0], -1001
+            )
+
+        asyncio.run(run())
+
+    def test_disabled_assembly_saves_confirmation_without_group_notice(self):
+        async def run():
+            participant = {
+                "name": "Алексей",
+                "tg_id": 12345,
+                "confirmed": False,
+                "group_update_sent": False,
+                "group_chat_id": -1001,
+            }
+            context = SimpleNamespace(
+                interaction_logger=MagicMock(),
+                debug_logger=MagicMock(),
+                state_cache=SimpleNamespace(
+                    state={
+                        "sunday_date": "2026-10-11",
+                        "group_chat_id": -1001,
+                        "participants": {"Ответственный": participant},
+                    },
+                    save=MagicMock(),
+                ),
+                service_registry=SimpleNamespace(
+                    get_service=MagicMock(return_value={"enabled": False})
+                ),
+                bot=SimpleNamespace(send_message=AsyncMock()),
+                group_chat_id=-1001,
+            )
+            dispatcher = SimpleNamespace(include_router=MagicMock())
+            register(dispatcher, context)
+            callback = SimpleNamespace(
+                data="cfm:2026-10-11:Ответственный",
+                from_user=SimpleNamespace(id=12345, username="alex"),
+                message=None,
+                answer=AsyncMock(),
+            )
+
+            await router.callback_query.handlers[-1].callback(callback)
+
+            self.assertTrue(participant["confirmed"])
+            self.assertFalse(participant["group_update_sent"])
+            context.bot.send_message.assert_not_awaited()
+            self.assertIn("служение отключено", callback.answer.await_args.args[0])
 
         asyncio.run(run())
 
@@ -431,6 +519,54 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_service_admin_can_use_guided_notification_setup(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 12345)
+            message = self.message(12345, "/service_notify")
+
+            await self.admin_router.message.handlers[6].callback(message)
+
+            keyboard = message.answer.await_args.kwargs["reply_markup"]
+            buttons = [
+                button
+                for row in keyboard.inline_keyboard
+                for button in row
+            ]
+            self.assertEqual(
+                [(button.text, button.callback_data) for button in buttons],
+                [("ЗВУК", "service:service_notify:sound")],
+            )
+
+            callback = SimpleNamespace(
+                data="service:service_notify:sound",
+                from_user=SimpleNamespace(id=12345),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.admin_router.callback_query.handlers[0].callback(callback)
+            self.assertIn(
+                "число дней",
+                callback.message.answer.await_args.args[0],
+            )
+
+            staged_input = next(
+                handler.callback
+                for handler in self.admin_router.message.handlers
+                if handler.callback.__name__ == "on_service_parameter"
+            )
+            parameters = self.message(
+                12345, '3 17:00 | Звук: {name} | {"Микшер":"{name}"}'
+            )
+            await staged_input(parameters)
+            self.assertEqual(
+                self.registry.get_service("sound")["reminder_days"], 3
+            )
+
+        asyncio.run(run())
+
     def test_management_commands_are_silent_outside_private_chat(self):
         async def run():
             message = self.message(
@@ -571,6 +707,113 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertFalse(request.user_is_bot)
 
             self.assertEqual(self.registry.list_service_admins("assembly"), [])
+
+        asyncio.run(run())
+
+    def test_old_chat_picker_response_is_rejected_after_handler_restart(self):
+        async def run():
+            first_command = self.message(67890, "/service_chat sound")
+            await self.admin_router.message.handlers[4].callback(first_command)
+            old_request_id = (
+                first_command.answer.await_args.kwargs["reply_markup"]
+                .keyboard[0][0].request_chat.request_id
+            )
+
+            new_dispatcher = SimpleNamespace(include_router=MagicMock())
+            register(new_dispatcher, self.context)
+            new_admin_router = (
+                new_dispatcher.include_router.call_args_list[0].args[0]
+            )
+            new_command = self.message(67890, "/service_chat coffee")
+            await new_admin_router.message.handlers[4].callback(new_command)
+            new_request_id = (
+                new_command.answer.await_args.kwargs["reply_markup"]
+                .keyboard[0][0].request_chat.request_id
+            )
+            self.assertNotEqual(old_request_id, new_request_id)
+
+            stale_response = self.message(67890, None)
+            stale_response.chat_shared = SimpleNamespace(
+                request_id=old_request_id,
+                chat_id=-1009911,
+                title="Старый выбор",
+                username=None,
+            )
+            await new_admin_router.message.handlers[10].callback(stale_response)
+
+            self.assertIn("не соответствует активному запросу", stale_response.answer.await_args.args[0])
+            self.assertIsNone(self.registry.get_service("sound")["group_chat_id"])
+            self.assertIsNone(self.registry.get_service("coffee")["group_chat_id"])
+
+        asyncio.run(run())
+
+    def test_staged_input_filter_does_not_consume_commands(self):
+        async def run():
+            handler = next(
+                handler
+                for handler in self.admin_router.message.handlers
+                if handler.callback.__name__ == "on_service_parameter"
+            )
+            filter_object = handler.filters[0]
+
+            command_matches = await filter_object.call(
+                value=self.message(67890, "/test_notify")
+            )
+            text_matches = await filter_object.call(
+                value=self.message(67890, "some staged input")
+            )
+
+            self.assertFalse(command_matches)
+            self.assertTrue(text_matches)
+
+        asyncio.run(run())
+
+    def test_switching_management_commands_clears_old_staged_input(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 24680)
+            remove = self.message(67890, "/service_admin_remove sound")
+            await self.admin_router.message.handlers[3].callback(remove)
+            settings = self.message(67890, "/service_settings sound")
+            await self.admin_router.message.handlers[1].callback(settings)
+            staged_input = next(
+                handler.callback
+                for handler in self.admin_router.message.handlers
+                if handler.callback.__name__ == "on_service_parameter"
+            )
+            numeric_text = self.message(67890, "24680")
+
+            await staged_input(numeric_text)
+
+            self.assertEqual(self.registry.list_service_admins("sound"), [24680])
+            numeric_text.answer.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_back_to_services_reports_registry_read_errors(self):
+        async def run():
+            self.context.service_registry = SimpleNamespace(
+                is_super_admin=MagicMock(
+                    side_effect=sqlite3.OperationalError("database unavailable")
+                )
+            )
+            callback = SimpleNamespace(
+                data="service:back_to_services:list",
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+
+            await self.admin_router.callback_query.handlers[0].callback(callback)
+
+            self.assertEqual(
+                callback.message.answer.await_args.args[0],
+                "Не удалось прочитать реестр служений.",
+            )
+            callback.answer.assert_awaited_once()
+            self.context.debug_logger.exception.assert_called()
 
         asyncio.run(run())
 

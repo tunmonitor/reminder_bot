@@ -63,6 +63,14 @@ class ServiceRegistryTest(unittest.TestCase):
         self.assertEqual(sound["group_chat_id"], -10055)
         self.assertFalse(sound["enabled"])
 
+    def test_share_request_ids_remain_unique_after_registry_restart(self):
+        first_request_id = self.registry.next_share_request_id()
+        self.registry.initialize(1001, -19999)
+
+        second_request_id = self.registry.next_share_request_id()
+
+        self.assertGreater(second_request_id, first_request_id)
+
     def test_no_op_admin_changes_do_not_create_audit_entries(self):
         self.registry.add_service_admin(1001, "sound", 3003)
         self.registry.add_service_admin(1001, "sound", 3003)

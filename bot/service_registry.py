@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import sqlite3
 import stat
 from contextlib import contextmanager
@@ -78,7 +79,18 @@ class ServiceRegistry:
                     details_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS runtime_counters (
+                    name TEXT PRIMARY KEY,
+                    next_value INTEGER NOT NULL
+                        CHECK (next_value >= 0 AND next_value <= 2147483647)
+                );
                 """
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO runtime_counters (name, next_value) "
+                "VALUES ('telegram_share_request_id', ?)",
+                (secrets.randbelow(2**30) + 2**30,),
             )
             now = _utc_now()
             for service in SERVICES:
@@ -108,6 +120,31 @@ class ServiceRegistry:
                     "VALUES (?, ?)",
                     (super_admin_id, now),
                 )
+
+    def next_share_request_id(self) -> int:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT next_value FROM runtime_counters "
+                "WHERE name = 'telegram_share_request_id'"
+            ).fetchone()
+            if row is None or row["next_value"] == 0:
+                raise ValueError(
+                    "Исчерпан счётчик запросов выбора Telegram."
+                )
+            request_id = row["next_value"]
+            if request_id == 2**31 - 1:
+                connection.execute(
+                    "UPDATE runtime_counters SET next_value = 0 "
+                    "WHERE name = 'telegram_share_request_id'"
+                )
+            else:
+                connection.execute(
+                    "UPDATE runtime_counters SET next_value = ? "
+                    "WHERE name = 'telegram_share_request_id'",
+                    (request_id + 1,),
+                )
+        return request_id
 
     def _ensure_private_database_file(self) -> None:
         try:

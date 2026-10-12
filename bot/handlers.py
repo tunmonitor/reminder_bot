@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import html
-import itertools
 import json
 import logging
 import sqlite3
@@ -72,7 +71,20 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     pending_admin_confirmations: dict[
         tuple[int, str, int], tuple[str, str]
     ] = {}
-    share_request_ids = itertools.count(1)
+    def new_share_request_id() -> int:
+        registry = service_registry()
+        if registry is None:
+            raise ValueError("Реестр служений временно недоступен.")
+        return registry.next_share_request_id()
+
+    def clear_pending_actor(actor_id: int) -> None:
+        pending_inputs.pop(actor_id, None)
+        for request_id, pending in list(pending_shares.items()):
+            if pending[0] == actor_id:
+                pending_shares.pop(request_id, None)
+        for key in list(pending_admin_confirmations):
+            if key[0] == actor_id:
+                pending_admin_confirmations.pop(key, None)
 
     def service_registry():
         registry = getattr(context, "service_registry", None)
@@ -171,12 +183,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         reply_markup=settings_keyboard(service_id),
                     )
                     return
-                if not registry.is_super_admin(actor_id):
+                if operation == "service_notify":
+                    if not is_service_admin(actor_id, service_id):
+                        raise PermissionError(
+                            "Настройки доступны только администратору этого служения."
+                        )
+                elif not registry.is_super_admin(actor_id):
                     raise PermissionError(
                         "Эта команда доступна только супер-администратору."
                     )
                 if operation == "service_admin_add":
-                    await offer_registered_admins(
+                    await offer_user_selection(
                         message, actor_id, service_id
                     )
                     return
@@ -191,7 +208,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
             is_super_admin = registry.is_super_admin(actor_id)
             services = registry.list_services()
-            if operation == "service_settings":
+            if operation in {"service_settings", "service_notify"}:
                 services = [
                     item for item in services
                     if is_super_admin
@@ -253,7 +270,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         label: str,
     ) -> None:
         if operation == "service_chat":
-            request_id = next(share_request_ids)
+            request_id = new_share_request_id()
             pending_shares[request_id] = (
                 actor_id, "service_chat", service_id
             )
@@ -317,6 +334,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or message.chat.type != ChatType.PRIVATE
         ):
             return
+        clear_pending_actor(message.from_user.id)
         if service_registry() is None:
             await message.answer(
                 "Реестр настроек служений недоступен. "
@@ -362,10 +380,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ]
         )
 
-    async def offer_registered_admins(
+    async def offer_user_selection(
         message: Message, actor_id: int, service_id: str
     ) -> None:
-        request_id = next(share_request_ids)
+        request_id = new_share_request_id()
         pending_shares[request_id] = (
             actor_id, "service_admin_add", service_id
         )
@@ -452,6 +470,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def on_service_settings(message: Message) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
+        clear_pending_actor(message.from_user.id)
         parts = (message.text or "").split()
         if len(parts) == 1:
             await request_service_input(message, "service_settings")
@@ -464,6 +483,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def on_service_admin_add(message: Message) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
+        clear_pending_actor(message.from_user.id)
         parts = (message.text or "").split()
         if len(parts) == 1:
             await request_service_input(message, "service_admin_add")
@@ -490,6 +510,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def on_service_admin_remove(message: Message) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
+        clear_pending_actor(message.from_user.id)
         parts = (message.text or "").split()
         if len(parts) == 1:
             await request_service_input(message, "service_admin_remove")
@@ -516,6 +537,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def on_service_chat(message: Message) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
+        clear_pending_actor(message.from_user.id)
         parts = (message.text or "").split()
         if len(parts) == 1:
             await request_service_input(message, "service_chat")
@@ -575,6 +597,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def on_service_contact(message: Message) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
+        clear_pending_actor(message.from_user.id)
         payload = (message.text or "").partition(" ")[2].strip()
         parts = payload.split("|")
         prefix_parts = parts[0].strip().split(maxsplit=1) if parts else []
@@ -611,6 +634,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def on_service_notify(message: Message) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
+        clear_pending_actor(message.from_user.id)
         payload = (message.text or "").partition(" ")[2]
         fields = [field.strip() for field in payload.split("|", 2)]
         if not payload.strip():
@@ -684,6 +708,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def on_start(message: Message) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
+        clear_pending_actor(message.from_user.id)
         await message.answer(
             "Здравствуйте! Для управления служениями используйте команды "
             "из меню бота.",
@@ -704,7 +729,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await callback.answer("Некорректный выбор служения.")
             return
         _, operation, service_id = callback_parts
+        clear_pending_actor(callback.from_user.id)
         if operation == "back_to_services":
+            clear_pending_actor(callback.from_user.id)
             registry = service_registry()
             if registry is None:
                 await callback.message.answer(
@@ -712,36 +739,45 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     parse_mode=None,
                 )
             else:
-                is_super_admin = registry.is_super_admin(
-                    callback.from_user.id
-                )
-                services = registry.list_services()
-                services = [
-                    service for service in services
-                    if is_super_admin
-                    or registry.is_service_admin(
-                        callback.from_user.id, service["id"]
+                try:
+                    is_super_admin = registry.is_super_admin(
+                        callback.from_user.id
                     )
-                ]
-                keyboard = InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [
-                            InlineKeyboardButton(
-                                text=service_label(service),
-                                callback_data=(
-                                    "service:service_settings:"
-                                    f"{service['id']}"
-                                ),
-                            )
-                        ]
-                        for service in services
+                    services = registry.list_services()
+                    services = [
+                        service for service in services
+                        if is_super_admin
+                        or registry.is_service_admin(
+                            callback.from_user.id, service["id"]
+                        )
                     ]
-                )
-                await callback.message.answer(
-                    "Выберите служение, чтобы посмотреть его настройки.",
-                    reply_markup=keyboard,
-                    parse_mode=None,
-                )
+                    keyboard = InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                InlineKeyboardButton(
+                                    text=service_label(service),
+                                    callback_data=(
+                                        "service:service_settings:"
+                                        f"{service['id']}"
+                                    ),
+                                )
+                            ]
+                            for service in services
+                        ]
+                    )
+                    await callback.message.answer(
+                        "Выберите служение, чтобы посмотреть его настройки.",
+                        reply_markup=keyboard,
+                        parse_mode=None,
+                    )
+                except sqlite3.Error:
+                    debug.exception(
+                        "Не удалось загрузить список служений для возврата"
+                    )
+                    await callback.message.answer(
+                        "Не удалось прочитать реестр служений.",
+                        parse_mode=None,
+                    )
             await callback.answer()
             return
         if operation not in {
@@ -782,7 +818,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             else None
                         ),
                     )
-            elif operation == "edit_notify":
+            elif operation in {"edit_notify", "service_notify"}:
                 if not is_service_admin(
                     callback.from_user.id, service_id
                 ):
@@ -802,7 +838,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "Эта команда доступна только супер-администратору."
                     )
                 if operation == "service_admin_add":
-                    await offer_registered_admins(
+                    await offer_user_selection(
                         callback.message,
                         callback.from_user.id,
                         service_id,
@@ -1003,13 +1039,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             reply_markup=ReplyKeyboardRemove(),
         )
 
-    @admin_router.message(F.text)
+    @admin_router.message(F.text & ~F.text.startswith("/"))
     async def on_service_parameter(message: Message) -> None:
         if (
             not message.from_user
             or message.chat.type != ChatType.PRIVATE
             or not message.text
-            or message.text.startswith("/")
         ):
             return
         pending = pending_inputs.get(message.from_user.id)
@@ -1278,10 +1313,30 @@ async def _confirm_locked(
             except Exception:  # noqa: BLE001
                 debug.exception("Не удалось отредактировать ЛС")
 
-    if not participant.get("group_update_sent"):
+    group_update_blocked_reason = None
+    registry = getattr(context, "service_registry", None)
+    if not participant.get("group_update_sent") and registry is not None:
+        try:
+            assembly = registry.get_service("assembly")
+        except sqlite3.Error:
+            debug.exception(
+                "Не удалось проверить состояние служения «Собрание»"
+            )
+            group_update_blocked_reason = (
+                "не удалось проверить состояние служения"
+            )
+        else:
+            if assembly is None or not assembly["enabled"]:
+                group_update_blocked_reason = "служение отключено"
+
+    if not participant.get("group_update_sent") and not group_update_blocked_reason:
+        group_chat_id = participant.get(
+            "group_chat_id",
+            state.get("group_chat_id", context.group_chat_id),
+        )
         try:
             await context.bot.send_message(
-                context.group_chat_id,
+                group_chat_id,
                 f"🔔 Участник {participant['name']} подтвердил роль {role}",
                 parse_mode=None,
             )
@@ -1311,6 +1366,11 @@ async def _confirm_locked(
         await cb.answer(
             "Уведомление отправлено, но состояние не удалось сохранить. "
             "Нажмите кнопку повторно для повтора сохранения."
+        )
+    elif group_update_blocked_reason:
+        await cb.answer(
+            "Подтверждение сохранено; уведомление в группу не отправлено: "
+            f"{group_update_blocked_reason}."
         )
     else:
         await cb.answer(

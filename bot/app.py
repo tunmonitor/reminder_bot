@@ -203,9 +203,12 @@ def _existing_pid_process_status(path: Path) -> tuple[str, bool] | None:
     return pid, running
 
 
-def _build_state(assignments: dict[str, dict]) -> dict:
+def _build_state(
+    assignments: dict[str, dict], group_chat_id: int | None = None
+) -> dict:
     return {
         "sunday_date": None,
+        "group_chat_id": group_chat_id,
         "general_message_id": None,
         "general_sent": False,
         "general_text": None,
@@ -225,15 +228,25 @@ def _build_state(assignments: dict[str, dict]) -> dict:
     }
 
 
-def _merge_week_state(previous: dict | None, current: dict) -> dict:
+def _merge_week_state(
+    previous: dict | None,
+    current: dict,
+    group_chat_id: int | None = None,
+) -> dict:
     if not previous or previous.get("sunday_date") != current["sunday_date"]:
         return current
 
-    current["general_message_id"] = previous.get("general_message_id")
-    current["general_sent"] = previous.get(
-        "general_sent", previous.get("general_message_id") is not None
-    )
-    current["general_text"] = previous.get("general_text")
+    if group_chat_id is None:
+        group_chat_id = current.get("group_chat_id")
+    old_group_chat_id = previous.get("group_chat_id", group_chat_id)
+    current["group_chat_id"] = group_chat_id
+    same_group_chat = old_group_chat_id == group_chat_id
+    if same_group_chat:
+        current["general_message_id"] = previous.get("general_message_id")
+        current["general_sent"] = previous.get(
+            "general_sent", previous.get("general_message_id") is not None
+        )
+        current["general_text"] = previous.get("general_text")
     old_participants = previous.get("participants", {})
     for role, participant in current["participants"].items():
         old = old_participants.get(role, {})
@@ -243,6 +256,9 @@ def _merge_week_state(previous: dict | None, current: dict) -> dict:
             )
             participant["message_id"] = old.get("message_id")
             participant["chat_id"] = old.get("chat_id")
+            participant["group_chat_id"] = old.get(
+                "group_chat_id", old_group_chat_id
+            )
             participant["confirmed"] = old.get("confirmed", False)
             participant["group_update_sent"] = old.get("group_update_sent", False)
     return current
@@ -339,7 +355,7 @@ async def _process_upcoming_sunday(
 
     sunday_date = _next_sunday_in_tz(tz)
     sunday_iso = sunday_date.isoformat()
-    if state_cache.matches_week(sunday_iso):
+    if state_cache.matches_week(sunday_iso, delivery_group_chat_id):
         interaction_logger.info("Рассылка для %s уже отправлена", sunday_iso)
         return
 
@@ -385,9 +401,11 @@ async def _process_upcoming_sunday(
             debug_logger,
         )
 
-    state = _build_state(assignments)
+    state = _build_state(assignments, delivery_group_chat_id)
     state["sunday_date"] = sunday_iso
-    state = _merge_week_state(state_cache.state, state)
+    state = _merge_week_state(
+        state_cache.state, state, delivery_group_chat_id
+    )
     state_cache.replace(state)
 
     try:
@@ -506,7 +524,7 @@ async def run(args: CliArgs) -> None:
                         ),
                         BotCommand(
                             command="start",
-                            description="Зарегистрироваться для назначения администратором",
+                            description="Начать работу с ботом",
                         ),
                         BotCommand(
                             command="test_notify",
