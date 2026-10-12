@@ -12,7 +12,12 @@ from aiogram import F, Dispatcher, Router
 from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from .notifier import CONFIRM_PREFIX, _notify_admin
 
@@ -56,6 +61,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     interaction: logging.Logger = context.interaction_logger
     debug: logging.Logger = context.debug_logger
     admin_router = Router()
+    pending_inputs: dict[int, tuple[str, str]] = {}
 
     def service_registry():
         registry = getattr(context, "service_registry", None)
@@ -79,6 +85,174 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
              if service["id"] == service_id),
             None,
         )
+
+    def service_label(service: dict) -> str:
+        return service["name"].upper()
+
+    def settings_text(registry: Any, actor_id: int, service_id: str) -> str:
+        if not is_service_admin(actor_id, service_id):
+            raise PermissionError(
+                "Настройки доступны только администратору этого служения."
+            )
+        service = service_by_id(registry, service_id)
+        if service is None:
+            raise ValueError("Служение не найдено.")
+        lines = [
+            service_label(service),
+            f"Статус: {'включено' if service['enabled'] else 'выключено'}",
+            f"Групповой чат: {service['group_chat_id'] or 'не задан'}",
+            f"Напоминание: за {service['reminder_days']} дн. "
+            f"в {service['reminder_time']}",
+            f"Текст для группы: {service['group_template'] or 'не задан'}",
+            "Тексты личных сообщений: "
+            + (
+                json.dumps(
+                    service["personal_templates"], ensure_ascii=False
+                )
+                if service["personal_templates"]
+                else "не заданы"
+            ),
+        ]
+        if registry.is_super_admin(actor_id):
+            admins = registry.list_service_admins(service_id)
+            contacts = registry.list_responsible_contacts(
+                actor_id, service_id
+            )
+            lines.append(
+                f"Администраторы (Telegram ID): "
+                f"{', '.join(map(str, admins)) or 'не назначены'}"
+            )
+            lines.append("Ответственные (задача — имя — Telegram ID):")
+            lines.extend(
+                f"{item['task']} — {item['name']} — {item['telegram_id']}"
+                + (f" (@{item['username']})" if item["username"] else "")
+                for item in contacts
+            )
+            if not contacts:
+                lines.append("Пока не добавлены.")
+        return "\n".join(lines)
+
+    async def request_service_input(
+        message: Message, operation: str, service_id: str | None = None
+    ) -> None:
+        registry = service_registry()
+        if registry is None:
+            await message.answer(
+                "Реестр настроек служений недоступен. "
+                "Попробуйте позже или сообщите супер-администратору.",
+                parse_mode=None,
+            )
+            return
+        actor_id = message.from_user.id
+        try:
+            if service_id:
+                service = service_by_id(registry, service_id)
+                if service is None:
+                    raise ValueError("Служение не найдено.")
+                if operation == "service_settings":
+                    await run_registry_command(
+                        message,
+                        lambda user_id: settings_text(
+                            registry, user_id, service_id
+                        ),
+                    )
+                    return
+                if not registry.is_super_admin(actor_id):
+                    raise PermissionError(
+                        "Эта команда доступна только супер-администратору."
+                    )
+                await ask_for_service_parameters(
+                    message,
+                    actor_id,
+                    operation,
+                    service_id,
+                    service_label(service),
+                )
+                return
+
+            is_super_admin = registry.is_super_admin(actor_id)
+            services = registry.list_services()
+            if operation == "service_settings":
+                services = [
+                    item for item in services
+                    if is_super_admin
+                    or registry.is_service_admin(actor_id, item["id"])
+                ]
+                if not services:
+                    raise PermissionError(
+                        "У вас нет прав администратора ни для одного служения."
+                    )
+            elif not is_super_admin:
+                raise PermissionError(
+                    "Эта команда доступна только супер-администратору."
+                )
+        except (PermissionError, ValueError) as exc:
+            await message.answer(str(exc), parse_mode=None)
+            return
+        except sqlite3.Error:
+            debug.exception("Не удалось загрузить список служений")
+            await message.answer(
+                "Не удалось загрузить список служений.", parse_mode=None
+            )
+            return
+
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=service_label(service),
+                        callback_data=f"service:{operation}:{service['id']}",
+                    )
+                ]
+                for service in services
+            ]
+        )
+        descriptions = {
+            "service_settings": "Выберите служение, настройки которого нужно посмотреть.",
+            "service_admin_add": "Выберите служение, затем укажите Telegram ID нового администратора.",
+            "service_admin_remove": "Выберите служение, затем укажите Telegram ID администратора для удаления.",
+            "service_chat": "Выберите служение, затем укажите ID группового чата и on/off.",
+            "service_contact": "Выберите служение, затем данные ответственного и его Telegram ID.",
+            "service_notify": "Выберите служение, затем дни, время и тексты уведомлений.",
+        }
+        await message.answer(
+            descriptions[operation],
+            reply_markup=keyboard,
+            parse_mode=None,
+        )
+
+    async def ask_for_service_parameters(
+        message: Message,
+        actor_id: int,
+        operation: str,
+        service_id: str,
+        label: str,
+    ) -> None:
+        prompts = {
+            "service_admin_add": (
+                f"{label}: введите Telegram ID пользователя, "
+                "которого нужно назначить администратором."
+            ),
+            "service_admin_remove": (
+                f"{label}: введите Telegram ID администратора, которого "
+                "нужно снять."
+            ),
+            "service_chat": (
+                f"{label}: введите ID группового чата и on/off через пробел. "
+                "Например: -1001234567890 on"
+            ),
+            "service_contact": (
+                f"{label}: введите задачу | имя ответственного | Telegram ID "
+                "[| username]."
+            ),
+            "service_notify": (
+                f"{label}: введите число дней, время HH:MM, текст группы и "
+                "JSON личных текстов через |.\n"
+                'Например: 2 17:30 | Текст группы | {"Задача":"Текст"}'
+            ),
+        }
+        pending_inputs[actor_id] = (operation, service_id)
+        await message.answer(prompts[operation], parse_mode=None)
 
     async def run_registry_command(message: Message, operation) -> None:
         if (
@@ -135,20 +309,23 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
             ]
             if not visible:
+                await message.answer(
+                    "Вы не назначены администратором служений.",
+                    parse_mode=None,
+                )
                 return
 
             lines = ["Служения:"]
             for service in visible:
                 state = "включено" if service["enabled"] else "выключено"
-                lines.append(
-                    f"{service['id']} — {service['name']}: {state}"
-                )
+                lines.append(f"{service_label(service)} — {state}")
                 if is_super_admin:
                     admins = registry.list_service_admins(service["id"])
                     lines.append(
-                        "  чат: "
+                        "  Групповой чат: "
                         f"{service['group_chat_id'] or 'не задан'}; "
-                        f"админы: {', '.join(map(str, admins)) or 'нет'}"
+                        "администраторы: "
+                        f"{', '.join(map(str, admins)) or 'не назначены'}"
                     )
         except sqlite3.Error:
             debug.exception("Не удалось прочитать список служений")
@@ -164,71 +341,28 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
         parts = (message.text or "").split()
-        if len(parts) != 2:
-            await message.answer(
-                "Формат: /service_settings <service_id>", parse_mode=None
-            )
+        if len(parts) == 1:
+            await request_service_input(message, "service_settings")
             return
-
-        service_id = parts[1]
-
-        def show_settings(actor_id: int) -> str:
-            registry = service_registry()
-            if registry is None or not is_service_admin(actor_id, service_id):
-                raise PermissionError(
-                    "Настройки доступны только администратору этого служения."
-                )
-            service = service_by_id(registry, service_id)
-            if service is None:
-                raise ValueError(f"Неизвестное служение: {service_id}")
-            lines = [
-                f"{service['name']} ({service['id']})",
-                f"Статус: {'включено' if service['enabled'] else 'выключено'}",
-                f"Групповой чат: {service['group_chat_id'] or 'не задан'}",
-                f"Напоминание: за {service['reminder_days']} дн. "
-                f"в {service['reminder_time']}",
-                "Шаблон группы: "
-                f"{service['group_template'] or 'не задан'}",
-                "Личные шаблоны: "
-                + (
-                    json.dumps(
-                        service["personal_templates"], ensure_ascii=False
-                    )
-                    if service["personal_templates"]
-                    else "не заданы"
-                ),
-            ]
-            if registry.is_super_admin(actor_id):
-                admins = registry.list_service_admins(service_id)
-                contacts = registry.list_responsible_contacts(
-                    actor_id, service_id
-                )
-                lines.append(
-                    f"Администраторы: {', '.join(map(str, admins)) or 'нет'}"
-                )
-                lines.append("Привязки ответственных:")
-                lines.extend(
-                    f"  {item['task']} — {item['name']}: "
-                    f"{item['telegram_id']}"
-                    + (f" (@{item['username']})" if item["username"] else "")
-                    for item in contacts
-                )
-                if not contacts:
-                    lines.append("  нет")
-            return "\n".join(lines)
-
-        await run_registry_command(message, show_settings)
+        await request_service_input(
+            message, "service_settings", parts[1]
+        )
 
     @admin_router.message(Command("service_admin_add"))
     async def on_service_admin_add(message: Message) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
         parts = (message.text or "").split()
-        if len(parts) != 3:
-            await message.answer(
-                "Формат: /service_admin_add <service_id> <telegram_id>",
-                parse_mode=None,
+        if len(parts) == 1:
+            await request_service_input(message, "service_admin_add")
+            return
+        if len(parts) == 2:
+            await request_service_input(
+                message, "service_admin_add", parts[1]
             )
+            return
+        if len(parts) != 3:
+            await message.answer("Лишние параметры. Запустите команду ещё раз.", parse_mode=None)
             return
         service_id, raw_telegram_id = parts[1:]
 
@@ -245,11 +379,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
         parts = (message.text or "").split()
-        if len(parts) != 3:
-            await message.answer(
-                "Формат: /service_admin_remove <service_id> <telegram_id>",
-                parse_mode=None,
+        if len(parts) == 1:
+            await request_service_input(message, "service_admin_remove")
+            return
+        if len(parts) == 2:
+            await request_service_input(
+                message, "service_admin_remove", parts[1]
             )
+            return
+        if len(parts) != 3:
+            await message.answer("Лишние параметры. Запустите команду ещё раз.", parse_mode=None)
             return
         service_id, raw_telegram_id = parts[1:]
 
@@ -266,11 +405,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
         parts = (message.text or "").split()
+        if len(parts) == 1:
+            await request_service_input(message, "service_chat")
+            return
+        if len(parts) == 2:
+            await request_service_input(message, "service_chat", parts[1])
+            return
         if len(parts) != 4:
-            await message.answer(
-                "Формат: /service_chat <service_id> <chat_id> <on|off>",
-                parse_mode=None,
-            )
+            await message.answer("Не хватает параметров. Запустите команду ещё раз.", parse_mode=None)
             return
         service_id, raw_chat_id, raw_enabled = parts[1:]
 
@@ -299,12 +441,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         parts = payload.split("|")
         prefix_parts = parts[0].strip().split(maxsplit=1) if parts else []
         details = [field.strip() for field in parts[1:]]
-        if len(prefix_parts) != 2 or len(details) not in {2, 3}:
-            await message.answer(
-                "Формат: /service_contact <service_id> "
-                "<задача> | <имя> | <telegram_id> [| <username>]",
-                parse_mode=None,
+        if not payload:
+            await request_service_input(message, "service_contact")
+            return
+        if len(prefix_parts) == 1:
+            await request_service_input(
+                message, "service_contact", prefix_parts[0]
             )
+            return
+        if len(prefix_parts) != 2 or len(details) not in {2, 3}:
+            await message.answer("Не хватает параметров. Запустите команду ещё раз.", parse_mode=None)
             return
         service_id, task = prefix_parts
         name, raw_telegram_id, *username = details
@@ -329,12 +475,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         payload = (message.text or "").partition(" ")[2]
         fields = [field.strip() for field in payload.split("|", 2)]
-        if len(fields) != 3:
-            await message.answer(
-                "Формат: /service_notify <service_id> <дни> <HH:MM> | "
-                "<текст группы> | <JSON личных шаблонов>",
-                parse_mode=None,
+        if not payload.strip():
+            await request_service_input(message, "service_notify")
+            return
+        if len(fields) == 1:
+            service_parts = fields[0].split()
+            await request_service_input(
+                message, "service_notify", service_parts[0]
             )
+            return
+        if len(fields) != 3:
+            await message.answer("Не хватает параметров. Запустите команду ещё раз.", parse_mode=None)
             return
         settings, group_template, raw_templates = fields
         settings_parts = settings.split(maxsplit=2)
@@ -363,6 +514,190 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return "Настройки уведомлений сохранены."
 
         await run_registry_command(message, set_notifications)
+
+    @admin_router.message(Command("cancel"))
+    async def on_cancel_service_command(message: Message) -> None:
+        if (
+            not message.from_user
+            or message.chat.type != ChatType.PRIVATE
+        ):
+            return
+        if pending_inputs.pop(message.from_user.id, None) is None:
+            await message.answer(
+                "Нет активного запроса параметров.", parse_mode=None
+            )
+            return
+        await message.answer("Ввод команды отменён.", parse_mode=None)
+
+    @admin_router.callback_query(F.data.startswith("service:"))
+    async def on_service_selected(callback: CallbackQuery) -> None:
+        if (
+            not callback.from_user
+            or not callback.message
+            or callback.message.chat.type != ChatType.PRIVATE
+        ):
+            await callback.answer()
+            return
+        callback_parts = callback.data.split(":", 2)
+        if len(callback_parts) != 3:
+            await callback.answer("Некорректный выбор служения.")
+            return
+        _, operation, service_id = callback_parts
+        if operation not in {
+            "service_settings",
+            "service_admin_add",
+            "service_admin_remove",
+            "service_chat",
+            "service_contact",
+            "service_notify",
+        }:
+            await callback.answer("Неизвестная команда.")
+            return
+        registry = service_registry()
+        if registry is None:
+            await callback.message.answer(
+                "Реестр настроек служений недоступен. Попробуйте позже.",
+                parse_mode=None,
+            )
+            await callback.answer()
+            return
+        try:
+            service = service_by_id(registry, service_id)
+            if service is None:
+                raise ValueError("Служение не найдено.")
+            if operation == "service_settings":
+                response = settings_text(
+                    registry, callback.from_user.id, service_id
+                )
+                for chunk in _telegram_text_chunks(response):
+                    await callback.message.answer(chunk, parse_mode=None)
+            else:
+                if not registry.is_super_admin(callback.from_user.id):
+                    raise PermissionError(
+                        "Эта команда доступна только супер-администратору."
+                    )
+                await ask_for_service_parameters(
+                    callback.message,
+                    callback.from_user.id,
+                    operation,
+                    service_id,
+                    service_label(service),
+                )
+        except (PermissionError, ValueError) as exc:
+            await callback.message.answer(str(exc), parse_mode=None)
+        except sqlite3.Error:
+            debug.exception("Не удалось обработать выбор служения")
+            await callback.message.answer(
+                "Не удалось прочитать реестр служений.", parse_mode=None
+            )
+        await callback.answer()
+
+    @admin_router.message(F.text)
+    async def on_service_parameter(message: Message) -> None:
+        if (
+            not message.from_user
+            or message.chat.type != ChatType.PRIVATE
+            or not message.text
+            or message.text.startswith("/")
+        ):
+            return
+        pending = pending_inputs.get(message.from_user.id)
+        if pending is None:
+            return
+        operation, service_id = pending
+        registry = service_registry()
+        if registry is None:
+            pending_inputs.pop(message.from_user.id, None)
+            await message.answer(
+                "Реестр настроек служений недоступен. Попробуйте позже.",
+                parse_mode=None,
+            )
+            return
+        text = message.text.strip()
+        try:
+            if operation == "service_admin_add":
+                registry.add_service_admin(
+                    message.from_user.id, service_id, int(text)
+                )
+                response = "Администратор служения назначен."
+            elif operation == "service_admin_remove":
+                registry.remove_service_admin(
+                    message.from_user.id, service_id, int(text)
+                )
+                response = "Администратор служения снят."
+            elif operation == "service_chat":
+                parts = text.split()
+                if len(parts) != 2 or parts[1] not in {"on", "off"}:
+                    raise ValueError(
+                        "Введите ID чата и on или off, например: "
+                        "-1001234567890 on."
+                    )
+                chat_id = int(parts[0])
+                registry.set_group_chat(
+                    message.from_user.id,
+                    service_id,
+                    chat_id,
+                    enabled=parts[1] == "on",
+                )
+                if service_id == "assembly":
+                    context.group_chat_id = chat_id
+                response = "Групповой чат и статус служения сохранены."
+            elif operation == "service_contact":
+                fields = [field.strip() for field in text.split("|")]
+                if len(fields) not in {3, 4}:
+                    raise ValueError(
+                        "Введите: задача | имя | Telegram ID [| username]."
+                    )
+                task, name, raw_id, *username = fields
+                registry.set_responsible_contact(
+                    message.from_user.id,
+                    service_id,
+                    task,
+                    name,
+                    int(raw_id),
+                    username[0] if username else "",
+                )
+                response = "Привязка ответственного сохранена."
+            elif operation == "service_notify":
+                fields = [field.strip() for field in text.split("|", 2)]
+                if len(fields) != 3:
+                    raise ValueError(
+                        "Введите: дни HH:MM | текст группы | JSON личных шаблонов."
+                    )
+                schedule = fields[0].split()
+                if len(schedule) != 2:
+                    raise ValueError("Укажите число дней и время HH:MM.")
+                try:
+                    templates = json.loads(fields[2])
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        "Личные шаблоны должны быть корректным JSON."
+                    ) from exc
+                registry.set_notification_settings(
+                    message.from_user.id,
+                    service_id,
+                    reminder_days=int(schedule[0]),
+                    reminder_time=schedule[1],
+                    group_template=fields[1],
+                    personal_templates=templates,
+                )
+                response = "Настройки уведомлений сохранены."
+            else:
+                pending_inputs.pop(message.from_user.id, None)
+                return
+        except (PermissionError, ValueError) as exc:
+            await message.answer(str(exc), parse_mode=None)
+            return
+        except sqlite3.Error:
+            debug.exception("Ошибка сохранения настроек служения")
+            await message.answer(
+                "Не удалось сохранить настройки из-за ошибки базы данных.",
+                parse_mode=None,
+            )
+            return
+
+        pending_inputs.pop(message.from_user.id, None)
+        await message.answer(response, parse_mode=None)
 
     @router.message(Command("test_notify"))
     async def on_test_notify(message: Message) -> None:

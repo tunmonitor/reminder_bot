@@ -490,6 +490,90 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_service_listing_uses_only_readable_russian_labels(self):
+        async def run():
+            message = self.message(67890, "/services")
+            await self.admin_router.message.handlers[0].callback(message)
+
+            result = message.answer.await_args.args[0]
+            self.assertIn("СОБРАНИЕ", result)
+            self.assertIn("ТРАНСЛЯЦИЯ", result)
+            self.assertNotIn("assembly", result)
+            self.assertNotIn("broadcast", result)
+
+        asyncio.run(run())
+
+    def test_settings_command_without_arguments_offers_service_buttons(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 12345)
+            message = self.message(12345, "/service_settings")
+
+            await self.admin_router.message.handlers[1].callback(message)
+
+            message.answer.assert_awaited_once()
+            text = message.answer.await_args.args[0]
+            keyboard = message.answer.await_args.kwargs["reply_markup"]
+            buttons = [
+                button
+                for row in keyboard.inline_keyboard
+                for button in row
+            ]
+            self.assertIn("Выберите служение", text)
+            self.assertEqual(
+                [(button.text, button.callback_data) for button in buttons],
+                [("ЗВУК", "service:service_settings:sound")],
+            )
+
+            callback = SimpleNamespace(
+                data=buttons[0].callback_data,
+                from_user=SimpleNamespace(id=12345),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.admin_router.callback_query.handlers[0].callback(callback)
+            self.assertIn(
+                "ЗВУК",
+                callback.message.answer.await_args.args[0],
+            )
+            callback.answer.assert_awaited_once()
+
+        asyncio.run(run())
+
+    def test_admin_add_command_without_parameters_guides_user_through_flow(self):
+        async def run():
+            message = self.message(67890, "/service_admin_add")
+            await self.admin_router.message.handlers[2].callback(message)
+
+            keyboard = message.answer.await_args.kwargs["reply_markup"]
+            button = keyboard.inline_keyboard[0][0]
+            self.assertEqual(button.text, "СОБРАНИЕ")
+            callback = SimpleNamespace(
+                data=button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.admin_router.callback_query.handlers[0].callback(callback)
+            self.assertIn(
+                "Telegram ID",
+                callback.message.answer.await_args.args[0],
+            )
+
+            incoming = self.message(67890, "24680")
+            await self.admin_router.message.handlers[-1].callback(incoming)
+            self.assertEqual(self.registry.list_service_admins("assembly"), [24680])
+            incoming.answer.assert_awaited_once_with(
+                "Администратор служения назначен.", parse_mode=None
+            )
+
+        asyncio.run(run())
+
 
 if __name__ == "__main__":
     unittest.main()

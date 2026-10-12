@@ -13,7 +13,9 @@ from types import SimpleNamespace
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import BotCommand
 
 if __package__:
     from .cli import CliArgs
@@ -469,6 +471,49 @@ async def run(args: CliArgs) -> None:
             token=credentials.bot_token,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         )
+        if callable(getattr(bot, "set_my_commands", None)):
+            try:
+                await bot.set_my_commands(
+                    [
+                        BotCommand(command="services", description="Список служений"),
+                        BotCommand(
+                            command="service_settings",
+                            description="Настройки служения",
+                        ),
+                        BotCommand(
+                            command="service_admin_add",
+                            description="Назначить администратора служения",
+                        ),
+                        BotCommand(
+                            command="service_admin_remove",
+                            description="Снять администратора служения",
+                        ),
+                        BotCommand(
+                            command="service_chat",
+                            description="Настроить групповой чат",
+                        ),
+                        BotCommand(
+                            command="service_contact",
+                            description="Связать ответственного с Telegram",
+                        ),
+                        BotCommand(
+                            command="service_notify",
+                            description="Настроить тексты и время уведомлений",
+                        ),
+                        BotCommand(
+                            command="cancel",
+                            description="Отменить ввод параметров",
+                        ),
+                        BotCommand(
+                            command="test_notify",
+                            description="Проверить доставку уведомлений",
+                        ),
+                    ]
+                )
+            except TelegramAPIError:
+                debug_logger.exception(
+                    "Не удалось обновить меню команд Telegram"
+                )
         dp = Dispatcher(storage=MemoryStorage())
         context = SimpleNamespace(
             bot=bot,
