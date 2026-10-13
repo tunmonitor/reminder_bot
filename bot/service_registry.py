@@ -68,7 +68,7 @@ class ServiceRegistry:
                     username TEXT NOT NULL DEFAULT '',
                     updated_by INTEGER NOT NULL CHECK (updated_by > 0),
                     updated_at TEXT NOT NULL,
-                    PRIMARY KEY (service_id, task, name)
+                    PRIMARY KEY (service_id, task, telegram_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS configuration_audit (
@@ -87,6 +87,39 @@ class ServiceRegistry:
                 );
                 """
             )
+            contact_primary_key = [
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(responsible_contacts)"
+                )
+                if row["pk"]
+            ]
+            if contact_primary_key != ["service_id", "task", "telegram_id"]:
+                connection.executescript(
+                    """
+                    CREATE TABLE responsible_contacts_v2 (
+                        service_id TEXT NOT NULL
+                            REFERENCES services(id) ON DELETE CASCADE,
+                        task TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        telegram_id INTEGER NOT NULL CHECK (telegram_id > 0),
+                        username TEXT NOT NULL DEFAULT '',
+                        updated_by INTEGER NOT NULL CHECK (updated_by > 0),
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (service_id, task, telegram_id)
+                    );
+                    INSERT INTO responsible_contacts_v2 (
+                        service_id, task, name, telegram_id, username,
+                        updated_by, updated_at
+                    )
+                    SELECT service_id, task, name, telegram_id, username,
+                           updated_by, updated_at
+                    FROM responsible_contacts;
+                    DROP TABLE responsible_contacts;
+                    ALTER TABLE responsible_contacts_v2
+                    RENAME TO responsible_contacts;
+                    """
+                )
             connection.execute(
                 "INSERT OR IGNORE INTO runtime_counters (name, next_value) "
                 "VALUES ('telegram_share_request_id', ?)",
@@ -403,7 +436,8 @@ class ServiceRegistry:
                     service_id, task, name, telegram_id, username,
                     updated_by, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(service_id, task, name) DO UPDATE SET
+                ON CONFLICT(service_id, task, telegram_id) DO UPDATE SET
+                    name = excluded.name,
                     telegram_id = excluded.telegram_id,
                     username = excluded.username,
                     updated_by = excluded.updated_by,
@@ -425,7 +459,8 @@ class ServiceRegistry:
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT telegram_id, username FROM responsible_contacts "
-                "WHERE service_id = ? AND task = ? AND name = ?",
+                "WHERE service_id = ? AND task = ? AND name = ? "
+                "ORDER BY updated_at DESC LIMIT 1",
                 (service_id, task.strip(), name.strip()),
             ).fetchone()
         return dict(row) if row else None

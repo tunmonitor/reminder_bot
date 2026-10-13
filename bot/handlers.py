@@ -68,11 +68,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     debug: logging.Logger = context.debug_logger
     admin_router = Router()
     pending_inputs: dict[int, dict[str, Any]] = {}
-    pending_shares: dict[int, tuple[int, str, str, str | None]] = {}
+    pending_shares: dict[
+        int, tuple[int, str, str, str | None, str | None]
+    ] = {}
     pending_admin_confirmations: dict[
-        tuple[int, str, int], tuple[str, str | None, str, str]
+        tuple[int, str, int], tuple[str, str | None, str | None, str, str]
     ] = {}
     pending_task_choices: dict[str, tuple[int, str, str, str | None]] = {}
+    pending_task_pages: dict[str, tuple[int, str, str, int]] = {}
+    pending_contact_person_choices: dict[
+        str, tuple[int, str, str, str]
+    ] = {}
     pending_notify_task_choices: dict[str, tuple[int, str, str | None]] = {}
     def new_share_request_id() -> int:
         registry = service_registry()
@@ -91,6 +97,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         for key in list(pending_task_choices):
             if pending_task_choices[key][0] == actor_id:
                 pending_task_choices.pop(key, None)
+        for key in list(pending_task_pages):
+            if pending_task_pages[key][0] == actor_id:
+                pending_task_pages.pop(key, None)
+        for key in list(pending_contact_person_choices):
+            if pending_contact_person_choices[key][0] == actor_id:
+                pending_contact_person_choices.pop(key, None)
         for key in list(pending_notify_task_choices):
             if pending_notify_task_choices[key][0] == actor_id:
                 pending_notify_task_choices.pop(key, None)
@@ -281,7 +293,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if operation == "service_chat":
             request_id = new_share_request_id()
             pending_shares[request_id] = (
-                actor_id, "service_chat", service_id, None
+                actor_id, "service_chat", service_id, None, None
             )
             keyboard = ReplyKeyboardMarkup(
                 keyboard=[
@@ -432,8 +444,216 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         token = secrets.token_urlsafe(8)
         task_choices[token] = (actor_id, operation, service_id, task)
         return InlineKeyboardButton(
-            text=task,
+            text=task if len(task) <= 48 else task[:45] + "...",
             callback_data=f"task:{operation}:{token}",
+        )
+
+    async def send_task_choices_page(
+        message: Message,
+        actor_id: int,
+        service_id: str,
+        operation: str,
+        page: int = 0,
+    ) -> None:
+        pending = pending_inputs.get(actor_id)
+        if (
+            pending is None
+            or pending.get("operation") != operation
+            or pending.get("service_id") != service_id
+        ):
+            await message.answer(
+                "Выбор задач устарел. Запустите команду заново.",
+                parse_mode=None,
+            )
+            return
+
+        tasks = pending.get("schedule_tasks", [])
+        page_size = 10
+        page_count = max(1, (len(tasks) + page_size - 1) // page_size)
+        page = min(max(page, 0), page_count - 1)
+        page_tasks = tasks[page * page_size:(page + 1) * page_size]
+        rows = []
+        if operation == "service_contact":
+            assignments = pending.get("schedule_assignments", {})
+            registered = pending.get("registered_contacts", {})
+            details = []
+            for task in page_tasks:
+                schedule_names = ", ".join(assignments.get(task, []))
+                saved_contacts = registered.get(task, [])
+                saved_text = (
+                    ", ".join(
+                        f"{contact['name']} (ID {contact['telegram_id']}"
+                        + (
+                            f", @{contact['username']}"
+                            if contact["username"]
+                            else ""
+                        )
+                        + ")"
+                        for contact in saved_contacts
+                    )
+                    if saved_contacts
+                    else "не привязаны"
+                )
+                details.append(
+                    f"• {task} — по расписанию: {schedule_names}; "
+                    f"в боте: {saved_text}"
+                )
+            if details:
+                intro = "Задачи из графика и привязанные в боте ответственные:\n"
+                for chunk in _telegram_text_chunks(intro + "\n".join(details)):
+                    await message.answer(chunk, parse_mode=None)
+            elif not tasks:
+                await message.answer(
+                    "В расписании нет задач с назначенными ответственными "
+                    "для этого служения.",
+                    parse_mode=None,
+                )
+
+        if operation == "service_contact":
+            rows.extend(
+                [
+                    _task_button(
+                        actor_id,
+                        service_id,
+                        task,
+                        operation=operation,
+                        task_choices=pending_task_choices,
+                    )
+                ]
+                for task in page_tasks
+            )
+        else:
+            for task in page_tasks:
+                token = secrets.token_urlsafe(8)
+                pending_notify_task_choices[token] = (
+                    actor_id, service_id, task
+                )
+                label = task if len(task) <= 48 else task[:45] + "..."
+                rows.append([
+                    InlineKeyboardButton(
+                        text=label,
+                        callback_data=f"notify_task:{token}",
+                    )
+                ])
+            token = secrets.token_urlsafe(8)
+            pending_notify_task_choices[token] = (actor_id, service_id, None)
+            rows.append([
+                InlineKeyboardButton(
+                    text="Завершить и сохранить",
+                    callback_data=f"notify_task:{token}",
+                )
+            ])
+
+        navigation = []
+        if page > 0:
+            token = secrets.token_urlsafe(8)
+            pending_task_pages[token] = (
+                actor_id, operation, service_id, page - 1
+            )
+            navigation.append(
+                InlineKeyboardButton(
+                    text="← Назад", callback_data=f"task_page:{token}"
+                )
+            )
+        if page + 1 < page_count:
+            token = secrets.token_urlsafe(8)
+            pending_task_pages[token] = (
+                actor_id, operation, service_id, page + 1
+            )
+            navigation.append(
+                InlineKeyboardButton(
+                    text="Далее →", callback_data=f"task_page:{token}"
+                )
+            )
+        if navigation:
+            rows.append(navigation)
+
+        if operation == "service_contact":
+            prompt = (
+                f"Выберите задачу из графика (страница {page + 1}/{page_count})."
+                if tasks
+                else "Для этого служения пока нет задач с ответственными в графике."
+            )
+        else:
+            prompt = (
+                "Выберите задачу из графика для индивидуального текста "
+                f"(страница {page + 1}/{page_count})."
+                if tasks
+                else "В расписании пока нет задач с назначенными "
+                "ответственными. Можно завершить и сохранить настройки."
+            )
+        await message.answer(
+            prompt,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            parse_mode=None,
+        )
+
+    async def offer_contact_name_choices(
+        message: Message,
+        actor_id: int,
+        service_id: str,
+        task: str,
+    ) -> None:
+        pending = pending_inputs.get(actor_id)
+        if (
+            pending is None
+            or pending.get("operation") != "service_contact"
+            or pending.get("service_id") != service_id
+            or task not in pending.get("schedule_assignments", {})
+        ):
+            await message.answer(
+                "Задача отсутствует в актуальном файле расписания.",
+                parse_mode=None,
+            )
+            return
+
+        pending["step"] = "choose_contact_person"
+        pending["active_task"] = task
+        registered = pending.get("registered_contacts", {}).get(task, [])
+        contacts_by_name = {
+            contact["name"]: contact for contact in registered
+        }
+        rows = []
+        details = []
+        for person_name in pending["schedule_assignments"][task]:
+            contact = contacts_by_name.get(person_name)
+            if contact:
+                status = (
+                    f"уже привязан Telegram ID {contact['telegram_id']}"
+                    + (
+                        f" (@{contact['username']})"
+                        if contact["username"]
+                        else ""
+                    )
+                )
+                action = "Изменить привязку"
+            else:
+                status = "данные Telegram не указаны"
+                action = "Выбрать пользователя"
+            details.append(f"• {person_name} — {status}")
+            token = secrets.token_urlsafe(8)
+            pending_contact_person_choices[token] = (
+                actor_id, service_id, task, person_name
+            )
+            label = (
+                f"{action}: {person_name}"
+                if len(person_name) <= 40
+                else f"{action}: {person_name[:37]}..."
+            )
+            rows.append([
+                InlineKeyboardButton(
+                    text=label,
+                    callback_data=f"contact_person:{token}",
+                )
+            ])
+        await message.answer(
+            "Ответственные за задачу «"
+            + task
+            + "» по файлу расписания:\n"
+            + "\n".join(details)
+            + "\nВыберите имя, чтобы привязать или изменить Telegram-пользователя.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            parse_mode=None,
         )
 
     async def offer_contact_task_choices(
@@ -445,49 +665,48 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "Реестр настроек служений недоступен.", parse_mode=None
             )
             return
+        task_loader = getattr(context, "load_service_task_assignments", None)
+        if not callable(task_loader):
+            await message.answer(
+                "Загрузка задач из файла расписания недоступна.",
+                parse_mode=None,
+            )
+            return
+        try:
+            assignments = await task_loader(service_id)
+        except (PermissionError, ValueError) as exc:
+            await message.answer(str(exc), parse_mode=None)
+            return
+        except Exception:
+            debug.exception("Не удалось прочитать задачи из графика служений")
+            await message.answer(
+                "Не удалось прочитать файл графика служений. "
+                "Проверьте доступность расписания и попробуйте снова.",
+                parse_mode=None,
+            )
+            return
         try:
             contacts = registry.list_responsible_contacts(actor_id, service_id)
         except (PermissionError, ValueError) as exc:
             await message.answer(str(exc), parse_mode=None)
             return
         except sqlite3.Error:
-            debug.exception("Не удалось загрузить задачи служения")
+            debug.exception("Не удалось прочитать привязки ответственных")
             await message.answer(
-                "Не удалось прочитать список задач служения.", parse_mode=None
+                "Не удалось прочитать список привязанных пользователей.",
+                parse_mode=None,
             )
             return
-        tasks = sorted({item["task"] for item in contacts})
-        rows = [
-            [
-                _task_button(
-                    actor_id,
-                    service_id,
-                    task,
-                    operation="service_contact",
-                    task_choices=pending_task_choices,
-                )
-            ]
-            for task in tasks
-        ]
-        new_task_token = secrets.token_urlsafe(8)
-        pending_task_choices[new_task_token] = (
-            actor_id,
-            "service_contact",
-            service_id,
-            None,
-        )
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="Добавить новую задачу",
-                    callback_data=f"task:service_contact:{new_task_token}",
-                )
-            ]
-        )
-        await message.answer(
-            "Выберите существующую задачу или добавьте новую.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-            parse_mode=None,
+        pending = pending_inputs[actor_id]
+        pending["schedule_assignments"] = assignments
+        pending["schedule_tasks"] = sorted(assignments)
+        pending["registered_contacts"] = {}
+        for contact in contacts:
+            pending["registered_contacts"].setdefault(
+                contact["task"], []
+            ).append(contact)
+        await send_task_choices_page(
+            message, actor_id, service_id, "service_contact"
         )
 
     async def offer_notify_task_choices(
@@ -505,42 +724,33 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 parse_mode=None,
             )
             return
-        tasks = sorted(pending["personal_templates"])
-        rows = []
-        for task in tasks:
-            token = secrets.token_urlsafe(8)
-            pending_notify_task_choices[token] = (actor_id, service_id, task)
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        text=task,
-                        callback_data=f"notify_task:{token}",
-                    )
-                ]
+        task_loader = getattr(context, "load_service_task_assignments", None)
+        if not callable(task_loader):
+            await message.answer(
+                "Загрузка задач из файла расписания недоступна.",
+                parse_mode=None,
             )
-        token = secrets.token_urlsafe(8)
-        pending_notify_task_choices[token] = (actor_id, service_id, None)
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="Завершить и сохранить",
-                    callback_data=f"notify_task:{token}",
-                )
-            ]
-        )
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="Добавить задачу",
-                    callback_data=f"notify_task_new:{service_id}",
-                )
-            ]
-        )
+            return
+        try:
+            assignments = await task_loader(service_id)
+        except Exception:
+            debug.exception("Не удалось прочитать задачи из графика служений")
+            await message.answer(
+                "Не удалось прочитать файл графика служений. "
+                "Проверьте доступность расписания и попробуйте снова.",
+                parse_mode=None,
+            )
+            return
+        pending["schedule_assignments"] = assignments
+        pending["schedule_tasks"] = sorted(assignments)
+        pending["personal_templates"] = {
+            task: text
+            for task, text in pending["personal_templates"].items()
+            if task in assignments
+        }
         pending["step"] = "choose_notify_task"
-        await message.answer(
-            "Выберите задачу для индивидуального текста или добавьте новую.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-            parse_mode=None,
+        await send_task_choices_page(
+            message, actor_id, service_id, "service_notify"
         )
 
     def service_chat_keyboard(service_id: str) -> InlineKeyboardMarkup:
@@ -576,7 +786,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         await message.answer(
             f"Введите индивидуальный текст напоминания для задачи "
             f"«{task}». В шаблоне можно использовать {{name}} и "
-            "{{sunday_date}}.",
+            "{sunday_date}.",
             parse_mode=None,
         )
 
@@ -644,30 +854,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("operation") != "service_contact"
             or pending.get("service_id") != service_id
             or pending.get("step") != "choose_task"
+            or task is None
+            or task not in pending.get("schedule_tasks", [])
         ):
             await callback.answer("Запрос задачи устарел.")
             return
-        if task is None:
-            pending["step"] = "new_contact_task"
-            await callback.message.answer(
-                "Введите название новой задачи или /cancel для отмены.",
-                parse_mode=None,
-            )
-        else:
-            try:
-                await offer_contact_user_selection(
-                    callback.message, callback.from_user.id, service_id, task
-                )
-            except ValueError as exc:
-                await callback.message.answer(str(exc), parse_mode=None)
-            except sqlite3.Error:
-                debug.exception(
-                    "Не удалось создать запрос выбора ответственного"
-                )
-                await callback.message.answer(
-                    "Не удалось открыть выбор пользователя из-за ошибки базы.",
-                    parse_mode=None,
-                )
+        await offer_contact_name_choices(
+            callback.message, callback.from_user.id, service_id, task
+        )
         await callback.answer()
 
     @admin_router.callback_query(F.data.startswith("notify_task:"))
@@ -689,6 +883,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("operation") != "service_notify"
             or pending.get("service_id") != selection[1]
             or pending.get("step") != "choose_notify_task"
+            or (
+                selection[2] is not None
+                and selection[2] not in pending.get("schedule_tasks", [])
+            )
         ):
             await callback.answer("Этот выбор устарел. Начните настройку заново.")
             return
@@ -705,36 +903,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     @admin_router.callback_query(F.data.startswith("notify_task_new:"))
     async def on_notify_new_task(callback: CallbackQuery) -> None:
-        if (
-            not callback.from_user
-            or not callback.message
-            or callback.message.chat.type != ChatType.PRIVATE
-        ):
-            await callback.answer()
-            return
-        service_id = callback.data.partition(":")[2]
-        pending = pending_inputs.get(callback.from_user.id)
-        if (
-            pending is None
-            or pending.get("operation") != "service_notify"
-            or pending.get("service_id") != service_id
-            or pending.get("step") != "choose_notify_task"
-        ):
-            await callback.answer("Этот запрос устарел.")
-            return
-        pending["step"] = "new_notify_task"
-        await callback.message.answer(
-            "Введите название задачи для нового индивидуального текста.",
-            parse_mode=None,
+        await callback.answer(
+            "Добавление произвольных задач отключено. "
+            "Используйте задачи из файла расписания."
         )
-        await callback.answer()
 
     async def offer_user_selection(
         message: Message, actor_id: int, service_id: str
     ) -> None:
         request_id = new_share_request_id()
         pending_shares[request_id] = (
-            actor_id, "service_admin_add", service_id, None
+            actor_id, "service_admin_add", service_id, None, None
         )
         keyboard = ReplyKeyboardMarkup(
             keyboard=[
@@ -762,12 +941,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         )
 
     async def offer_contact_user_selection(
-        message: Message, actor_id: int, service_id: str, task: str
+        message: Message,
+        actor_id: int,
+        service_id: str,
+        task: str,
+        contact_name: str,
     ) -> None:
         pending_inputs.pop(actor_id, None)
         request_id = new_share_request_id()
         pending_shares[request_id] = (
-            actor_id, "service_contact", service_id, task
+            actor_id, "service_contact", service_id, task, contact_name
         )
         keyboard = ReplyKeyboardMarkup(
             keyboard=[
@@ -788,8 +971,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             one_time_keyboard=True,
         )
         await message.answer(
-            f"Задача «{task}». Нажмите кнопку и выберите ответственного "
-            "в Telegram.",
+            f"Нажмите кнопку и выберите пользователя Telegram для имени "
+            f"«{contact_name}» (задача «{task}»). "
+            "Проверьте выбор — назначение подтвердите на следующем шаге.",
             reply_markup=keyboard,
             parse_mode=None,
         )
@@ -986,30 +1170,19 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if not payload:
             await request_service_input(message, "service_contact")
             return
-        if len(prefix_parts) == 1:
+        if len(prefix_parts) == 1 and not details:
             await request_service_input(
                 message, "service_contact", prefix_parts[0]
             )
             return
-        if len(prefix_parts) != 2 or len(details) not in {2, 3}:
-            await message.answer("Не хватает параметров. Запустите команду ещё раз.", parse_mode=None)
-            return
-        service_id, task = prefix_parts
-        name, raw_telegram_id, *username = details
-
-        def set_contact(actor_id: int) -> str:
-            registry = service_registry()
-            registry.set_responsible_contact(
-                actor_id,
-                service_id,
-                task,
-                name,
-                int(raw_telegram_id),
-                username[0] if username else "",
+        if len(prefix_parts) != 1 or details:
+            await message.answer(
+                "Ручной ввод задач и ответственных отключён. "
+                "Укажите только служение, например /service_contact sound; "
+                "задачу и имя нужно выбрать из файла расписания.",
+                parse_mode=None,
             )
-            return "Привязка ответственного сохранена."
-
-        await run_registry_command(message, set_contact)
+            return
 
     @admin_router.message(Command("service_notify"))
     async def on_service_notify(message: Message) -> None:
@@ -1023,40 +1196,24 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         if len(fields) == 1:
             service_parts = fields[0].split()
+            if len(service_parts) != 1:
+                await message.answer(
+                    "Настройки нужно вводить пошагово; индивидуальные задачи "
+                    "выбираются из файла расписания. Используйте "
+                    "/service_notify <service_id>.",
+                    parse_mode=None,
+                )
+                return
             await request_service_input(
                 message, "service_notify", service_parts[0]
             )
             return
-        if len(fields) != 3:
-            await message.answer("Не хватает параметров. Запустите команду ещё раз.", parse_mode=None)
-            return
-        settings, group_template, raw_templates = fields
-        settings_parts = settings.split(maxsplit=2)
-        if len(settings_parts) != 3:
-            await message.answer(
-                "Перед первым | укажите service_id, число дней и время.",
-                parse_mode=None,
-            )
-            return
-        service_id, raw_days, reminder_time = settings_parts
-
-        def set_notifications(actor_id: int) -> str:
-            try:
-                personal_templates = json.loads(raw_templates)
-            except json.JSONDecodeError as exc:
-                raise ValueError("Личные шаблоны должны быть корректным JSON.") from exc
-            registry = service_registry()
-            registry.set_notification_settings(
-                actor_id,
-                service_id,
-                reminder_days=int(raw_days),
-                reminder_time=reminder_time,
-                group_template=group_template,
-                personal_templates=personal_templates,
-            )
-            return "Настройки уведомлений сохранены."
-
-        await run_registry_command(message, set_notifications)
+        await message.answer(
+            "Настройки нужно вводить пошагово; индивидуальные задачи "
+            "выбираются из файла расписания. Используйте /service_notify "
+            "<service_id>.",
+            parse_mode=None,
+        )
 
     @admin_router.message(Command("cancel"))
     async def on_cancel_service_command(message: Message) -> None:
@@ -1351,7 +1508,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await callback.answer()
             return
         try:
-            operation, task, first_name, username = selected_user
+            operation, task, contact_name, selected_display_name, username = (
+                selected_user
+            )
             if operation == "service_admin_add":
                 registry.add_service_admin(
                     callback.from_user.id, service_id, user_id
@@ -1361,7 +1520,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     callback.from_user.id,
                     service_id,
                     task or "",
-                    first_name or f"Пользователь {user_id}",
+                    contact_name or f"Пользователь {user_id}",
                     user_id,
                     username,
                 )
@@ -1374,7 +1533,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 parse_mode=None,
             )
         else:
-            display_name = first_name or f"Пользователь {user_id}"
+            display_name = selected_display_name or f"Пользователь {user_id}"
             if operation == "service_admin_add":
                 response = (
                     f"{display_name} (ID {user_id}"
@@ -1383,11 +1542,91 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
             else:
                 response = (
-                    f"{display_name} (ID {user_id}"
+                    f"Ответственный «{contact_name}» из файла расписания "
+                    f"связан с {display_name} (ID {user_id}"
                     + (f", @{username}" if username else "")
-                    + f") сохранён ответственным за задачу «{task}»."
+                    + f") для задачи «{task}»."
                 )
             await callback.message.answer(response, parse_mode=None)
+        await callback.answer()
+
+    @admin_router.callback_query(F.data.startswith("task_page:"))
+    async def on_task_page(callback: CallbackQuery) -> None:
+        if (
+            not callback.from_user
+            or not callback.message
+            or callback.message.chat.type != ChatType.PRIVATE
+        ):
+            await callback.answer()
+            return
+        token = callback.data.partition(":")[2]
+        selection = pending_task_pages.pop(token, None)
+        if selection is None or selection[0] != callback.from_user.id:
+            await callback.answer("Этот список устарел. Запустите команду заново.")
+            return
+        _, operation, service_id, page = selection
+        pending = pending_inputs.get(callback.from_user.id)
+        if (
+            pending is None
+            or pending.get("operation") != operation
+            or pending.get("service_id") != service_id
+        ):
+            await callback.answer("Этот список устарел. Запустите команду заново.")
+            return
+        await send_task_choices_page(
+            callback.message,
+            callback.from_user.id,
+            service_id,
+            operation,
+            page,
+        )
+        await callback.answer()
+
+    @admin_router.callback_query(F.data.startswith("contact_person:"))
+    async def on_contact_person_choice(callback: CallbackQuery) -> None:
+        if (
+            not callback.from_user
+            or not callback.message
+            or callback.message.chat.type != ChatType.PRIVATE
+        ):
+            await callback.answer()
+            return
+        token = callback.data.partition(":")[2]
+        selection = pending_contact_person_choices.pop(token, None)
+        pending = pending_inputs.get(callback.from_user.id)
+        if (
+            selection is None
+            or selection[0] != callback.from_user.id
+            or pending is None
+            or pending.get("operation") != "service_contact"
+            or pending.get("service_id") != selection[1]
+            or pending.get("step") != "choose_contact_person"
+            or pending.get("active_task") != selection[2]
+            or selection[3]
+            not in pending.get("schedule_assignments", {}).get(
+                selection[2], []
+            )
+        ):
+            await callback.answer("Этот выбор устарел. Начните команду заново.")
+            return
+        try:
+            await offer_contact_user_selection(
+                callback.message,
+                callback.from_user.id,
+                selection[1],
+                selection[2],
+                selection[3],
+            )
+        except ValueError as exc:
+            await callback.message.answer(str(exc), parse_mode=None)
+        except sqlite3.Error:
+            debug.exception(
+                "Не удалось создать запрос выбора ответственного"
+            )
+            await callback.message.answer(
+                "Не удалось открыть выбор пользователя из-за ошибки базы.",
+                parse_mode=None,
+            )
         await callback.answer()
 
     @admin_router.message(F.users_shared)
@@ -1423,28 +1662,41 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         user_id = selected_user.user_id
         operation = pending[1]
         task = pending[3]
-        if operation == "service_contact" and not task:
+        contact_name = pending[4]
+        if operation == "service_contact" and (not task or not contact_name):
             await message.answer(
                 "Не удалось определить задачу. Запустите привязку заново.",
                 parse_mode=None,
                 reply_markup=ReplyKeyboardRemove(),
             )
             return
+        selected_display_name = " ".join(
+            part.strip()
+            for part in (
+                selected_user.first_name or "",
+                getattr(selected_user, "last_name", "") or "",
+            )
+            if part and part.strip()
+        )
         key = (message.from_user.id, pending[2], user_id)
         pending_admin_confirmations[key] = (
             operation,
             task,
-            selected_user.first_name,
+            contact_name,
+            selected_display_name,
             selected_user.username or "",
         )
-        display_name = selected_user.first_name or f"Пользователь {user_id}"
+        display_name = selected_display_name or f"Пользователь {user_id}"
         username = (
             f" (@{selected_user.username})" if selected_user.username else ""
         )
         operation_title = (
             "назначить администратором"
             if operation == "service_admin_add"
-            else f"назначить ответственным за задачу «{task}»"
+            else (
+                f"привязать к записи «{contact_name}» из файла для задачи "
+                f"«{task}»"
+            )
         )
         callback_prefix = (
             "service_admin" if operation == "service_admin_add"
@@ -1583,16 +1835,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     context.group_chat_id = chat_id
                 response = "Групповой чат и статус служения сохранены."
             elif operation == "service_contact":
-                if pending["step"] == "new_contact_task":
-                    if not text:
-                        raise ValueError("Название задачи не может быть пустым.")
-                    await offer_contact_user_selection(
-                        message, message.from_user.id, service_id, text
-                    )
-                    pending_inputs.pop(message.from_user.id, None)
-                    return
-                pending_inputs.pop(message.from_user.id, None)
-                return
+                raise ValueError(
+                    "Задачи и имена ответственных берутся из файла расписания. "
+                    "Выберите их кнопками выше; ручной ввод отключён."
+                )
             elif operation == "service_notify":
                 step = pending["step"]
                 if step == "days":
@@ -1639,17 +1885,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     pending["group_template"] = text
                     await offer_notify_task_choices(
                         message, message.from_user.id, service_id
-                    )
-                    return
-                if step == "new_notify_task":
-                    if not text:
-                        raise ValueError("Название задачи не может быть пустым.")
-                    pending["active_task"] = text
-                    pending["step"] = "notify_template"
-                    await message.answer(
-                        f"Введите индивидуальный текст для задачи «{text}». "
-                        "В шаблоне можно использовать {name} и {sunday_date}.",
-                        parse_mode=None,
                     )
                     return
                 if step == "notify_template":
@@ -1881,7 +2116,13 @@ async def _confirm_locked(
     first_confirmation = not participant.get("confirmed")
     if first_confirmation:
         participant["confirmed"] = True
-    if first_confirmation or participant.get("confirmation_persisted") is False:
+    needs_confirmation_persist = (
+        first_confirmation
+        or participant.get("confirmation_persisted") is False
+    )
+    newly_persisted = needs_confirmation_persist
+    if needs_confirmation_persist:
+        participant.pop("confirmation_persisted", None)
         confirmation_persisted = await _persist_confirmation(context, debug)
         if not confirmation_persisted:
             participant["confirmation_persisted"] = False
@@ -1889,9 +2130,8 @@ async def _confirm_locked(
                 "Не удалось сохранить подтверждение. Нажмите кнопку повторно."
             )
             return
-        participant.pop("confirmation_persisted", None)
 
-    if first_confirmation:
+    if newly_persisted:
         if cb.message and cb.message.text:
             try:
                 await cb.message.edit_text(
@@ -1948,7 +2188,7 @@ async def _confirm_locked(
         "group_update_persisted", True
     ):
         await cb.answer(
-            "Принято!" if first_confirmation else "Вы уже подтвердили участие!"
+            "Принято!" if newly_persisted else "Вы уже подтвердили участие!"
         )
     elif participant.get("group_update_sent"):
         await cb.answer(

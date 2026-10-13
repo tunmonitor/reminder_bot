@@ -115,6 +115,68 @@ class ServiceRegistryTest(unittest.TestCase):
             {"telegram_id": 5005, "username": "alex_new"},
         )
 
+    def test_same_display_name_keeps_distinct_telegram_contacts(self):
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Алексей", 4004, "alex_one"
+        )
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Алексей", 5005, "alex_two"
+        )
+
+        contacts = self.registry.list_responsible_contacts(1001, "sound")
+
+        self.assertEqual(
+            [
+                (item["name"], item["telegram_id"], item["username"])
+                for item in contacts
+                if item["task"] == "Микшер"
+            ],
+            [
+                ("Алексей", 4004, "alex_one"),
+                ("Алексей", 5005, "alex_two"),
+            ],
+        )
+
+    def test_migrates_contact_primary_key_from_name_to_telegram_id(self):
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Алексей", 4004, "alex"
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.executescript(
+                """
+                ALTER TABLE responsible_contacts
+                RENAME TO contacts_new;
+                CREATE TABLE responsible_contacts (
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    task TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    telegram_id INTEGER NOT NULL CHECK (telegram_id > 0),
+                    username TEXT NOT NULL DEFAULT '',
+                    updated_by INTEGER NOT NULL CHECK (updated_by > 0),
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (service_id, task, name)
+                );
+                INSERT INTO responsible_contacts
+                SELECT * FROM contacts_new;
+                DROP TABLE contacts_new;
+                """
+            )
+
+        self.registry.initialize(1001, -10001)
+
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Алексей", 5005, "alex2"
+        )
+        contacts = [
+            item for item in self.registry.list_responsible_contacts(1001, "sound")
+            if item["task"] == "Микшер"
+        ]
+        self.assertEqual(
+            {item["telegram_id"] for item in contacts}, {4004, 5005}
+        )
+
     def test_service_admin_can_edit_only_own_notification_settings(self):
         self.registry.add_service_admin(1001, "sound", 3003)
         self.registry.add_service_admin(1001, "slides", 4004)

@@ -26,7 +26,13 @@ if __package__:
         load_templates,
         service_registry_path,
     )
-    from .excel_parser import ROLES, parse_people, parse_schedule, resolve_assignments
+    from .excel_parser import (
+        ROLES,
+        parse_people,
+        parse_schedule,
+        parse_service_events,
+        resolve_assignments,
+    )
     from .handlers import register
     from .logger import setup_loggers
     from .notifier import (
@@ -49,7 +55,13 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         load_templates,
         service_registry_path,
     )
-    from bot.excel_parser import ROLES, parse_people, parse_schedule, resolve_assignments
+    from bot.excel_parser import (
+        ROLES,
+        parse_people,
+        parse_schedule,
+        parse_service_events,
+        resolve_assignments,
+    )
     from bot.handlers import register
     from bot.logger import setup_loggers
     from bot.notifier import (
@@ -327,6 +339,50 @@ async def _prepare_test_notification_previews(
         xlsx_path.unlink(missing_ok=True)
 
 
+async def _load_service_task_assignments(
+    credentials,
+    shm_dir: Path,
+    tz,
+    service_id: str,
+    debug_logger,
+) -> dict[str, list[str]]:
+    sunday_date = _next_sunday_in_tz(tz)
+    debug_dir = shm_dir / "debug"
+    directory_fd = open_private_directory(debug_dir, create=True)
+    os.close(directory_fd)
+    file_fd, file_name = tempfile.mkstemp(
+        prefix=f"schedule-tasks-{sunday_date:%Y%m%d}-",
+        suffix=".xlsx",
+        dir=debug_dir,
+    )
+    os.fchmod(file_fd, 0o600)
+    os.close(file_fd)
+    xlsx_path = Path(file_name)
+    try:
+        await download_public(
+            credentials.yandex_public_url,
+            xlsx_path,
+            debug_logger,
+            attempts=1,
+            interval=0,
+        )
+        events_by_service = parse_service_events(
+            xlsx_path, sunday_date, debug_logger
+        )
+        assignments: dict[str, set[str]] = {}
+        for event in events_by_service.get(service_id, []):
+            for assignment in event.assignments:
+                assignments.setdefault(assignment.task, set()).add(
+                    assignment.name
+                )
+        return {
+            task: sorted(names)
+            for task, names in sorted(assignments.items())
+        }
+    finally:
+        xlsx_path.unlink(missing_ok=True)
+
+
 async def _process_upcoming_sunday(
     bot: Bot,
     credentials,
@@ -565,7 +621,15 @@ async def run(args: CliArgs) -> None:
                 credentials, templates, shm_dir, tz, debug_logger
             )
 
+        async def load_service_task_assignments(
+            service_id: str,
+        ) -> dict[str, list[str]]:
+            return await _load_service_task_assignments(
+                credentials, shm_dir, tz, service_id, debug_logger
+            )
+
         context.prepare_test_previews = prepare_test_previews
+        context.load_service_task_assignments = load_service_task_assignments
         register(dp, context)
 
         async def scheduled_job() -> None:
