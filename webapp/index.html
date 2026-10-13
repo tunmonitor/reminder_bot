@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Test Mini App</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+    <h1>Привет от Raspberry Pi!</h1>
+    <p id="user">Загрузка...</p>
+    <script>
+        const tg = window.Telegram.WebApp;
+        tg.ready();
+        tg.expand();
+        
+        // Показать данные пользователя
+        document.getElementById("user").textContent = 
+            "User ID: " + tg.initDataUnsafe?.user?.id;
+    </script>
+</body>
+</html>

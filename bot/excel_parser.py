@@ -292,7 +292,9 @@ def parse_service_events(
     workbook = _load_workbook(path, debug_logger)
     try:
         expected_sheet = _schedule_sheet_name(month)
-        worksheet, sheet_name = _find_sheet(workbook, expected_sheet)
+        worksheet, sheet_name = _find_sheet(
+            workbook, expected_sheet, legacy_names=("График",)
+        )
         if worksheet is None:
             raise RuntimeError(f"Лист расписания '{expected_sheet}' не найден")
 
@@ -300,6 +302,42 @@ def parse_service_events(
         rows = list(worksheet.iter_rows(values_only=True))
         if not rows:
             raise RuntimeError(f"Лист расписания '{sheet_name}' пуст")
+
+        result: dict[str, list[ServiceEvent]] = {
+            service.id: [] for service in SERVICES
+        }
+        if _normalized(sheet_name) == "график":
+            event_rows = [
+                (row_index, event_date)
+                for row_index, row in enumerate(rows)
+                if row and (event_date := _cell_date(row[0], month.year)) is not None
+            ]
+            for event_index, (row_index, event_date) in enumerate(event_rows):
+                if (event_date.year, event_date.month) != (month.year, month.month):
+                    continue
+                next_row = (
+                    event_rows[event_index + 1][0]
+                    if event_index + 1 < len(event_rows)
+                    else len(rows)
+                )
+                assignments = tuple(
+                    ServiceAssignment(task=role, name=name)
+                    for row in rows[row_index + 1:next_row]
+                    for role, name in _parse_legacy_task_row(row)
+                )
+                result["assembly"].append(
+                    ServiceEvent(
+                        service_id="assembly",
+                        event_date=event_date,
+                        assignments=assignments,
+                    )
+                )
+            debug_logger.debug(
+                "Прочитан legacy-лист '%s': событий Собрания=%s",
+                sheet_name,
+                len(result["assembly"]),
+            )
+            return result
 
         aliases = {
             _normalized(alias): service
@@ -323,9 +361,6 @@ def parse_service_events(
                 )
             service_columns[service.id] = column
 
-        result: dict[str, list[ServiceEvent]] = {
-            service.id: [] for service in SERVICES
-        }
         for service in SERVICES:
             start_column = service_columns.get(service.id)
             if start_column is None:

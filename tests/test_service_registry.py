@@ -115,26 +115,56 @@ class ServiceRegistryTest(unittest.TestCase):
             {"telegram_id": 5005, "username": "alex_new"},
         )
 
-    def test_same_display_name_keeps_distinct_telegram_contacts(self):
+    def test_rebinding_contact_replaces_old_name_and_user_rows(self):
         self.registry.set_responsible_contact(
             1001, "sound", "Микшер", "Алексей", 4004, "alex_one"
         )
         self.registry.set_responsible_contact(
             1001, "sound", "Микшер", "Алексей", 5005, "alex_two"
         )
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Павел", 5005, "pavel"
+        )
 
         contacts = self.registry.list_responsible_contacts(1001, "sound")
-
         self.assertEqual(
             [
                 (item["name"], item["telegram_id"], item["username"])
                 for item in contacts
                 if item["task"] == "Микшер"
             ],
-            [
-                ("Алексей", 4004, "alex_one"),
-                ("Алексей", 5005, "alex_two"),
-            ],
+            [("Павел", 5005, "pavel")],
+        )
+
+    def test_initialization_cleans_existing_duplicate_contact_names(self):
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Алексей", 4004, "alex_old"
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                "DROP INDEX idx_responsible_contacts_name"
+            )
+            connection.execute(
+                """
+                INSERT INTO responsible_contacts (
+                    service_id, task, name, telegram_id, username,
+                    updated_by, updated_at
+                ) VALUES ('sound', 'Микшер', 'Алексей', 5005, 'alex_new',
+                          1001, '2026-10-13T00:00:00+00:00')
+                """
+            )
+            connection.commit()
+
+        self.registry.initialize(1001, -10001)
+
+        contacts = [
+            item
+            for item in self.registry.list_responsible_contacts(1001, "sound")
+            if item["task"] == "Микшер"
+        ]
+        self.assertEqual(
+            [(item["name"], item["telegram_id"], item["username"]) for item in contacts],
+            [("Алексей", 5005, "alex_new")],
         )
 
     def test_migrates_contact_primary_key_from_name_to_telegram_id(self):
@@ -160,21 +190,45 @@ class ServiceRegistryTest(unittest.TestCase):
                 );
                 INSERT INTO responsible_contacts
                 SELECT * FROM contacts_new;
+                INSERT INTO responsible_contacts (
+                    service_id, task, name, telegram_id, username,
+                    updated_by, updated_at
+                ) VALUES (
+                    'sound', 'Микшер', 'Алексей-дубликат', 4004,
+                    'alex_duplicate', 1001, '2026-10-13T00:00:00+00:00'
+                );
                 DROP TABLE contacts_new;
+                CREATE TABLE responsible_contacts_v2 (stale TEXT);
                 """
             )
 
         self.registry.initialize(1001, -10001)
 
+        with closing(sqlite3.connect(self.path)) as connection:
+            migrated = connection.execute(
+                "SELECT name, telegram_id, username "
+                "FROM responsible_contacts WHERE task = 'Микшер'"
+            ).fetchall()
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            leftover = connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'responsible_contacts_v2'"
+            ).fetchone()
+        self.assertEqual(integrity, "ok")
+        self.assertIsNone(leftover)
+        self.assertEqual(len(migrated), 1)
+        self.assertEqual(migrated[0][1], 4004)
+
         self.registry.set_responsible_contact(
-            1001, "sound", "Микшер", "Алексей", 5005, "alex2"
+            1001, "sound", "Микшер", "Алексей-дубликат", 5005, "alex2"
         )
         contacts = [
             item for item in self.registry.list_responsible_contacts(1001, "sound")
             if item["task"] == "Микшер"
         ]
         self.assertEqual(
-            {item["telegram_id"] for item in contacts}, {4004, 5005}
+            [(item["name"], item["telegram_id"]) for item in contacts],
+            [("Алексей-дубликат", 5005)],
         )
 
     def test_service_admin_can_edit_only_own_notification_settings(self):

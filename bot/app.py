@@ -383,6 +383,102 @@ async def _load_service_task_assignments(
         xlsx_path.unlink(missing_ok=True)
 
 
+class _TemplateValues(dict):
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+async def _prepare_service_test_previews(
+    service_id: str,
+    credentials,
+    shm_dir: Path,
+    tz,
+    registry: ServiceRegistry,
+    debug_logger,
+) -> dict:
+    sunday_date = _next_sunday_in_tz(tz)
+    service = registry.get_service(service_id)
+    if service is None:
+        raise ValueError(f"Служение '{service_id}' не найдено")
+    assignments = await _load_service_task_assignments(
+        credentials, shm_dir, tz, service_id, debug_logger
+    )
+    contacts = registry.list_responsible_contacts(
+        credentials.admin_tg_id, service_id
+    )
+    contacts_by_name = {
+        (contact["task"], contact["name"]): contact for contact in contacts
+    }
+    rendered_assignments = []
+    personal_messages = []
+    issues = []
+    sunday_str = sunday_date.strftime("%d.%m.%Y")
+    for task, names in assignments.items():
+        rendered_names = []
+        for name in names:
+            contact = contacts_by_name.get((task, name))
+            if contact is None:
+                rendered_names.append(f"{name} (Telegram не привязан)")
+                issues.append(
+                    f"Не привязан Telegram-пользователь: {task} — {name}"
+                )
+                telegram_id = ""
+                username = ""
+            else:
+                username = contact["username"]
+                telegram_id = str(contact["telegram_id"])
+                rendered_names.append(
+                    f"{name} (ID {telegram_id}"
+                    + (f", @{username}" if username else "")
+                    + ")"
+                )
+            template = service["personal_templates"].get(
+                task,
+                "{name}, вы назначены на задачу «{task}» службы "
+                "«{service_name}» на {sunday_date}.",
+            )
+            personal_text = template.format_map(
+                _TemplateValues(
+                    name=name,
+                    task=task,
+                    service_name=service["name"],
+                    sunday_date=sunday_str,
+                    telegram_id=telegram_id,
+                    username=username,
+                )
+            )
+            personal_messages.append(
+                {
+                    "task": task,
+                    "name": name,
+                    "telegram_id": telegram_id,
+                    "text": personal_text,
+                }
+            )
+        rendered_assignments.append(
+            f"• {task}: " + (", ".join(rendered_names) or "ответственные не указаны")
+        )
+    if not assignments:
+        issues.append("В актуальном графике для службы нет назначенных задач.")
+    assignment_text = "\n".join(rendered_assignments) or "Задачи не найдены."
+    group_template = service["group_template"] or (
+        "{service_name} — {sunday_date}\n{task_assignments}"
+    )
+    group_text = group_template.format_map(
+        _TemplateValues(
+            service_name=service["name"],
+            sunday_date=sunday_str,
+            task_assignments=assignment_text,
+        )
+    )
+    return {
+        "sunday_date": sunday_date,
+        "group_text": group_text,
+        "personal_messages": personal_messages,
+        "issues": issues,
+    }
+
+
 async def _process_upcoming_sunday(
     bot: Bot,
     credentials,
@@ -583,6 +679,10 @@ async def run(args: CliArgs) -> None:
                             description="Связать ответственного с Telegram",
                         ),
                         BotCommand(
+                            command="service_sync",
+                            description="Обновить задачи и ответственных из графика",
+                        ),
+                        BotCommand(
                             command="service_notify",
                             description="Настроить тексты и время уведомлений",
                         ),
@@ -628,8 +728,21 @@ async def run(args: CliArgs) -> None:
                 credentials, shm_dir, tz, service_id, debug_logger
             )
 
+        async def prepare_service_test_previews(service_id: str) -> dict:
+            if service_registry is None:
+                raise ValueError("Реестр настроек служений недоступен")
+            return await _prepare_service_test_previews(
+                service_id,
+                credentials,
+                shm_dir,
+                tz,
+                service_registry,
+                debug_logger,
+            )
+
         context.prepare_test_previews = prepare_test_previews
         context.load_service_task_assignments = load_service_task_assignments
+        context.prepare_service_test_previews = prepare_service_test_previews
         register(dp, context)
 
         async def scheduled_job() -> None:

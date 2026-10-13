@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import json
 import logging
 import secrets
@@ -10,7 +9,7 @@ import sqlite3
 from typing import Any
 
 from aiogram import F, Dispatcher, Router
-from aiogram.enums import ChatType, ParseMode
+from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from aiogram.types import (
@@ -229,7 +228,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
             is_super_admin = registry.is_super_admin(actor_id)
             services = registry.list_services()
-            if operation in {"service_settings", "service_notify"}:
+            if operation in {
+                "service_settings", "service_notify", "service_sync"
+            }:
                 services = [
                     item for item in services
                     if is_super_admin
@@ -239,7 +240,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     raise PermissionError(
                         "У вас нет прав администратора ни для одного служения."
                     )
-            elif operation == "service_admin_add":
+            elif operation in {"service_admin_add", "service_sync"}:
                 if not is_super_admin:
                     raise PermissionError(
                         "Эта команда доступна только супер-администратору."
@@ -275,7 +276,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "service_admin_remove": "Выберите служение, затем укажите Telegram ID администратора для удаления.",
             "service_chat": "Выберите служение, затем выберите действие: настроить чат или отключить служение.",
             "service_contact": "Выберите служение, задачу, затем выберите ответственного кнопкой Telegram.",
-            "service_notify": "Выберите служение и последовательно задайте дни, время и тексты уведомлений.",
+            "service_sync": "Скачайте актуальный график выбранной службы и проверьте привязки ответственных.",
+            "service_notify": "Выберите служение и укажите, какой параметр уведомлений изменить.",
         }
         await message.answer(
             descriptions[operation],
@@ -349,30 +351,43 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             pending_inputs[actor_id] = {
                 "operation": operation,
                 "service_id": service_id,
-                "step": "days",
-                "reminder_days": None,
-                "reminder_time": None,
-                "group_template": None,
+                "step": "menu",
+                "reminder_days": service["reminder_days"],
+                "reminder_time": service["reminder_time"],
+                "group_template": service["group_template"],
                 "personal_templates": dict(
                     service["personal_templates"] if service else {}
                 ),
             }
-            prompts[operation] = (
-                f"{label}: за сколько дней до воскресенья отправлять "
-                "напоминание? Введите число от 0 до 6."
-            )
+            await show_notification_settings_menu(message, actor_id, service_id)
+            return
         elif operation == "service_admin_remove":
             pending_inputs[actor_id] = {
                 "operation": operation,
                 "service_id": service_id,
                 "step": "text",
             }
-        elif operation == "service_contact":
+        elif operation in {"service_contact", "service_sync"}:
             pending_inputs[actor_id] = {
-                "operation": operation,
+                "operation": "service_contact",
                 "service_id": service_id,
                 "step": "choose_task",
             }
+            prompt = (
+                f"{label}: актуальный файл графика загружен. "
+                "Сверьте задачи и ответственных с показанными привязками; "
+                "выберите имя, если требуется добавить или изменить Telegram."
+                if operation == "service_sync"
+                else (
+                    f"{label}: выберите задачу и ответственного из "
+                    "актуального файла графика, чтобы привязать пользователя "
+                    "Telegram."
+                )
+            )
+            await message.answer(
+                prompt,
+                parse_mode=None,
+            )
             await offer_contact_task_choices(message, actor_id, service_id)
             return
         await message.answer(prompts[operation], parse_mode=None)
@@ -539,7 +554,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             pending_notify_task_choices[token] = (actor_id, service_id, None)
             rows.append([
                 InlineKeyboardButton(
-                    text="Завершить и сохранить",
+                    text="Вернуться к настройкам",
                     callback_data=f"notify_task:{token}",
                 )
             ])
@@ -581,6 +596,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 if tasks
                 else "В расписании пока нет задач с назначенными "
                 "ответственными. Можно завершить и сохранить настройки."
+            )
+            rows.extend(
+                notification_edit_controls(service_id).inline_keyboard
             )
         await message.answer(
             prompt,
@@ -711,7 +729,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     async def offer_notify_task_choices(
         message: Message, actor_id: int, service_id: str
-    ) -> None:
+    ) -> bool:
         pending = pending_inputs.get(actor_id)
         registry = service_registry()
         if (
@@ -723,34 +741,189 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "Пошаговая настройка уведомлений завершена или недоступна.",
                 parse_mode=None,
             )
-            return
-        task_loader = getattr(context, "load_service_task_assignments", None)
-        if not callable(task_loader):
-            await message.answer(
-                "Загрузка задач из файла расписания недоступна.",
-                parse_mode=None,
-            )
-            return
-        try:
-            assignments = await task_loader(service_id)
-        except Exception:
-            debug.exception("Не удалось прочитать задачи из графика служений")
-            await message.answer(
-                "Не удалось прочитать файл графика служений. "
-                "Проверьте доступность расписания и попробуйте снова.",
-                parse_mode=None,
-            )
-            return
+            return False
+        if "schedule_assignments" in pending:
+            assignments = pending["schedule_assignments"]
+        else:
+            task_loader = getattr(context, "load_service_task_assignments", None)
+            if not callable(task_loader):
+                await message.answer(
+                    "Загрузка задач из файла расписания недоступна.",
+                    parse_mode=None,
+                )
+                return False
+            try:
+                assignments = await task_loader(service_id)
+            except Exception:
+                debug.exception("Не удалось прочитать задачи из графика служений")
+                await message.answer(
+                    "Не удалось прочитать файл графика служений. "
+                    "Проверьте доступность расписания и попробуйте снова.",
+                    parse_mode=None,
+                )
+                return False
         pending["schedule_assignments"] = assignments
         pending["schedule_tasks"] = sorted(assignments)
-        pending["personal_templates"] = {
-            task: text
-            for task, text in pending["personal_templates"].items()
-            if task in assignments
-        }
         pending["step"] = "choose_notify_task"
         await send_task_choices_page(
             message, actor_id, service_id, "service_notify"
+        )
+        return True
+
+    async def show_notification_settings_menu(
+        message: Message, actor_id: int, service_id: str
+    ) -> None:
+        pending = pending_inputs.get(actor_id)
+        if (
+            pending is None
+            or pending.get("operation") != "service_notify"
+            or pending.get("service_id") != service_id
+        ):
+            await message.answer(
+                "Настройка устарела. Запустите /service_notify заново.",
+                parse_mode=None,
+            )
+            return
+        service = service_by_id(service_registry(), service_id)
+        if service is None:
+            await message.answer("Служение не найдено.", parse_mode=None)
+            return
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=f"Дни до события: {pending['reminder_days']}",
+                        callback_data=f"notify_edit:days:{service_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text=f"Время: {pending['reminder_time']}",
+                        callback_data=f"notify_edit:time:{service_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Текст группового сообщения",
+                        callback_data=f"notify_edit:group_template:{service_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text=(
+                            "Личные шаблоны "
+                            f"({len(pending['personal_templates'])})"
+                        ),
+                        callback_data=f"notify_edit:personal:{service_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Завершить и сохранить",
+                        callback_data=f"notify_finish:{service_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Отмена",
+                        callback_data=f"notify_cancel:{service_id}",
+                    )
+                ],
+            ]
+        )
+        await message.answer(
+            f"{service_label(service)} — выберите, что изменить. "
+            "Текущие значения сохраняются, пока вы их не измените.",
+            reply_markup=keyboard,
+            parse_mode=None,
+        )
+
+    def notification_edit_controls(service_id: str) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Завершить и сохранить",
+                        callback_data=f"notify_finish:{service_id}",
+                    ),
+                    InlineKeyboardButton(
+                        text="Отмена",
+                        callback_data=f"notify_cancel:{service_id}",
+                    ),
+                ]
+            ]
+        )
+
+    async def begin_notification_edit(
+        message: Message, actor_id: int, service_id: str, field: str
+    ) -> None:
+        pending = pending_inputs.get(actor_id)
+        if (
+            pending is None
+            or pending.get("operation") != "service_notify"
+            or pending.get("service_id") != service_id
+        ):
+            await message.answer(
+                "Настройка устарела. Запустите /service_notify заново.",
+                parse_mode=None,
+            )
+            return
+        if field == "personal":
+            if "schedule_assignments" not in pending:
+                task_loader = getattr(
+                    context, "load_service_task_assignments", None
+                )
+                if not callable(task_loader):
+                    await message.answer(
+                        "Загрузка задач из файла расписания недоступна.",
+                        parse_mode=None,
+                    )
+                    return
+                try:
+                    pending["schedule_assignments"] = await task_loader(
+                        service_id
+                    )
+                except Exception:
+                    debug.exception(
+                        "Не удалось прочитать задачи для личных шаблонов"
+                    )
+                    await message.answer(
+                        "Не удалось прочитать файл графика. "
+                        "Попробуйте выбрать этот пункт ещё раз.",
+                        parse_mode=None,
+                    )
+                    return
+                pending["schedule_tasks"] = sorted(
+                    pending["schedule_assignments"]
+                )
+            pending["step"] = "choose_notify_task"
+            await send_task_choices_page(
+                message, actor_id, service_id, "service_notify"
+            )
+            return
+        prompts = {
+            "days": (
+                "Введите число дней до события от 0 до 6. "
+                f"Текущее значение: {pending['reminder_days']}."
+            ),
+            "time": (
+                "Введите время в формате HH:MM. "
+                f"Текущее значение: {pending['reminder_time']}."
+            ),
+            "group_template": (
+                "Введите новый текст для группы. Шаблоны: {service_name}, "
+                "{sunday_date}, {task_assignments}. "
+                "Пустое значение не меняет текущий текст."
+            ),
+        }
+        if field not in prompts:
+            await message.answer("Неизвестный параметр.", parse_mode=None)
+            return
+        pending["step"] = field
+        await message.answer(
+            prompts[field],
+            reply_markup=notification_edit_controls(service_id),
+            parse_mode=None,
         )
 
     def service_chat_keyboard(service_id: str) -> InlineKeyboardMarkup:
@@ -785,8 +958,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         pending["step"] = "notify_template"
         await message.answer(
             f"Введите индивидуальный текст напоминания для задачи "
-            f"«{task}». В шаблоне можно использовать {{name}} и "
-            "{sunday_date}.",
+            f"«{task}». Шаблоны: {{name}}, {{task}}, {{service_name}}, "
+            "{{sunday_date}}, {{telegram_id}}, {{username}}.",
+            reply_markup=notification_edit_controls(service_id),
             parse_mode=None,
         )
 
@@ -892,8 +1066,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         task = selection[2]
         if task is None:
-            await save_notification_setup(
-                callback.message, callback.from_user.id
+            await show_notification_settings_menu(
+                callback.message, callback.from_user.id, selection[1]
             )
         else:
             await begin_notify_template(
@@ -1335,6 +1509,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "service_chat_set",
             "service_chat_disable",
             "service_contact",
+            "service_sync",
             "service_notify",
             "test_notify",
         }:
@@ -1422,15 +1597,39 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     raise PermissionError(
                         "Проверка доставки доступна только главному администратору."
                     )
-                if service["group_chat_id"] is None:
-                    await callback.message.answer(
-                        f"Для {service_label(service)} сначала настройте групповой чат.",
-                        parse_mode=None,
+                rows = []
+                if service["group_chat_id"] is not None:
+                    rows.append([
+                        InlineKeyboardButton(
+                            text="Проверить отправку в групповой чат",
+                            callback_data=(
+                                f"test_action:group:{service_id}"
+                            ),
+                        )
+                    ])
+                rows.append([
+                    InlineKeyboardButton(
+                        text="Показать тексты админу",
+                        callback_data=f"test_action:preview:{service_id}",
                     )
-                else:
-                    await execute_test_notification(
-                        callback.message, service["group_chat_id"]
+                ])
+                await callback.message.answer(
+                    f"{service_label(service)}: выберите проверку.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+                    parse_mode=None,
+                )
+            elif operation == "service_sync":
+                if not registry.is_super_admin(callback.from_user.id):
+                    raise PermissionError(
+                        "Синхронизация графика доступна только супер-администратору."
                     )
+                await ask_for_service_parameters(
+                    callback.message,
+                    callback.from_user.id,
+                    "service_sync",
+                    service_id,
+                    service_label(service),
+                )
             else:
                 if not registry.is_super_admin(callback.from_user.id):
                     raise PermissionError(
@@ -1457,6 +1656,75 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await callback.message.answer(
                 "Не удалось прочитать реестр служений.", parse_mode=None
             )
+        await callback.answer()
+
+    @admin_router.callback_query(F.data.startswith("notify_edit:"))
+    async def on_notification_setting_edit(callback: CallbackQuery) -> None:
+        if (
+            not callback.from_user
+            or not callback.message
+            or callback.message.chat.type != ChatType.PRIVATE
+        ):
+            await callback.answer()
+            return
+        _, field, service_id = callback.data.split(":", 2)
+        registry = service_registry()
+        if registry is None or not is_service_admin(
+            callback.from_user.id, service_id
+        ):
+            await callback.answer("Недостаточно прав.")
+            return
+        await begin_notification_edit(
+            callback.message, callback.from_user.id, service_id, field
+        )
+        await callback.answer()
+
+    @admin_router.callback_query(F.data.startswith("notify_finish:"))
+    async def on_notification_setting_finish(callback: CallbackQuery) -> None:
+        if (
+            not callback.from_user
+            or not callback.message
+            or callback.message.chat.type != ChatType.PRIVATE
+        ):
+            await callback.answer()
+            return
+        service_id = callback.data.partition(":")[2]
+        pending = pending_inputs.get(callback.from_user.id)
+        if not is_service_admin(callback.from_user.id, service_id):
+            await callback.answer("Недостаточно прав.")
+            return
+        if (
+            pending is None
+            or pending.get("operation") != "service_notify"
+            or pending.get("service_id") != service_id
+        ):
+            await callback.answer("Настройка устарела. Запустите её заново.")
+            return
+        await save_notification_setup(
+            callback.message, callback.from_user.id
+        )
+        await callback.answer()
+
+    @admin_router.callback_query(F.data.startswith("notify_cancel:"))
+    async def on_notification_setting_cancel(callback: CallbackQuery) -> None:
+        if not callback.from_user or not callback.message:
+            await callback.answer()
+            return
+        service_id = callback.data.partition(":")[2]
+        pending = pending_inputs.get(callback.from_user.id)
+        if (
+            callback.message.chat.type != ChatType.PRIVATE
+            or pending is None
+            or pending.get("operation") != "service_notify"
+            or pending.get("service_id") != service_id
+        ):
+            await callback.answer("Настройка устарела.")
+            return
+        clear_pending_actor(callback.from_user.id)
+        await callback.message.answer(
+            "Изменения отменены, сохранённые настройки не изменены.",
+            parse_mode=None,
+        )
         await callback.answer()
 
     @admin_router.callback_query(
@@ -1566,10 +1834,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         _, operation, service_id, page = selection
         pending = pending_inputs.get(callback.from_user.id)
+        expected_step = {
+            "service_contact": "choose_task",
+            "service_notify": "choose_notify_task",
+        }.get(operation)
         if (
-            pending is None
+            expected_step is None
+            or pending is None
             or pending.get("operation") != operation
             or pending.get("service_id") != service_id
+            or pending.get("step") != expected_step
         ):
             await callback.answer("Этот список устарел. Запустите команду заново.")
             return
@@ -1851,11 +2125,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     if not 0 <= days <= 6:
                         raise ValueError("Число дней должно быть от 0 до 6.")
                     pending["reminder_days"] = days
-                    pending["step"] = "time"
-                    await message.answer(
-                        "Укажите время отправки напоминания в формате HH:MM, "
-                        "например 17:15.",
-                        parse_mode=None,
+                    pending["step"] = "menu"
+                    await show_notification_settings_menu(
+                        message, message.from_user.id, service_id
                     )
                     return
                 if step == "time":
@@ -1871,19 +2143,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             "Укажите время в формате HH:MM, например 17:15."
                         )
                     pending["reminder_time"] = text
-                    pending["step"] = "group_template"
-                    await message.answer(
-                        "Введите текст напоминания для группового чата. "
-                        "Доступны шаблоны {sunday_date}, {tg_responsible}, "
-                        "{tg_leader}, {tg_preacher}.",
-                        parse_mode=None,
+                    pending["step"] = "menu"
+                    await show_notification_settings_menu(
+                        message, message.from_user.id, service_id
                     )
                     return
                 if step == "group_template":
                     if not text:
                         raise ValueError("Текст для группы не может быть пустым.")
                     pending["group_template"] = text
-                    await offer_notify_task_choices(
+                    pending["step"] = "menu"
+                    await show_notification_settings_menu(
                         message, message.from_user.id, service_id
                     )
                     return
@@ -1892,9 +2162,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         raise ValueError(
                             "Текст индивидуального напоминания не может быть пустым."
                         )
-                    pending["personal_templates"][pending["active_task"]] = text
+                    active_task = pending.get("active_task")
+                    if not active_task:
+                        raise ValueError(
+                            "Выбор задачи устарел. Запустите /service_notify заново."
+                        )
+                    pending["personal_templates"][active_task] = text
                     pending.pop("active_task", None)
-                    await offer_notify_task_choices(
+                    pending["step"] = "menu"
+                    await show_notification_settings_menu(
                         message, message.from_user.id, service_id
                     )
                     return
@@ -1916,104 +2192,116 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         pending_inputs.pop(message.from_user.id, None)
         await message.answer(response, parse_mode=None)
 
-    async def execute_test_notification(
-        message: Message, group_chat_id: int
-    ) -> None:
-        group_result = "✅ отправлено"
-        try:
-            await context.bot.send_message(
-                group_chat_id,
-                "🔧 ТЕСТ бота: проверка доставки в групповой чат. "
-                "Обычная рассылка участникам не запускалась.",
+    @admin_router.message(Command("service_sync"))
+    async def on_service_sync(message: Message) -> None:
+        if not message.from_user or message.chat.type != ChatType.PRIVATE:
+            return
+        clear_pending_actor(message.from_user.id)
+        payload = (message.text or "").partition(" ")[2].strip()
+        if payload:
+            await message.answer(
+                "Служение нужно выбрать кнопкой. Используйте /service_sync "
+                "без параметров.",
                 parse_mode=None,
             )
-        except TelegramAPIError as exc:
-            group_result = f"❌ ошибка ({type(exc).__name__})"
-            debug.exception("Тестовая отправка в группу не удалась")
+            return
+        await request_service_input(message, "service_sync")
 
-        try:
-            previews = await context.prepare_test_previews()
-        except Exception as exc:  # noqa: BLE001
-            debug.exception("Не удалось подготовить предпросмотр рассылки")
-            previews = None
-            schedule_result = (
-                f"Предпросмотр расписания не подготовлен "
-                f"({type(exc).__name__})."
-            )
-        else:
-            schedule_result = (
-                f"Предпросмотр расписания на "
-                f"{previews['sunday_date']:%d.%m.%Y} подготовлен."
-            )
-
-        report_lines = [
-            "🔧 Проверка доставки завершена.",
-            f"Тестовое сообщение в группу: {group_result}.",
-            schedule_result,
-            "Личные сообщения участникам не отправлялись.",
-        ]
-        if previews and previews["issues"]:
-            report_lines.append(
-                "Предупреждения: " + "; ".join(previews["issues"])
-            )
-        report = "\n".join(report_lines)
-        preview_failures = []
-        try:
-            await context.bot.send_message(
-                context.admin_id, report, parse_mode=None
-            )
-        except TelegramAPIError:
-            debug.exception("Не удалось отправить результат теста администратору")
-            preview_failures.append("итоговый отчёт")
-
-        if previews:
-            preview_messages = [
-                (
-                    "👁 Предпросмотр сообщения для группы "
-                    f"на {previews['sunday_date']:%d.%m.%Y}:\n\n"
-                    f"{previews['group_text']}",
-                    "сообщение для группы",
-                ),
-                *[
-                    (
-                        "👁 Предпросмотр личного сообщения "
-                        f"({role}, {html.escape(name)}):\n\n{text}",
-                        f"личное сообщение для роли «{role}»",
-                    )
-                    for role, name, text in previews["personal_messages"]
-                ],
-            ]
-            for preview_text, description in preview_messages:
-                try:
-                    await context.bot.send_message(
-                        context.admin_id,
-                        preview_text,
-                        parse_mode=ParseMode.HTML,
-                    )
-                except TelegramAPIError:
-                    debug.exception(
-                        "Не удалось отправить предпросмотр: %s", description
-                    )
-                    preview_failures.append(description)
-
-        if preview_failures:
-            try:
+    async def execute_test_notification(
+        message: Message, service: dict, action: str
+    ) -> None:
+        if action == "group":
+            group_chat_id = service["group_chat_id"]
+            if group_chat_id is None:
                 await message.answer(
-                    "Не удалось отправить администратору: "
-                    + ", ".join(preview_failures),
+                    "Для этого служения не настроен групповой чат.",
                     parse_mode=None,
+                )
+                return
+            try:
+                await context.bot.send_message(
+                    group_chat_id,
+                    f"🔧 ТЕСТ службы «{service['name']}»: проверка доставки. "
+                    "Обычная рассылка не запускалась.",
+                    parse_mode=None,
+                )
+            except TelegramAPIError as exc:
+                debug.exception("Тестовая отправка в группу не удалась")
+                await message.answer(
+                    f"Не удалось отправить тест в группу: {type(exc).__name__}.",
+                    parse_mode=None,
+                )
+            else:
+                await message.answer(
+                    f"Тестовое сообщение службы «{service['name']}» отправлено "
+                    "в настроенную группу. Рассылка участникам не запускалась.",
+                    parse_mode=None,
+                )
+            return
+
+        prepare_previews = getattr(
+            context, "prepare_service_test_previews", None
+        )
+        if not callable(prepare_previews):
+            await message.answer(
+                "Предпросмотр сообщений для служений недоступен.",
+                parse_mode=None,
+            )
+            return
+        try:
+            previews = await prepare_previews(service["id"])
+        except (
+            IndexError,
+            KeyError,
+            OSError,
+            PermissionError,
+            RuntimeError,
+            sqlite3.Error,
+            TypeError,
+            ValueError,
+        ) as exc:
+            debug.exception(
+                "Не удалось подготовить предпросмотр службы %s",
+                service["id"],
+            )
+            await message.answer(
+                f"Не удалось подготовить предпросмотр: {type(exc).__name__}.",
+                parse_mode=None,
+            )
+            return
+
+        output = [
+            f"👁 Предпросмотр службы «{service['name']}» "
+            f"на {previews['sunday_date']:%d.%m.%Y}:",
+            "",
+            previews["group_text"],
+        ]
+        output.extend(
+            f"\nЛичное сообщение для {item['name']} "
+            f"(задача «{item['task']}»):\n{item['text']}"
+            for item in previews["personal_messages"]
+        )
+        if previews["issues"]:
+            output.extend(("", "Замечания:", *previews["issues"]))
+        for chunk in _telegram_text_chunks("\n".join(output)):
+            try:
+                await context.bot.send_message(
+                    context.admin_id, chunk, parse_mode=None
                 )
             except TelegramAPIError:
                 debug.exception(
-                    "Не удалось сообщить администратору об ошибке предпросмотра"
+                    "Не удалось отправить администратору предпросмотр службы %s",
+                    service["id"],
                 )
-
-        interaction.info(
-            "Тест уведомлений запущен администратором tg_id=%s; "
-            "группа: %s; предпросмотр: %s",
-            context.admin_id,
-            group_result,
-            "готов" if previews else "ошибка",
+                await message.answer(
+                    "Не удалось доставить администратору полный предпросмотр.",
+                    parse_mode=None,
+                )
+                return
+        await message.answer(
+            "Предпросмотр выбранной службы отправлен вам в личные сообщения. "
+            "Сообщения в группу и участникам не отправлялись.",
+            parse_mode=None,
         )
 
     @router.message(Command("test_notify"))
@@ -2047,21 +2335,41 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     )
                 ]
                 for service in services
-                if service["group_chat_id"] is not None
             ]
         )
-        if not keyboard.inline_keyboard:
-            await message.answer(
-                "Нет служений с настроенным групповым чатом.",
-                parse_mode=None,
-            )
-            return
         await message.answer(
-            "Выберите служение, в групповой чат которого отправить тестовое "
-            "сообщение. Личные сообщения участникам не отправляются.",
+            "Сначала выберите служение, затем — вид проверки.",
             reply_markup=keyboard,
             parse_mode=None,
         )
+
+    @router.callback_query(F.data.startswith("test_action:"))
+    async def on_test_notify_action(callback: CallbackQuery) -> None:
+        if (
+            not callback.from_user
+            or callback.from_user.id != context.admin_id
+            or not callback.message
+            or callback.message.chat.type != ChatType.PRIVATE
+        ):
+            await callback.answer()
+            return
+        _, action, service_id = callback.data.split(":", 2)
+        registry = service_registry()
+        if registry is None:
+            await callback.answer("Реестр служений недоступен.")
+            return
+        try:
+            service = service_by_id(registry, service_id)
+            if service is None:
+                raise ValueError("Служение не найдено.")
+            if action not in {"group", "preview"}:
+                raise ValueError("Неизвестный вид проверки.")
+            await execute_test_notification(
+                callback.message, service, action
+            )
+        except (ValueError, sqlite3.Error) as exc:
+            await callback.message.answer(str(exc), parse_mode=None)
+        await callback.answer()
 
     @router.callback_query(F.data.startswith(f"{CONFIRM_PREFIX}:"))
     async def on_confirm(cb: CallbackQuery) -> None:  # noqa: D401

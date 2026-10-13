@@ -97,6 +97,8 @@ class ServiceRegistry:
             if contact_primary_key != ["service_id", "task", "telegram_id"]:
                 connection.executescript(
                     """
+                    BEGIN IMMEDIATE;
+                    DROP TABLE IF EXISTS responsible_contacts_v2;
                     CREATE TABLE responsible_contacts_v2 (
                         service_id TEXT NOT NULL
                             REFERENCES services(id) ON DELETE CASCADE,
@@ -114,12 +116,38 @@ class ServiceRegistry:
                     )
                     SELECT service_id, task, name, telegram_id, username,
                            updated_by, updated_at
-                    FROM responsible_contacts;
+                    FROM responsible_contacts
+                    WHERE rowid IN (
+                        SELECT MAX(rowid)
+                        FROM responsible_contacts
+                        GROUP BY service_id, task, telegram_id
+                    )
+                    AND rowid IN (
+                        SELECT MAX(rowid)
+                        FROM responsible_contacts
+                        GROUP BY service_id, task, name
+                    );
                     DROP TABLE responsible_contacts;
                     ALTER TABLE responsible_contacts_v2
                     RENAME TO responsible_contacts;
+                    COMMIT;
                     """
                 )
+            connection.execute(
+                """
+                DELETE FROM responsible_contacts
+                WHERE rowid NOT IN (
+                    SELECT MAX(rowid)
+                    FROM responsible_contacts
+                    GROUP BY service_id, task, name
+                )
+                """
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "idx_responsible_contacts_name "
+                "ON responsible_contacts(service_id, task, name)"
+            )
             connection.execute(
                 "INSERT OR IGNORE INTO runtime_counters (name, next_value) "
                 "VALUES ('telegram_share_request_id', ?)",
@@ -359,7 +387,7 @@ class ServiceRegistry:
         *,
         reminder_days: int,
         reminder_time: str,
-        group_template: str,
+        group_template: str | None,
         personal_templates: dict[str, str],
     ) -> None:
         _validate_positive_id(actor_id, "actor_id")
@@ -369,8 +397,10 @@ class ServiceRegistry:
             raise ValueError("reminder_days не может быть отрицательным")
         if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", reminder_time):
             raise ValueError("reminder_time должен быть в формате HH:MM")
-        if not isinstance(group_template, str) or not group_template.strip():
-            raise ValueError("Текст группового уведомления обязателен")
+        if group_template is not None and (
+            not isinstance(group_template, str) or not group_template.strip()
+        ):
+            raise ValueError("Текст группового уведомления не может быть пустым")
         if not isinstance(personal_templates, dict) or any(
             not isinstance(task, str)
             or not isinstance(text, str)
@@ -431,17 +461,17 @@ class ServiceRegistry:
             self._require_super_admin(connection, actor_id)
             self._require_service(connection, service_id)
             connection.execute(
+                "DELETE FROM responsible_contacts "
+                "WHERE service_id = ? AND task = ? "
+                "AND (name = ? OR telegram_id = ?)",
+                (service_id, task, name, telegram_id),
+            )
+            connection.execute(
                 """
                 INSERT INTO responsible_contacts (
                     service_id, task, name, telegram_id, username,
                     updated_by, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(service_id, task, telegram_id) DO UPDATE SET
-                    name = excluded.name,
-                    telegram_id = excluded.telegram_id,
-                    username = excluded.username,
-                    updated_by = excluded.updated_by,
-                    updated_at = excluded.updated_at
                 """,
                 (
                     service_id, task, name, telegram_id,
