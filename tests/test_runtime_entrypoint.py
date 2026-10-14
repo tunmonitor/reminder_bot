@@ -14,6 +14,25 @@ from zoneinfo import ZoneInfo
 
 
 class ReminderBotEntrypointTest(unittest.TestCase):
+    def test_webapp_menu_button_uses_configured_https_url(self):
+        from bot.app import _configure_webapp_menu
+
+        async def configure():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                project = Path(tmp_dir)
+                (project / "webapp_config.json").write_text(
+                    '{"host":"127.0.0.1","port":8080,'
+                    '"public_url":"https://example.org/app"}',
+                    encoding="utf-8",
+                )
+                bot = SimpleNamespace(set_chat_menu_button=AsyncMock())
+                await _configure_webapp_menu(bot, project, MagicMock())
+                bot.set_chat_menu_button.assert_awaited_once()
+                button = bot.set_chat_menu_button.await_args.kwargs["menu_button"]
+                self.assertEqual(button.web_app.url, "https://example.org/app")
+
+        asyncio.run(configure())
+
     def test_test_notification_previews_use_upcoming_assignments(self):
         from bot import app
 
@@ -98,6 +117,51 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 self.assertEqual(list((shm_dir / "debug").iterdir()), [])
 
         asyncio.run(prepare())
+
+    def test_service_reminder_sends_group_and_personal_once(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def send_reminder():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                registry.set_responsible_contact(
+                    1001, "assembly", "Камеры", "Анна", 2002, "anna"
+                )
+                reminder = registry.get_service("assembly")["reminders"][0]
+                bot = SimpleNamespace(send_message=AsyncMock())
+                credentials = SimpleNamespace(admin_tg_id=1001)
+                logger = MagicMock()
+                assignments = {"Камеры": ["Анна"]}
+                with patch.object(
+                    app,
+                    "_load_service_task_assignments",
+                    new=AsyncMock(return_value=(assignments, True)),
+                ) as load_assignments:
+                    for _ in range(2):
+                        await app._process_service_reminder(
+                            bot,
+                            credentials,
+                            Path(tmp_dir),
+                            ZoneInfo("UTC"),
+                            registry,
+                            "assembly",
+                            reminder,
+                            logger,
+                            logger,
+                        )
+
+                self.assertEqual(bot.send_message.await_count, 2)
+                self.assertEqual(
+                    bot.send_message.await_args_list[0].args[0], -10001
+                )
+                self.assertEqual(
+                    bot.send_message.await_args_list[1].args[0], 2002
+                )
+                self.assertEqual(load_assignments.await_count, 2)
+
+        asyncio.run(send_reminder())
 
     def test_scheduler_initialization_failure_closes_bot_without_pid(self):
         from bot import app

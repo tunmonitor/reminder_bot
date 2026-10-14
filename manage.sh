@@ -664,10 +664,6 @@ cmd_restore_data() {
         echo "Использование: $0 restore-data <snapshot-directory>" >&2
         return 2
     fi
-    if cmd_status >/dev/null 2>&1; then
-        echo "❌ Перед восстановлением остановите бота командой: $0 stop" >&2
-        return 1
-    fi
     if [[ "$snapshot" != /* ]]; then
         snapshot="$PWD/$snapshot"
     fi

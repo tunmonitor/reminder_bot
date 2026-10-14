@@ -12,6 +12,11 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 RATE_LIMIT_DELAY = 0.05         # согласно ТЗ — защита от HTTP 429
 CONFIRM_PREFIX = "cfm"          # короткий префикс для callback_data
+TELEGRAM_TEXT_LIMIT = 4096
+
+
+def _utf16_length(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
 
 
 def build_confirm_kb(role: str, sunday_iso: str) -> InlineKeyboardMarkup:
@@ -147,6 +152,14 @@ async def send_assignments(
             "Подготовлено личное сообщение: роль=%s, tg_id=%s, username=@%s\n%s",
             role, info["tg_id"], info["username"], text,
         )
+        if _utf16_length(text) > TELEGRAM_TEXT_LIMIT:
+            message = (
+                f"Личное напоминание для {info['name']} ({role}) не отправлено: "
+                f"длина превышает лимит Telegram в {TELEGRAM_TEXT_LIMIT} единиц UTF-16"
+            )
+            debug_logger.error(message)
+            await _notify_admin(bot, admin_id, message, debug_logger)
+            continue
         try:
             msg = await bot.send_message(
                 info["tg_id"], text,

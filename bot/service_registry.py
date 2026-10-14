@@ -125,8 +125,55 @@ class ServiceRegistry:
                     next_value INTEGER NOT NULL
                         CHECK (next_value >= 0 AND next_value <= 2147483647)
                 );
+
+                CREATE TABLE IF NOT EXISTS service_reminders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    reminder_days INTEGER NOT NULL CHECK (reminder_days >= 0),
+                    reminder_time TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS service_reminder_deliveries (
+                    service_id TEXT NOT NULL,
+                    reminder_id INTEGER NOT NULL,
+                    event_date TEXT NOT NULL,
+                    recipient_key TEXT NOT NULL,
+                    delivered_at TEXT NOT NULL,
+                    PRIMARY KEY (
+                        service_id, reminder_id, event_date, recipient_key
+                    )
+                );
+
+                CREATE TABLE IF NOT EXISTS service_reminder_migrations (
+                    name TEXT PRIMARY KEY
+                );
                 """
             )
+            reminder_indexes = connection.execute(
+                "PRAGMA index_list(service_reminders)"
+            ).fetchall()
+            if any(row["unique"] for row in reminder_indexes):
+                connection.executescript(
+                    """
+                    CREATE TABLE service_reminders_v2 (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        service_id TEXT NOT NULL REFERENCES services(id)
+                            ON DELETE CASCADE,
+                        reminder_days INTEGER NOT NULL
+                            CHECK (reminder_days >= 0),
+                        reminder_time TEXT NOT NULL
+                    );
+                    INSERT INTO service_reminders_v2 (
+                        id, service_id, reminder_days, reminder_time
+                    )
+                    SELECT id, service_id, reminder_days, reminder_time
+                    FROM service_reminders;
+                    DROP TABLE service_reminders;
+                    ALTER TABLE service_reminders_v2
+                        RENAME TO service_reminders;
+                    """
+                )
             admin_columns = {
                 row["name"]
                 for row in connection.execute(
@@ -232,6 +279,29 @@ class ServiceRegistry:
                     "VALUES (?, ?)",
                     (super_admin_id, now),
                 )
+            migrated_reminders = connection.execute(
+                "SELECT 1 FROM service_reminder_migrations "
+                "WHERE name = 'legacy-reminders'"
+            ).fetchone()
+            if migrated_reminders is None:
+                connection.execute(
+                    """
+                    INSERT INTO service_reminders (
+                        service_id, reminder_days, reminder_time
+                    )
+                    SELECT services.id, services.reminder_days,
+                           services.reminder_time
+                    FROM services
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM service_reminders
+                        WHERE service_reminders.service_id = services.id
+                    )
+                    """
+                )
+                connection.execute(
+                    "INSERT INTO service_reminder_migrations (name) "
+                    "VALUES ('legacy-reminders')"
+                )
 
     def next_share_request_id(self) -> int:
         with self._connection() as connection:
@@ -306,10 +376,25 @@ class ServiceRegistry:
                 "group_template, personal_templates_json "
                 "FROM services ORDER BY id"
             ).fetchall()
+            reminders = connection.execute(
+                "SELECT id, service_id, reminder_days, reminder_time "
+                "FROM service_reminders ORDER BY service_id, reminder_days, "
+                "reminder_time, id"
+            ).fetchall()
+        reminders_by_service: dict[str, list[dict]] = {}
+        for reminder in reminders:
+            reminders_by_service.setdefault(reminder["service_id"], []).append(
+                {
+                    "id": reminder["id"],
+                    "reminder_days": reminder["reminder_days"],
+                    "reminder_time": reminder["reminder_time"],
+                }
+            )
         return [
             {
                 **dict(row),
                 "aliases": json.loads(row["aliases_json"]),
+                "reminders": reminders_by_service.get(row["id"], []),
                 "enabled": bool(row["enabled"]),
                 "personal_templates": (
                     json.loads(row["personal_templates_json"])
@@ -462,6 +547,8 @@ class ServiceRegistry:
         reminder_time: str,
         group_template: str | None,
         personal_templates: dict[str, str],
+        reminders: list[dict] | None = None,
+        allow_duplicate_reminders: bool = False,
     ) -> None:
         _validate_positive_id(actor_id, "actor_id")
         if isinstance(reminder_days, bool) or not isinstance(reminder_days, int):
@@ -494,10 +581,48 @@ class ServiceRegistry:
                 PERSONAL_TEMPLATE_FIELDS,
                 f"Личный шаблон для задачи «{task}»",
             )
+        normalized_reminders = (
+            self._validate_reminders(
+                reminders,
+                allow_duplicates=allow_duplicate_reminders,
+            )
+            if reminders is not None
+            else None
+        )
 
         with self._connection() as connection:
             self._require_service(connection, service_id)
             self._require_service_editor(connection, actor_id, service_id)
+            if normalized_reminders is None:
+                existing_reminders = connection.execute(
+                    "SELECT id, reminder_days, reminder_time "
+                    "FROM service_reminders WHERE service_id = ? "
+                    "ORDER BY id",
+                    (service_id,),
+                ).fetchall()
+                default_reminders = [
+                    {
+                        "id": row["id"],
+                        "reminder_days": row["reminder_days"],
+                        "reminder_time": row["reminder_time"],
+                    }
+                    for row in existing_reminders
+                ]
+                if default_reminders:
+                    default_reminders[0] = {
+                        "id": default_reminders[0]["id"],
+                        "reminder_days": reminder_days,
+                        "reminder_time": reminder_time,
+                    }
+                else:
+                    default_reminders = [{
+                        "reminder_days": reminder_days,
+                        "reminder_time": reminder_time,
+                    }]
+                normalized_reminders = self._validate_reminders(
+                    default_reminders,
+                    allow_duplicates=allow_duplicate_reminders,
+                )
             connection.execute(
                 """
                 UPDATE services SET
@@ -517,15 +642,218 @@ class ServiceRegistry:
                     service_id,
                 ),
             )
+            self._replace_service_reminders(
+                connection, service_id, normalized_reminders
+            )
             self._audit(
                 connection, actor_id, "service_notifications_updated", service_id,
                 {
                     "reminder_days": reminder_days,
                     "reminder_time": reminder_time,
+                    "reminders": normalized_reminders,
                     "group_template": group_template,
                     "personal_templates": personal_templates,
                 },
             )
+
+    def is_service_reminder_delivered(
+        self,
+        service_id: str,
+        reminder_id: int,
+        event_date: str,
+        recipient_key: str,
+    ) -> bool:
+        with self._connection() as connection:
+            reminder_ids = self._equivalent_reminder_ids(
+                connection, service_id, reminder_id
+            )
+            if not reminder_ids:
+                reminder_ids = [reminder_id]
+            placeholders = ",".join("?" for _ in reminder_ids)
+            return connection.execute(
+                f"""
+                SELECT 1 FROM service_reminder_deliveries
+                WHERE service_id = ? AND reminder_id IN ({placeholders})
+                  AND event_date = ? AND recipient_key = ?
+                """,
+                (service_id, *reminder_ids, event_date, recipient_key),
+            ).fetchone() is not None
+
+    def mark_service_reminder_delivered(
+        self,
+        service_id: str,
+        reminder_id: int,
+        event_date: str,
+        recipient_key: str,
+    ) -> None:
+        with self._connection() as connection:
+            reminder_ids = self._equivalent_reminder_ids(
+                connection, service_id, reminder_id
+            ) or [reminder_id]
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO service_reminder_deliveries (
+                    service_id, reminder_id, event_date, recipient_key,
+                    delivered_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        service_id,
+                        duplicate_id,
+                        event_date,
+                        recipient_key,
+                        _utc_now(),
+                    )
+                    for duplicate_id in reminder_ids
+                ),
+            )
+
+    @staticmethod
+    def _equivalent_reminder_ids(
+        connection: sqlite3.Connection, service_id: str, reminder_id: int
+    ) -> list[int]:
+        reminder = connection.execute(
+            "SELECT reminder_days, reminder_time FROM service_reminders "
+            "WHERE service_id = ? AND id = ?",
+            (service_id, reminder_id),
+        ).fetchone()
+        if reminder is None:
+            return []
+        return [
+            row["id"]
+            for row in connection.execute(
+                "SELECT id FROM service_reminders WHERE service_id = ? "
+                "AND reminder_days = ? AND reminder_time = ?",
+                (service_id, reminder["reminder_days"], reminder["reminder_time"]),
+            )
+        ]
+
+    @staticmethod
+    def _validate_reminders(
+        reminders: list[dict], *, allow_duplicates: bool = False
+    ) -> list[dict]:
+        if not isinstance(reminders, list):
+            raise ValueError("Настройки уведомлений имеют неверный формат.")
+        normalized = []
+        seen: set[tuple[int, str]] = set()
+        for reminder in reminders:
+            if not isinstance(reminder, dict):
+                raise ValueError("Настройка уведомления имеет неверный формат.")
+            days = reminder.get("reminder_days")
+            reminder_time = reminder.get("reminder_time")
+            if isinstance(days, bool) or not isinstance(days, int) or days < 0:
+                raise ValueError("Число дней должно быть целым числом от 0 до 6.")
+            if days > 6:
+                raise ValueError("Число дней должно быть целым числом от 0 до 6.")
+            if not isinstance(reminder_time, str) or not re.fullmatch(
+                r"(?:[01]\d|2[0-3]):[0-5]\d", reminder_time
+            ):
+                raise ValueError("Время уведомления должно быть в формате HH:MM.")
+            key = (days, reminder_time)
+            if key in seen and not allow_duplicates:
+                raise ValueError(
+                    f"Уведомление за {days} дн. в {reminder_time} уже задано."
+                )
+            seen.add(key)
+            reminder_id = reminder.get("id")
+            if reminder_id is not None and (
+                isinstance(reminder_id, bool)
+                or not isinstance(reminder_id, int)
+                or reminder_id <= 0
+            ):
+                raise ValueError("Идентификатор уведомления некорректен.")
+            normalized.append(
+                {
+                    "id": reminder_id,
+                    "reminder_days": days,
+                    "reminder_time": reminder_time,
+                }
+            )
+        return normalized
+
+    @staticmethod
+    def _replace_service_reminders(
+        connection: sqlite3.Connection,
+        service_id: str,
+        reminders: list[dict],
+    ) -> None:
+        existing_rows = connection.execute(
+            "SELECT id, reminder_days, reminder_time "
+            "FROM service_reminders WHERE service_id = ?",
+            (service_id,),
+        ).fetchall()
+        existing = {row["id"] for row in existing_rows}
+        requested_ids = {
+            reminder["id"]
+            for reminder in reminders
+            if reminder["id"] is not None
+        }
+        if requested_ids - existing:
+            raise ValueError("Одно из уведомлений устарело; обновите настройки.")
+        removed_ids = existing - requested_ids
+        if removed_ids:
+            requested_by_id = {
+                reminder["id"]: reminder for reminder in reminders
+                if reminder["id"] is not None
+            }
+            for row in existing_rows:
+                if row["id"] not in removed_ids:
+                    continue
+                survivors = [
+                    reminder for reminder in requested_by_id.values()
+                    if reminder["reminder_days"] == row["reminder_days"]
+                    and reminder["reminder_time"] == row["reminder_time"]
+                ]
+                for survivor in survivors:
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO service_reminder_deliveries (
+                            service_id, reminder_id, event_date,
+                            recipient_key, delivered_at
+                        )
+                        SELECT service_id, ?, event_date, recipient_key,
+                               delivered_at
+                        FROM service_reminder_deliveries
+                        WHERE service_id = ? AND reminder_id = ?
+                        """,
+                        (survivor["id"], service_id, row["id"]),
+                    )
+            placeholders = ",".join("?" for _ in removed_ids)
+            connection.execute(
+                "DELETE FROM service_reminder_deliveries "
+                "WHERE service_id = ? AND reminder_id IN "
+                f"({placeholders})",
+                (service_id, *sorted(removed_ids)),
+            )
+            connection.execute(
+                "DELETE FROM service_reminders WHERE service_id = ? "
+                f"AND id IN ({placeholders})",
+                (service_id, *sorted(removed_ids)),
+            )
+        for reminder in reminders:
+            if reminder["id"] is None:
+                connection.execute(
+                    "INSERT INTO service_reminders "
+                    "(service_id, reminder_days, reminder_time) VALUES (?, ?, ?)",
+                    (
+                        service_id,
+                        reminder["reminder_days"],
+                        reminder["reminder_time"],
+                    ),
+                )
+            else:
+                connection.execute(
+                    "UPDATE service_reminders "
+                    "SET reminder_days = ?, reminder_time = ? "
+                    "WHERE service_id = ? AND id = ?",
+                    (
+                        reminder["reminder_days"],
+                        reminder["reminder_time"],
+                        service_id,
+                        reminder["id"],
+                    ),
+                )
 
     def set_responsible_contact(
         self,

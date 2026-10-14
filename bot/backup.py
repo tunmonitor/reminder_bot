@@ -11,10 +11,11 @@ import shutil
 import sqlite3
 import stat
 import tempfile
+import re
 from contextlib import closing
 from datetime import datetime, time, timedelta
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Coroutine
 from zoneinfo import ZoneInfo
 
 from .config import service_registry_path
@@ -24,6 +25,79 @@ from .excel_parser import parse_people, parse_schedule
 BACKUP_MOUNT = Path("/mnt/external_data")
 BACKUP_BASE = BACKUP_MOUNT / "reminder_bot" / "backups"
 SNAPSHOT_FORMAT_VERSION = 1
+BOT_PID_FILENAME = "reminder_bot_bot.pid"
+
+
+def assert_bot_stopped(project_dir: Path, shm_dir: Path) -> None:
+    """Refuse restoration when the managed bot or a legacy bot is running."""
+    pid_path = shm_dir / BOT_PID_FILENAME
+    if pid_path.exists() or pid_path.is_symlink():
+        if not _is_regular_private_file(pid_path):
+            raise RuntimeError(f"PID-файл бота небезопасен: {pid_path}")
+        try:
+            pid_contents = pid_path.read_text("ascii")
+        except (OSError, UnicodeError) as exc:
+            raise RuntimeError(f"Не удалось безопасно прочитать PID-файл: {pid_path}") from exc
+        match = re.fullmatch(r"([1-9][0-9]*):([0-9]+)", pid_contents)
+        if match is None:
+            raise RuntimeError(f"PID-файл бота имеет неверный формат: {pid_path}")
+        pid, starttime = match.groups()
+        proc_stat = Path("/proc") / pid / "stat"
+        try:
+            actual_starttime = proc_stat.read_text("ascii").rsplit(")", 1)[1].split()[19]
+        except FileNotFoundError:
+            actual_starttime = None
+        except (OSError, UnicodeError, IndexError) as exc:
+            raise RuntimeError(
+                f"Не удалось проверить процесс из PID-файла (PID {pid})"
+            ) from exc
+        if actual_starttime == starttime:
+            raise RuntimeError(
+                f"Бот ещё работает (PID {pid}); остановите его перед восстановлением"
+            )
+
+    proc_root = Path("/proc")
+    try:
+        entries = tuple(proc_root.iterdir())
+    except OSError as exc:
+        raise RuntimeError("Не удалось проверить запущенные процессы бота") from exc
+    expected_script = (project_dir / "reminder_bot.py").resolve()
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            executable = (entry / "exe").resolve().name
+            if not executable.startswith("python"):
+                continue
+            argv = (entry / "cmdline").read_bytes().decode(
+                "utf-8", errors="replace"
+            ).split("\0")
+            argv = [value for value in argv if value]
+            cwd = (entry / "cwd").resolve()
+        except (OSError, PermissionError):
+            continue
+        module_bot = any(
+            argv[index:index + 2] == ["-m", "bot.reminder_bot"]
+            for index in range(max(0, len(argv) - 1))
+        )
+        script_bot = False
+        for value in argv[1:]:
+            candidate = Path(value)
+            if candidate.name != "reminder_bot.py":
+                continue
+            if not candidate.is_absolute():
+                candidate = cwd / candidate
+            try:
+                script_bot = candidate.resolve() == expected_script
+            except OSError:
+                script_bot = False
+            if script_bot:
+                break
+        if (module_bot and cwd == project_dir.resolve()) or script_bot:
+            raise RuntimeError(
+                f"Обнаружен работающий процесс бота (PID {entry.name}); "
+                "остановите его перед восстановлением"
+            )
 
 
 def _is_regular_private_file(path: Path) -> bool:
@@ -134,6 +208,7 @@ class BackupManager:
         self.registry_path = registry_path or service_registry_path()
         self._debounce_handle: asyncio.TimerHandle | None = None
         self._backup_lock = asyncio.Lock()
+        self._tasks: set[asyncio.Task] = set()
         self._failure_callback: Callable[[str], Awaitable[None]] | None = None
 
     def set_failure_callback(
@@ -155,8 +230,33 @@ class BackupManager:
             self._debounce_handle.cancel()
         self._debounce_handle = loop.call_later(
             self.debounce_seconds,
-            lambda: asyncio.create_task(self._run_background_backup("изменение данных")),
+            self._start_background_backup,
         )
+
+    def start_background_backup(self, reason: str) -> asyncio.Task:
+        return self.start_task(
+            self._run_background_backup(reason),
+            name=f"reminder-bot-backup-{reason}",
+        )
+
+    def start_task(
+        self, coroutine: Coroutine[Any, Any, Any], *, name: str
+    ) -> asyncio.Task:
+        task = asyncio.create_task(coroutine, name=name)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    def _start_background_backup(self) -> None:
+        self._debounce_handle = None
+        self.start_background_backup("изменение данных")
+
+    async def close(self) -> None:
+        if self._debounce_handle is not None:
+            self._debounce_handle.cancel()
+            self._debounce_handle = None
+        if self._tasks:
+            await asyncio.gather(*tuple(self._tasks), return_exceptions=True)
 
     async def create_snapshot(self, reason: str) -> Path:
         async with self._backup_lock:
@@ -238,11 +338,12 @@ class BackupManager:
 
             shutil.copyfile(xlsx_path, stage / "schedule.xlsx", follow_symlinks=False)
             os.chmod(stage / "schedule.xlsx", 0o600)
-            target_date, schedule_data, contacts = self._parse_schedule(xlsx_path)
+            staged_xlsx = stage / "schedule.xlsx"
+            target_date, schedule_data, contacts = self._parse_schedule(staged_xlsx)
             schedule_json = {
                 "format_version": SNAPSHOT_FORMAT_VERSION,
                 "processed_at": datetime.now(self.timezone).isoformat(),
-                "source_sha256": _sha256(xlsx_path),
+                "source_sha256": _sha256(staged_xlsx),
                 "target_date": target_date.isoformat(),
                 "processed_month": target_date.month,
                 "processed_year": target_date.year,
@@ -381,6 +482,7 @@ class BackupManager:
         return manifest
 
     def restore_snapshot(self, snapshot: Path) -> None:
+        assert_bot_stopped(Path(__file__).resolve().parent.parent, self.shm_dir)
         self._require_external_mount()
         if snapshot.is_symlink():
             raise ValueError("Каталог снимка не может быть символической ссылкой")

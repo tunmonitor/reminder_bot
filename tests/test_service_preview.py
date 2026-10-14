@@ -66,9 +66,12 @@ class ServicePreviewTest(unittest.TestCase):
             preview = asyncio.run(run())
 
             self.assertIn("Звук", preview["group_text"])
-            self.assertIn("Микшер: Алексей", preview["group_text"])
-            self.assertIn("ID 12345, @alex", preview["group_text"])
-            self.assertIn("Мария (Telegram не привязан)", preview["group_text"])
+            self.assertIn("├ Микшер 🎚️\n├ Алексей (@alex)", preview["group_text"])
+            self.assertNotIn("12345", preview["group_text"])
+            self.assertIn("├ Мария (Telegram не привязан)", preview["group_text"])
+            self.assertIn("{task_assignments}", preview["example_group_template"])
+            self.assertIn("Алексей (@alex)", preview["example_group_text"])
+            self.assertNotIn("12345", preview["example_group_text"])
             self.assertEqual(len(preview["personal_messages"]), 3)
             alex_message = preview["personal_messages"][0]
             self.assertEqual(alex_message["telegram_id"], "12345")
@@ -205,7 +208,8 @@ class ServicePreviewTest(unittest.TestCase):
 
             previews = asyncio.run(run())
             self.assertIn("Новый Звук", previews["group_text"])
-            self.assertIn("Алексей (ID 12345, @alex)", previews["group_text"])
+            self.assertIn("Алексей (@alex)", previews["group_text"])
+            self.assertNotIn("12345", previews["group_text"])
             self.assertEqual(
                 previews["personal_messages"][0]["text"],
                 "Алексей (12345, @alex)",

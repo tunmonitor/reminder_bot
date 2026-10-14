@@ -6,7 +6,7 @@ import asyncio
 import logging
 from pathlib import Path
 
-from .backup import BackupManager, environment_name
+from .backup import BackupManager, assert_bot_stopped, environment_name
 from .config import PROJECT_DIR, load_timezone
 
 
@@ -37,6 +37,7 @@ def main(argv=None) -> int:
         return 0
     if args.snapshot is None:
         raise ValueError("Для восстановления укажите --snapshot")
+    assert_bot_stopped(PROJECT_DIR, args.shm_dir)
     manager.restore_snapshot(args.snapshot)
     print(f"Данные восстановлены из {args.snapshot}")
     return 0

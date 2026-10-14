@@ -12,6 +12,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -122,6 +123,7 @@ def service_registry_path() -> Path:
 class WebAppConfig:
     host: str
     port: int
+    public_url: str | None = None
 
 
 def load_webapp_config(
@@ -145,7 +147,33 @@ def load_webapp_config(
         raise RuntimeError(
             "webapp_config.json: поле 'port' должно быть целым числом от 1 до 65535"
         )
-    return WebAppConfig(host=host.strip(), port=port)
+    public_url = data.get("public_url")
+    if public_url is not None:
+        if not isinstance(public_url, str) or not public_url.strip():
+            raise RuntimeError(
+                "webapp_config.json: поле 'public_url' должно быть непустой HTTPS-ссылкой"
+            )
+        public_url = public_url.strip()
+        parsed_url = urlsplit(public_url)
+        try:
+            parsed_url.port
+        except ValueError:
+            raise RuntimeError(
+                "webapp_config.json: поле 'public_url' содержит некорректный порт"
+            ) from None
+        if (
+            parsed_url.scheme != "https"
+            or not parsed_url.hostname
+            or any(character.isspace() for character in parsed_url.hostname)
+            or parsed_url.username is not None
+            or parsed_url.password is not None
+            or parsed_url.fragment
+        ):
+            raise RuntimeError(
+                "webapp_config.json: поле 'public_url' должно быть HTTPS-ссылкой "
+                "без учётных данных и fragment"
+            )
+    return WebAppConfig(host=host.strip(), port=port, public_url=public_url)
 
 
 # ----------------------------

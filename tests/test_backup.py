@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 import json
 import logging
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -12,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from openpyxl import Workbook
 
-from bot.backup import BackupManager
+from bot.backup import BackupManager, assert_bot_stopped
 from bot.excel_parser import _MONTH_SHEETS
 
 
@@ -97,6 +99,32 @@ class BackupManagerTest(unittest.TestCase):
         self.assertEqual(data["assignments"]["Ответственный"], "Алексей")
         self.assertEqual(data["contacts"]["Ответственный"]["Алексей"]["telegram_id"], 101)
 
+    def test_snapshot_parses_and_hashes_the_staged_workbook(self):
+        from datetime import date
+        from unittest.mock import patch
+
+        observed_paths = []
+        parsed_workbook_bytes = []
+
+        def parse_staged(path):
+            observed_paths.append(path)
+            parsed_workbook_bytes.append(path.read_bytes())
+            self.xlsx.write_bytes(b"live workbook changed during snapshot")
+            return date(2030, 1, 6), {"Ответственный": "Алексей"}, {}
+
+        with patch.object(self.manager, "_parse_schedule", side_effect=parse_staged):
+            snapshot = asyncio.run(self.manager.create_snapshot("race test"))
+        workbook = snapshot / "schedule.xlsx"
+        schedule = json.loads((snapshot / "schedule.json").read_text("utf-8"))
+        self.assertEqual(len(observed_paths), 1)
+        self.assertEqual(observed_paths[0].name, "schedule.xlsx")
+        self.assertEqual(parsed_workbook_bytes, [workbook.read_bytes()])
+        self.assertEqual(
+            schedule["source_sha256"],
+            hashlib.sha256(workbook.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(self.xlsx.read_bytes(), b"live workbook changed during snapshot")
+
     def test_restore_replaces_database_schedule_and_state(self):
         snapshot = asyncio.run(self.manager.create_snapshot("test"))
         with closing(sqlite3.connect(self.database)) as connection:
@@ -172,6 +200,71 @@ class BackupDebounceTest(unittest.IsolatedAsyncioTestCase):
             manager.mark_dirty()
             await asyncio.sleep(0.04)
             self.assertEqual(manager._run_background_backup.await_count, 1)
+
+    async def test_close_cancels_debounce_and_waits_for_started_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = BackupManager(
+                "test",
+                Path(tmp) / "shm",
+                ZoneInfo("Europe/Moscow"),
+                logging.getLogger("test.backup.close"),
+                backup_base=Path(tmp) / "backups",
+                mount_point=Path(tmp),
+                require_mount=False,
+                debounce_seconds=60,
+            )
+            manager._run_background_backup = AsyncMock()
+            manager.mark_dirty()
+            handle = manager._debounce_handle
+            task = manager.start_background_backup("active")
+            await manager.close()
+            self.assertTrue(handle.cancelled())
+            manager._run_background_backup.assert_awaited_once_with("active")
+            self.assertTrue(task.done())
+
+
+class RestoreProcessGuardTest(unittest.TestCase):
+    def test_rejects_malformed_pid_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shm = root / "shm"
+            shm.mkdir(mode=0o700)
+            pid_file = shm / "reminder_bot_bot.pid"
+            pid_file.write_text("not-a-pid", "ascii")
+            pid_file.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeError, "неверный формат"):
+                assert_bot_stopped(root, shm)
+
+    def test_rejects_unsafe_pid_file_permissions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shm = root / "shm"
+            shm.mkdir(mode=0o700)
+            pid_file = shm / "reminder_bot_bot.pid"
+            pid_file.write_text("999999999:1", "ascii")
+            pid_file.chmod(0o644)
+            with self.assertRaisesRegex(RuntimeError, "небезопасен"):
+                assert_bot_stopped(root, shm)
+
+    def test_rejects_pid_file_for_live_process(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shm = root / "shm"
+            shm.mkdir(mode=0o700)
+            stat_fields = (
+                Path("/proc/self/stat")
+                .read_text("ascii")
+                .rsplit(")", 1)[1]
+                .split()
+            )
+            pid_file = shm / "reminder_bot_bot.pid"
+            pid_file.write_text(
+                f"{os.getpid()}:{stat_fields[19]}",
+                "ascii",
+            )
+            pid_file.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeError, "ещё работает"):
+                assert_bot_stopped(root, shm)
 
 
 if __name__ == "__main__":

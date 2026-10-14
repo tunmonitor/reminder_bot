@@ -125,6 +125,58 @@ class PartialNotificationTest(unittest.TestCase):
 
         asyncio.run(send())
 
+    def test_long_personal_message_is_rejected_with_admin_warning(self):
+        async def send():
+            bot = SimpleNamespace(
+                send_message=AsyncMock(
+                    side_effect=[
+                        SimpleNamespace(message_id=10),
+                        SimpleNamespace(message_id=11, chat=SimpleNamespace(id=67890)),
+                    ]
+                )
+            )
+            assignments = {
+                "Ответственный": {
+                    "name": "😀" * 2100,
+                    "username": "alex",
+                    "tg_id": 12345,
+                }
+            }
+            state = {
+                "participants": {
+                    "Ответственный": {
+                        "message_id": None,
+                        "chat_id": None,
+                    }
+                }
+            }
+            templates = {
+                "general": "Ответственный: @{tg_responsible}",
+                "roles": {"Ответственный": "{name}"},
+            }
+            with patch("bot.notifier.asyncio.sleep", new=AsyncMock()):
+                await send_assignments(
+                    bot=bot,
+                    group_chat_id=-100,
+                    admin_id=67890,
+                    assignments=assignments,
+                    state=state,
+                    templates=templates,
+                    sunday_str="11.10.2026",
+                    sunday_iso="2026-10-11",
+                    interaction_logger=MagicMock(),
+                    debug_logger=MagicMock(),
+                )
+            self.assertEqual(bot.send_message.await_count, 2)
+            self.assertEqual(bot.send_message.await_args_list[1].args[0], 67890)
+            self.assertIn(
+                "не отправлено",
+                bot.send_message.await_args_list[1].args[1],
+            )
+            self.assertFalse(state["participants"]["Ответственный"].get("delivered"))
+
+        asyncio.run(send())
+
     def test_failed_personal_delivery_retries_without_resending_successes(self):
         from aiogram.exceptions import TelegramAPIError
 

@@ -15,7 +15,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand
+from aiogram.types import BotCommand, MenuButtonWebApp, WebAppInfo
 
 if __package__:
     from .cli import CliArgs
@@ -25,6 +25,7 @@ if __package__:
         load_credentials,
         load_schedule,
         load_templates,
+        load_webapp_config,
         service_registry_path,
     )
     from .excel_parser import (
@@ -37,13 +38,16 @@ if __package__:
     from .handlers import register
     from .logger import setup_loggers
     from .notifier import (
+        TELEGRAM_TEXT_LIMIT,
         _notify_admin,
+        _utf16_length,
         build_general_message,
         build_personal_message,
         send_assignments,
     )
+    from .presentation import format_task_assignments
     from .secure_fs import open_private_directory
-    from .scheduler import build_scheduler
+    from .scheduler import add_service_reminder_jobs, build_scheduler
     from .service_registry import ServiceRegistry
     from .state import StateCache
     from .yandex_disk import download_public
@@ -56,6 +60,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         load_credentials,
         load_schedule,
         load_templates,
+        load_webapp_config,
         service_registry_path,
     )
     from bot.excel_parser import (
@@ -68,13 +73,16 @@ else:  # pragma: no cover - поддержка запуска файла нап�
     from bot.handlers import register
     from bot.logger import setup_loggers
     from bot.notifier import (
+        TELEGRAM_TEXT_LIMIT,
         _notify_admin,
+        _utf16_length,
         build_general_message,
         build_personal_message,
         send_assignments,
     )
+    from bot.presentation import format_task_assignments
     from bot.secure_fs import open_private_directory
-    from bot.scheduler import build_scheduler
+    from bot.scheduler import add_service_reminder_jobs, build_scheduler
     from bot.service_registry import ServiceRegistry
     from bot.state import StateCache
     from bot.yandex_disk import download_public
@@ -161,6 +169,31 @@ def _remove_pid_if_owned(path: Path) -> None:
         os.unlink(path.name, dir_fd=directory_fd)
     finally:
         os.close(directory_fd)
+
+
+async def _configure_webapp_menu(bot: Bot, project_dir: Path, logger) -> None:
+    config_candidates = (
+        project_dir / "reminder_bot_webapp_config.json",
+        project_dir / "webapp_config.json",
+    )
+    if not any(path.is_file() for path in config_candidates):
+        return
+    try:
+        config = load_webapp_config(project_dir)
+    except (OSError, RuntimeError, ValueError):
+        logger.exception("Не удалось загрузить конфигурацию Telegram Web App")
+        return
+    if config.public_url is None:
+        return
+    try:
+        await bot.set_chat_menu_button(
+            menu_button=MenuButtonWebApp(
+                text="Открыть приложение",
+                web_app=WebAppInfo(url=config.public_url),
+            )
+        )
+    except TelegramAPIError:
+        logger.exception("Не удалось настроить кнопку Telegram Web App")
 
 
 def _existing_pid_process_status(path: Path) -> tuple[str, bool] | None:
@@ -358,7 +391,9 @@ async def _load_service_task_assignments(
     service_id: str,
     debug_logger,
     only_date: date | None = None,
-) -> dict[str, list[str]]:
+    *,
+    return_event_found: bool = False,
+) -> dict[str, list[str]] | tuple[dict[str, list[str]], bool]:
     sunday_date = only_date or _next_sunday_in_tz(tz)
     debug_dir = shm_dir / "debug"
     directory_fd = open_private_directory(debug_dir, create=True)
@@ -382,18 +417,25 @@ async def _load_service_task_assignments(
         events_by_service = parse_service_events(
             xlsx_path, sunday_date, debug_logger
         )
+        service_events = events_by_service.get(service_id, [])
+        event_found = any(
+            event.event_date == sunday_date for event in service_events
+        )
         assignments: dict[str, set[str]] = {}
-        for event in events_by_service.get(service_id, []):
+        for event in service_events:
             if only_date is not None and event.event_date != only_date:
                 continue
             for assignment in event.assignments:
                 assignments.setdefault(assignment.task, set()).add(
                     assignment.name
                 )
-        return {
+        result = {
             task: sorted(names)
             for task, names in sorted(assignments.items())
         }
+        if return_event_found:
+            return result, event_found
+        return result
     finally:
         xlsx_path.unlink(missing_ok=True)
 
@@ -401,6 +443,247 @@ async def _load_service_task_assignments(
 class _TemplateValues(dict):
     def __missing__(self, key: str) -> str:
         return "{" + key + "}"
+
+
+async def _process_service_reminder(
+    bot: Bot,
+    credentials,
+    shm_dir: Path,
+    tz,
+    registry: ServiceRegistry,
+    service_id: str,
+    reminder: dict,
+    interaction_logger,
+    debug_logger,
+) -> None:
+    service = registry.get_service(service_id)
+    if service is None or not service["enabled"]:
+        return
+    event_date = datetime.now(tz).date() + timedelta(
+        days=reminder["reminder_days"]
+    )
+    try:
+        assignments, event_found = await _load_service_task_assignments(
+            credentials,
+            shm_dir,
+            tz,
+            service_id,
+            debug_logger,
+            only_date=event_date,
+            return_event_found=True,
+        )
+    except Exception as exc:
+        debug_logger.exception(
+            "Не удалось подготовить уведомление служения %s на %s",
+            service_id,
+            event_date,
+        )
+        await _notify_admin(
+            bot,
+            credentials.admin_tg_id,
+            f"Не удалось подготовить уведомление «{service['name']}» "
+            f"на {event_date:%d.%m.%Y}: {type(exc).__name__}: {exc}",
+            debug_logger,
+        )
+        return
+    if not event_found:
+        interaction_logger.info(
+            "Уведомление служения %s пропущено: событие на %s не найдено",
+            service_id,
+            event_date,
+        )
+        return
+
+    try:
+        contacts = registry.list_responsible_contacts(
+            credentials.admin_tg_id, service_id
+        )
+    except Exception as exc:
+        debug_logger.exception(
+            "Не удалось загрузить контакты служения %s", service_id
+        )
+        await _notify_admin(
+            bot,
+            credentials.admin_tg_id,
+            f"Не удалось загрузить контакты служения «{service['name']}»: "
+            f"{type(exc).__name__}: {exc}",
+            debug_logger,
+        )
+        return
+    contacts_by_name = {
+        (contact["task"], contact["name"]): contact for contact in contacts
+    }
+    date_text = event_date.strftime("%d.%m.%Y")
+    assignment_text = format_task_assignments(
+        assignments, contacts_by_name, mark_unlinked=True
+    )
+    group_template = service["group_template"] or (
+        "Напоминание о служении «{service_name}» в воскресенье "
+        "{sunday_date}:\n{task_assignments}"
+    )
+    try:
+        group_text = group_template.format_map(
+            _TemplateValues(
+                service_name=service["name"],
+                sunday_date=date_text,
+                task_assignments=assignment_text,
+            )
+        )
+    except (AttributeError, IndexError, KeyError, ValueError) as exc:
+        await _notify_admin(
+            bot,
+            credentials.admin_tg_id,
+            f"Некорректный групповой шаблон служения «{service['name']}»: "
+            f"{type(exc).__name__}",
+            debug_logger,
+        )
+        return
+
+    if not assignments:
+        await _notify_admin(
+            bot,
+            credentials.admin_tg_id,
+            f"В графике найдено служение «{service['name']}» на "
+            f"{date_text}, но задачи не назначены.",
+            debug_logger,
+        )
+
+    group_chat_id = service["group_chat_id"]
+    group_recipient = f"group:{group_chat_id}"
+    if group_chat_id is None:
+        await _notify_admin(
+            bot,
+            credentials.admin_tg_id,
+            f"Для служения «{service['name']}» не задан групповой чат.",
+            debug_logger,
+        )
+    elif not registry.is_service_reminder_delivered(
+        service_id, reminder["id"], event_date.isoformat(), group_recipient
+    ):
+        if _utf16_length(group_text) > TELEGRAM_TEXT_LIMIT:
+            await _notify_admin(
+                bot,
+                credentials.admin_tg_id,
+                f"Групповое уведомление «{service['name']}» на {date_text} "
+                "превышает ограничение Telegram и не отправлено.",
+                debug_logger,
+            )
+        else:
+            try:
+                await bot.send_message(
+                    group_chat_id, group_text, parse_mode=None
+                )
+            except Exception as exc:
+                debug_logger.exception(
+                    "Не удалось отправить групповое уведомление %s на %s",
+                    service_id,
+                    event_date,
+                )
+                await _notify_admin(
+                    bot,
+                    credentials.admin_tg_id,
+                    f"Не удалось отправить групповое уведомление "
+                    f"«{service['name']}» на {date_text}: "
+                    f"{type(exc).__name__}.",
+                    debug_logger,
+                )
+            else:
+                registry.mark_service_reminder_delivered(
+                    service_id,
+                    reminder["id"],
+                    event_date.isoformat(),
+                    group_recipient,
+                )
+                interaction_logger.info(
+                    "Групповое уведомление служения %s отправлено на %s",
+                    service_id,
+                    event_date,
+                )
+
+    for task, names in assignments.items():
+        for name in names:
+            contact = contacts_by_name.get((task, name))
+            if contact is None:
+                await _notify_admin(
+                    bot,
+                    credentials.admin_tg_id,
+                    f"Не привязан Telegram для ответственного «{name}» "
+                    f"(задача «{task}», служение «{service['name']}», "
+                    f"{date_text}); личное уведомление пропущено.",
+                    debug_logger,
+                )
+                continue
+            telegram_id = contact["telegram_id"]
+            recipient = f"personal:{task}:{telegram_id}"
+            if registry.is_service_reminder_delivered(
+                service_id, reminder["id"], event_date.isoformat(), recipient
+            ):
+                continue
+            template = service["personal_templates"].get(
+                task,
+                "{name}, вы назначены на задачу «{task}» службы "
+                "«{service_name}» на {sunday_date}.",
+            )
+            try:
+                personal_text = template.format_map(
+                    _TemplateValues(
+                        name=name,
+                        task=task,
+                        service_name=service["name"],
+                        sunday_date=date_text,
+                        telegram_id=str(telegram_id),
+                        username=contact["username"],
+                    )
+                )
+            except (AttributeError, IndexError, KeyError, ValueError) as exc:
+                await _notify_admin(
+                    bot,
+                    credentials.admin_tg_id,
+                    f"Некорректный личный шаблон задачи «{task}» "
+                    f"служения «{service['name']}»: {type(exc).__name__}.",
+                    debug_logger,
+                )
+                continue
+            if not personal_text.startswith("🔔"):
+                personal_text = f"🔔 {personal_text}"
+            if _utf16_length(personal_text) > TELEGRAM_TEXT_LIMIT:
+                await _notify_admin(
+                    bot,
+                    credentials.admin_tg_id,
+                    f"Личное уведомление «{service['name']}» для {name} "
+                    f"на {date_text} превышает ограничение Telegram.",
+                    debug_logger,
+                )
+                continue
+            try:
+                await bot.send_message(
+                    telegram_id, personal_text, parse_mode=None
+                )
+            except Exception as exc:
+                debug_logger.exception(
+                    "Не удалось отправить личное уведомление %s, задача %s",
+                    service_id,
+                    task,
+                )
+                await _notify_admin(
+                    bot,
+                    credentials.admin_tg_id,
+                    f"Не удалось отправить личное уведомление «{service['name']}» "
+                    f"для {name} на {date_text}: {type(exc).__name__}.",
+                    debug_logger,
+                )
+            else:
+                registry.mark_service_reminder_delivered(
+                    service_id,
+                    reminder["id"],
+                    event_date.isoformat(),
+                    recipient,
+                )
+                interaction_logger.info(
+                    "Личное уведомление служения %s для задачи %s отправлено",
+                    service_id,
+                    task,
+                )
 
 
 async def _prepare_service_test_previews(
@@ -431,7 +714,7 @@ async def _prepare_service_test_previews(
     contacts_by_name = {
         (contact["task"], contact["name"]): contact for contact in contacts
     }
-    rendered_assignments = []
+    rendered_assignment_names: dict[str, list[str]] = {}
     personal_messages = []
     issues = []
     sunday_str = sunday_date.strftime("%d.%m.%Y")
@@ -441,11 +724,10 @@ async def _prepare_service_test_previews(
         else personal_templates
     )
     for task, names in assignments.items():
-        rendered_names = []
         for name in names:
             contact = contacts_by_name.get((task, name))
             if contact is None:
-                rendered_names.append(f"{name} (Telegram не привязан)")
+                rendered_assignment_names.setdefault(task, []).append(name)
                 issues.append(
                     f"Не привязан Telegram-пользователь: {task} — {name}"
                 )
@@ -454,11 +736,7 @@ async def _prepare_service_test_previews(
             else:
                 username = contact["username"]
                 telegram_id = str(contact["telegram_id"])
-                rendered_names.append(
-                    f"{name} (ID {telegram_id}"
-                    + (f", @{username}" if username else "")
-                    + ")"
-                )
+                rendered_assignment_names.setdefault(task, []).append(name)
             template = templates.get(
                 task,
                 "{name}, вы назначены на задачу «{task}» службы "
@@ -488,12 +766,13 @@ async def _prepare_service_test_previews(
                     "text": personal_text,
                 }
             )
-        rendered_assignments.append(
-            f"• {task}: " + (", ".join(rendered_names) or "ответственные не указаны")
-        )
     if not assignments:
         issues.append("В актуальном графике для службы нет назначенных задач.")
-    assignment_text = "\n".join(rendered_assignments) or "Задачи не найдены."
+    assignment_text = format_task_assignments(
+        rendered_assignment_names,
+        contacts_by_name,
+        mark_unlinked=True,
+    )
     effective_group_template = (
         service["group_template"]
         if group_template is None
@@ -513,9 +792,22 @@ async def _prepare_service_test_previews(
         raise ValueError(
             f"Некорректный групповой шаблон служения «{service['name']}»"
         ) from exc
+    example_group_template = (
+        "Напоминание о служении «{service_name}» в воскресенье "
+        "{sunday_date}:\n{task_assignments}"
+    )
+    example_group_text = example_group_template.format_map(
+        _TemplateValues(
+            service_name=service["name"],
+            sunday_date=sunday_str,
+            task_assignments=assignment_text,
+        )
+    )
     return {
         "sunday_date": sunday_date,
         "group_text": group_text,
+        "example_group_template": example_group_template,
+        "example_group_text": example_group_text,
         "personal_messages": personal_messages,
         "issues": issues,
     }
@@ -705,7 +997,7 @@ async def run(args: CliArgs) -> None:
             "продолжаем запуск существующих напоминаний без него"
         )
         service_registry = None
-    jobs = load_schedule()
+    jobs = load_schedule() if service_registry is None else []
     pid_file = _pid_path(shm_dir)
     bot = None
     scheduler = None
@@ -823,28 +1115,31 @@ async def run(args: CliArgs) -> None:
                 )
 
             backup_manager.set_failure_callback(notify_backup_failure)
-            try:
-                current_schedule = shm_dir / "reminder_bot_current.xlsx"
-                if not current_schedule.is_file():
-                    await download_public(
-                        credentials.yandex_public_url,
-                        current_schedule,
-                        debug_logger,
-                        attempts=1,
-                        interval=0,
-                        on_change=backup_manager.mark_dirty,
+
+            async def create_startup_backup() -> None:
+                try:
+                    current_schedule = shm_dir / "reminder_bot_current.xlsx"
+                    if not current_schedule.is_file():
+                        await download_public(
+                            credentials.yandex_public_url,
+                            current_schedule,
+                            debug_logger,
+                            attempts=1,
+                            interval=0,
+                            on_change=backup_manager.mark_dirty,
+                        )
+                    await backup_manager.create_snapshot("запуск экземпляра")
+                except Exception as exc:
+                    debug_logger.exception(
+                        "Не удалось создать резервную копию при запуске"
                     )
-                await backup_manager.create_snapshot("запуск экземпляра")
-            except Exception as exc:
-                debug_logger.exception("Не удалось создать резервную копию при запуске")
-                await notify_backup_failure(
-                    "Не удалось создать резервную копию при запуске: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-            nightly_backup_task = asyncio.create_task(
-                backup_manager.run_nightly(),
-                name="reminder-bot-nightly-backup",
-            )
+                    await notify_backup_failure(
+                        "Не удалось создать резервную копию при запуске: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
+        else:
+            create_startup_backup = None
 
         async def scheduled_job() -> None:
             task = asyncio.current_task()
@@ -873,6 +1168,53 @@ async def run(args: CliArgs) -> None:
             callback=scheduled_job,
             debug_logger=debug_logger,
         )
+        if service_registry is not None:
+            async def scheduled_service_reminder(
+                service_id: str, reminder: dict
+            ) -> None:
+                task = asyncio.current_task()
+                if task is not None:
+                    active_jobs.add(task)
+                try:
+                    await _process_service_reminder(
+                        bot,
+                        credentials,
+                        shm_dir,
+                        tz,
+                        service_registry,
+                        service_id,
+                        reminder,
+                        interaction_logger,
+                        debug_logger,
+                    )
+                except Exception:
+                    debug_logger.exception(
+                        "Ошибка обработки напоминания служения %s",
+                        service_id,
+                    )
+                    await _notify_admin(
+                        bot,
+                        credentials.admin_tg_id,
+                        f"Ошибка обработки напоминания служения "
+                        f"«{service_id}». Подробности записаны в журнал.",
+                        debug_logger,
+                    )
+                finally:
+                    if task is not None:
+                        active_jobs.discard(task)
+
+            def refresh_service_reminders() -> None:
+                if service_registry is None or scheduler is None:
+                    return
+                add_service_reminder_jobs(
+                    scheduler,
+                    service_registry.list_services(),
+                    scheduled_service_reminder,
+                    tz,
+                    debug_logger,
+                )
+
+            context.refresh_service_reminder_jobs = refresh_service_reminders
 
         try:
             _write_pid(pid_file)
@@ -895,7 +1237,20 @@ async def run(args: CliArgs) -> None:
             debug_logger.error(message)
             raise FileExistsError(message) from exc
 
+        if service_registry is not None:
+            refresh_service_reminders()
         scheduler.start()
+        await _configure_webapp_menu(bot, PROJECT_DIR, debug_logger)
+        if backup_manager is not None:
+            if create_startup_backup is not None:
+                backup_manager.start_task(
+                    create_startup_backup(),
+                    name="reminder-bot-startup-backup",
+                )
+            nightly_backup_task = asyncio.create_task(
+                backup_manager.run_nightly(),
+                name="reminder-bot-nightly-backup",
+            )
         await dp.start_polling(bot, close_bot_session=False)
     finally:
         if nightly_backup_task is not None:
@@ -916,11 +1271,15 @@ async def run(args: CliArgs) -> None:
                 scheduler.shutdown(wait=False)
         finally:
             try:
-                if bot is not None:
-                    await bot.session.close()
+                if backup_manager is not None:
+                    await backup_manager.close()
             finally:
-                if pid_created:
-                    _remove_pid_if_owned(pid_file)
+                try:
+                    if bot is not None:
+                        await bot.session.close()
+                finally:
+                    if pid_created:
+                        _remove_pid_if_owned(pid_file)
 
 
 __all__ = ["run"]

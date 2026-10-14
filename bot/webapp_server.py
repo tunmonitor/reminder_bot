@@ -24,11 +24,15 @@ class _WebAppHandler(SimpleHTTPRequestHandler):
         relative = unquote(urlsplit(path).path).lstrip("/")
         if "\x00" in relative or "\\" in relative:
             return str(self._root / ".not-found")
-        candidate = self._root.joinpath(*Path(relative).parts)
+        candidate = self._root / "index.html" if not relative else (
+            self._root.joinpath(*Path(relative).parts)
+        )
         try:
             resolved = candidate.resolve(strict=False)
             resolved.relative_to(self._root)
         except (OSError, ValueError):
+            return str(self._root / ".not-found")
+        if resolved.is_dir():
             return str(self._root / ".not-found")
         return str(resolved)
 
@@ -37,7 +41,26 @@ class _WebAppHandler(SimpleHTTPRequestHandler):
         return None
 
     def log_message(self, fmt, *args):
-        self._logger.info("%s %s", self.command, urlsplit(self.path).path)
+        status = next(
+            (str(value) for value in args if str(value).isdigit() and len(str(value)) == 3),
+            "unknown",
+        )
+        self._logger.info(
+            "%s %s %s", self.command, urlsplit(self.path).path, status
+        )
+
+    def log_error(self, fmt, *args):
+        status = next(
+            (str(value) for value in args if str(value).isdigit() and len(str(value)) == 3),
+            "unknown",
+        )
+        self._logger.warning(
+            "%s %s %s: %s",
+            getattr(self, "command", "?"),
+            urlsplit(getattr(self, "path", "")).path,
+            status,
+            fmt % args if args else fmt,
+        )
 
 
 def _parse_args(argv=None):
@@ -56,7 +79,8 @@ def main(argv=None) -> int:
     if not root.is_dir() or root.is_symlink():
         raise RuntimeError(f"Каталог Web App отсутствует или небезопасен: {root}")
     root = root.resolve(strict=True)
-    if not (root / "index.html").is_file():
+    index_path = root / "index.html"
+    if index_path.is_symlink() or not index_path.is_file():
         raise RuntimeError(f"Не найдена входная страница Web App: {root / 'index.html'}")
     if args.check:
         return 0

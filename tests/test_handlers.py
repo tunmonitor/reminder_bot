@@ -2,6 +2,7 @@ import asyncio
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -767,14 +768,16 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             menu = service_callback.message.answer.await_args.kwargs[
                 "reply_markup"
             ]
-            days_button = next(
+            reminders_button = next(
                 button
                 for row in menu.inline_keyboard
                 for button in row
-                if button.callback_data.startswith("notify_edit:days:sound:")
+                if button.callback_data.startswith(
+                    "notify_edit:reminders:sound:"
+                )
             )
             edit_callback = SimpleNamespace(
-                data=days_button.callback_data,
+                data=reminders_button.callback_data,
                 from_user=SimpleNamespace(id=12345),
                 message=SimpleNamespace(
                     chat=SimpleNamespace(type="private"),
@@ -785,14 +788,52 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             await self.callback_handler(
                 "on_notification_setting_edit"
             )(edit_callback)
-            self.assertIn("0 до 6", edit_callback.message.answer.await_args.args[0])
-            controls = edit_callback.message.answer.await_args.kwargs[
+            rules_menu = edit_callback.message.answer.await_args.kwargs[
                 "reply_markup"
             ]
-            self.assertEqual(
-                [button.text for row in controls.inline_keyboard for button in row],
-                ["✅ Завершить и сохранить", "✖️ Отмена"],
+            rule_button = next(
+                button
+                for row in rules_menu.inline_keyboard
+                for button in row
+                if button.callback_data.startswith("notify_rule:edit:sound:")
             )
+            rule_callback = SimpleNamespace(
+                data=rule_button.callback_data,
+                from_user=SimpleNamespace(id=12345),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_notification_rule_action")(
+                rule_callback
+            )
+            edit_rule_menu = rule_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            days_button = next(
+                button
+                for row in edit_rule_menu.inline_keyboard
+                for button in row
+                if button.text.startswith("📅 Дни")
+            )
+            days_callback = SimpleNamespace(
+                data=days_button.callback_data,
+                from_user=SimpleNamespace(id=12345),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_notification_rule_action")(
+                days_callback
+            )
+            self.assertIn("0 до 6", days_callback.message.answer.await_args.args[0])
+            controls = days_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
 
             staged_input = next(
                 item.callback
@@ -850,29 +891,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             retry_menu = retry_service_callback.message.answer.await_args.kwargs[
                 "reply_markup"
             ]
-            time_button = next(
-                button
-                for row in retry_menu.inline_keyboard
-                for button in row
-                if button.callback_data.startswith("notify_edit:time:sound:")
-            )
-            time_callback = SimpleNamespace(
-                data=time_button.callback_data,
-                from_user=SimpleNamespace(id=12345),
-                message=SimpleNamespace(
-                    chat=SimpleNamespace(type="private"),
-                    answer=AsyncMock(),
-                ),
-                answer=AsyncMock(),
-            )
-            await self.callback_handler("on_notification_setting_edit")(
-                time_callback
-            )
             cancel_button = next(
                 button
-                for row in time_callback.message.answer.await_args.kwargs[
-                    "reply_markup"
-                ].inline_keyboard
+                for row in retry_menu.inline_keyboard
                 for button in row
                 if button.text == "✖️ Отмена"
             )
@@ -891,6 +912,94 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             cancelled_service = self.registry.get_service("sound")
             self.assertEqual(cancelled_service["reminder_days"], 3)
             self.assertEqual(cancelled_service["reminder_time"], "17:00")
+
+        asyncio.run(run())
+
+    def test_guided_notification_setup_adds_independent_reminder(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 12345)
+            command = self.message(12345, "/service_notify")
+            await self.admin_router.message.handlers[6].callback(command)
+            selection = SimpleNamespace(
+                data="service:service_notify:sound",
+                from_user=SimpleNamespace(id=12345),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_selected")(selection)
+            main_menu = selection.message.answer.await_args.kwargs["reply_markup"]
+            reminder_button = next(
+                button
+                for row in main_menu.inline_keyboard
+                for button in row
+                if button.text.startswith("⏰ Напоминания")
+            )
+            reminder_menu_callback = SimpleNamespace(
+                data=reminder_button.callback_data,
+                from_user=SimpleNamespace(id=12345),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_notification_setting_edit")(
+                reminder_menu_callback
+            )
+            rules_menu = reminder_menu_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            add_button = next(
+                button
+                for row in rules_menu.inline_keyboard
+                for button in row
+                if button.text == "➕ Добавить уведомление"
+            )
+            add_callback = SimpleNamespace(
+                data=add_button.callback_data,
+                from_user=SimpleNamespace(id=12345),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_notification_rule_action")(
+                add_callback
+            )
+            parameter_handler = next(
+                item.callback
+                for item in self.admin_router.message.handlers
+                if item.callback.__name__ == "on_service_parameter"
+            )
+            await parameter_handler(self.message(12345, "3"))
+            await parameter_handler(self.message(12345, "09:00"))
+
+            session_id = add_callback.data.split(":")[3]
+            finish = SimpleNamespace(
+                data=f"notify_finish:sound:{session_id}",
+                from_user=SimpleNamespace(id=12345),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_notification_setting_finish")(
+                finish
+            )
+
+            reminders = self.registry.get_service("sound")["reminders"]
+            self.assertEqual(
+                sorted(
+                    (item["reminder_days"], item["reminder_time"])
+                    for item in reminders
+                ),
+                [(1, "18:00"), (3, "09:00")],
+            )
 
         asyncio.run(run())
 
@@ -921,7 +1030,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 for row in first_menu.inline_keyboard
                 for button in row
                 if button.text in {
-                    "📅 Дни до события: 1",
+                    "⏰ Напоминания (1)",
                     "✅ Завершить и сохранить",
                     "✖️ Отмена",
                 }
@@ -940,7 +1049,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             for callback_name, old_data in (
                 (
                     "on_notification_setting_edit",
-                    old_buttons["📅 Дни до события: 1"],
+                    old_buttons["⏰ Напоминания (1)"],
                 ),
                 (
                     "on_notification_setting_finish",
@@ -1116,10 +1225,21 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 group_template="Сохранённая группа: {service_name}",
                 personal_templates={"Микшер": "Сохранённый текст {name}"},
             )
+            with closing(sqlite3.connect(self.registry.path)) as connection:
+                connection.execute(
+                    "UPDATE services SET group_template = ? WHERE id = ?",
+                    ("Напоминание: {tg_responsible}", "sound"),
+                )
+                connection.commit()
             self.context.prepare_service_test_previews = AsyncMock(
                 return_value={
                     "sunday_date": date(2026, 10, 11),
                     "group_text": "Пример группы на воскресенье",
+                    "example_group_template": (
+                        "Напоминание о служении «{service_name}» в воскресенье "
+                        "{sunday_date}:\n{task_assignments}"
+                    ),
+                    "example_group_text": "Пример с задачами и ответственными",
                     "personal_messages": [
                         {
                             "task": "Микшер",
@@ -1167,13 +1287,19 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 group_callback
             )
             group_prompt = group_callback.message.answer.await_args.args[0]
-            self.assertIn("Сохранённая группа: {service_name}", group_prompt)
+            self.assertIn("Напоминание: {tg_responsible}", group_prompt)
+            self.assertIn("не подставляются", group_prompt)
+            self.assertIn("Замените их на {task_assignments}", group_prompt)
             self.assertIn("Пример группы на воскресенье", group_prompt)
+            self.assertIn("Пример текста для ввода", group_prompt)
+            self.assertIn("{task_assignments}", group_prompt)
+            self.assertIn("Так будет выглядеть сообщение", group_prompt)
+            self.assertIn("Пример с задачами и ответственными", group_prompt)
             self.assertEqual(
                 self.context.prepare_service_test_previews.await_args.kwargs[
                     "group_template"
                 ],
-                "Сохранённая группа: {service_name}",
+                "Напоминание: {tg_responsible}",
             )
             staged_input = next(
                 item.callback
@@ -1188,7 +1314,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             self.assertEqual(
                 self.registry.get_service("sound")["group_template"],
-                "Сохранённая группа: {service_name}",
+                "Напоминание: {tg_responsible}",
             )
             valid_group = self.message(67890, "Новое {service_name}")
             await staged_input(valid_group)
@@ -1288,7 +1414,11 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             ]
             name_button = name_markup.inline_keyboard[0][0]
             self.assertIn(
-                "уже привязан Telegram ID 11111",
+                "уже привязан",
+                task_callback.message.answer.await_args.args[0],
+            )
+            self.assertNotIn(
+                "11111",
                 task_callback.message.answer.await_args.args[0],
             )
             name_callback = SimpleNamespace(
@@ -1404,7 +1534,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             self.assertIn("Микшер", output)
             self.assertIn("Имя из расписания", output)
-            self.assertIn("ID 11111", output)
+            self.assertNotIn("ID 11111", output)
+            self.assertNotIn("11111", output)
             self.assertIn("График загружен", output)
 
         asyncio.run(run())
@@ -2131,25 +2262,27 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 67890, "sound", 24680, "sound_admin"
             )
             self.registry.set_responsible_contact(
-                67890, "sound", "Ведущий", "Аркадий", 718343838
+                67890, "sound", "Ведущий", "Аркадий", 718343838, "arkady"
             )
             self.registry.set_responsible_contact(
-                67890, "sound", "Ведущий", "Евгений", 306139797
+                67890, "sound", "Ведущий", "Евгений", 306139797, "evgen"
             )
             self.registry.set_responsible_contact(
-                67890, "sound", "Проповедник", "Денис", 801625873
+                67890, "sound", "Проповедник", "Денис", 801625873, "denis"
             )
             message = self.message(67890, "/service_settings sound")
 
             await self.admin_router.message.handlers[1].callback(message)
 
             text = message.answer.await_args.args[0]
-            self.assertIn("👤 Администраторы\n└ 24680 · @sound_admin", text)
+            self.assertIn("👤 Администраторы\n├ @sound_admin", text)
             self.assertIn(
-                "├ Ведущие: Аркадий (ID 718343838), Евгений (ID 306139797)",
+                "├ Ведущий 🎤\n├ Аркадий (@arkady)\n├ Евгений (@evgen)",
                 text,
             )
-            self.assertIn("└ Проповедники: Денис (ID 801625873)", text)
+            self.assertIn("├ Проповедник 📖\n├ Денис (@denis)", text)
+            for user_id in ("24680", "718343838", "306139797", "801625873"):
+                self.assertNotIn(user_id, text)
             self.assertNotIn("Ведущий —", text)
 
         asyncio.run(run())
@@ -2719,7 +2852,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertEqual(
                 self.registry.list_service_admins("assembly"), [24680]
             )
-            self.assertIn(
+            self.assertNotIn(
                 "24680",
                 admin_callback.message.answer.await_args.args[0],
             )
@@ -2759,6 +2892,14 @@ class ServiceManagementHandlerTest(unittest.TestCase):
     def test_settings_message_has_next_action_button(self):
         async def run():
             self.registry.add_service_admin(67890, "sound", 24680)
+            self.registry.set_notification_settings(
+                24680,
+                "sound",
+                reminder_days=1,
+                reminder_time="16:00",
+                group_template="Сохранённый групповой текст",
+                personal_templates={"Микшер": "Сохранённый личный текст"},
+            )
             selection_message = self.message(
                 67890, "/service_settings sound"
             )
@@ -2782,6 +2923,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 "⚙️ ЗВУК",
                 selection_message.answer.await_args.args[0],
             )
+            settings_response = selection_message.answer.await_args.args[0]
+            self.assertIn("Сохранённый групповой текст", settings_response)
+            self.assertIn("Сохранённый личный текст", settings_response)
+            self.assertFalse(settings_response.startswith("✅"))
 
             callback = SimpleNamespace(
                 data=edit_button.callback_data,
@@ -2803,7 +2948,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     button.callback_data
                     for row in menu.inline_keyboard
                     for button in row
-                    if button.text.startswith("📅 Дни до события")
+                    if button.text.startswith("⏰ Напоминания")
                 ),
                 [
                     button.callback_data

@@ -9,6 +9,57 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 
+def add_service_reminder_jobs(
+    scheduler: AsyncIOScheduler,
+    services: list[dict],
+    callback: Callable[[str, dict], Awaitable[None]],
+    tz: ZoneInfo,
+    debug_logger: logging.Logger,
+) -> None:
+    for job in scheduler.get_jobs():
+        if job.id.startswith("service-reminder-"):
+            scheduler.remove_job(job.id)
+    for service in services:
+        reminders_by_schedule = {}
+        for reminder in service["reminders"]:
+            schedule = (
+                reminder["reminder_days"],
+                reminder["reminder_time"],
+            )
+            current = reminders_by_schedule.get(schedule)
+            if current is None or reminder["id"] < current["id"]:
+                reminders_by_schedule[schedule] = reminder
+        for reminder in reminders_by_schedule.values():
+            reminder_id = reminder["id"]
+            trigger = CronTrigger(
+                hour=int(reminder["reminder_time"][:2]),
+                minute=int(reminder["reminder_time"][3:]),
+                timezone=tz,
+            )
+            job_id = f"service-reminder-{service['id']}-{reminder_id}"
+
+            async def run_reminder(
+                selected_service_id=service["id"],
+                selected_reminder=reminder.copy(),
+            ) -> None:
+                await callback(selected_service_id, selected_reminder)
+
+            scheduler.add_job(
+                run_reminder,
+                trigger,
+                id=job_id,
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+            )
+            debug_logger.debug(
+                "Зарегистрировано уведомление служения %s (%s): %s",
+                service["id"],
+                reminder_id,
+                trigger,
+            )
+
+
 def build_scheduler(
     tz: ZoneInfo,
     jobs: list[dict],

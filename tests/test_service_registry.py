@@ -239,6 +239,135 @@ class ServiceRegistryTest(unittest.TestCase):
         self.assertIn("{service_name}", service["group_template"])
         self.assertIn("{telegram_id}", service["personal_templates"]["Микшер"])
 
+    def test_multiple_reminders_keep_ids_and_update_independently(self):
+        current = self.registry.get_service("sound")["reminders"][0]
+        self.registry.set_notification_settings(
+            1001,
+            "sound",
+            reminder_days=3,
+            reminder_time="18:00",
+            group_template=None,
+            personal_templates={},
+            reminders=[
+                {
+                    "id": current["id"],
+                    "reminder_days": 3,
+                    "reminder_time": "18:00",
+                },
+                {"reminder_days": 1, "reminder_time": "09:15"},
+            ],
+        )
+
+        reminders = self.registry.get_service("sound")["reminders"]
+        self.assertEqual(len(reminders), 2)
+        self.assertEqual(
+            next(item["id"] for item in reminders if item["reminder_days"] == 3),
+            current["id"],
+        )
+        self.assertEqual(
+            [(item["reminder_days"], item["reminder_time"]) for item in reminders],
+            [(1, "09:15"), (3, "18:00")],
+        )
+
+    def test_intentionally_empty_reminder_list_stays_empty_after_restart(self):
+        self.registry.set_notification_settings(
+            1001,
+            "sound",
+            reminder_days=1,
+            reminder_time="18:00",
+            group_template=None,
+            personal_templates={},
+            reminders=[],
+        )
+
+        self.registry.initialize(1001, -10001)
+
+        self.assertEqual(
+            self.registry.get_service("sound")["reminders"], []
+        )
+
+    def test_duplicate_reminders_require_confirmation_and_deliver_once(self):
+        current = self.registry.get_service("sound")["reminders"][0]
+        duplicate_rules = [
+            {
+                "id": current["id"],
+                "reminder_days": 2,
+                "reminder_time": "17:30",
+            },
+            {"reminder_days": 2, "reminder_time": "17:30"},
+        ]
+        with self.assertRaisesRegex(ValueError, "уже задано"):
+            self.registry.set_notification_settings(
+                1001,
+                "sound",
+                reminder_days=2,
+                reminder_time="17:30",
+                group_template=None,
+                personal_templates={},
+                reminders=duplicate_rules,
+            )
+
+        self.registry.set_notification_settings(
+            1001,
+            "sound",
+            reminder_days=2,
+            reminder_time="17:30",
+            group_template=None,
+            personal_templates={},
+            reminders=duplicate_rules,
+            allow_duplicate_reminders=True,
+        )
+        reminders = self.registry.get_service("sound")["reminders"]
+        event_date = "2026-10-18"
+        self.registry.mark_service_reminder_delivered(
+            "sound", reminders[0]["id"], event_date, "group:-10001"
+        )
+        self.assertTrue(
+            self.registry.is_service_reminder_delivered(
+                "sound", reminders[1]["id"], event_date, "group:-10001"
+            )
+        )
+
+    def test_legacy_unique_reminder_constraint_is_migrated(self):
+        legacy_path = Path(self.temp_dir.name) / "legacy" / "services.sqlite3"
+        legacy_path.parent.mkdir(mode=0o700)
+        with sqlite3.connect(legacy_path) as connection:
+            connection.execute(
+                """
+                CREATE TABLE service_reminders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    service_id TEXT NOT NULL,
+                    reminder_days INTEGER NOT NULL,
+                    reminder_time TEXT NOT NULL,
+                    UNIQUE(service_id, reminder_days, reminder_time)
+                )
+                """
+            )
+        legacy_path.chmod(0o600)
+        legacy_registry = ServiceRegistry(legacy_path)
+        legacy_registry.initialize(1001, -10001)
+        existing = legacy_registry.get_service("sound")["reminders"][0]
+        legacy_registry.set_notification_settings(
+            1001,
+            "sound",
+            reminder_days=1,
+            reminder_time="18:00",
+            group_template=None,
+            personal_templates={},
+            reminders=[
+                {
+                    "id": existing["id"],
+                    "reminder_days": 1,
+                    "reminder_time": "18:00",
+                },
+                {"reminder_days": 1, "reminder_time": "18:00"},
+            ],
+            allow_duplicate_reminders=True,
+        )
+        self.assertEqual(
+            len(legacy_registry.get_service("sound")["reminders"]), 2
+        )
+
     def test_rebinding_contact_replaces_old_name_and_user_rows(self):
         self.registry.set_responsible_contact(
             1001, "sound", "Микшер", "Алексей", 4004, "alex_one"
