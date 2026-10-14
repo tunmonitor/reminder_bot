@@ -91,7 +91,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     previews["personal_messages"],
-                    [("Ответственный", "Алексей", "Алексей, 18.10.2026")],
+                    [("Ответственный", "Алексей", "🔔 Алексей, 18.10.2026")],
                 )
                 self.assertTrue(any("Ведущий" in issue for issue in previews["issues"]))
                 self.assertTrue(any("Проповедник" in issue for issue in previews["issues"]))

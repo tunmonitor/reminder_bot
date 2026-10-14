@@ -50,7 +50,7 @@ class PartialNotificationTest(unittest.TestCase):
         )
 
         self.assertEqual(group_text, "Ответственный: @&lt;b&gt;alex&lt;/b&gt;")
-        self.assertEqual(personal_text, "&lt;b&gt;Алексей&lt;/b&gt;")
+        self.assertEqual(personal_text, "🔔 &lt;b&gt;Алексей&lt;/b&gt;")
 
     def test_sends_group_and_available_participant_with_missing_roles(self):
         async def send():
@@ -110,7 +110,7 @@ class PartialNotificationTest(unittest.TestCase):
             self.assertEqual(len(bot.send_message.await_args_list), 2)
             self.assertEqual(
                 bot.send_message.await_args_list[1].args,
-                (12345, "Алексей, 11.10.2026"),
+                (12345, "🔔 Алексей, 11.10.2026"),
             )
             self.assertEqual(state["participants"]["Ответственный"]["message_id"], 11)
             self.assertEqual(
@@ -192,7 +192,7 @@ class PartialNotificationTest(unittest.TestCase):
             self.assertEqual(bot.send_message.await_count, 4)
             self.assertEqual(
                 bot.send_message.await_args_list[3].args,
-                (23456, "Павел"),
+                (23456, "🔔 Павел"),
             )
             bot.edit_message_text.assert_not_awaited()
             self.assertTrue(state["participants"]["Ведущий"]["delivered"])

@@ -17,7 +17,7 @@ CONFIRM_PREFIX = "cfm"          # короткий префикс для callbac
 def build_confirm_kb(role: str, sunday_iso: str) -> InlineKeyboardMarkup:
     data = f"{CONFIRM_PREFIX}:{sunday_iso}:{role}"
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Принял, буду", callback_data=data),
+        InlineKeyboardButton(text="✅ Принял, буду", callback_data=data),
     ]])
 
 
@@ -46,9 +46,10 @@ def build_personal_message(
     templates: dict,
     sunday_str: str,
 ) -> str:
-    return templates["roles"][role].format(
+    text = templates["roles"][role].format(
         name=html.escape(info["name"]), sunday_date=sunday_str,
     )
+    return text if text.startswith("🔔") else f"🔔 {text}"
 
 
 async def _notify_admin(bot: Bot, admin_id: int, text: str,

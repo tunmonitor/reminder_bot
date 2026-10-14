@@ -291,7 +291,7 @@ class ConfirmationHandlerTest(unittest.TestCase):
                 merged["participants"]["Ответственный"]["group_update_sent"]
             )
             callback.answer.assert_awaited_once_with(
-                "Вы уже подтвердили участие!"
+                "ℹ️ Вы уже подтвердили участие"
             )
 
         asyncio.run(run())
@@ -604,7 +604,10 @@ class ConfirmationHandlerTest(unittest.TestCase):
 
             self.assertEqual(context.bot.send_message.await_count, 1)
             self.assertTrue(participant["group_update_sent"])
-            self.assertEqual(second.answer.await_args.args[0], "Вы уже подтвердили участие!")
+            self.assertEqual(
+                second.answer.await_args.args[0],
+                "ℹ️ Вы уже подтвердили участие",
+            )
 
         asyncio.run(run())
 
@@ -788,7 +791,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             ]
             self.assertEqual(
                 [button.text for row in controls.inline_keyboard for button in row],
-                ["Завершить и сохранить", "Отмена"],
+                ["✅ Завершить и сохранить", "✖️ Отмена"],
             )
 
             staged_input = next(
@@ -802,7 +805,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 button
                 for row in controls.inline_keyboard
                 for button in row
-                if button.text == "Завершить и сохранить"
+                if button.text == "✅ Завершить и сохранить"
             )
             finish_callback = SimpleNamespace(
                 data=finish_button.callback_data,
@@ -871,7 +874,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "reply_markup"
                 ].inline_keyboard
                 for button in row
-                if button.text == "Отмена"
+                if button.text == "✖️ Отмена"
             )
             cancel_callback = SimpleNamespace(
                 data=cancel_button.callback_data,
@@ -918,9 +921,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 for row in first_menu.inline_keyboard
                 for button in row
                 if button.text in {
-                    "Дни до события: 1",
-                    "Завершить и сохранить",
-                    "Отмена",
+                    "📅 Дни до события: 1",
+                    "✅ Завершить и сохранить",
+                    "✖️ Отмена",
                 }
             }
             second_menu = await begin_session()
@@ -928,24 +931,24 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 button.callback_data
                 for row in second_menu.inline_keyboard
                 for button in row
-                if button.text == "Завершить и сохранить"
+                if button.text == "✅ Завершить и сохранить"
             )
             self.assertNotEqual(
-                old_buttons["Завершить и сохранить"], current_finish
+                old_buttons["✅ Завершить и сохранить"], current_finish
             )
 
             for callback_name, old_data in (
                 (
                     "on_notification_setting_edit",
-                    old_buttons["Дни до события: 1"],
+                    old_buttons["📅 Дни до события: 1"],
                 ),
                 (
                     "on_notification_setting_finish",
-                    old_buttons["Завершить и сохранить"],
+                    old_buttons["✅ Завершить и сохранить"],
                 ),
                 (
                     "on_notification_setting_cancel",
-                    old_buttons["Отмена"],
+                    old_buttons["✖️ Отмена"],
                 ),
             ):
                 callback = SimpleNamespace(
@@ -1015,9 +1018,11 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     finish
                 )
 
-            edit.answer.assert_awaited_once_with("Не удалось проверить права.")
+            edit.answer.assert_awaited_once_with(
+                "❌ Не удалось проверить права."
+            )
             finish.answer.assert_awaited_once_with(
-                "Не удалось проверить права."
+                "❌ Не удалось проверить права."
             )
             self.context.debug_logger.exception.assert_any_call(
                 "Не удалось проверить права на изменение настроек служения"
@@ -1052,7 +1057,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 button
                 for row in menu.inline_keyboard
                 for button in row
-                if button.text.startswith("Личные шаблоны")
+                if button.text.startswith("📝 Личные шаблоны")
             )
             personal_callback = SimpleNamespace(
                 data=personal_button.callback_data,
@@ -1147,7 +1152,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 button
                 for row in menu.inline_keyboard
                 for button in row
-                if button.text == "Текст группового сообщения"
+                if button.text == "📝 Текст группового сообщения"
             )
             group_callback = SimpleNamespace(
                 data=group_button.callback_data,
@@ -1193,7 +1198,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 button
                 for row in menu.inline_keyboard
                 for button in row
-                if button.text.startswith("Личные шаблоны")
+                if button.text.startswith("📝 Личные шаблоны")
             )
             personal_callback = SimpleNamespace(
                 data=personal_button.callback_data,
@@ -1632,7 +1637,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 button
                 for row in contact_keyboard.inline_keyboard
                 for button in row
-                if button.text == "Далее →"
+                if button.text == "Далее ➡️"
             )
             page_callback = SimpleNamespace(
                 data=next_page.callback_data,
@@ -1724,7 +1729,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 button
                 for row in keyboard.inline_keyboard
                 for button in row
-                if button.text == "Далее →"
+                if button.text == "Далее ➡️"
             )
 
             task_callback = SimpleNamespace(
@@ -1813,7 +1818,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "reply_markup"
                 ].inline_keyboard
                 for button in row
-                if button.text == "Вернуться к настройкам"
+                if button.text == "⬅️ К настройкам"
             )
             return_callback = SimpleNamespace(
                 data=return_button.callback_data,
@@ -1833,7 +1838,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "reply_markup"
                 ].inline_keyboard
                 for button in row
-                if button.text == "Завершить и сохранить"
+                if button.text == "✅ Завершить и сохранить"
             )
             finish_callback = SimpleNamespace(
                 data=finish_button.callback_data,
@@ -1893,7 +1898,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 button
                 for row in action_keyboard.inline_keyboard
                 for button in row
-                if button.text == "Отключить служение"
+                if button.text == "🔴 Отключить служение"
             )
             disable_callback = SimpleNamespace(
                 data=disable_button.callback_data,
@@ -2117,6 +2122,35 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 all(len(chunk.encode("utf-16-le")) // 2 <= 4000 for chunk in chunks)
             )
             self.assertIn("Ответственный 59", "".join(chunks))
+
+        asyncio.run(run())
+
+    def test_settings_group_contacts_by_task(self):
+        async def run():
+            self.registry.add_service_admin(
+                67890, "sound", 24680, "sound_admin"
+            )
+            self.registry.set_responsible_contact(
+                67890, "sound", "Ведущий", "Аркадий", 718343838
+            )
+            self.registry.set_responsible_contact(
+                67890, "sound", "Ведущий", "Евгений", 306139797
+            )
+            self.registry.set_responsible_contact(
+                67890, "sound", "Проповедник", "Денис", 801625873
+            )
+            message = self.message(67890, "/service_settings sound")
+
+            await self.admin_router.message.handlers[1].callback(message)
+
+            text = message.answer.await_args.args[0]
+            self.assertIn("👤 Администраторы\n└ 24680 · @sound_admin", text)
+            self.assertIn(
+                "├ Ведущие: Аркадий (ID 718343838), Евгений (ID 306139797)",
+                text,
+            )
+            self.assertIn("└ Проповедники: Денис (ID 801625873)", text)
+            self.assertNotIn("Ведущий —", text)
 
         asyncio.run(run())
 
@@ -2385,7 +2419,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             ]
             self.assertTrue(
                 any(
-                    button.text == "Возврат к задачам"
+                    button.text == "⬅️ К задачам"
                     for row in list_markup.inline_keyboard
                     for button in row
                 )
@@ -2427,7 +2461,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 [
                     "Выбрать пользователя: Алексей",
                     "Изменить привязку: Иван",
-                    "Возврат к задачам",
+                    "⬅️ К задачам",
                 ],
             )
             next_person = list_markup.inline_keyboard[0][0]
@@ -2737,8 +2771,16 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 edit_button.callback_data, "service:edit_notify:sound"
             )
             self.assertIn(
-                "чтобы изменить дни",
+                "ℹ️ чтобы изменить дни",
                 selection_message.answer.await_args.args[0].lower(),
+            )
+            self.assertIn(
+                "📡 Настройки",
+                selection_message.answer.await_args.args[0],
+            )
+            self.assertIn(
+                "⚙️ ЗВУК",
+                selection_message.answer.await_args.args[0],
             )
 
             callback = SimpleNamespace(
@@ -2753,15 +2795,15 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             await self.callback_handler("on_service_selected")(callback)
             menu = callback.message.answer.await_args.kwargs["reply_markup"]
             self.assertIn(
-                "выберите, что изменить",
-                callback.message.answer.await_args.args[0],
+                "ℹ️ выберите, что изменить",
+                callback.message.answer.await_args.args[0].lower(),
             )
             self.assertIn(
                 next(
                     button.callback_data
                     for row in menu.inline_keyboard
                     for button in row
-                    if button.text.startswith("Дни до события")
+                    if button.text.startswith("📅 Дни до события")
                 ),
                 [
                     button.callback_data
