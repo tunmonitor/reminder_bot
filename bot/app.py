@@ -20,6 +20,7 @@ from aiogram.types import BotCommand
 if __package__:
     from .cli import CliArgs
     from .config import (
+        PROJECT_DIR,
         get_tz,
         load_credentials,
         load_schedule,
@@ -46,9 +47,11 @@ if __package__:
     from .service_registry import ServiceRegistry
     from .state import StateCache
     from .yandex_disk import download_public
+    from .backup import BackupManager, environment_name
 else:  # pragma: no cover - поддержка запуска файла напрямую
     from bot.cli import CliArgs
     from bot.config import (
+        PROJECT_DIR,
         get_tz,
         load_credentials,
         load_schedule,
@@ -75,6 +78,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
     from bot.service_registry import ServiceRegistry
     from bot.state import StateCache
     from bot.yandex_disk import download_public
+    from bot.backup import BackupManager, environment_name
 
 
 def _next_sunday_in_tz(tz) -> date:
@@ -527,6 +531,7 @@ async def _process_upcoming_sunday(
     debug_logger,
     tz,
     service_registry=None,
+    backup_manager: BackupManager | None = None,
 ) -> None:
     delivery_group_chat_id = credentials.group_chat_id
     if service_registry is not None:
@@ -562,7 +567,12 @@ async def _process_upcoming_sunday(
     debug_logger.info("Подготовка рассылки на %s", sunday_iso)
 
     try:
-        await download_public(credentials.yandex_public_url, xlsx_path, debug_logger)
+        await download_public(
+            credentials.yandex_public_url,
+            xlsx_path,
+            debug_logger,
+            on_change=backup_manager.mark_dirty if backup_manager else None,
+        )
         schedule = parse_schedule(xlsx_path, sunday_date, debug_logger)
         people = parse_people(xlsx_path, debug_logger)
         assignment_issues = [
@@ -663,8 +673,24 @@ async def run(args: CliArgs) -> None:
     credentials = load_credentials()
     templates = load_templates()
     tz = get_tz(credentials.timezone)
-    state_cache = StateCache(shm_dir / "reminder_state_cache.json")
-    service_registry = ServiceRegistry(service_registry_path())
+    try:
+        backup_manager = BackupManager(
+            environment_name(PROJECT_DIR),
+            shm_dir,
+            tz,
+            debug_logger,
+            registry_path=service_registry_path(),
+        )
+    except RuntimeError as exc:
+        debug_logger.warning("Резервирование отключено: %s", exc)
+        backup_manager = None
+    change_callback = backup_manager.mark_dirty if backup_manager else None
+    state_cache = StateCache(
+        shm_dir / "reminder_state_cache.json", on_change=change_callback
+    )
+    service_registry = ServiceRegistry(
+        service_registry_path(), on_change=change_callback
+    )
     registry_context_group_chat_id = credentials.group_chat_id
     try:
         service_registry.initialize(
@@ -683,6 +709,7 @@ async def run(args: CliArgs) -> None:
     pid_file = _pid_path(shm_dir)
     bot = None
     scheduler = None
+    nightly_backup_task: asyncio.Task | None = None
     pid_created = False
     active_jobs: set[asyncio.Task[None]] = set()
 
@@ -789,6 +816,36 @@ async def run(args: CliArgs) -> None:
         context.prepare_service_test_previews = prepare_service_test_previews
         register(dp, context)
 
+        if backup_manager is not None:
+            async def notify_backup_failure(message: str) -> None:
+                await _notify_admin(
+                    bot, credentials.admin_tg_id, message, debug_logger
+                )
+
+            backup_manager.set_failure_callback(notify_backup_failure)
+            try:
+                current_schedule = shm_dir / "reminder_bot_current.xlsx"
+                if not current_schedule.is_file():
+                    await download_public(
+                        credentials.yandex_public_url,
+                        current_schedule,
+                        debug_logger,
+                        attempts=1,
+                        interval=0,
+                        on_change=backup_manager.mark_dirty,
+                    )
+                await backup_manager.create_snapshot("запуск экземпляра")
+            except Exception as exc:
+                debug_logger.exception("Не удалось создать резервную копию при запуске")
+                await notify_backup_failure(
+                    "Не удалось создать резервную копию при запуске: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            nightly_backup_task = asyncio.create_task(
+                backup_manager.run_nightly(),
+                name="reminder-bot-nightly-backup",
+            )
+
         async def scheduled_job() -> None:
             task = asyncio.current_task()
             if task is not None:
@@ -804,6 +861,7 @@ async def run(args: CliArgs) -> None:
                     debug_logger=debug_logger,
                     tz=tz,
                     service_registry=service_registry,
+                    backup_manager=backup_manager,
                 )
             finally:
                 if task is not None:
@@ -840,6 +898,9 @@ async def run(args: CliArgs) -> None:
         scheduler.start()
         await dp.start_polling(bot, close_bot_session=False)
     finally:
+        if nightly_backup_task is not None:
+            nightly_backup_task.cancel()
+            await asyncio.gather(nightly_backup_task, return_exceptions=True)
         try:
             if scheduler is not None and scheduler.running:
                 scheduler.pause()

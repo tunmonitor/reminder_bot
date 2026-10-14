@@ -11,7 +11,8 @@
 #   - ОЗУ: /dev/shm/reminder_bot/{test|prod}/
 #   - PID: /dev/shm/reminder_bot/{test|prod}/reminder_bot_bot.pid
 #   - Логи: reminder_bot_interaction.log (INFO), reminder_bot_debug.log (DEBUG)
-#   - Команды: start | stop | restart | status | backup | logs | debug-logs | clear-logs
+#   - Команды: start | stop | restart | status | backup | backup-data |
+#     restore-data | webapp {start|stop|restart|status} | logs | debug-logs | clear-logs
 #   - stop делает backup перед kill; start восстанавливает лог из backup при чистой ОЗУ.
 #   - status печатает "БОТ РАБОТАЕТ" для CI-проверок.
 
@@ -45,6 +46,8 @@ PID_FILE="$SHM_DIR/reminder_bot_bot.pid"
 LOG_FILE="$LOG_DIR/reminder_bot_interaction.log"
 DEBUG_LOG_FILE="$LOG_DIR/reminder_bot_debug.log"
 NOHUP_LOG="$LOG_DIR/sys_nohup.log"
+WEBAPP_PID_FILE="$SHM_DIR/reminder_bot_webapp.pid"
+WEBAPP_LOG_FILE="$LOG_DIR/reminder_bot_webapp.log"
 
 # Персистентные бэкапы логов на SD-карте
 BACKUP_DIR="$PROJECT_DIR/logs_backup"
@@ -648,6 +651,167 @@ cmd_backup() {
     do_backup
 }
 
+cmd_backup_data() {
+    cd "$PROJECT_DIR" || return 1
+    PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+        REMINDER_BOT_ENV="$ENV_NAME" \
+        "$PYTHON_EXEC" -m bot.backup_cli create --shm-dir "$SHM_DIR"
+}
+
+cmd_restore_data() {
+    local snapshot=${1:-}
+    if [ -z "$snapshot" ]; then
+        echo "Использование: $0 restore-data <snapshot-directory>" >&2
+        return 2
+    fi
+    if cmd_status >/dev/null 2>&1; then
+        echo "❌ Перед восстановлением остановите бота командой: $0 stop" >&2
+        return 1
+    fi
+    if [[ "$snapshot" != /* ]]; then
+        snapshot="$PWD/$snapshot"
+    fi
+    cd "$PROJECT_DIR" || return 1
+    PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+        REMINDER_BOT_ENV="$ENV_NAME" \
+        "$PYTHON_EXEC" -m bot.backup_cli restore \
+        --shm-dir "$SHM_DIR" --snapshot "$snapshot"
+}
+
+cmd_webapp() {
+    local action=${1:-}
+    if [ "$#" -ne 1 ]; then
+        echo "Использование: $0 webapp {start|stop|restart|status}" >&2
+        return 2
+    fi
+    if has_symlink_path_component "$SHM_DIR" ||
+       has_symlink_path_component "$LOG_DIR"; then
+        echo "❌ Каталоги Web App не должны содержать символические ссылки." >&2
+        return 1
+    fi
+    mkdir -p "$SHM_DIR" "$LOG_DIR" || return 1
+    chmod 700 "$SHM_DIR" "$LOG_DIR" || return 1
+    if [ ! -O "$SHM_DIR" ] || [ ! -O "$LOG_DIR" ]; then
+        echo "❌ Каталоги Web App должны принадлежать текущему пользователю." >&2
+        return 1
+    fi
+    cd "$PROJECT_DIR" || return 1
+
+    case "$action" in
+        start)
+            if [ -e "$WEBAPP_PID_FILE" ] || [ -L "$WEBAPP_PID_FILE" ]; then
+                if ! secure_private_file "$WEBAPP_PID_FILE"; then
+                    echo "❌ PID-файл Web App небезопасен: $WEBAPP_PID_FILE" >&2
+                    return 1
+                fi
+                local current_pid current_starttime
+                current_pid=$(cut -d: -f1 "$WEBAPP_PID_FILE" 2>/dev/null)
+                current_starttime=$(cut -d: -f2 "$WEBAPP_PID_FILE" 2>/dev/null)
+                if is_valid_process "$current_pid" "$current_starttime"; then
+                    echo "Web App уже запущен (PID $current_pid)."
+                    return 0
+                fi
+                rm -f -- "$WEBAPP_PID_FILE" || return 1
+            fi
+            if ! PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+                "$PYTHON_EXEC" -m bot.webapp_server \
+                --project-dir "$PROJECT_DIR" --check; then
+                echo "❌ Конфигурация Web App не прошла проверку." >&2
+                return 1
+            fi
+            if [ -e "$WEBAPP_LOG_FILE" ] || [ -L "$WEBAPP_LOG_FILE" ]; then
+                if ! secure_private_file "$WEBAPP_LOG_FILE"; then
+                    echo "❌ Лог Web App небезопасен: $WEBAPP_LOG_FILE" >&2
+                    return 1
+                fi
+            fi
+            (umask 077; : >> "$WEBAPP_LOG_FILE") || return 1
+            local prior_log_lines
+            prior_log_lines=$(wc -l < "$WEBAPP_LOG_FILE")
+            PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+                nohup "$PYTHON_EXEC" -u -m bot.webapp_server \
+                --project-dir "$PROJECT_DIR" >> "$WEBAPP_LOG_FILE" 2>&1 &
+            local webapp_pid=$!
+            local webapp_starttime
+            webapp_starttime=$(get_process_starttime "$webapp_pid")
+            if [ -z "$webapp_starttime" ]; then
+                echo "❌ Не удалось получить время старта Web App." >&2
+                return 1
+            fi
+            local waited=0
+            while [ "$waited" -lt 30 ]; do
+                is_valid_process "$webapp_pid" "$webapp_starttime" || break
+                if tail -n "+$((prior_log_lines + 1))" "$WEBAPP_LOG_FILE" |
+                    grep -q "Web App HTTP server listening"; then
+                    local pid_tmp="$SHM_DIR/.webapp-pid.$$"
+                    (umask 077; printf '%s:%s\n' "$webapp_pid" \
+                        "$webapp_starttime" > "$pid_tmp") || return 1
+                    chmod 600 "$pid_tmp" || return 1
+                    if [ -e "$WEBAPP_PID_FILE" ] || [ -L "$WEBAPP_PID_FILE" ]; then
+                        rm -f -- "$pid_tmp"
+                        echo "❌ PID-файл Web App появился во время запуска." >&2
+                        return 1
+                    fi
+                    mv -- "$pid_tmp" "$WEBAPP_PID_FILE" || return 1
+                    echo "✅ Web App запущен (PID $webapp_pid) [$ENV_NAME]."
+                    return 0
+                fi
+                sleep 0.1
+                waited=$((waited + 1))
+            done
+            if is_valid_process "$webapp_pid" "$webapp_starttime"; then
+                kill_with_wait "$webapp_pid" "$webapp_starttime" 3 "Web App с ошибкой старта" || true
+            fi
+            echo "❌ Не удалось запустить Web App; проверьте $WEBAPP_LOG_FILE" >&2
+            return 1
+            ;;
+        stop)
+            if [ ! -e "$WEBAPP_PID_FILE" ] && [ ! -L "$WEBAPP_PID_FILE" ]; then
+                echo "Web App остановлен."
+                return 0
+            fi
+            if ! secure_private_file "$WEBAPP_PID_FILE"; then
+                echo "❌ PID-файл Web App небезопасен: $WEBAPP_PID_FILE" >&2
+                return 1
+            fi
+            local pid starttime
+            pid=$(cut -d: -f1 "$WEBAPP_PID_FILE" 2>/dev/null)
+            starttime=$(cut -d: -f2 "$WEBAPP_PID_FILE" 2>/dev/null)
+            if is_valid_process "$pid" "$starttime"; then
+                kill_with_wait "$pid" "$starttime" 10 "Web App" || return 1
+            fi
+            rm -f -- "$WEBAPP_PID_FILE"
+            echo "✅ Web App остановлен."
+            ;;
+        status)
+            if [ -e "$WEBAPP_PID_FILE" ] || [ -L "$WEBAPP_PID_FILE" ]; then
+                if ! secure_private_file "$WEBAPP_PID_FILE"; then
+                    echo "❌ PID-файл Web App небезопасен: $WEBAPP_PID_FILE" >&2
+                    return 1
+                fi
+                local pid starttime
+                pid=$(cut -d: -f1 "$WEBAPP_PID_FILE" 2>/dev/null)
+                starttime=$(cut -d: -f2 "$WEBAPP_PID_FILE" 2>/dev/null)
+                if is_valid_process "$pid" "$starttime"; then
+                    echo "WEBAPP RUNNING"
+                    return 0
+                fi
+            fi
+            echo "WEBAPP STOPPED"
+            return 1
+            ;;
+        restart)
+            cmd_webapp stop || return 1
+            sleep 1
+            cmd_webapp start
+            ;;
+        *)
+            echo "Использование: $0 webapp {start|stop|restart|status}" >&2
+            return 2
+            ;;
+    esac
+}
+
 # --------------------------------------------
 # Просмотр логов
 # --------------------------------------------
@@ -734,6 +898,17 @@ case "$1" in
     backup)
         cmd_backup
         ;;
+    backup-data)
+        cmd_backup_data
+        ;;
+    restore-data)
+        shift
+        cmd_restore_data "$@"
+        ;;
+    webapp)
+        shift
+        cmd_webapp "$@"
+        ;;
     logs)
         shift
         cmd_logs "$@"
@@ -746,7 +921,7 @@ case "$1" in
         cmd_clear_logs
         ;;
     *)
-        echo "📋 Использование: $0 {start|stop|restart|status|backup|logs [--follow]|debug-logs [--follow]|clear-logs}"
+        echo "📋 Использование: $0 {start|stop|restart|status|backup|backup-data|restore-data <snapshot>|webapp {start|stop|restart|status}|logs [--follow]|debug-logs [--follow]|clear-logs}"
         echo "   ENV определяется автоматически по имени каталога ($ENV_NAME)."
         exit 1
         ;;

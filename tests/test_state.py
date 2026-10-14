@@ -7,6 +7,24 @@ from bot.state import StateCache
 
 
 class StateCacheTest(unittest.TestCase):
+    def test_change_callback_runs_only_after_persisted_changes(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            changes = []
+            cache = StateCache(
+                Path(tmp_dir) / "state.json",
+                on_change=lambda: changes.append("changed"),
+            )
+            cache.matches_week("2026-10-11")
+            self.assertEqual(changes, [])
+
+            cache.replace({
+                "sunday_date": "2026-10-11",
+                "complete": False,
+                "participants": {},
+            })
+            cache.clear()
+            self.assertEqual(changes, ["changed", "changed"])
+
     def test_week_is_complete_only_after_all_required_deliveries(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             cache = StateCache(Path(tmp_dir) / "state.json")

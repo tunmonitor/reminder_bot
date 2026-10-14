@@ -2,8 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import os
+import stat
+import tempfile
 from pathlib import Path
+from typing import Callable
 
 import aiohttp
 
@@ -21,6 +26,7 @@ async def download_public(
     debug_logger: logging.Logger,
     attempts: int = RETRY_ATTEMPTS,
     interval: int = RETRY_INTERVAL,
+    on_change: Callable[[], None] | None = None,
 ) -> Path:
     """Скачивает xlsx по публичной ссылке в dest. Возвращает dest."""
     last_err: Exception | None = None
@@ -59,8 +65,47 @@ async def download_public(
                         "Yandex downloaded %s bytes -> %s",
                         len(content), dest,
                     )
+                    previous_digest = (
+                        hashlib.sha256(dest.read_bytes()).digest()
+                        if dest.is_file() and not dest.is_symlink()
+                        else None
+                    )
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    dest.write_bytes(content)
+                    if dest.is_symlink():
+                        raise PermissionError(
+                            f"Файл расписания не должен быть символической ссылкой: {dest}"
+                        )
+                    if dest.exists():
+                        current_stat = dest.lstat()
+                        if (
+                            not stat.S_ISREG(current_stat.st_mode)
+                            or current_stat.st_nlink != 1
+                            or current_stat.st_uid != os.geteuid()
+                        ):
+                            raise PermissionError(
+                                f"Файл расписания небезопасен: {dest}"
+                            )
+                    file_fd, temp_name = tempfile.mkstemp(
+                        prefix=f".{dest.name}-", dir=dest.parent
+                    )
+                    temp_path = Path(temp_name)
+                    try:
+                        os.fchmod(file_fd, 0o600)
+                        with os.fdopen(file_fd, "wb") as output:
+                            file_fd = -1
+                            output.write(content)
+                            output.flush()
+                            os.fsync(output.fileno())
+                        os.replace(temp_path, dest)
+                    finally:
+                        if file_fd >= 0:
+                            os.close(file_fd)
+                        temp_path.unlink(missing_ok=True)
+                    if (
+                        on_change is not None
+                        and previous_digest != hashlib.sha256(content).digest()
+                    ):
+                        on_change()
                     return dest
 
             except Exception as exc:  # noqa: BLE001

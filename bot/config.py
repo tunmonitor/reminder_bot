@@ -2,7 +2,8 @@
 
 Приоритет:
 1) файлы с префиксом reminder_bot_* в корне проекта;
-2) короткие имена (credentials.env, templates.json, schedule_config.json);
+2) короткие имена (credentials.env, templates.json, schedule_config.json,
+   webapp_config.json);
 3) переменные окружения процесса.
 """
 from __future__ import annotations
@@ -88,6 +89,19 @@ def load_credentials() -> Credentials:
     )
 
 
+def load_timezone() -> ZoneInfo:
+    env_path = _first_existing(
+        PROJECT_DIR / "reminder_bot_credentials.env",
+        PROJECT_DIR / "credentials.env",
+    )
+    file_data = _parse_env_file(env_path) if env_path else {}
+    return get_tz(
+        file_data.get("TIMEZONE")
+        or os.environ.get("TIMEZONE")
+        or "Europe/Moscow"
+    )
+
+
 def service_registry_path() -> Path:
     env_path = _first_existing(
         PROJECT_DIR / "reminder_bot_credentials.env",
@@ -102,6 +116,36 @@ def service_registry_path() -> Path:
         path = Path(configured_path).expanduser()
         return path if path.is_absolute() else PROJECT_DIR / path
     return PROJECT_DIR / ".runtime" / "reminder_bot.sqlite3"
+
+
+@dataclass(frozen=True)
+class WebAppConfig:
+    host: str
+    port: int
+
+
+def load_webapp_config(
+    project_dir: Path = PROJECT_DIR,
+    configured_path: Path | None = None,
+) -> WebAppConfig:
+    path = configured_path or _first_existing(
+        project_dir / "reminder_bot_webapp_config.json",
+        project_dir / "webapp_config.json",
+    )
+    if path is None or not path.is_file():
+        raise RuntimeError("webapp_config.json не найден")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise RuntimeError("webapp_config.json должен содержать JSON-объект")
+    host = data.get("host")
+    port = data.get("port")
+    if not isinstance(host, str) or not host.strip():
+        raise RuntimeError("webapp_config.json: поле 'host' должно быть строкой")
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise RuntimeError(
+            "webapp_config.json: поле 'port' должно быть целым числом от 1 до 65535"
+        )
+    return WebAppConfig(host=host.strip(), port=port)
 
 
 # ----------------------------

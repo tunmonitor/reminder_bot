@@ -14,9 +14,13 @@ reminder_bot_templates.json
 templates.json
 reminder_bot_schedule_config.json
 schedule_config.json
+reminder_bot_webapp_config.json
+webapp_config.json
 .runtime/
 *.sqlite3
 *.sqlite3-journal
+*.sqlite3-shm
+*.sqlite3-wal
 
 # Персистентные бэкапы логов
 reminder_bot_logs_backup/

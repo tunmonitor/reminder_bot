@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from string import Formatter
+from typing import Callable
 
 from .secure_fs import open_private_directory
 from .services import SERVICES
@@ -51,8 +52,11 @@ def validate_notification_template(
 
 
 class ServiceRegistry:
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self, path: Path, on_change: Callable[[], None] | None = None
+    ) -> None:
         self.path = path
+        self.on_change = on_change
 
     def initialize(self, super_admin_id: int, assembly_group_chat_id: int) -> None:
         if super_admin_id <= 0:
@@ -284,11 +288,15 @@ class ServiceRegistry:
     @contextmanager
     def _connection(self):
         connection = self._connect()
+        changed = False
         try:
             with connection:
                 yield connection
+            changed = connection.total_changes > 0
         finally:
             connection.close()
+        if changed and self.on_change is not None:
+            self.on_change()
 
     def list_services(self) -> list[dict]:
         with self._connection() as connection:

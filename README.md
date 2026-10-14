@@ -5,23 +5,143 @@ Telegram-бот напоминаний по расписанию для Raspberr
 ## Установка
 
 ```bash
-cd /home/pi/app/reminder_bot/prod      # или .../test
-python3 -m venv venv
-venv/bin/pip install -r requirements.txt
+cd /home/pi/app/reminder_bot/prod      # или /mnt/external_data/reminder_bot/test
+python3 -m venv venv                   # только если venv ещё не создан
+./venv/bin/pip install -r requirements.txt
 cp reminder_bot_credentials.env.example reminder_bot_credentials.env
-# ... заполнить BOT_TOKEN, ADMIN_TG_ID, GROUP_CHAT_ID, YANDEX_PUBLIC_URL
+# Заполнить BOT_TOKEN, ADMIN_TG_ID, GROUP_CHAT_ID, YANDEX_PUBLIC_URL.
+cp webapp_config.example.json webapp_config.json
+# При необходимости задать отдельный порт для этого окружения.
 ```
 
-Управление
-./reminder_bot_manage.sh start
-./reminder_bot_manage.sh status
-./reminder_bot_manage.sh logs
-./reminder_bot_manage.sh debug-logs
-./reminder_bot_manage.sh logs --follow
-./reminder_bot_manage.sh backup
-./reminder_bot_manage.sh stop
+Зависимости устанавливаются в отдельное окружение каждого развёртывания
+(`venv/`). На Raspberry Pi для работы из исходного репозитория используйте
+`/home/pi/.venv`. Скрипт `manage.sh` определяет `test` или `prod` по имени
+каталога окружения, где он находится; запускайте команды из соответствующей
+копии проекта, а не из каталога `src`.
+
+## Работа и управление
+
+### Telegram-бот
+
+Бот обрабатывает команды Telegram и выполняет рассылку по расписанию из
+`reminder_bot_schedule_config.json`. Управление выполняется скриптом
+`manage.sh` в каталоге окружения:
+
+```bash
+./manage.sh start
+./manage.sh status
+./manage.sh restart
+./manage.sh stop
+```
+
+`start` запускает только бота. `stop` сохраняет текущий журнал взаимодействий,
+затем останавливает бота; `restart` выполняет остановку и запуск. `status`
+печатает `БОТ РАБОТАЕТ` или `БОТ ОСТАНОВЛЕН`.
+
+### Telegram Web App и HTTP-сервер
+
+Web App — статическая страница и ресурсы в `webapp/`, входная страница —
+`webapp/index.html`. HTTP-сервер запускается и управляется отдельно от бота:
+
+```bash
+./manage.sh webapp start
+./manage.sh webapp status
+./manage.sh webapp restart
+./manage.sh webapp stop
+```
+
+Перед первым запуском в каждом окружении создайте локальный конфиг:
+
+```bash
+cp webapp_config.example.json webapp_config.json
+```
+
+Укажите в `webapp_config.json` адрес привязки и свободный порт, например:
+
+```json
+{
+  "host": "127.0.0.1",
+  "port": 8080
+}
+```
+
+Для test и prod используйте независимые порты. Встроенный сервер раздаёт
+только файлы из `webapp/`; конфигурация и другие файлы проекта не
+публикуются. Telegram требует HTTPS для Mini App: для публичного доступа
+оставляйте сервер на loopback и настройте HTTPS reverse proxy на его порт.
+Не выставляйте HTTP-порт напрямую в Интернет.
+Сервер сейчас раздаёт статические файлы; API для чтения/изменения данных бота
+этими командами не предоставляется.
+
+PID Web App хранится в
+`/dev/shm/reminder_bot/<env>/reminder_bot_webapp.pid`, журнал —
+`/dev/shm/reminder_bot/<env>/reminder_bot_webapp.log` (если не переопределены
+пути окружения). Запуск Web App не запускает бота и наоборот.
+
+### Логи и резервные копии
+
+```bash
+./manage.sh logs
+./manage.sh debug-logs
+./manage.sh logs --follow
+./manage.sh debug-logs --follow
+./manage.sh backup
+./manage.sh backup-data
+./manage.sh restore-data /mnt/external_data/reminder_bot/backups/prod/<snapshot>
+```
 
 Команды `logs` и `debug-logs` по умолчанию выводят последние строки и завершаются. Для непрерывного слежения укажите `--follow`.
+`backup` сохраняет только interaction-лог. `backup-data` создаёт проверенный
+снимок данных приложения: SQLite, SQL-экспорт, текущий кэш и расписание в
+XLSX и нормализованном JSON. Снимки записываются только на смонтированный
+внешний диск в `/mnt/external_data/reminder_bot/backups/{test|prod}/`;
+старые копии автоматически не удаляются.
+
+Работающий бот также создаёт снимок при запуске, ежедневно в 03:00 по
+настроенному часовому поясу и через 10 минут после последнего изменения
+сохраняемых данных. Ошибка резервирования записывается в debug-лог и
+сообщается администратору; текущая работа бота продолжается, если её данные
+доступны. Восстановление запускайте только при остановленном боте; снимок
+должен соответствовать тому же окружению (`test` или `prod`) и пройти
+проверку целостности.
+
+### Дополнительные параметры управления
+
+`manage.sh` поддерживает следующие переменные окружения:
+
+| Переменная | Назначение | Значение по умолчанию |
+|---|---|---|
+| `SHM_BASE` | Корень оперативных каталогов экземпляров | `/dev/shm/reminder_bot` |
+| `SHM_DIR` | Каталог PID и текущего XLSX/кэша выбранного экземпляра | `$SHM_BASE/<env>` |
+| `LOG_DIR` | Каталог логов | значение `SHM_DIR` |
+| `REMINDER_BOT_DB_PATH` | Путь SQLite-реестра (задаётся в credentials или окружении процесса) | `<project>/.runtime/reminder_bot.sqlite3` |
+| `TIMEZONE` | Часовой пояс планировщика и ночного бэкапа (задаётся в credentials или окружении процесса) | `Europe/Moscow` |
+
+Окружение (`test` или `prod`) скрипт определяет по имени каталога проекта;
+ручное переопределение для `backup-data` не требуется. Примеры:
+
+```bash
+SHM_BASE=/dev/shm/reminder_bot ./manage.sh status
+SHM_DIR=/dev/shm/reminder_bot/test LOG_DIR=/dev/shm/reminder_bot/test/logs ./manage.sh start
+./manage.sh backup-data
+```
+
+Путь к резервному хранилищу фиксирован: `/mnt/external_data/reminder_bot/backups`.
+Если диск не смонтирован, создание и восстановление снимка завершатся ошибкой;
+резервные копии не будут записаны в альтернативное место.
+
+Перед восстановлением остановите соответствующий экземпляр:
+
+```bash
+./manage.sh stop
+./manage.sh restore-data /mnt/external_data/reminder_bot/backups/test/<snapshot>
+./manage.sh start
+```
+
+`restore-data` проверяет окружение снимка, manifest, контрольные суммы и
+целостность SQLite. Если рядом с базой остались SQLite-файлы `-wal`/`-shm`,
+восстановление прекращается для ручной проверки; удалять их вслепую нельзя.
 
 ## Сценарии взаимодействия пользователя с ботом
 

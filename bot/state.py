@@ -19,13 +19,18 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 class StateCache:
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self, path: Path, on_change: Callable[[], None] | None = None
+    ) -> None:
         self.path = path
+        self.on_change = on_change
         self.state: dict[str, Any] | None = None
         self._load()
 
@@ -42,10 +47,24 @@ class StateCache:
         if self.state is None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self.state, ensure_ascii=False, indent=2),
-                       encoding="utf-8")
-        tmp.replace(self.path)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".reminder_state_cache-", suffix=".tmp", dir=self.path.parent
+        )
+        tmp = Path(tmp_name)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as cache_file:
+                fd = -1
+                json.dump(self.state, cache_file, ensure_ascii=False, indent=2)
+                cache_file.flush()
+                os.fsync(cache_file.fileno())
+            tmp.replace(self.path)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            tmp.unlink(missing_ok=True)
+        if self.on_change is not None:
+            self.on_change()
 
     # --- api ---
     def replace(self, state: dict[str, Any]) -> None:
@@ -57,6 +76,8 @@ class StateCache:
         self.state = None
         if self.path.exists():
             self.path.unlink()
+            if self.on_change is not None:
+                self.on_change()
 
     def matches_week(
         self,

@@ -16,6 +16,20 @@ class ServiceRegistryTest(unittest.TestCase):
         self.registry = ServiceRegistry(self.path)
         self.registry.initialize(1001, -10001)
 
+    def test_change_callback_runs_only_for_committed_writes(self):
+        changes = []
+        registry = ServiceRegistry(
+            self.path, on_change=lambda: changes.append("changed")
+        )
+        registry.initialize(1001, -10001)
+        changes.clear()
+
+        registry.list_services()
+        self.assertEqual(changes, [])
+
+        registry.set_group_chat(1001, "sound", -10055, enabled=True)
+        self.assertEqual(changes, ["changed"])
+
     def test_bootstrap_seeds_catalog_and_configures_only_assembly(self):
         services = {service["id"]: service for service in self.registry.list_services()}
 
