@@ -96,6 +96,74 @@ class ServiceRegistryTest(unittest.TestCase):
         self.registry.remove_service_admin(1001, "sound", 3003)
         self.assertFalse(self.registry.is_service_admin(3003, "sound"))
 
+    def test_admins_can_be_shared_across_services_and_have_usernames(self):
+        self.registry.add_service_admin(1001, "sound", 3003, "sound_user")
+        self.registry.add_service_admin(1001, "sound", 4004, "@other_user")
+        self.registry.add_service_admin(1001, "slides", 3003, "sound_user")
+
+        self.assertEqual(
+            self.registry.list_service_admin_details("sound"),
+            [
+                {"telegram_id": 3003, "username": "sound_user"},
+                {"telegram_id": 4004, "username": "other_user"},
+            ],
+        )
+        self.assertEqual(
+            self.registry.list_service_admin_details("slides"),
+            [{"telegram_id": 3003, "username": "sound_user"}],
+        )
+        self.assertTrue(self.registry.is_service_admin(3003, "sound"))
+        self.assertTrue(self.registry.is_service_admin(3003, "slides"))
+
+    def test_existing_admin_username_can_be_refreshed_without_duplicate_audit(self):
+        self.registry.add_service_admin(1001, "sound", 3003)
+
+        self.registry.add_service_admin(1001, "sound", 3003, "@new_user")
+        self.registry.add_service_admin(1001, "sound", 3003, "@new_user")
+
+        self.assertEqual(
+            self.registry.list_service_admin_details("sound"),
+            [{"telegram_id": 3003, "username": "new_user"}],
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM configuration_audit "
+                "WHERE action = 'service_admin_added'"
+            ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_initialization_adds_username_column_to_existing_admin_table(self):
+        self.registry.add_service_admin(1001, "sound", 3003)
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.executescript(
+                """
+                ALTER TABLE service_admins RENAME TO service_admins_with_username;
+                CREATE TABLE service_admins (
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    telegram_id INTEGER NOT NULL CHECK (telegram_id > 0),
+                    created_by INTEGER NOT NULL CHECK (created_by > 0),
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (service_id, telegram_id)
+                );
+                INSERT INTO service_admins (
+                    service_id, telegram_id, created_by, created_at
+                )
+                SELECT service_id, telegram_id, created_by, created_at
+                FROM service_admins_with_username;
+                DROP TABLE service_admins_with_username;
+                """
+            )
+            connection.commit()
+
+        self.registry.initialize(1001, -10001)
+
+        self.assertEqual(
+            self.registry.list_service_admin_details("sound"),
+            [{"telegram_id": 3003, "username": ""}],
+        )
+
     def test_super_admin_configures_group_and_manual_telegram_mapping(self):
         self.registry.set_group_chat(1001, "sound", -10022, enabled=True)
         self.registry.set_responsible_contact(

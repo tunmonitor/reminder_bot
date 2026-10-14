@@ -1014,6 +1014,126 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_template_edit_prompts_show_saved_text_and_upcoming_preview(self):
+        async def run():
+            self.registry.set_notification_settings(
+                67890,
+                "sound",
+                reminder_days=1,
+                reminder_time="18:00",
+                group_template="Сохранённая группа: {service_name}",
+                personal_templates={"Микшер": "Сохранённый текст {name}"},
+            )
+            self.context.prepare_service_test_previews = AsyncMock(
+                return_value={
+                    "sunday_date": date(2026, 10, 11),
+                    "group_text": "Пример группы на воскресенье",
+                    "personal_messages": [
+                        {
+                            "task": "Микшер",
+                            "name": "Алексей",
+                            "telegram_id": "12345",
+                            "text": "Пример личного сообщения",
+                        }
+                    ],
+                    "issues": [],
+                }
+            )
+            command = self.message(67890, "/service_notify")
+            await self.admin_router.message.handlers[6].callback(command)
+            service_callback = SimpleNamespace(
+                data="service:service_notify:sound",
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_selected")(
+                service_callback
+            )
+            menu = service_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            group_button = next(
+                button
+                for row in menu.inline_keyboard
+                for button in row
+                if button.text == "Текст группового сообщения"
+            )
+            group_callback = SimpleNamespace(
+                data=group_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_notification_setting_edit")(
+                group_callback
+            )
+            group_prompt = group_callback.message.answer.await_args.args[0]
+            self.assertIn("Сохранённая группа: {service_name}", group_prompt)
+            self.assertIn("Пример группы на воскресенье", group_prompt)
+            self.assertEqual(
+                self.context.prepare_service_test_previews.await_args.kwargs[
+                    "group_template"
+                ],
+                "Сохранённая группа: {service_name}",
+            )
+
+            personal_button = next(
+                button
+                for row in menu.inline_keyboard
+                for button in row
+                if button.text.startswith("Личные шаблоны")
+            )
+            personal_callback = SimpleNamespace(
+                data=personal_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_notification_setting_edit")(
+                personal_callback
+            )
+            task_button = next(
+                button
+                for row in personal_callback.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.text == "Микшер"
+            )
+            task_callback = SimpleNamespace(
+                data=task_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_notify_task_choice")(
+                task_callback
+            )
+            personal_prompt = task_callback.message.answer.await_args.args[0]
+            self.assertIn("Сохранённый текст {name}", personal_prompt)
+            self.assertIn("Пример личного сообщения", personal_prompt)
+            self.assertEqual(
+                self.context.prepare_service_test_previews.await_args.kwargs[
+                    "personal_templates"
+                ],
+                {"Микшер": "Сохранённый текст {name}"},
+            )
+
+        asyncio.run(run())
+
     def test_service_contact_uses_task_choice_and_native_user_picker(self):
         async def run():
             self.registry.set_responsible_contact(
@@ -1309,7 +1429,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 len(contact_keyboard.inline_keyboard[0:10]), 10
             )
             self.assertEqual(
-                sum(len(row) for row in contact_keyboard.inline_keyboard), 11
+                sum(len(row) for row in contact_keyboard.inline_keyboard), 12
             )
             next_page = next(
                 button
@@ -1334,7 +1454,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                         "reply_markup"
                     ].inline_keyboard
                 ),
-                12,
+                13,
             )
 
             notify_command = self.message(67890, "/service_notify")
@@ -1880,6 +2000,187 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertFalse(request.user_is_bot)
 
             self.assertEqual(self.registry.list_service_admins("assembly"), [])
+
+        asyncio.run(run())
+
+    def test_admin_can_add_self_by_entering_id_and_username(self):
+        async def run():
+            command = self.message(67890, "/service_admin_add")
+            await self.admin_router.message.handlers[2].callback(command)
+            service_button = next(
+                button
+                for row in command.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.text == "СОБРАНИЕ"
+            )
+            service_callback = SimpleNamespace(
+                data=service_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_selected")(
+                service_callback
+            )
+            staged_input = next(
+                item.callback
+                for item in self.admin_router.message.handlers
+                if item.callback.__name__ == "on_service_parameter"
+            )
+            manual_input = self.message(67890, "67890 @self_admin")
+            await staged_input(manual_input)
+            confirmation = manual_input.answer.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard[0][0]
+            callback = SimpleNamespace(
+                data=confirmation.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+
+            await self.callback_handler("on_shared_admin_confirmation")(
+                callback
+            )
+
+            self.assertEqual(
+                self.registry.list_service_admin_details("assembly"),
+                [{"telegram_id": 67890, "username": "self_admin"}],
+            )
+
+        asyncio.run(run())
+
+    def test_services_listing_separates_services_and_shows_admin_usernames(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 12345, "sound_admin")
+            self.registry.add_service_admin(67890, "slides", 12345, "sound_admin")
+            message = self.message(67890, "/services")
+
+            await self.admin_router.message.handlers[0].callback(message)
+
+            result = "\n".join(
+                call.args[0] for call in message.answer.await_args_list
+            )
+            self.assertIn("ЗВУК", result)
+            self.assertIn("12345 (@sound_admin)", result)
+            self.assertIn("СЛАЙДЫ", result)
+            self.assertIn("\n\n", result)
+            self.assertTrue(self.registry.is_service_admin(12345, "sound"))
+            self.assertTrue(self.registry.is_service_admin(12345, "slides"))
+
+        asyncio.run(run())
+
+    def test_contact_manual_input_cancel_and_confirm_return_to_contact_list(self):
+        async def run():
+            self.context.load_service_task_assignments = AsyncMock(
+                return_value={"Микшер": ["Алексей"]}
+            )
+            command = self.message(67890, "/service_contact sound")
+            await self.admin_router.message.handlers[5].callback(command)
+            task_button = command.answer.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard[0][0]
+            task_callback = SimpleNamespace(
+                data=task_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_task_choice")(task_callback)
+            person_button = task_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard[0][0]
+            person_callback = SimpleNamespace(
+                data=person_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_contact_person_choice")(
+                person_callback
+            )
+            staged_input = next(
+                item.callback
+                for item in self.admin_router.message.handlers
+                if item.callback.__name__ == "on_service_parameter"
+            )
+
+            async def enter_user_and_finish(action):
+                manual_message = self.message(
+                    67890, "33333 @manual_user"
+                )
+                await staged_input(manual_message)
+                button = manual_message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard[0][1 if action == "cancel" else 0]
+                callback = SimpleNamespace(
+                    data=button.callback_data,
+                    from_user=SimpleNamespace(id=67890),
+                    message=SimpleNamespace(
+                        chat=SimpleNamespace(type="private"),
+                        answer=AsyncMock(),
+                    ),
+                    answer=AsyncMock(),
+                )
+                await self.callback_handler(
+                    "on_shared_admin_confirmation"
+                )(callback)
+                return callback, manual_message
+
+            cancelled, _ = await enter_user_and_finish("cancel")
+            self.assertIn(
+                "Назначение отменено",
+                cancelled.message.answer.await_args_list[0].args[0],
+            )
+            list_markup = cancelled.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            self.assertTrue(
+                any(
+                    button.text == "Завершить привязку"
+                    for row in list_markup.inline_keyboard
+                    for button in row
+                )
+            )
+
+            person_button = list_markup.inline_keyboard[0][0]
+            person_callback = SimpleNamespace(
+                data=person_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_contact_person_choice")(
+                person_callback
+            )
+            confirmed, _ = await enter_user_and_finish("confirm")
+            self.assertEqual(
+                self.registry.get_responsible_contact(
+                    "sound", "Микшер", "Алексей"
+                ),
+                {"telegram_id": 33333, "username": "manual_user"},
+            )
+            self.assertIn(
+                "уже привязан Telegram ID 33333",
+                confirmed.message.answer.await_args.args[0],
+            )
 
         asyncio.run(run())
 

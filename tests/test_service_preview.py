@@ -176,6 +176,41 @@ class ServicePreviewTest(unittest.TestCase):
                         )
                     )
 
+    def test_preview_renders_templates_under_guided_setup_overrides(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ServiceRegistry(Path(temp_dir) / "registry.sqlite3")
+            registry.initialize(67890, -100)
+            registry.set_responsible_contact(
+                67890, "sound", "Микшер", "Алексей", 12345, "alex"
+            )
+            assignments = {"Микшер": ["Алексей"]}
+
+            async def run():
+                with patch(
+                    "bot.app._load_service_task_assignments",
+                    new=AsyncMock(return_value=assignments),
+                ):
+                    return await _prepare_service_test_previews(
+                        "sound",
+                        SimpleNamespace(admin_tg_id=67890),
+                        Path(temp_dir),
+                        ZoneInfo("UTC"),
+                        registry,
+                        logging.getLogger("test-service-template-overrides"),
+                        group_template="Новый {service_name}: {task_assignments}",
+                        personal_templates={
+                            "Микшер": "{name} ({telegram_id}, @{username})"
+                        },
+                    )
+
+            previews = asyncio.run(run())
+            self.assertIn("Новый Звук", previews["group_text"])
+            self.assertIn("Алексей (ID 12345, @alex)", previews["group_text"])
+            self.assertEqual(
+                previews["personal_messages"][0]["text"],
+                "Алексей (12345, @alex)",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

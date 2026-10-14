@@ -55,6 +55,7 @@ class ServiceRegistry:
                 CREATE TABLE IF NOT EXISTS service_admins (
                     service_id TEXT NOT NULL REFERENCES services(id) ON DELETE CASCADE,
                     telegram_id INTEGER NOT NULL CHECK (telegram_id > 0),
+                    username TEXT NOT NULL DEFAULT '',
                     created_by INTEGER NOT NULL CHECK (created_by > 0),
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (service_id, telegram_id)
@@ -87,6 +88,17 @@ class ServiceRegistry:
                 );
                 """
             )
+            admin_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(service_admins)"
+                )
+            }
+            if "username" not in admin_columns:
+                connection.execute(
+                    "ALTER TABLE service_admins "
+                    "ADD COLUMN username TEXT NOT NULL DEFAULT ''"
+                )
             contact_primary_key = [
                 row["name"]
                 for row in connection.execute(
@@ -295,20 +307,38 @@ class ServiceRegistry:
         actor_id: int,
         service_id: str,
         telegram_id: int,
+        username: str = "",
     ) -> None:
         _validate_positive_id(actor_id, "actor_id")
         _validate_positive_id(telegram_id, "telegram_id")
+        normalized_username = username.strip()
+        if normalized_username.startswith("@"):
+            normalized_username = normalized_username[1:]
+        if normalized_username and not re.fullmatch(
+            r"[A-Za-z][A-Za-z0-9_]{4,31}", normalized_username
+        ):
+            raise ValueError("Некорректный Telegram username.")
         with self._connection() as connection:
             self._require_super_admin(connection, actor_id)
             self._require_service(connection, service_id)
-            cursor = connection.execute(
+            existing = connection.execute(
+                "SELECT 1 FROM service_admins "
+                "WHERE service_id = ? AND telegram_id = ?",
+                (service_id, telegram_id),
+            ).fetchone()
+            connection.execute(
                 "INSERT INTO service_admins "
-                "(service_id, telegram_id, created_by, created_at) "
-                "VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(service_id, telegram_id) DO NOTHING",
-                (service_id, telegram_id, actor_id, _utc_now()),
+                "(service_id, telegram_id, username, created_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(service_id, telegram_id) DO UPDATE SET "
+                "username = CASE WHEN excluded.username != '' "
+                "THEN excluded.username ELSE service_admins.username END",
+                (
+                    service_id, telegram_id, normalized_username,
+                    actor_id, _utc_now(),
+                ),
             )
-            if cursor.rowcount:
+            if existing is None:
                 self._audit(
                     connection, actor_id, "service_admin_added", service_id,
                     {"telegram_id": telegram_id},
@@ -519,6 +549,16 @@ class ServiceRegistry:
                 (service_id,),
             ).fetchall()
         return [row["telegram_id"] for row in rows]
+
+    def list_service_admin_details(self, service_id: str) -> list[dict]:
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            rows = connection.execute(
+                "SELECT telegram_id, username FROM service_admins "
+                "WHERE service_id = ? ORDER BY telegram_id",
+                (service_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     @staticmethod
     def _require_super_admin(

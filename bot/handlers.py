@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import secrets
 import sqlite3
 from typing import Any
@@ -71,13 +72,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         int, tuple[int, str, str, str | None, str | None]
     ] = {}
     pending_admin_confirmations: dict[
-        tuple[int, str, int], tuple[str, str | None, str | None, str, str]
+        tuple[int, str, int],
+        tuple[str, str | None, str | None, str | None, str, str],
     ] = {}
     pending_task_choices: dict[str, tuple[int, str, str, str | None]] = {}
     pending_task_pages: dict[str, tuple[int, str, str, int]] = {}
     pending_contact_person_choices: dict[
         str, tuple[int, str, str, str]
     ] = {}
+    pending_contact_navigation: dict[str, tuple[int, str, str]] = {}
     pending_notify_task_choices: dict[str, tuple[int, str, str | None]] = {}
     def new_share_request_id() -> int:
         registry = service_registry()
@@ -102,6 +105,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         for key in list(pending_contact_person_choices):
             if pending_contact_person_choices[key][0] == actor_id:
                 pending_contact_person_choices.pop(key, None)
+        for key in list(pending_contact_navigation):
+            if pending_contact_navigation[key][0] == actor_id:
+                pending_contact_navigation.pop(key, None)
         for key in list(pending_notify_task_choices):
             if pending_notify_task_choices[key][0] == actor_id:
                 pending_notify_task_choices.pop(key, None)
@@ -159,13 +165,22 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "«Изменить настройки уведомлений» ниже.",
         ]
         if registry.is_super_admin(actor_id):
-            admins = registry.list_service_admins(service_id)
+            admins = registry.list_service_admin_details(service_id)
+            admins_text = ", ".join(
+                f"{admin['telegram_id']}"
+                + (
+                    f" (@{admin['username']})"
+                    if admin["username"]
+                    else ""
+                )
+                for admin in admins
+            )
             contacts = registry.list_responsible_contacts(
                 actor_id, service_id
             )
             lines.append(
-                f"Администраторы (Telegram ID): "
-                f"{', '.join(map(str, admins)) or 'не назначены'}"
+                f"Администраторы (Telegram ID и username): "
+                f"{admins_text or 'не назначены'}"
             )
             lines.append("Ответственные (задача — имя — Telegram ID):")
             lines.extend(
@@ -464,6 +479,20 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             callback_data=f"task:{operation}:{token}",
         )
 
+    def contact_navigation_button(
+        actor_id: int, service_id: str, action: str
+    ) -> InlineKeyboardButton:
+        token = secrets.token_urlsafe(8)
+        pending_contact_navigation[token] = (actor_id, service_id, action)
+        label = {
+            "tasks": "К списку задач",
+            "finish": "Завершить привязку",
+        }[action]
+        return InlineKeyboardButton(
+            text=label,
+            callback_data=f"contact_nav:{token}",
+        )
+
     async def send_task_choices_page(
         message: Message,
         actor_id: int,
@@ -538,6 +567,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 ]
                 for task in page_tasks
             )
+            rows.append([
+                contact_navigation_button(
+                    actor_id, service_id, "finish"
+                )
+            ])
         else:
             for task in page_tasks:
                 token = secrets.token_urlsafe(8)
@@ -625,6 +659,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
         pending["step"] = "choose_contact_person"
         pending["active_task"] = task
+        for token, choice in list(pending_contact_person_choices.items()):
+            if choice[:3] == (actor_id, service_id, task):
+                pending_contact_person_choices.pop(token, None)
+        for token, choice in list(pending_contact_navigation.items()):
+            if choice[:2] == (actor_id, service_id):
+                pending_contact_navigation.pop(token, None)
         registered = pending.get("registered_contacts", {}).get(task, [])
         contacts_by_name = {
             contact["name"]: contact for contact in registered
@@ -662,12 +702,27 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     callback_data=f"contact_person:{token}",
                 )
             ])
+        rows.extend(
+            [
+                [
+                    contact_navigation_button(
+                        actor_id, service_id, "tasks"
+                    )
+                ],
+                [
+                    contact_navigation_button(
+                        actor_id, service_id, "finish"
+                    )
+                ],
+            ]
+        )
         await message.answer(
             "Ответственные за задачу «"
             + task
             + "» по файлу расписания:\n"
             + "\n".join(details)
-            + "\nВыберите имя, чтобы привязать или изменить Telegram-пользователя.",
+            + "\nВыберите имя, чтобы привязать или изменить Telegram-пользователя. "
+            "После каждого изменения список появится снова.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             parse_mode=None,
         )
@@ -876,6 +931,76 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ]
         )
 
+    async def notification_template_preview(
+        actor_id: int, service_id: str, task: str | None = None
+    ) -> str:
+        pending = pending_inputs.get(actor_id)
+        registry = service_registry()
+        if pending is None or registry is None:
+            return "Предпросмотр недоступен: настройки служения не найдены."
+        service = service_by_id(registry, service_id)
+        if service is None:
+            return "Предпросмотр недоступен: служение не найдено."
+        prepare_previews = getattr(
+            context, "prepare_service_test_previews", None
+        )
+        if not callable(prepare_previews):
+            return "Предпросмотр на предстоящее воскресенье недоступен."
+        try:
+            previews = await prepare_previews(
+                service_id,
+                group_template=pending["group_template"],
+                personal_templates=pending["personal_templates"],
+            )
+        except (
+            AttributeError,
+            IndexError,
+            KeyError,
+            OSError,
+            PermissionError,
+            RuntimeError,
+            sqlite3.Error,
+            TypeError,
+            ValueError,
+        ) as exc:
+            debug.exception(
+                "Не удалось подготовить предпросмотр шаблона службы %s",
+                service_id,
+            )
+            return (
+                "Предпросмотр на предстоящее воскресенье недоступен "
+                f"({type(exc).__name__})."
+            )
+        if task is None:
+            current = pending["group_template"] or (
+                "(не задан — используется текст по умолчанию)"
+            )
+            return (
+                f"Текущий текст группового шаблона:\n{current}\n\n"
+                f"Пример на {previews['sunday_date']:%d.%m.%Y}:\n"
+                f"{previews['group_text']}"
+            )
+
+        default_template = (
+            "{name}, вы назначены на задачу «{task}» службы "
+            "«{service_name}» на {sunday_date}."
+        )
+        current = pending["personal_templates"].get(task, default_template)
+        examples = [
+            item
+            for item in previews["personal_messages"]
+            if item["task"] == task
+        ]
+        example_text = "\n\n".join(
+            f"{item['name']} (ID {item['telegram_id']}):\n{item['text']}"
+            for item in examples
+        ) or "На предстоящее воскресенье для этой задачи нет назначенных пользователей."
+        return (
+            f"Текущий личный шаблон для задачи «{task}»:\n{current}\n\n"
+            f"Пример на {previews['sunday_date']:%d.%m.%Y} "
+            f"для текущих привязок:\n{example_text}"
+        )
+
     async def begin_notification_edit(
         message: Message, actor_id: int, service_id: str, field: str
     ) -> None:
@@ -942,13 +1067,24 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await message.answer("Неизвестный параметр.", parse_mode=None)
             return
         pending["step"] = field
-        await message.answer(
-            prompts[field],
-            reply_markup=notification_edit_controls(
-                service_id, pending["session_id"]
-            ),
-            parse_mode=None,
-        )
+        text = prompts[field]
+        if field == "group_template":
+            text += "\n\n" + await notification_template_preview(
+                actor_id, service_id
+            )
+        chunks = _telegram_text_chunks(text)
+        for index, chunk in enumerate(chunks):
+            await message.answer(
+                chunk,
+                reply_markup=(
+                    notification_edit_controls(
+                        service_id, pending["session_id"]
+                    )
+                    if index == len(chunks) - 1
+                    else None
+                ),
+                parse_mode=None,
+            )
 
     def service_chat_keyboard(service_id: str) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
@@ -980,15 +1116,27 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         pending["active_task"] = task
         pending["step"] = "notify_template"
-        await message.answer(
+        text = (
             f"Введите индивидуальный текст напоминания для задачи "
             f"«{task}». Шаблоны: {{name}}, {{task}}, {{service_name}}, "
-            f"{{sunday_date}}, {{telegram_id}}, {{username}}.",
-            reply_markup=notification_edit_controls(
-                service_id, pending["session_id"]
-            ),
-            parse_mode=None,
+            f"{{sunday_date}}, {{telegram_id}}, {{username}}.\n\n"
+            + await notification_template_preview(
+                actor_id, service_id, task
+            )
         )
+        chunks = _telegram_text_chunks(text)
+        for index, chunk in enumerate(chunks):
+            await message.answer(
+                chunk,
+                reply_markup=(
+                    notification_edit_controls(
+                        service_id, pending["session_id"]
+                    )
+                    if index == len(chunks) - 1
+                    else None
+                ),
+                parse_mode=None,
+            )
 
     async def save_notification_setup(message: Message, actor_id: int) -> None:
         pending = pending_inputs.get(actor_id)
@@ -1111,6 +1259,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def offer_user_selection(
         message: Message, actor_id: int, service_id: str
     ) -> None:
+        pending_inputs[actor_id] = {
+            "operation": "service_admin_add",
+            "service_id": service_id,
+            "step": "await_user",
+        }
         request_id = new_share_request_id()
         pending_shares[request_id] = (
             actor_id, "service_admin_add", service_id, None, None
@@ -1135,7 +1288,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         )
         await message.answer(
             "Нажмите кнопку и выберите пользователя в Telegram. "
-            "Проверьте выбор — назначение подтвердите на следующем шаге.",
+            "Либо отправьте его Telegram ID, при желании дополнив "
+            "username через пробел: 123456789 @username. "
+            "Администратор также может назначить самого себя. "
+            "Назначение подтвердите на следующем шаге.",
             reply_markup=keyboard,
             parse_mode=None,
         )
@@ -1147,7 +1303,20 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         task: str,
         contact_name: str,
     ) -> None:
-        pending_inputs.pop(actor_id, None)
+        pending = pending_inputs.get(actor_id)
+        if (
+            pending is None
+            or pending.get("operation") != "service_contact"
+            or pending.get("service_id") != service_id
+            or pending.get("active_task") != task
+        ):
+            await message.answer(
+                "Сценарий привязки устарел. Запустите /service_contact заново.",
+                parse_mode=None,
+            )
+            return
+        pending["step"] = "await_user"
+        pending["active_contact_name"] = contact_name
         request_id = new_share_request_id()
         pending_shares[request_id] = (
             actor_id, "service_contact", service_id, task, contact_name
@@ -1173,7 +1342,97 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         await message.answer(
             f"Нажмите кнопку и выберите пользователя Telegram для имени "
             f"«{contact_name}» (задача «{task}»). "
+            "Или отправьте Telegram ID, при желании дополнив username "
+            "через пробел: 123456789 @username. "
             "Проверьте выбор — назначение подтвердите на следующем шаге.",
+            reply_markup=keyboard,
+            parse_mode=None,
+        )
+
+    def parse_manual_user(text: str) -> tuple[int, str]:
+        parts = text.split()
+        if len(parts) not in {1, 2}:
+            raise ValueError(
+                "Введите Telegram ID и при необходимости username "
+                "через пробел, например: 123456789 @username."
+            )
+        try:
+            user_id = int(parts[0])
+        except ValueError as exc:
+            raise ValueError(
+                "Telegram ID должен быть положительным числом."
+            ) from exc
+        if user_id <= 0:
+            raise ValueError("Telegram ID должен быть положительным числом.")
+        username = ""
+        if len(parts) == 2:
+            username = parts[1]
+            if username.startswith("@"):
+                username = username[1:]
+        if username and not re.fullmatch(
+            r"[A-Za-z][A-Za-z0-9_]{4,31}", username
+        ):
+            raise ValueError("Некорректный Telegram username.")
+        return user_id, username
+
+    async def ask_user_assignment_confirmation(
+        message: Message,
+        actor_id: int,
+        service_id: str,
+        operation: str,
+        user_id: int,
+        username: str,
+        task: str | None = None,
+        contact_name: str | None = None,
+        display_name: str | None = None,
+    ) -> None:
+        key = (actor_id, service_id, user_id)
+        confirmation_id = secrets.token_urlsafe(8)
+        pending_admin_confirmations[key] = (
+            operation,
+            task,
+            contact_name,
+            display_name,
+            username,
+            confirmation_id,
+        )
+        callback_prefix = (
+            "service_admin" if operation == "service_admin_add"
+            else "service_contact"
+        )
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Подтвердить",
+                        callback_data=(
+                            f"{callback_prefix}_confirm:{service_id}:"
+                            f"{user_id}:{confirmation_id}"
+                        ),
+                    ),
+                    InlineKeyboardButton(
+                        text="Отмена",
+                        callback_data=(
+                            f"{callback_prefix}_cancel:{service_id}:"
+                            f"{user_id}:{confirmation_id}"
+                        ),
+                    ),
+                ]
+            ]
+        )
+        title = (
+            "назначить администратором служения"
+            if operation == "service_admin_add"
+            else (
+                f"привязать к записи «{contact_name}» из файла "
+                f"для задачи «{task}»"
+            )
+        )
+        user_display = display_name or f"Пользователь {user_id}"
+        await message.answer(
+            f"Подтвердите действие: {title}: {user_display}"
+            + (f" (@{username})" if username else "")
+            + f" (ID {user_id})?",
             reply_markup=keyboard,
             parse_mode=None,
         )
@@ -1212,17 +1471,30 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 return
 
             lines = ["Служения:"]
-            for service in visible:
+            for index, service in enumerate(visible):
                 state = "включено" if service["enabled"] else "выключено"
                 lines.append(f"{service_label(service)} — {state}")
                 if is_super_admin:
-                    admins = registry.list_service_admins(service["id"])
+                    admins = registry.list_service_admin_details(
+                        service["id"]
+                    )
+                    admin_text = ", ".join(
+                        f"{admin['telegram_id']}"
+                        + (
+                            f" (@{admin['username']})"
+                            if admin["username"]
+                            else ""
+                        )
+                        for admin in admins
+                    )
                     lines.append(
                         "  Групповой чат: "
                         f"{service['group_chat_id'] or 'не задан'}; "
                         "администраторы: "
-                        f"{', '.join(map(str, admins)) or 'не назначены'}"
+                        f"{admin_text or 'не назначены'}"
                     )
+                if index + 1 < len(visible):
+                    lines.append("")
         except sqlite3.Error:
             debug.exception("Не удалось прочитать список служений")
             await message.answer(
@@ -1259,15 +1531,21 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 message, "service_admin_add", parts[1]
             )
             return
-        if len(parts) != 3:
-            await message.answer("Лишние параметры. Запустите команду ещё раз.", parse_mode=None)
+        if len(parts) not in {3, 4}:
+            await message.answer(
+                "Укажите ID пользователя и необязательный username.",
+                parse_mode=None,
+            )
             return
-        service_id, raw_telegram_id = parts[1:]
+        service_id, raw_telegram_id = parts[1:3]
+        username = parts[3].lstrip("@") if len(parts) == 4 else ""
 
         def add_admin(actor_id: int) -> str:
             telegram_id = int(raw_telegram_id)
             registry = service_registry()
-            registry.add_service_admin(actor_id, service_id, telegram_id)
+            registry.add_service_admin(
+                actor_id, service_id, telegram_id, username
+            )
             return "Администратор служения добавлен (или уже был назначен)."
 
         await run_registry_command(message, add_admin)
@@ -1434,6 +1712,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         for key in list(pending_task_choices):
             if pending_task_choices[key][0] == message.from_user.id:
                 pending_task_choices.pop(key, None)
+                had_request = True
+        for key in list(pending_task_pages):
+            if pending_task_pages[key][0] == message.from_user.id:
+                pending_task_pages.pop(key, None)
+                had_request = True
+        for key in list(pending_contact_person_choices):
+            if pending_contact_person_choices[key][0] == message.from_user.id:
+                pending_contact_person_choices.pop(key, None)
+                had_request = True
+        for key in list(pending_contact_navigation):
+            if pending_contact_navigation[key][0] == message.from_user.id:
+                pending_contact_navigation.pop(key, None)
                 had_request = True
         for key in list(pending_notify_task_choices):
             if pending_notify_task_choices[key][0] == message.from_user.id:
@@ -1791,10 +2081,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await callback.answer()
             return
         parts = callback.data.split(":")
-        if len(parts) != 3:
+        if len(parts) != 4:
             await callback.answer("Некорректное подтверждение.")
             return
-        action, service_id, raw_user_id = parts
+        action, service_id, raw_user_id, confirmation_id = parts
         action_type = action.rsplit("_", 1)[1]
         try:
             user_id = int(raw_user_id)
@@ -1808,12 +2098,38 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             if selected_user and selected_user[0] == "service_admin_add"
             else "service_contact"
         )
-        if selected_user is None or action.rsplit("_", 1)[0] != expected_prefix:
+        if (
+            selected_user is None
+            or selected_user[0] not in {"service_admin_add", "service_contact"}
+            or selected_user[5] != confirmation_id
+            or action.rsplit("_", 1)[0] != expected_prefix
+        ):
             await callback.answer("Запрос устарел. Начните команду заново.")
             return
         pending_admin_confirmations.pop(key, None)
+        (
+            operation,
+            task,
+            contact_name,
+            selected_display_name,
+            username,
+            _,
+        ) = selected_user
         if action_type == "cancel":
             await callback.message.answer("Назначение отменено.", parse_mode=None)
+            if operation == "service_admin_add":
+                pending_inputs.pop(callback.from_user.id, None)
+            else:
+                contact_pending = pending_inputs.get(callback.from_user.id)
+                if contact_pending is not None:
+                    contact_pending["step"] = "choose_contact_person"
+                    contact_pending.pop("active_contact_name", None)
+                await offer_contact_name_choices(
+                    callback.message,
+                    callback.from_user.id,
+                    service_id,
+                    task or "",
+                )
             await callback.answer()
             return
         registry = service_registry()
@@ -1825,12 +2141,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await callback.answer()
             return
         try:
-            operation, task, contact_name, selected_display_name, username = (
-                selected_user
-            )
             if operation == "service_admin_add":
                 registry.add_service_admin(
-                    callback.from_user.id, service_id, user_id
+                    callback.from_user.id, service_id, user_id, username or ""
                 )
             else:
                 registry.set_responsible_contact(
@@ -1865,6 +2178,41 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     + f") для задачи «{task}»."
                 )
             await callback.message.answer(response, parse_mode=None)
+            if operation == "service_contact":
+                contact_pending = pending_inputs.get(callback.from_user.id)
+                if contact_pending is not None:
+                    registered = contact_pending.setdefault(
+                        "registered_contacts", {}
+                    ).setdefault(task or "", [])
+                    registered[:] = [
+                        item for item in registered
+                        if (
+                            item["name"] != contact_name
+                            and item["telegram_id"] != user_id
+                        )
+                    ]
+                    registered.append(
+                        {
+                            "task": task,
+                            "name": contact_name,
+                            "telegram_id": user_id,
+                            "username": username or "",
+                        }
+                    )
+        if operation == "service_admin_add":
+            pending_inputs.pop(callback.from_user.id, None)
+        else:
+            contact_pending = pending_inputs.get(callback.from_user.id)
+            if contact_pending is not None:
+                contact_pending["step"] = "choose_contact_person"
+                contact_pending.pop("active_contact_name", None)
+            if task:
+                await offer_contact_name_choices(
+                    callback.message,
+                    callback.from_user.id,
+                    service_id,
+                    task,
+                )
         await callback.answer()
 
     @admin_router.callback_query(F.data.startswith("task_page:"))
@@ -1952,6 +2300,48 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
         await callback.answer()
 
+    @admin_router.callback_query(F.data.startswith("contact_nav:"))
+    async def on_contact_navigation(callback: CallbackQuery) -> None:
+        if (
+            not callback.from_user
+            or not callback.message
+            or callback.message.chat.type != ChatType.PRIVATE
+        ):
+            await callback.answer()
+            return
+        token = callback.data.partition(":")[2]
+        selection = pending_contact_navigation.pop(token, None)
+        pending = pending_inputs.get(callback.from_user.id)
+        if (
+            selection is None
+            or selection[0] != callback.from_user.id
+            or pending is None
+            or pending.get("operation") != "service_contact"
+            or pending.get("service_id") != selection[1]
+            or pending.get("step") != "choose_contact_person"
+        ):
+            await callback.answer("Этот выбор устарел. Начните команду заново.")
+            return
+        _, service_id, action = selection
+        if action == "tasks":
+            pending["step"] = "choose_task"
+            pending.pop("active_task", None)
+            pending.pop("active_contact_name", None)
+            await send_task_choices_page(
+                callback.message,
+                callback.from_user.id,
+                service_id,
+                "service_contact",
+            )
+        else:
+            clear_pending_actor(callback.from_user.id)
+            await callback.message.answer(
+                "Привязка ответственных завершена.",
+                parse_mode=None,
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        await callback.answer()
+
     @admin_router.message(F.users_shared)
     async def on_users_shared(message: Message) -> None:
         if (
@@ -1986,6 +2376,26 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         operation = pending[1]
         task = pending[3]
         contact_name = pending[4]
+        active = pending_inputs.get(message.from_user.id)
+        if (
+            active is None
+            or active.get("operation") != operation
+            or active.get("service_id") != pending[2]
+            or active.get("step") != "await_user"
+            or (
+                operation == "service_contact"
+                and (
+                    active.get("active_task") != task
+                    or active.get("active_contact_name") != contact_name
+                )
+            )
+        ):
+            await message.answer(
+                "Выбор пользователя устарел. Выберите задачу и имя заново.",
+                parse_mode=None,
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
         if operation == "service_contact" and (not task or not contact_name):
             await message.answer(
                 "Не удалось определить задачу. Запустите привязку заново.",
@@ -2001,53 +2411,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             if part and part.strip()
         )
-        key = (message.from_user.id, pending[2], user_id)
-        pending_admin_confirmations[key] = (
+        await ask_user_assignment_confirmation(
+            message,
+            message.from_user.id,
+            pending[2],
             operation,
+            user_id,
+            selected_user.username or "",
             task,
             contact_name,
             selected_display_name,
-            selected_user.username or "",
-        )
-        display_name = selected_display_name or f"Пользователь {user_id}"
-        username = (
-            f" (@{selected_user.username})" if selected_user.username else ""
-        )
-        operation_title = (
-            "назначить администратором"
-            if operation == "service_admin_add"
-            else (
-                f"привязать к записи «{contact_name}» из файла для задачи "
-                f"«{task}»"
-            )
-        )
-        callback_prefix = (
-            "service_admin" if operation == "service_admin_add"
-            else "service_contact"
-        )
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="Подтвердить",
-                        callback_data=(
-                            f"{callback_prefix}_confirm:{pending[2]}:{user_id}"
-                        ),
-                    ),
-                    InlineKeyboardButton(
-                        text="Отмена",
-                        callback_data=(
-                            f"{callback_prefix}_cancel:{pending[2]}:{user_id}"
-                        ),
-                    ),
-                ]
-            ]
-        )
-        await message.answer(
-            f"{operation_title}: {display_name}"
-            f"{username} (ID {user_id})?",
-            reply_markup=keyboard,
-            parse_mode=None,
         )
 
     @admin_router.message(F.chat_shared)
@@ -2131,10 +2504,21 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         text = message.text.strip()
         try:
             if operation == "service_admin_add":
-                registry.add_service_admin(
-                    message.from_user.id, service_id, int(text)
+                if pending.get("step") != "await_user":
+                    raise ValueError(
+                        "Сначала выберите пользователя или введите "
+                        "его Telegram ID."
+                    )
+                user_id, username = parse_manual_user(text)
+                await ask_user_assignment_confirmation(
+                    message,
+                    message.from_user.id,
+                    service_id,
+                    operation,
+                    user_id,
+                    username,
                 )
-                response = "Администратор служения назначен."
+                return
             elif operation == "service_admin_remove":
                 registry.remove_service_admin(
                     message.from_user.id, service_id, int(text)
@@ -2158,10 +2542,28 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     context.group_chat_id = chat_id
                 response = "Групповой чат и статус служения сохранены."
             elif operation == "service_contact":
-                raise ValueError(
-                    "Задачи и имена ответственных берутся из файла расписания. "
-                    "Выберите их кнопками выше; ручной ввод отключён."
+                if pending.get("step") != "await_user":
+                    raise ValueError(
+                        "Сначала выберите задачу и ответственного кнопками."
+                    )
+                task = pending.get("active_task")
+                contact_name = pending.get("active_contact_name")
+                if not task or not contact_name:
+                    raise ValueError(
+                        "Выбор ответственного устарел. Выберите его заново."
+                    )
+                user_id, username = parse_manual_user(text)
+                await ask_user_assignment_confirmation(
+                    message,
+                    message.from_user.id,
+                    service_id,
+                    operation,
+                    user_id,
+                    username,
+                    task,
+                    contact_name,
                 )
+                return
             elif operation == "service_notify":
                 step = pending["step"]
                 if step == "days":
