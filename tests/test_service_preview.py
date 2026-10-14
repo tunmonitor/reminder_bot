@@ -1,7 +1,9 @@
 import asyncio
 import logging
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -150,14 +152,12 @@ class ServicePreviewTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             registry = ServiceRegistry(Path(temp_dir) / "registry.sqlite3")
             registry.initialize(67890, -100)
-            registry.set_notification_settings(
-                67890,
-                "sound",
-                reminder_days=1,
-                reminder_time="18:00",
-                group_template="{service_name.attribute}",
-                personal_templates={},
-            )
+            with closing(sqlite3.connect(registry.path)) as connection:
+                connection.execute(
+                    "UPDATE services SET group_template = ? WHERE id = ?",
+                    ("{service_name.attribute}", "sound"),
+                )
+                connection.commit()
             with patch(
                 "bot.app._load_service_task_assignments",
                 new=AsyncMock(return_value={"Звук": ["Алексей"]}),

@@ -10,9 +10,44 @@ import stat
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from string import Formatter
 
 from .secure_fs import open_private_directory
 from .services import SERVICES
+
+
+GROUP_TEMPLATE_FIELDS = frozenset(
+    {"service_name", "sunday_date", "task_assignments"}
+)
+PERSONAL_TEMPLATE_FIELDS = frozenset(
+    {"name", "task", "service_name", "sunday_date", "telegram_id", "username"}
+)
+
+
+def validate_notification_template(
+    template: str,
+    allowed_fields: frozenset[str],
+    label: str,
+) -> None:
+    allowed = ", ".join(sorted(f"{{{field}}}" for field in allowed_fields))
+    try:
+        for _, field_name, format_spec, conversion in Formatter().parse(template):
+            if field_name is None:
+                continue
+            if field_name not in allowed_fields:
+                raise ValueError(
+                    f"{label}: поле {{{field_name}}} не поддерживается. "
+                    f"Доступны: {allowed}."
+                )
+            if format_spec or conversion:
+                raise ValueError(
+                    f"{label}: для шаблонов разрешены только простые "
+                    f"поля без форматирования. Доступны: {allowed}."
+                )
+    except ValueError as exc:
+        if str(exc).startswith(f"{label}:"):
+            raise
+        raise ValueError(f"{label}: некорректный синтаксис шаблона.") from exc
 
 
 class ServiceRegistry:
@@ -431,6 +466,12 @@ class ServiceRegistry:
             not isinstance(group_template, str) or not group_template.strip()
         ):
             raise ValueError("Текст группового уведомления не может быть пустым")
+        if group_template is not None:
+            validate_notification_template(
+                group_template,
+                GROUP_TEMPLATE_FIELDS,
+                "Шаблон группового уведомления",
+            )
         if not isinstance(personal_templates, dict) or any(
             not isinstance(task, str)
             or not isinstance(text, str)
@@ -439,6 +480,12 @@ class ServiceRegistry:
             for task, text in personal_templates.items()
         ):
             raise ValueError("Шаблоны личных сообщений должны быть непустыми")
+        for task, template in personal_templates.items():
+            validate_notification_template(
+                template,
+                PERSONAL_TEMPLATE_FIELDS,
+                f"Личный шаблон для задачи «{task}»",
+            )
 
         with self._connection() as connection:
             self._require_service(connection, service_id)

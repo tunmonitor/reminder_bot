@@ -183,6 +183,48 @@ class ServiceRegistryTest(unittest.TestCase):
             {"telegram_id": 5005, "username": "alex_new"},
         )
 
+    def test_notification_template_validation_rejects_invalid_fields_and_syntax(self):
+        for group_template, personal_templates in (
+            ("{unknown}", {}),
+            ("{service_name", {}),
+            ("{service_name!r}", {}),
+            (None, {"Микшер": "{name.attribute}"}),
+            (None, {"Микшер": "{missing}"}),
+            (None, {"Микшер": "{name"}),
+        ):
+            with self.subTest(
+                group_template=group_template,
+                personal_templates=personal_templates,
+            ):
+                with self.assertRaises(ValueError):
+                    self.registry.set_notification_settings(
+                        1001,
+                        "sound",
+                        reminder_days=1,
+                        reminder_time="18:00",
+                        group_template=group_template,
+                        personal_templates=personal_templates,
+                    )
+
+    def test_notification_template_validation_accepts_supported_fields(self):
+        self.registry.set_notification_settings(
+            1001,
+            "sound",
+            reminder_days=1,
+            reminder_time="18:00",
+            group_template="{service_name} {sunday_date} {task_assignments}",
+            personal_templates={
+                "Микшер": (
+                    "{name} {task} {service_name} {sunday_date} "
+                    "{telegram_id} {username}"
+                )
+            },
+        )
+
+        service = self.registry.get_service("sound")
+        self.assertIn("{service_name}", service["group_template"])
+        self.assertIn("{telegram_id}", service["personal_templates"]["Микшер"])
+
     def test_rebinding_contact_replaces_old_name_and_user_rows(self):
         self.registry.set_responsible_contact(
             1001, "sound", "Микшер", "Алексей", 4004, "alex_one"
@@ -307,14 +349,16 @@ class ServiceRegistryTest(unittest.TestCase):
             "sound",
             reminder_days=2,
             reminder_time="16:45",
-            group_template="Звук: {name}",
+            group_template="Звук: {service_name}",
             personal_templates={"Микшер": "{name}, проверьте звук"},
         )
 
         services = {service["id"]: service for service in self.registry.list_services()}
         self.assertEqual(services["sound"]["reminder_days"], 2)
         self.assertEqual(services["sound"]["reminder_time"], "16:45")
-        self.assertEqual(services["sound"]["group_template"], "Звук: {name}")
+        self.assertEqual(
+            services["sound"]["group_template"], "Звук: {service_name}"
+        )
         self.assertEqual(
             services["sound"]["personal_templates"],
             {"Микшер": "{name}, проверьте звук"},
