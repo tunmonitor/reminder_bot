@@ -95,7 +95,7 @@ class StateCacheTest(unittest.TestCase):
         self.assertFalse(merged["participants"]["Ведущий"]["delivered"])
         self.assertIsNone(merged["participants"]["Ведущий"]["message_id"])
 
-    def test_merge_resends_group_message_to_new_chat_but_keeps_old_dm_chat(self):
+    def test_merge_routes_confirmations_to_new_group_and_resets_group_update(self):
         previous = _build_state(
             {
                 "Ответственный": {
@@ -116,6 +116,9 @@ class StateCacheTest(unittest.TestCase):
             message_id=51,
             chat_id=12345,
             group_chat_id=-1001,
+            confirmed=True,
+            group_update_sent=True,
+            group_update_persisted=True,
         )
         current = _build_state(
             {
@@ -134,7 +137,17 @@ class StateCacheTest(unittest.TestCase):
         self.assertEqual(merged["group_chat_id"], -1002)
         self.assertTrue(merged["participants"]["Ответственный"]["delivered"])
         self.assertEqual(
-            merged["participants"]["Ответственный"]["group_chat_id"], -1001
+            merged["participants"]["Ответственный"]["chat_id"], 12345
+        )
+        self.assertEqual(
+            merged["participants"]["Ответственный"]["group_chat_id"], -1002
+        )
+        self.assertTrue(merged["participants"]["Ответственный"]["confirmed"])
+        self.assertFalse(
+            merged["participants"]["Ответственный"]["group_update_sent"]
+        )
+        self.assertFalse(
+            merged["participants"]["Ответственный"]["group_update_persisted"]
         )
 
     def test_merge_legacy_incomplete_week_uses_credentials_chat(self):
@@ -177,7 +190,7 @@ class StateCacheTest(unittest.TestCase):
         )
         self.assertEqual(
             merged["participants"]["Ответственный"]["group_chat_id"],
-            -1001,
+            -1002,
         )
 
 

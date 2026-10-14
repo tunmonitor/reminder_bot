@@ -266,18 +266,26 @@ def _merge_week_state(
     for role, participant in current["participants"].items():
         old = old_participants.get(role, {})
         if old.get("tg_id") == participant["tg_id"]:
+            old_participant_group_chat_id = old.get("group_chat_id")
+            if old_participant_group_chat_id is None:
+                old_participant_group_chat_id = old_group_chat_id
+            same_participant_group = (
+                old_participant_group_chat_id == group_chat_id
+            )
             participant["delivered"] = old.get(
                 "delivered", old.get("message_id") is not None
             )
             participant["message_id"] = old.get("message_id")
             participant["chat_id"] = old.get("chat_id")
-            participant["group_chat_id"] = (
-                old.get("group_chat_id")
-                if old.get("group_chat_id") is not None
-                else old_group_chat_id
-            )
+            participant["group_chat_id"] = group_chat_id
             participant["confirmed"] = old.get("confirmed", False)
-            participant["group_update_sent"] = old.get("group_update_sent", False)
+            participant["group_update_sent"] = (
+                old.get("group_update_sent", False)
+                if same_participant_group
+                else False
+            )
+            if not same_participant_group:
+                participant["group_update_persisted"] = False
     return current
 
 
@@ -345,8 +353,9 @@ async def _load_service_task_assignments(
     tz,
     service_id: str,
     debug_logger,
+    only_date: date | None = None,
 ) -> dict[str, list[str]]:
-    sunday_date = _next_sunday_in_tz(tz)
+    sunday_date = only_date or _next_sunday_in_tz(tz)
     debug_dir = shm_dir / "debug"
     directory_fd = open_private_directory(debug_dir, create=True)
     os.close(directory_fd)
@@ -371,6 +380,8 @@ async def _load_service_task_assignments(
         )
         assignments: dict[str, set[str]] = {}
         for event in events_by_service.get(service_id, []):
+            if only_date is not None and event.event_date != only_date:
+                continue
             for assignment in event.assignments:
                 assignments.setdefault(assignment.task, set()).add(
                     assignment.name
@@ -401,7 +412,12 @@ async def _prepare_service_test_previews(
     if service is None:
         raise ValueError(f"Служение '{service_id}' не найдено")
     assignments = await _load_service_task_assignments(
-        credentials, shm_dir, tz, service_id, debug_logger
+        credentials,
+        shm_dir,
+        tz,
+        service_id,
+        debug_logger,
+        only_date=sunday_date,
     )
     contacts = registry.list_responsible_contacts(
         credentials.admin_tg_id, service_id
@@ -437,16 +453,22 @@ async def _prepare_service_test_previews(
                 "{name}, вы назначены на задачу «{task}» службы "
                 "«{service_name}» на {sunday_date}.",
             )
-            personal_text = template.format_map(
-                _TemplateValues(
-                    name=name,
-                    task=task,
-                    service_name=service["name"],
-                    sunday_date=sunday_str,
-                    telegram_id=telegram_id,
-                    username=username,
+            try:
+                personal_text = template.format_map(
+                    _TemplateValues(
+                        name=name,
+                        task=task,
+                        service_name=service["name"],
+                        sunday_date=sunday_str,
+                        telegram_id=telegram_id,
+                        username=username,
+                    )
                 )
-            )
+            except (AttributeError, IndexError, KeyError, ValueError) as exc:
+                raise ValueError(
+                    f"Некорректный личный шаблон для задачи «{task}» "
+                    f"служения «{service['name']}»"
+                ) from exc
             personal_messages.append(
                 {
                     "task": task,
@@ -464,13 +486,18 @@ async def _prepare_service_test_previews(
     group_template = service["group_template"] or (
         "{service_name} — {sunday_date}\n{task_assignments}"
     )
-    group_text = group_template.format_map(
-        _TemplateValues(
-            service_name=service["name"],
-            sunday_date=sunday_str,
-            task_assignments=assignment_text,
+    try:
+        group_text = group_template.format_map(
+            _TemplateValues(
+                service_name=service["name"],
+                sunday_date=sunday_str,
+                task_assignments=assignment_text,
+            )
         )
-    )
+    except (AttributeError, IndexError, KeyError, ValueError) as exc:
+        raise ValueError(
+            f"Некорректный групповой шаблон служения «{service['name']}»"
+        ) from exc
     return {
         "sunday_date": sunday_date,
         "group_text": group_text,

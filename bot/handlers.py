@@ -228,9 +228,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
             is_super_admin = registry.is_super_admin(actor_id)
             services = registry.list_services()
-            if operation in {
-                "service_settings", "service_notify", "service_sync"
-            }:
+            if operation in {"service_settings", "service_notify"}:
                 services = [
                     item for item in services
                     if is_super_admin
@@ -348,9 +346,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         }
         if operation == "service_notify":
             service = service_by_id(registry, service_id)
+            if service is None:
+                raise ValueError("Служение не найдено.")
             pending_inputs[actor_id] = {
                 "operation": operation,
                 "service_id": service_id,
+                "session_id": secrets.token_urlsafe(9),
                 "step": "menu",
                 "reminder_days": service["reminder_days"],
                 "reminder_time": service["reminder_time"],
@@ -597,9 +598,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 else "В расписании пока нет задач с назначенными "
                 "ответственными. Можно завершить и сохранить настройки."
             )
-            rows.extend(
-                notification_edit_controls(service_id).inline_keyboard
-            )
         await message.answer(
             prompt,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -793,19 +791,28 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 [
                     InlineKeyboardButton(
                         text=f"Дни до события: {pending['reminder_days']}",
-                        callback_data=f"notify_edit:days:{service_id}",
+                        callback_data=(
+                            f"notify_edit:days:{service_id}:"
+                            f"{pending['session_id']}"
+                        ),
                     )
                 ],
                 [
                     InlineKeyboardButton(
                         text=f"Время: {pending['reminder_time']}",
-                        callback_data=f"notify_edit:time:{service_id}",
+                        callback_data=(
+                            f"notify_edit:time:{service_id}:"
+                            f"{pending['session_id']}"
+                        ),
                     )
                 ],
                 [
                     InlineKeyboardButton(
                         text="Текст группового сообщения",
-                        callback_data=f"notify_edit:group_template:{service_id}",
+                        callback_data=(
+                            f"notify_edit:group_template:{service_id}:"
+                            f"{pending['session_id']}"
+                        ),
                     )
                 ],
                 [
@@ -814,19 +821,28 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             "Личные шаблоны "
                             f"({len(pending['personal_templates'])})"
                         ),
-                        callback_data=f"notify_edit:personal:{service_id}",
+                        callback_data=(
+                            f"notify_edit:personal:{service_id}:"
+                            f"{pending['session_id']}"
+                        ),
                     )
                 ],
                 [
                     InlineKeyboardButton(
                         text="Завершить и сохранить",
-                        callback_data=f"notify_finish:{service_id}",
+                        callback_data=(
+                            f"notify_finish:{service_id}:"
+                            f"{pending['session_id']}"
+                        ),
                     )
                 ],
                 [
                     InlineKeyboardButton(
                         text="Отмена",
-                        callback_data=f"notify_cancel:{service_id}",
+                        callback_data=(
+                            f"notify_cancel:{service_id}:"
+                            f"{pending['session_id']}"
+                        ),
                     )
                 ],
             ]
@@ -838,17 +854,23 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             parse_mode=None,
         )
 
-    def notification_edit_controls(service_id: str) -> InlineKeyboardMarkup:
+    def notification_edit_controls(
+        service_id: str, session_id: str
+    ) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
                         text="Завершить и сохранить",
-                        callback_data=f"notify_finish:{service_id}",
+                        callback_data=(
+                            f"notify_finish:{service_id}:{session_id}"
+                        ),
                     ),
                     InlineKeyboardButton(
                         text="Отмена",
-                        callback_data=f"notify_cancel:{service_id}",
+                        callback_data=(
+                            f"notify_cancel:{service_id}:{session_id}"
+                        ),
                     ),
                 ]
             ]
@@ -922,7 +944,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         pending["step"] = field
         await message.answer(
             prompts[field],
-            reply_markup=notification_edit_controls(service_id),
+            reply_markup=notification_edit_controls(
+                service_id, pending["session_id"]
+            ),
             parse_mode=None,
         )
 
@@ -959,8 +983,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         await message.answer(
             f"Введите индивидуальный текст напоминания для задачи "
             f"«{task}». Шаблоны: {{name}}, {{task}}, {{service_name}}, "
-            "{{sunday_date}}, {{telegram_id}}, {{username}}.",
-            reply_markup=notification_edit_controls(service_id),
+            f"{{sunday_date}}, {{telegram_id}}, {{username}}.",
+            reply_markup=notification_edit_controls(
+                service_id, pending["session_id"]
+            ),
             parse_mode=None,
         )
 
@@ -1667,12 +1693,25 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         ):
             await callback.answer()
             return
-        _, field, service_id = callback.data.split(":", 2)
+        parts = callback.data.split(":", 3)
+        if len(parts) != 4:
+            await callback.answer("Настройка устарела. Запустите её заново.")
+            return
+        _, field, service_id, session_id = parts
         registry = service_registry()
         if registry is None or not is_service_admin(
             callback.from_user.id, service_id
         ):
             await callback.answer("Недостаточно прав.")
+            return
+        pending = pending_inputs.get(callback.from_user.id)
+        if (
+            pending is None
+            or pending.get("operation") != "service_notify"
+            or pending.get("service_id") != service_id
+            or pending.get("session_id") != session_id
+        ):
+            await callback.answer("Настройка устарела. Запустите её заново.")
             return
         await begin_notification_edit(
             callback.message, callback.from_user.id, service_id, field
@@ -1688,7 +1727,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         ):
             await callback.answer()
             return
-        service_id = callback.data.partition(":")[2]
+        parts = callback.data.split(":", 2)
+        if len(parts) != 3:
+            await callback.answer("Настройка устарела. Запустите её заново.")
+            return
+        _, service_id, session_id = parts
         pending = pending_inputs.get(callback.from_user.id)
         if not is_service_admin(callback.from_user.id, service_id):
             await callback.answer("Недостаточно прав.")
@@ -1697,6 +1740,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             pending is None
             or pending.get("operation") != "service_notify"
             or pending.get("service_id") != service_id
+            or pending.get("session_id") != session_id
         ):
             await callback.answer("Настройка устарела. Запустите её заново.")
             return
@@ -1710,13 +1754,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if not callback.from_user or not callback.message:
             await callback.answer()
             return
-        service_id = callback.data.partition(":")[2]
+        parts = callback.data.split(":", 2)
+        if len(parts) != 3:
+            await callback.answer("Настройка устарела.")
+            return
+        _, service_id, session_id = parts
         pending = pending_inputs.get(callback.from_user.id)
         if (
             callback.message.chat.type != ChatType.PRIVATE
             or pending is None
             or pending.get("operation") != "service_notify"
             or pending.get("service_id") != service_id
+            or pending.get("session_id") != session_id
         ):
             await callback.answer("Настройка устарела.")
             return
@@ -2251,6 +2300,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         try:
             previews = await prepare_previews(service["id"])
         except (
+            AttributeError,
             IndexError,
             KeyError,
             OSError,
@@ -2450,6 +2500,7 @@ async def _confirm_locked(
                 debug.exception("Не удалось отредактировать ЛС")
 
     group_update_blocked_reason = None
+    active_group_chat_id = None
     registry = getattr(context, "service_registry", None)
     if not participant.get("group_update_sent") and registry is not None:
         try:
@@ -2464,11 +2515,19 @@ async def _confirm_locked(
         else:
             if assembly is None or not assembly["enabled"]:
                 group_update_blocked_reason = "служение отключено"
+            elif assembly.get("group_chat_id") is None:
+                group_update_blocked_reason = "групповой чат не настроен"
+            else:
+                active_group_chat_id = assembly.get("group_chat_id")
 
     if not participant.get("group_update_sent") and not group_update_blocked_reason:
-        group_chat_id = participant.get(
-            "group_chat_id",
-            state.get("group_chat_id", context.group_chat_id),
+        group_chat_id = (
+            active_group_chat_id
+            if active_group_chat_id is not None
+            else participant.get(
+                "group_chat_id",
+                state.get("group_chat_id", context.group_chat_id),
+            )
         )
         try:
             await context.bot.send_message(

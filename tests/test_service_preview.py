@@ -2,6 +2,7 @@ import asyncio
 import logging
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -54,6 +55,10 @@ class ServicePreviewTest(unittest.TestCase):
                 self.assertEqual(
                     load_assignments.await_args.args[3], "sound"
                 )
+                self.assertEqual(
+                    load_assignments.await_args.kwargs["only_date"],
+                    result["sunday_date"],
+                )
                 return result
 
             preview = asyncio.run(run())
@@ -72,6 +77,104 @@ class ServicePreviewTest(unittest.TestCase):
             self.assertTrue(
                 any("Презентация — Иван" in issue for issue in preview["issues"])
             )
+
+    def test_task_loader_can_filter_assignments_to_one_sunday(self):
+        from bot.app import _load_service_task_assignments
+
+        target_sunday = date(2026, 10, 25)
+        next_sunday = date(2026, 11, 1)
+        parsed_events = {
+            "sound": [
+                SimpleNamespace(
+                    event_date=target_sunday,
+                    assignments=[
+                        SimpleNamespace(task="Звук", name="Алексей")
+                    ],
+                ),
+                SimpleNamespace(
+                    event_date=next_sunday,
+                    assignments=[
+                        SimpleNamespace(task="Звук", name="Мария"),
+                        SimpleNamespace(task="Слайды", name="Иван"),
+                    ],
+                ),
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            credentials = SimpleNamespace(yandex_public_url="public-url")
+            logger = logging.getLogger("test-service-date-filter")
+
+            async def run():
+                with (
+                    patch(
+                        "bot.app._next_sunday_in_tz",
+                        side_effect=[target_sunday, next_sunday],
+                    ),
+                    patch("bot.app.download_public", new=AsyncMock()),
+                    patch(
+                        "bot.app.parse_service_events",
+                        return_value=parsed_events,
+                    ) as parse_events,
+                ):
+                    month_assignments = await _load_service_task_assignments(
+                        credentials,
+                        Path(temp_dir),
+                        ZoneInfo("UTC"),
+                        "sound",
+                        logger,
+                    )
+                    sunday_assignments = await _load_service_task_assignments(
+                        credentials,
+                        Path(temp_dir),
+                        ZoneInfo("UTC"),
+                        "sound",
+                        logger,
+                        only_date=target_sunday,
+                    )
+                self.assertEqual(parse_events.call_count, 2)
+                self.assertEqual(
+                    [call.args[1] for call in parse_events.call_args_list],
+                    [target_sunday, target_sunday],
+                )
+                return month_assignments, sunday_assignments
+
+            month_assignments, sunday_assignments = asyncio.run(run())
+
+        self.assertEqual(
+            month_assignments,
+            {"Звук": ["Алексей", "Мария"], "Слайды": ["Иван"]},
+        )
+        self.assertEqual(sunday_assignments, {"Звук": ["Алексей"]})
+
+    def test_malformed_template_is_reported_as_clear_value_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ServiceRegistry(Path(temp_dir) / "registry.sqlite3")
+            registry.initialize(67890, -100)
+            registry.set_notification_settings(
+                67890,
+                "sound",
+                reminder_days=1,
+                reminder_time="18:00",
+                group_template="{service_name.attribute}",
+                personal_templates={},
+            )
+            with patch(
+                "bot.app._load_service_task_assignments",
+                new=AsyncMock(return_value={"Звук": ["Алексей"]}),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "Некорректный групповой шаблон"
+                ):
+                    asyncio.run(
+                        _prepare_service_test_previews(
+                            "sound",
+                            SimpleNamespace(admin_tg_id=67890),
+                            Path(temp_dir),
+                            ZoneInfo("UTC"),
+                            registry,
+                            logging.getLogger("test-invalid-template"),
+                        )
+                    )
 
 
 if __name__ == "__main__":
