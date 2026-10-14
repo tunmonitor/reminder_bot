@@ -113,6 +113,10 @@ class PartialNotificationTest(unittest.TestCase):
                 (12345, "Алексей, 11.10.2026"),
             )
             self.assertEqual(state["participants"]["Ответственный"]["message_id"], 11)
+            self.assertEqual(
+                state["participants"]["Ответственный"]["group_chat_id"],
+                -100,
+            )
             debug_messages = [
                 call.args[0] for call in debug_logger.debug.call_args_list
             ]

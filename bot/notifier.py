@@ -153,6 +153,7 @@ async def send_assignments(
             )
             participant_state["message_id"] = msg.message_id
             participant_state["chat_id"] = msg.chat.id
+            participant_state["group_chat_id"] = group_chat_id
             participant_state["delivered"] = True
             await persist_progress()
             interaction_logger.info(

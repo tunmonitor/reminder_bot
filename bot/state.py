@@ -3,12 +3,14 @@
 Формат:
 {
   "sunday_date": "2026-11-08",
+  "group_chat_id": -100123,
   "general_message_id": 123,
   "general_sent": true,
   "participants": {
       "Ответственный": {"name": "...", "username": "...", "tg_id": 1,
                         "delivered": true, "confirmed": false,
-                        "message_id": 10, "chat_id": 1},
+                        "message_id": 10, "chat_id": 1,
+                        "group_chat_id": -100123},
       "Ведущий":        {...},
       "Проповедник":    {...}
   }
@@ -56,9 +58,21 @@ class StateCache:
         if self.path.exists():
             self.path.unlink()
 
-    def matches_week(self, sunday_iso: str) -> bool:
+    def matches_week(
+        self,
+        sunday_iso: str,
+        group_chat_id: int | None = None,
+        legacy_group_chat_id: int | None = None,
+    ) -> bool:
+        if not self.state or self.state.get("sunday_date") != sunday_iso:
+            return False
+        saved_chat_id = self.state.get("group_chat_id")
+        if saved_chat_id is None:
+            saved_chat_id = legacy_group_chat_id
         return (
-            bool(self.state)
-            and self.state.get("sunday_date") == sunday_iso
-            and self.state.get("complete") is True
+            self.state.get("complete") is True
+            and (
+                group_chat_id is None
+                or saved_chat_id == group_chat_id
+            )
         )

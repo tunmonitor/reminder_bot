@@ -158,6 +158,46 @@ class ExcelParserTest(unittest.TestCase):
             for item in event.assignments
         ])
 
+    def test_service_events_support_legacy_schedule_sheet_for_assembly(self):
+        workbook = Workbook()
+        schedule = workbook.active
+        schedule.title = "График"
+        schedule.append(["Дата", "Задача", "Ответственный"])
+        schedule.append([date(2026, 10, 11), None, None])
+        schedule.append([None, "ХКЦ", "Алексей"])
+        schedule.append([None, "Ведущий", "Павел"])
+        schedule.append([date(2026, 10, 18), None, None])
+        schedule.append([None, "Проповедует", "Иван"])
+        workbook.save(self.path)
+
+        parsed = parse_service_events(
+            self.path, date(2026, 10, 1), self.debug_logger
+        )
+
+        self.assertEqual(
+            [
+                (
+                    event.event_date,
+                    [(item.task, item.name) for item in event.assignments],
+                )
+                for event in parsed["assembly"]
+            ],
+            [
+                (
+                    date(2026, 10, 11),
+                    [
+                        ("Ответственный", "Алексей"),
+                        ("Ведущий", "Павел"),
+                    ],
+                ),
+                (
+                    date(2026, 10, 18),
+                    [("Проповедник", "Иван")],
+                ),
+            ],
+        )
+        self.assertTrue(all(not events for key, events in parsed.items() if key != "assembly"))
+
     def test_service_events_exclude_dates_outside_requested_month_and_year(self):
         workbook = Workbook()
         schedule = workbook.active

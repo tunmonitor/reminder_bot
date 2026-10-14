@@ -13,7 +13,9 @@ from types import SimpleNamespace
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import BotCommand
 
 if __package__:
     from .cli import CliArgs
@@ -24,7 +26,13 @@ if __package__:
         load_templates,
         service_registry_path,
     )
-    from .excel_parser import ROLES, parse_people, parse_schedule, resolve_assignments
+    from .excel_parser import (
+        ROLES,
+        parse_people,
+        parse_schedule,
+        parse_service_events,
+        resolve_assignments,
+    )
     from .handlers import register
     from .logger import setup_loggers
     from .notifier import (
@@ -47,7 +55,13 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         load_templates,
         service_registry_path,
     )
-    from bot.excel_parser import ROLES, parse_people, parse_schedule, resolve_assignments
+    from bot.excel_parser import (
+        ROLES,
+        parse_people,
+        parse_schedule,
+        parse_service_events,
+        resolve_assignments,
+    )
     from bot.handlers import register
     from bot.logger import setup_loggers
     from bot.notifier import (
@@ -201,9 +215,12 @@ def _existing_pid_process_status(path: Path) -> tuple[str, bool] | None:
     return pid, running
 
 
-def _build_state(assignments: dict[str, dict]) -> dict:
+def _build_state(
+    assignments: dict[str, dict], group_chat_id: int | None = None
+) -> dict:
     return {
         "sunday_date": None,
+        "group_chat_id": group_chat_id,
         "general_message_id": None,
         "general_sent": False,
         "general_text": None,
@@ -223,26 +240,52 @@ def _build_state(assignments: dict[str, dict]) -> dict:
     }
 
 
-def _merge_week_state(previous: dict | None, current: dict) -> dict:
+def _merge_week_state(
+    previous: dict | None,
+    current: dict,
+    group_chat_id: int | None = None,
+    legacy_group_chat_id: int | None = None,
+) -> dict:
     if not previous or previous.get("sunday_date") != current["sunday_date"]:
         return current
 
-    current["general_message_id"] = previous.get("general_message_id")
-    current["general_sent"] = previous.get(
-        "general_sent", previous.get("general_message_id") is not None
-    )
-    current["general_text"] = previous.get("general_text")
+    if group_chat_id is None:
+        group_chat_id = current.get("group_chat_id")
+    old_group_chat_id = previous.get("group_chat_id")
+    if old_group_chat_id is None:
+        old_group_chat_id = legacy_group_chat_id
+    current["group_chat_id"] = group_chat_id
+    same_group_chat = old_group_chat_id == group_chat_id
+    if same_group_chat:
+        current["general_message_id"] = previous.get("general_message_id")
+        current["general_sent"] = previous.get(
+            "general_sent", previous.get("general_message_id") is not None
+        )
+        current["general_text"] = previous.get("general_text")
     old_participants = previous.get("participants", {})
     for role, participant in current["participants"].items():
         old = old_participants.get(role, {})
         if old.get("tg_id") == participant["tg_id"]:
+            old_participant_group_chat_id = old.get("group_chat_id")
+            if old_participant_group_chat_id is None:
+                old_participant_group_chat_id = old_group_chat_id
+            same_participant_group = (
+                old_participant_group_chat_id == group_chat_id
+            )
             participant["delivered"] = old.get(
                 "delivered", old.get("message_id") is not None
             )
             participant["message_id"] = old.get("message_id")
             participant["chat_id"] = old.get("chat_id")
+            participant["group_chat_id"] = group_chat_id
             participant["confirmed"] = old.get("confirmed", False)
-            participant["group_update_sent"] = old.get("group_update_sent", False)
+            participant["group_update_sent"] = (
+                old.get("group_update_sent", False)
+                if same_participant_group
+                else False
+            )
+            if not same_participant_group:
+                participant["group_update_persisted"] = False
     return current
 
 
@@ -304,6 +347,165 @@ async def _prepare_test_notification_previews(
         xlsx_path.unlink(missing_ok=True)
 
 
+async def _load_service_task_assignments(
+    credentials,
+    shm_dir: Path,
+    tz,
+    service_id: str,
+    debug_logger,
+    only_date: date | None = None,
+) -> dict[str, list[str]]:
+    sunday_date = only_date or _next_sunday_in_tz(tz)
+    debug_dir = shm_dir / "debug"
+    directory_fd = open_private_directory(debug_dir, create=True)
+    os.close(directory_fd)
+    file_fd, file_name = tempfile.mkstemp(
+        prefix=f"schedule-tasks-{sunday_date:%Y%m%d}-",
+        suffix=".xlsx",
+        dir=debug_dir,
+    )
+    os.fchmod(file_fd, 0o600)
+    os.close(file_fd)
+    xlsx_path = Path(file_name)
+    try:
+        await download_public(
+            credentials.yandex_public_url,
+            xlsx_path,
+            debug_logger,
+            attempts=1,
+            interval=0,
+        )
+        events_by_service = parse_service_events(
+            xlsx_path, sunday_date, debug_logger
+        )
+        assignments: dict[str, set[str]] = {}
+        for event in events_by_service.get(service_id, []):
+            if only_date is not None and event.event_date != only_date:
+                continue
+            for assignment in event.assignments:
+                assignments.setdefault(assignment.task, set()).add(
+                    assignment.name
+                )
+        return {
+            task: sorted(names)
+            for task, names in sorted(assignments.items())
+        }
+    finally:
+        xlsx_path.unlink(missing_ok=True)
+
+
+class _TemplateValues(dict):
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+async def _prepare_service_test_previews(
+    service_id: str,
+    credentials,
+    shm_dir: Path,
+    tz,
+    registry: ServiceRegistry,
+    debug_logger,
+) -> dict:
+    sunday_date = _next_sunday_in_tz(tz)
+    service = registry.get_service(service_id)
+    if service is None:
+        raise ValueError(f"Служение '{service_id}' не найдено")
+    assignments = await _load_service_task_assignments(
+        credentials,
+        shm_dir,
+        tz,
+        service_id,
+        debug_logger,
+        only_date=sunday_date,
+    )
+    contacts = registry.list_responsible_contacts(
+        credentials.admin_tg_id, service_id
+    )
+    contacts_by_name = {
+        (contact["task"], contact["name"]): contact for contact in contacts
+    }
+    rendered_assignments = []
+    personal_messages = []
+    issues = []
+    sunday_str = sunday_date.strftime("%d.%m.%Y")
+    for task, names in assignments.items():
+        rendered_names = []
+        for name in names:
+            contact = contacts_by_name.get((task, name))
+            if contact is None:
+                rendered_names.append(f"{name} (Telegram не привязан)")
+                issues.append(
+                    f"Не привязан Telegram-пользователь: {task} — {name}"
+                )
+                telegram_id = ""
+                username = ""
+            else:
+                username = contact["username"]
+                telegram_id = str(contact["telegram_id"])
+                rendered_names.append(
+                    f"{name} (ID {telegram_id}"
+                    + (f", @{username}" if username else "")
+                    + ")"
+                )
+            template = service["personal_templates"].get(
+                task,
+                "{name}, вы назначены на задачу «{task}» службы "
+                "«{service_name}» на {sunday_date}.",
+            )
+            try:
+                personal_text = template.format_map(
+                    _TemplateValues(
+                        name=name,
+                        task=task,
+                        service_name=service["name"],
+                        sunday_date=sunday_str,
+                        telegram_id=telegram_id,
+                        username=username,
+                    )
+                )
+            except (AttributeError, IndexError, KeyError, ValueError) as exc:
+                raise ValueError(
+                    f"Некорректный личный шаблон для задачи «{task}» "
+                    f"служения «{service['name']}»"
+                ) from exc
+            personal_messages.append(
+                {
+                    "task": task,
+                    "name": name,
+                    "telegram_id": telegram_id,
+                    "text": personal_text,
+                }
+            )
+        rendered_assignments.append(
+            f"• {task}: " + (", ".join(rendered_names) or "ответственные не указаны")
+        )
+    if not assignments:
+        issues.append("В актуальном графике для службы нет назначенных задач.")
+    assignment_text = "\n".join(rendered_assignments) or "Задачи не найдены."
+    group_template = service["group_template"] or (
+        "{service_name} — {sunday_date}\n{task_assignments}"
+    )
+    try:
+        group_text = group_template.format_map(
+            _TemplateValues(
+                service_name=service["name"],
+                sunday_date=sunday_str,
+                task_assignments=assignment_text,
+            )
+        )
+    except (AttributeError, IndexError, KeyError, ValueError) as exc:
+        raise ValueError(
+            f"Некорректный групповой шаблон служения «{service['name']}»"
+        ) from exc
+    return {
+        "sunday_date": sunday_date,
+        "group_text": group_text,
+        "personal_messages": personal_messages,
+        "issues": issues,
+    }
+
+
 async def _process_upcoming_sunday(
     bot: Bot,
     credentials,
@@ -313,10 +515,35 @@ async def _process_upcoming_sunday(
     interaction_logger,
     debug_logger,
     tz,
+    service_registry=None,
 ) -> None:
+    delivery_group_chat_id = credentials.group_chat_id
+    if service_registry is not None:
+        assembly = service_registry.get_service("assembly")
+        if assembly is None:
+            raise RuntimeError("В реестре не настроено служение «Собрание»")
+        if not assembly["enabled"]:
+            interaction_logger.info(
+                "Рассылка «Собрания» пропущена: служение отключено в реестре"
+            )
+            return
+        delivery_group_chat_id = assembly["group_chat_id"]
+        if delivery_group_chat_id is None:
+            await _notify_admin(
+                bot,
+                credentials.admin_tg_id,
+                "Рассылка «Собрания» не выполнена: не задан ID группового чата.",
+                debug_logger,
+            )
+            return
+
     sunday_date = _next_sunday_in_tz(tz)
     sunday_iso = sunday_date.isoformat()
-    if state_cache.matches_week(sunday_iso):
+    if state_cache.matches_week(
+        sunday_iso,
+        delivery_group_chat_id,
+        legacy_group_chat_id=credentials.group_chat_id,
+    ):
         interaction_logger.info("Рассылка для %s уже отправлена", sunday_iso)
         return
 
@@ -362,15 +589,20 @@ async def _process_upcoming_sunday(
             debug_logger,
         )
 
-    state = _build_state(assignments)
+    state = _build_state(assignments, delivery_group_chat_id)
     state["sunday_date"] = sunday_iso
-    state = _merge_week_state(state_cache.state, state)
+    state = _merge_week_state(
+        state_cache.state,
+        state,
+        delivery_group_chat_id,
+        legacy_group_chat_id=credentials.group_chat_id,
+    )
     state_cache.replace(state)
 
     try:
         general_delivery_complete = await send_assignments(
             bot=bot,
-            group_chat_id=credentials.group_chat_id,
+            group_chat_id=delivery_group_chat_id,
             admin_id=credentials.admin_tg_id,
             assignments=assignments,
             state=state,
@@ -422,10 +654,14 @@ async def run(args: CliArgs) -> None:
     tz = get_tz(credentials.timezone)
     state_cache = StateCache(shm_dir / "reminder_state_cache.json")
     service_registry = ServiceRegistry(service_registry_path())
+    registry_context_group_chat_id = credentials.group_chat_id
     try:
         service_registry.initialize(
             credentials.admin_tg_id, credentials.group_chat_id
         )
+        assembly = service_registry.get_service("assembly")
+        if assembly and assembly["group_chat_id"] is not None:
+            registry_context_group_chat_id = assembly["group_chat_id"]
     except Exception:
         debug_logger.exception(
             "Не удалось инициализировать реестр служений; "
@@ -444,10 +680,61 @@ async def run(args: CliArgs) -> None:
             token=credentials.bot_token,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         )
+        if callable(getattr(bot, "set_my_commands", None)):
+            try:
+                await bot.set_my_commands(
+                    [
+                        BotCommand(command="services", description="Список служений"),
+                        BotCommand(
+                            command="service_settings",
+                            description="Настройки служения",
+                        ),
+                        BotCommand(
+                            command="service_admin_add",
+                            description="Назначить администратора служения",
+                        ),
+                        BotCommand(
+                            command="service_admin_remove",
+                            description="Снять администратора служения",
+                        ),
+                        BotCommand(
+                            command="service_chat",
+                            description="Настроить групповой чат",
+                        ),
+                        BotCommand(
+                            command="service_contact",
+                            description="Связать ответственного с Telegram",
+                        ),
+                        BotCommand(
+                            command="service_sync",
+                            description="Обновить задачи и ответственных из графика",
+                        ),
+                        BotCommand(
+                            command="service_notify",
+                            description="Настроить тексты и время уведомлений",
+                        ),
+                        BotCommand(
+                            command="cancel",
+                            description="Отменить ввод параметров",
+                        ),
+                        BotCommand(
+                            command="start",
+                            description="Начать работу с ботом",
+                        ),
+                        BotCommand(
+                            command="test_notify",
+                            description="Проверить доставку уведомлений",
+                        ),
+                    ]
+                )
+            except TelegramAPIError:
+                debug_logger.exception(
+                    "Не удалось обновить меню команд Telegram"
+                )
         dp = Dispatcher(storage=MemoryStorage())
         context = SimpleNamespace(
             bot=bot,
-            group_chat_id=credentials.group_chat_id,
+            group_chat_id=registry_context_group_chat_id,
             admin_id=credentials.admin_tg_id,
             state_cache=state_cache,
             interaction_logger=interaction_logger,
@@ -461,7 +748,28 @@ async def run(args: CliArgs) -> None:
                 credentials, templates, shm_dir, tz, debug_logger
             )
 
+        async def load_service_task_assignments(
+            service_id: str,
+        ) -> dict[str, list[str]]:
+            return await _load_service_task_assignments(
+                credentials, shm_dir, tz, service_id, debug_logger
+            )
+
+        async def prepare_service_test_previews(service_id: str) -> dict:
+            if service_registry is None:
+                raise ValueError("Реестр настроек служений недоступен")
+            return await _prepare_service_test_previews(
+                service_id,
+                credentials,
+                shm_dir,
+                tz,
+                service_registry,
+                debug_logger,
+            )
+
         context.prepare_test_previews = prepare_test_previews
+        context.load_service_task_assignments = load_service_task_assignments
+        context.prepare_service_test_previews = prepare_service_test_previews
         register(dp, context)
 
         async def scheduled_job() -> None:
@@ -478,6 +786,7 @@ async def run(args: CliArgs) -> None:
                     interaction_logger=interaction_logger,
                     debug_logger=debug_logger,
                     tz=tz,
+                    service_registry=service_registry,
                 )
             finally:
                 if task is not None:

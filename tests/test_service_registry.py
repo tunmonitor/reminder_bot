@@ -2,6 +2,7 @@ import stat
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from bot.service_registry import ServiceRegistry
@@ -41,15 +42,41 @@ class ServiceRegistryTest(unittest.TestCase):
         services = {service["id"]: service for service in self.registry.list_services()}
         self.assertTrue(self.registry.is_super_admin(1001))
         self.assertFalse(self.registry.is_super_admin(2002))
-        self.assertEqual(services["assembly"]["group_chat_id"], -19999)
+        self.assertEqual(services["assembly"]["group_chat_id"], -10001)
         self.assertEqual(services["sound"]["group_chat_id"], -10002)
+
+    def test_initialization_preserves_assembly_chat_and_enabled_state(self):
+        self.registry.set_group_chat(1001, "assembly", -10055, enabled=False)
+
+        self.registry.initialize(1001, -19999)
+
+        assembly = self.registry.get_service("assembly")
+        self.assertEqual(assembly["group_chat_id"], -10055)
+        self.assertFalse(assembly["enabled"])
+
+    def test_disabling_service_preserves_its_group_chat(self):
+        self.registry.set_group_chat(1001, "sound", -10055, enabled=True)
+
+        self.registry.set_service_enabled(1001, "sound", False)
+
+        sound = self.registry.get_service("sound")
+        self.assertEqual(sound["group_chat_id"], -10055)
+        self.assertFalse(sound["enabled"])
+
+    def test_share_request_ids_remain_unique_after_registry_restart(self):
+        first_request_id = self.registry.next_share_request_id()
+        self.registry.initialize(1001, -19999)
+
+        second_request_id = self.registry.next_share_request_id()
+
+        self.assertGreater(second_request_id, first_request_id)
 
     def test_no_op_admin_changes_do_not_create_audit_entries(self):
         self.registry.add_service_admin(1001, "sound", 3003)
         self.registry.add_service_admin(1001, "sound", 3003)
         self.registry.remove_service_admin(1001, "sound", 9999)
 
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection:
             count = connection.execute(
                 "SELECT COUNT(*) FROM configuration_audit "
                 "WHERE action IN ('service_admin_added', 'service_admin_removed')"
@@ -86,6 +113,122 @@ class ServiceRegistryTest(unittest.TestCase):
                 "sound", "Микшер", "Алексей"
             ),
             {"telegram_id": 5005, "username": "alex_new"},
+        )
+
+    def test_rebinding_contact_replaces_old_name_and_user_rows(self):
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Алексей", 4004, "alex_one"
+        )
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Алексей", 5005, "alex_two"
+        )
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Павел", 5005, "pavel"
+        )
+
+        contacts = self.registry.list_responsible_contacts(1001, "sound")
+        self.assertEqual(
+            [
+                (item["name"], item["telegram_id"], item["username"])
+                for item in contacts
+                if item["task"] == "Микшер"
+            ],
+            [("Павел", 5005, "pavel")],
+        )
+
+    def test_initialization_cleans_existing_duplicate_contact_names(self):
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Алексей", 4004, "alex_old"
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                "DROP INDEX idx_responsible_contacts_name"
+            )
+            connection.execute(
+                """
+                INSERT INTO responsible_contacts (
+                    service_id, task, name, telegram_id, username,
+                    updated_by, updated_at
+                ) VALUES ('sound', 'Микшер', 'Алексей', 5005, 'alex_new',
+                          1001, '2026-10-13T00:00:00+00:00')
+                """
+            )
+            connection.commit()
+
+        self.registry.initialize(1001, -10001)
+
+        contacts = [
+            item
+            for item in self.registry.list_responsible_contacts(1001, "sound")
+            if item["task"] == "Микшер"
+        ]
+        self.assertEqual(
+            [(item["name"], item["telegram_id"], item["username"]) for item in contacts],
+            [("Алексей", 5005, "alex_new")],
+        )
+
+    def test_migrates_contact_primary_key_from_name_to_telegram_id(self):
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Алексей", 4004, "alex"
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.executescript(
+                """
+                ALTER TABLE responsible_contacts
+                RENAME TO contacts_new;
+                CREATE TABLE responsible_contacts (
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    task TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    telegram_id INTEGER NOT NULL CHECK (telegram_id > 0),
+                    username TEXT NOT NULL DEFAULT '',
+                    updated_by INTEGER NOT NULL CHECK (updated_by > 0),
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (service_id, task, name)
+                );
+                INSERT INTO responsible_contacts
+                SELECT * FROM contacts_new;
+                INSERT INTO responsible_contacts (
+                    service_id, task, name, telegram_id, username,
+                    updated_by, updated_at
+                ) VALUES (
+                    'sound', 'Микшер', 'Алексей-дубликат', 4004,
+                    'alex_duplicate', 1001, '2026-10-13T00:00:00+00:00'
+                );
+                DROP TABLE contacts_new;
+                CREATE TABLE responsible_contacts_v2 (stale TEXT);
+                """
+            )
+
+        self.registry.initialize(1001, -10001)
+
+        with closing(sqlite3.connect(self.path)) as connection:
+            migrated = connection.execute(
+                "SELECT name, telegram_id, username "
+                "FROM responsible_contacts WHERE task = 'Микшер'"
+            ).fetchall()
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            leftover = connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'responsible_contacts_v2'"
+            ).fetchone()
+        self.assertEqual(integrity, "ok")
+        self.assertIsNone(leftover)
+        self.assertEqual(len(migrated), 1)
+        self.assertEqual(migrated[0][1], 4004)
+
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Алексей-дубликат", 5005, "alex2"
+        )
+        contacts = [
+            item for item in self.registry.list_responsible_contacts(1001, "sound")
+            if item["task"] == "Микшер"
+        ]
+        self.assertEqual(
+            [(item["name"], item["telegram_id"]) for item in contacts],
+            [("Алексей-дубликат", 5005)],
         )
 
     def test_service_admin_can_edit_only_own_notification_settings(self):

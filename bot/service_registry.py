@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import sqlite3
 import stat
 from contextlib import contextmanager
@@ -67,7 +68,7 @@ class ServiceRegistry:
                     username TEXT NOT NULL DEFAULT '',
                     updated_by INTEGER NOT NULL CHECK (updated_by > 0),
                     updated_at TEXT NOT NULL,
-                    PRIMARY KEY (service_id, task, name)
+                    PRIMARY KEY (service_id, task, telegram_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS configuration_audit (
@@ -78,7 +79,79 @@ class ServiceRegistry:
                     details_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS runtime_counters (
+                    name TEXT PRIMARY KEY,
+                    next_value INTEGER NOT NULL
+                        CHECK (next_value >= 0 AND next_value <= 2147483647)
+                );
                 """
+            )
+            contact_primary_key = [
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(responsible_contacts)"
+                )
+                if row["pk"]
+            ]
+            if contact_primary_key != ["service_id", "task", "telegram_id"]:
+                connection.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    DROP TABLE IF EXISTS responsible_contacts_v2;
+                    CREATE TABLE responsible_contacts_v2 (
+                        service_id TEXT NOT NULL
+                            REFERENCES services(id) ON DELETE CASCADE,
+                        task TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        telegram_id INTEGER NOT NULL CHECK (telegram_id > 0),
+                        username TEXT NOT NULL DEFAULT '',
+                        updated_by INTEGER NOT NULL CHECK (updated_by > 0),
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (service_id, task, telegram_id)
+                    );
+                    INSERT INTO responsible_contacts_v2 (
+                        service_id, task, name, telegram_id, username,
+                        updated_by, updated_at
+                    )
+                    SELECT service_id, task, name, telegram_id, username,
+                           updated_by, updated_at
+                    FROM responsible_contacts
+                    WHERE rowid IN (
+                        SELECT MAX(rowid)
+                        FROM responsible_contacts
+                        GROUP BY service_id, task, telegram_id
+                    )
+                    AND rowid IN (
+                        SELECT MAX(rowid)
+                        FROM responsible_contacts
+                        GROUP BY service_id, task, name
+                    );
+                    DROP TABLE responsible_contacts;
+                    ALTER TABLE responsible_contacts_v2
+                    RENAME TO responsible_contacts;
+                    COMMIT;
+                    """
+                )
+            connection.execute(
+                """
+                DELETE FROM responsible_contacts
+                WHERE rowid NOT IN (
+                    SELECT MAX(rowid)
+                    FROM responsible_contacts
+                    GROUP BY service_id, task, name
+                )
+                """
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "idx_responsible_contacts_name "
+                "ON responsible_contacts(service_id, task, name)"
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO runtime_counters (name, next_value) "
+                "VALUES ('telegram_share_request_id', ?)",
+                (secrets.randbelow(2**30) + 2**30,),
             )
             now = _utc_now()
             for service in SERVICES:
@@ -99,11 +172,6 @@ class ServiceRegistry:
                         int(is_assembly),
                     ),
                 )
-            connection.execute(
-                "UPDATE services SET group_chat_id = ? WHERE id = 'assembly'",
-                (assembly_group_chat_id,),
-            )
-
             has_super_admin = connection.execute(
                 "SELECT 1 FROM super_admins LIMIT 1"
             ).fetchone()
@@ -113,6 +181,31 @@ class ServiceRegistry:
                     "VALUES (?, ?)",
                     (super_admin_id, now),
                 )
+
+    def next_share_request_id(self) -> int:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT next_value FROM runtime_counters "
+                "WHERE name = 'telegram_share_request_id'"
+            ).fetchone()
+            if row is None or row["next_value"] == 0:
+                raise ValueError(
+                    "Исчерпан счётчик запросов выбора Telegram."
+                )
+            request_id = row["next_value"]
+            if request_id == 2**31 - 1:
+                connection.execute(
+                    "UPDATE runtime_counters SET next_value = 0 "
+                    "WHERE name = 'telegram_share_request_id'"
+                )
+            else:
+                connection.execute(
+                    "UPDATE runtime_counters SET next_value = ? "
+                    "WHERE name = 'telegram_share_request_id'",
+                    (request_id + 1,),
+                )
+        return request_id
 
     def _ensure_private_database_file(self) -> None:
         try:
@@ -171,6 +264,16 @@ class ServiceRegistry:
             }
             for row in rows
         ]
+
+    def get_service(self, service_id: str) -> dict | None:
+        return next(
+            (
+                service
+                for service in self.list_services()
+                if service["id"] == service_id
+            ),
+            None,
+        )
 
     def is_super_admin(self, telegram_id: int) -> bool:
         with self._connection() as connection:
@@ -256,6 +359,27 @@ class ServiceRegistry:
                 {"group_chat_id": group_chat_id, "enabled": enabled},
             )
 
+    def set_service_enabled(
+        self, actor_id: int, service_id: str, enabled: bool
+    ) -> None:
+        _validate_positive_id(actor_id, "actor_id")
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled должен быть логическим значением")
+        with self._connection() as connection:
+            self._require_super_admin(connection, actor_id)
+            self._require_service(connection, service_id)
+            connection.execute(
+                "UPDATE services SET enabled = ? WHERE id = ?",
+                (int(enabled), service_id),
+            )
+            self._audit(
+                connection,
+                actor_id,
+                "service_enabled_updated",
+                service_id,
+                {"enabled": enabled},
+            )
+
     def set_notification_settings(
         self,
         actor_id: int,
@@ -263,7 +387,7 @@ class ServiceRegistry:
         *,
         reminder_days: int,
         reminder_time: str,
-        group_template: str,
+        group_template: str | None,
         personal_templates: dict[str, str],
     ) -> None:
         _validate_positive_id(actor_id, "actor_id")
@@ -273,8 +397,10 @@ class ServiceRegistry:
             raise ValueError("reminder_days не может быть отрицательным")
         if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", reminder_time):
             raise ValueError("reminder_time должен быть в формате HH:MM")
-        if not isinstance(group_template, str) or not group_template.strip():
-            raise ValueError("Текст группового уведомления обязателен")
+        if group_template is not None and (
+            not isinstance(group_template, str) or not group_template.strip()
+        ):
+            raise ValueError("Текст группового уведомления не может быть пустым")
         if not isinstance(personal_templates, dict) or any(
             not isinstance(task, str)
             or not isinstance(text, str)
@@ -335,16 +461,17 @@ class ServiceRegistry:
             self._require_super_admin(connection, actor_id)
             self._require_service(connection, service_id)
             connection.execute(
+                "DELETE FROM responsible_contacts "
+                "WHERE service_id = ? AND task = ? "
+                "AND (name = ? OR telegram_id = ?)",
+                (service_id, task, name, telegram_id),
+            )
+            connection.execute(
                 """
                 INSERT INTO responsible_contacts (
                     service_id, task, name, telegram_id, username,
                     updated_by, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(service_id, task, name) DO UPDATE SET
-                    telegram_id = excluded.telegram_id,
-                    username = excluded.username,
-                    updated_by = excluded.updated_by,
-                    updated_at = excluded.updated_at
                 """,
                 (
                     service_id, task, name, telegram_id,
@@ -362,10 +489,26 @@ class ServiceRegistry:
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT telegram_id, username FROM responsible_contacts "
-                "WHERE service_id = ? AND task = ? AND name = ?",
+                "WHERE service_id = ? AND task = ? AND name = ? "
+                "ORDER BY updated_at DESC LIMIT 1",
                 (service_id, task.strip(), name.strip()),
             ).fetchone()
         return dict(row) if row else None
+
+    def list_responsible_contacts(
+        self, actor_id: int, service_id: str
+    ) -> list[dict]:
+        _validate_positive_id(actor_id, "actor_id")
+        with self._connection() as connection:
+            self._require_super_admin(connection, actor_id)
+            self._require_service(connection, service_id)
+            rows = connection.execute(
+                "SELECT task, name, telegram_id, username "
+                "FROM responsible_contacts WHERE service_id = ? "
+                "ORDER BY task, name",
+                (service_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def list_service_admins(self, service_id: str) -> list[int]:
         with self._connection() as connection:
