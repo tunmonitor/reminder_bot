@@ -96,6 +96,74 @@ class ServiceRegistryTest(unittest.TestCase):
         self.registry.remove_service_admin(1001, "sound", 3003)
         self.assertFalse(self.registry.is_service_admin(3003, "sound"))
 
+    def test_admins_can_be_shared_across_services_and_have_usernames(self):
+        self.registry.add_service_admin(1001, "sound", 3003, "sound_user")
+        self.registry.add_service_admin(1001, "sound", 4004, "@other_user")
+        self.registry.add_service_admin(1001, "slides", 3003, "sound_user")
+
+        self.assertEqual(
+            self.registry.list_service_admin_details("sound"),
+            [
+                {"telegram_id": 3003, "username": "sound_user"},
+                {"telegram_id": 4004, "username": "other_user"},
+            ],
+        )
+        self.assertEqual(
+            self.registry.list_service_admin_details("slides"),
+            [{"telegram_id": 3003, "username": "sound_user"}],
+        )
+        self.assertTrue(self.registry.is_service_admin(3003, "sound"))
+        self.assertTrue(self.registry.is_service_admin(3003, "slides"))
+
+    def test_existing_admin_username_can_be_refreshed_without_duplicate_audit(self):
+        self.registry.add_service_admin(1001, "sound", 3003)
+
+        self.registry.add_service_admin(1001, "sound", 3003, "@new_user")
+        self.registry.add_service_admin(1001, "sound", 3003, "@new_user")
+
+        self.assertEqual(
+            self.registry.list_service_admin_details("sound"),
+            [{"telegram_id": 3003, "username": "new_user"}],
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM configuration_audit "
+                "WHERE action = 'service_admin_added'"
+            ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_initialization_adds_username_column_to_existing_admin_table(self):
+        self.registry.add_service_admin(1001, "sound", 3003)
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.executescript(
+                """
+                ALTER TABLE service_admins RENAME TO service_admins_with_username;
+                CREATE TABLE service_admins (
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    telegram_id INTEGER NOT NULL CHECK (telegram_id > 0),
+                    created_by INTEGER NOT NULL CHECK (created_by > 0),
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (service_id, telegram_id)
+                );
+                INSERT INTO service_admins (
+                    service_id, telegram_id, created_by, created_at
+                )
+                SELECT service_id, telegram_id, created_by, created_at
+                FROM service_admins_with_username;
+                DROP TABLE service_admins_with_username;
+                """
+            )
+            connection.commit()
+
+        self.registry.initialize(1001, -10001)
+
+        self.assertEqual(
+            self.registry.list_service_admin_details("sound"),
+            [{"telegram_id": 3003, "username": ""}],
+        )
+
     def test_super_admin_configures_group_and_manual_telegram_mapping(self):
         self.registry.set_group_chat(1001, "sound", -10022, enabled=True)
         self.registry.set_responsible_contact(
@@ -114,6 +182,48 @@ class ServiceRegistryTest(unittest.TestCase):
             ),
             {"telegram_id": 5005, "username": "alex_new"},
         )
+
+    def test_notification_template_validation_rejects_invalid_fields_and_syntax(self):
+        for group_template, personal_templates in (
+            ("{unknown}", {}),
+            ("{service_name", {}),
+            ("{service_name!r}", {}),
+            (None, {"Микшер": "{name.attribute}"}),
+            (None, {"Микшер": "{missing}"}),
+            (None, {"Микшер": "{name"}),
+        ):
+            with self.subTest(
+                group_template=group_template,
+                personal_templates=personal_templates,
+            ):
+                with self.assertRaises(ValueError):
+                    self.registry.set_notification_settings(
+                        1001,
+                        "sound",
+                        reminder_days=1,
+                        reminder_time="18:00",
+                        group_template=group_template,
+                        personal_templates=personal_templates,
+                    )
+
+    def test_notification_template_validation_accepts_supported_fields(self):
+        self.registry.set_notification_settings(
+            1001,
+            "sound",
+            reminder_days=1,
+            reminder_time="18:00",
+            group_template="{service_name} {sunday_date} {task_assignments}",
+            personal_templates={
+                "Микшер": (
+                    "{name} {task} {service_name} {sunday_date} "
+                    "{telegram_id} {username}"
+                )
+            },
+        )
+
+        service = self.registry.get_service("sound")
+        self.assertIn("{service_name}", service["group_template"])
+        self.assertIn("{telegram_id}", service["personal_templates"]["Микшер"])
 
     def test_rebinding_contact_replaces_old_name_and_user_rows(self):
         self.registry.set_responsible_contact(
@@ -239,14 +349,16 @@ class ServiceRegistryTest(unittest.TestCase):
             "sound",
             reminder_days=2,
             reminder_time="16:45",
-            group_template="Звук: {name}",
+            group_template="Звук: {service_name}",
             personal_templates={"Микшер": "{name}, проверьте звук"},
         )
 
         services = {service["id"]: service for service in self.registry.list_services()}
         self.assertEqual(services["sound"]["reminder_days"], 2)
         self.assertEqual(services["sound"]["reminder_time"], "16:45")
-        self.assertEqual(services["sound"]["group_template"], "Звук: {name}")
+        self.assertEqual(
+            services["sound"]["group_template"], "Звук: {service_name}"
+        )
         self.assertEqual(
             services["sound"]["personal_templates"],
             {"Микшер": "{name}, проверьте звук"},

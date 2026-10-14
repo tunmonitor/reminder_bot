@@ -1,7 +1,9 @@
 import asyncio
 import logging
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -150,14 +152,12 @@ class ServicePreviewTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             registry = ServiceRegistry(Path(temp_dir) / "registry.sqlite3")
             registry.initialize(67890, -100)
-            registry.set_notification_settings(
-                67890,
-                "sound",
-                reminder_days=1,
-                reminder_time="18:00",
-                group_template="{service_name.attribute}",
-                personal_templates={},
-            )
+            with closing(sqlite3.connect(registry.path)) as connection:
+                connection.execute(
+                    "UPDATE services SET group_template = ? WHERE id = ?",
+                    ("{service_name.attribute}", "sound"),
+                )
+                connection.commit()
             with patch(
                 "bot.app._load_service_task_assignments",
                 new=AsyncMock(return_value={"Звук": ["Алексей"]}),
@@ -175,6 +175,41 @@ class ServicePreviewTest(unittest.TestCase):
                             logging.getLogger("test-invalid-template"),
                         )
                     )
+
+    def test_preview_renders_templates_under_guided_setup_overrides(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ServiceRegistry(Path(temp_dir) / "registry.sqlite3")
+            registry.initialize(67890, -100)
+            registry.set_responsible_contact(
+                67890, "sound", "Микшер", "Алексей", 12345, "alex"
+            )
+            assignments = {"Микшер": ["Алексей"]}
+
+            async def run():
+                with patch(
+                    "bot.app._load_service_task_assignments",
+                    new=AsyncMock(return_value=assignments),
+                ):
+                    return await _prepare_service_test_previews(
+                        "sound",
+                        SimpleNamespace(admin_tg_id=67890),
+                        Path(temp_dir),
+                        ZoneInfo("UTC"),
+                        registry,
+                        logging.getLogger("test-service-template-overrides"),
+                        group_template="Новый {service_name}: {task_assignments}",
+                        personal_templates={
+                            "Микшер": "{name} ({telegram_id}, @{username})"
+                        },
+                    )
+
+            previews = asyncio.run(run())
+            self.assertIn("Новый Звук", previews["group_text"])
+            self.assertIn("Алексей (ID 12345, @alex)", previews["group_text"])
+            self.assertEqual(
+                previews["personal_messages"][0]["text"],
+                "Алексей (12345, @alex)",
+            )
 
 
 if __name__ == "__main__":

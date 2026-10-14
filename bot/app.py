@@ -406,6 +406,8 @@ async def _prepare_service_test_previews(
     tz,
     registry: ServiceRegistry,
     debug_logger,
+    group_template: str | None = None,
+    personal_templates: dict[str, str] | None = None,
 ) -> dict:
     sunday_date = _next_sunday_in_tz(tz)
     service = registry.get_service(service_id)
@@ -429,6 +431,11 @@ async def _prepare_service_test_previews(
     personal_messages = []
     issues = []
     sunday_str = sunday_date.strftime("%d.%m.%Y")
+    templates = (
+        service["personal_templates"]
+        if personal_templates is None
+        else personal_templates
+    )
     for task, names in assignments.items():
         rendered_names = []
         for name in names:
@@ -448,7 +455,7 @@ async def _prepare_service_test_previews(
                     + (f", @{username}" if username else "")
                     + ")"
                 )
-            template = service["personal_templates"].get(
+            template = templates.get(
                 task,
                 "{name}, вы назначены на задачу «{task}» службы "
                 "«{service_name}» на {sunday_date}.",
@@ -483,11 +490,15 @@ async def _prepare_service_test_previews(
     if not assignments:
         issues.append("В актуальном графике для службы нет назначенных задач.")
     assignment_text = "\n".join(rendered_assignments) or "Задачи не найдены."
-    group_template = service["group_template"] or (
+    effective_group_template = (
+        service["group_template"]
+        if group_template is None
+        else group_template
+    ) or (
         "{service_name} — {sunday_date}\n{task_assignments}"
     )
     try:
-        group_text = group_template.format_map(
+        group_text = effective_group_template.format_map(
             _TemplateValues(
                 service_name=service["name"],
                 sunday_date=sunday_str,
@@ -755,7 +766,11 @@ async def run(args: CliArgs) -> None:
                 credentials, shm_dir, tz, service_id, debug_logger
             )
 
-        async def prepare_service_test_previews(service_id: str) -> dict:
+        async def prepare_service_test_previews(
+            service_id: str,
+            group_template: str | None = None,
+            personal_templates: dict[str, str] | None = None,
+        ) -> dict:
             if service_registry is None:
                 raise ValueError("Реестр настроек служений недоступен")
             return await _prepare_service_test_previews(
@@ -765,6 +780,8 @@ async def run(args: CliArgs) -> None:
                 tz,
                 service_registry,
                 debug_logger,
+                group_template,
+                personal_templates,
             )
 
         context.prepare_test_previews = prepare_test_previews
