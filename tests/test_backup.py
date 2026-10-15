@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -16,6 +17,8 @@ from openpyxl import Workbook
 
 from bot.backup import (
     BackupManager,
+    MAX_SNAPSHOTS_PER_ENVIRONMENT,
+    MIN_RETAINED_SNAPSHOTS,
     application_instance_lock,
     assert_bot_stopped,
 )
@@ -128,6 +131,51 @@ class BackupManagerTest(unittest.TestCase):
             hashlib.sha256(workbook.read_bytes()).hexdigest(),
         )
         self.assertEqual(self.xlsx.read_bytes(), b"live workbook changed during snapshot")
+
+    def test_prunes_only_old_valid_snapshots_after_commit(self):
+        snapshot = asyncio.run(self.manager.create_snapshot("retention test"))
+        backup_dir = snapshot.parent
+        first_created_at = datetime(2020, 1, 1, tzinfo=ZoneInfo("UTC"))
+
+        def set_created_at(path, created_at):
+            manifest_path = path / "manifest.json"
+            manifest = json.loads(manifest_path.read_text("utf-8"))
+            manifest["created_at"] = created_at.isoformat()
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            manifest_path.chmod(0o600)
+
+        set_created_at(snapshot, first_created_at)
+        valid_snapshots = [snapshot]
+        for index in range(1, MAX_SNAPSHOTS_PER_ENVIRONMENT + 3):
+            candidate = backup_dir / f"snapshot-{index:02}"
+            shutil.copytree(snapshot, candidate)
+            set_created_at(candidate, first_created_at + timedelta(days=index))
+            valid_snapshots.append(candidate)
+
+        committed_snapshot = valid_snapshots[-1]
+        invalid_snapshot = backup_dir / "invalid-snapshot"
+        shutil.copytree(snapshot, invalid_snapshot)
+        with (invalid_snapshot / "database.sql").open("ab") as stream:
+            stream.write(b"-- tampered\n")
+
+        with self.assertLogs("test.backup", level="WARNING"):
+            self.manager._prune_old_snapshots(backup_dir, committed_snapshot)
+
+        remaining_valid = [
+            path
+            for path in valid_snapshots
+            if path.exists()
+        ]
+        self.assertEqual(len(remaining_valid), MAX_SNAPSHOTS_PER_ENVIRONMENT)
+        self.assertGreaterEqual(len(remaining_valid), MIN_RETAINED_SNAPSHOTS)
+        self.assertTrue(committed_snapshot.exists())
+        self.assertTrue(invalid_snapshot.exists())
+        self.assertFalse(valid_snapshots[0].exists())
+        self.assertFalse(valid_snapshots[1].exists())
+        self.assertFalse(valid_snapshots[2].exists())
 
     def test_restore_replaces_database_schedule_and_state(self):
         snapshot = asyncio.run(self.manager.create_snapshot("test"))

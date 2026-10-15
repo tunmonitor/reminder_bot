@@ -29,6 +29,8 @@ BACKUP_BASE = BACKUP_MOUNT / "reminder_bot" / "backups"
 SNAPSHOT_FORMAT_VERSION = 1
 BOT_PID_FILENAME = "reminder_bot_bot.pid"
 INSTANCE_LOCK_FILENAME = "reminder_bot_instance.lock"
+MAX_SNAPSHOTS_PER_ENVIRONMENT = 14
+MIN_RETAINED_SNAPSHOTS = 7
 
 
 @contextmanager
@@ -431,10 +433,111 @@ class BackupManager:
                 os.fsync(directory_fd)
             finally:
                 os.close(directory_fd)
+            self._prune_old_snapshots(backup_dir, final)
             return final
         except BaseException:
             shutil.rmtree(stage, ignore_errors=True)
             raise
+
+    def _prune_old_snapshots(
+        self, backup_dir: Path, committed_snapshot: Path
+    ) -> None:
+        snapshots = []
+        try:
+            candidates = tuple(backup_dir.iterdir())
+        except OSError:
+            self.logger.exception(
+                "Новый снимок создан, но каталог не удалось прочитать "
+                "для очистки старых копий: %s",
+                backup_dir,
+            )
+            return
+        for candidate in candidates:
+            if candidate == committed_snapshot or candidate.name.startswith(
+                ".snapshot-"
+            ):
+                continue
+            if candidate.is_symlink() or not candidate.is_dir():
+                continue
+            try:
+                manifest = self._validate_snapshot(
+                    candidate, self.environment
+                )
+                created_at = datetime.fromisoformat(manifest["created_at"])
+                if created_at.tzinfo is None or created_at.utcoffset() is None:
+                    raise ValueError("created_at не содержит часовой пояс")
+            except Exception:
+                self.logger.warning(
+                    "Старый снимок не прошёл проверку; оставляю его без изменений: %s",
+                    candidate,
+                    exc_info=True,
+                )
+                continue
+            snapshots.append((created_at, candidate.name, candidate))
+
+        try:
+            committed_manifest = self._validate_snapshot(
+                committed_snapshot, self.environment
+            )
+            committed_at = datetime.fromisoformat(
+                committed_manifest["created_at"]
+            )
+        except Exception:
+            self.logger.exception(
+                "Новый снимок создан, но не прошёл повторную проверку "
+                "для очистки старых копий: %s",
+                committed_snapshot,
+            )
+            return
+
+        snapshots.append(
+            (committed_at, committed_snapshot.name, committed_snapshot)
+        )
+        snapshots.sort(key=lambda item: (item[0], item[1]))
+        excess_count = min(
+            max(0, len(snapshots) - MAX_SNAPSHOTS_PER_ENVIRONMENT),
+            max(0, len(snapshots) - MIN_RETAINED_SNAPSHOTS),
+        )
+        removable = [
+            item for item in snapshots
+            if item[2] != committed_snapshot
+        ][:excess_count]
+        if removable and (
+            len(snapshots) - len(removable) < MIN_RETAINED_SNAPSHOTS
+        ):
+            self.logger.error(
+                "Очистка снимков отменена: не удалось сохранить минимум %d "
+                "проверенных копий",
+                MIN_RETAINED_SNAPSHOTS,
+            )
+            return
+
+        removed_any = False
+        for _, _, old_snapshot in removable:
+            try:
+                shutil.rmtree(old_snapshot)
+            except OSError:
+                self.logger.exception(
+                    "Не удалось удалить старый проверенный снимок %s",
+                    old_snapshot,
+                )
+                continue
+            self.logger.info("Удалён старый проверенный снимок: %s", old_snapshot)
+            removed_any = True
+
+        if removed_any:
+            try:
+                directory_fd = os.open(
+                    backup_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                )
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                self.logger.exception(
+                    "Не удалось синхронизировать каталог после очистки снимков"
+                )
 
     def _parse_schedule(self, xlsx_path: Path):
         today = datetime.now(self.timezone).date()

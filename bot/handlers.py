@@ -981,6 +981,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if service is None:
             await _send_dialog(message, "Служение не найдено.", parse_mode=None)
             return
+        pending["step"] = "menu"
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -1027,7 +1028,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 ],
                 [
                     InlineKeyboardButton(
-                        text="✖️ Отмена",
+                        text="✖️ Закрыть без сохранения",
                         callback_data=(
                             f"notify_cancel:{service_id}:"
                             f"{pending['session_id']}"
@@ -1056,6 +1057,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 parse_mode=None,
             )
             return
+        pending["step"] = "reminder_menu"
         rows = []
         for reminder in pending["reminders"]:
             label = (
@@ -1095,28 +1097,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 ],
                 [
                     InlineKeyboardButton(
-                        text="↩️ Назад",
+                        text="⬅️ К настройкам",
                         callback_data=(
-                            f"notify_rule:back:{service_id}:"
+                            f"notify_rule:root_back:{service_id}:"
                             f"{pending['session_id']}"
                         ),
                     )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="✅ Завершить и сохранить",
-                        callback_data=(
-                            f"notify_finish:{service_id}:"
-                            f"{pending['session_id']}"
-                        ),
-                    ),
-                    InlineKeyboardButton(
-                        text="✖️ Отмена",
-                        callback_data=(
-                            f"notify_cancel:{service_id}:"
-                            f"{pending['session_id']}"
-                        ),
-                    ),
                 ],
             ]
         )
@@ -1130,21 +1116,47 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         service_id: str, session_id: str
     ) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="⬅️ Назад без изменения",
+                    callback_data=f"notify_back:{service_id}:{session_id}",
+                )
+            ]]
+        )
+
+    def service_result_keyboard(service_id: str) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="✅ Завершить и сохранить",
-                        callback_data=(
-                            f"notify_finish:{service_id}:{session_id}"
-                        ),
-                    ),
+                        text="⚙️ К настройкам служения",
+                        callback_data=f"service:service_settings:{service_id}",
+                    )
+                ],
+                [
                     InlineKeyboardButton(
-                        text="✖️ Отмена",
-                        callback_data=(
-                            f"notify_cancel:{service_id}:{session_id}"
-                        ),
-                    ),
-                ]
+                        text="📋 К списку служений",
+                        callback_data="service:back_to_services:list",
+                    )
+                ],
+            ]
+        )
+
+    def test_result_keyboard(service_id: str) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🧪 Ещё одна проверка",
+                        callback_data=f"service:test_notify:{service_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="📋 К списку служений",
+                        callback_data="service:back_to_services:list",
+                    )
+                ],
             ]
         )
 
@@ -1390,6 +1402,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 parse_mode=None,
             )
             return
+        service = service_by_id(registry, pending["service_id"])
+        if service is None:
+            await _send_dialog(message, "Служение больше не существует.", parse_mode=None)
+            return
         if any(
             reminder.get("id") is None
             and not reminder.get("complete")
@@ -1441,7 +1457,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                                     f"{pending['service_id']}:"
                                     f"{pending['session_id']}"
                                 ),
-                            )
+                            ),
+                            InlineKeyboardButton(
+                                text="⬅️ Назад",
+                                callback_data=(
+                                    f"notify_duplicate_back:"
+                                    f"{pending['service_id']}:"
+                                    f"{pending['session_id']}"
+                                ),
+                            ),
                         ]
                     ]
                 )
@@ -1462,7 +1486,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             return
         pending_inputs.pop(actor_id, None)
-        await _send_dialog(message, "✅ Настройки уведомлений сохранены.", parse_mode=None
+        await _send_dialog(
+            message,
+            f"✅ Настройки уведомлений служения "
+            f"«{service_label(service)}» "
+            "сохранены.",
+            reply_markup=service_result_keyboard(pending["service_id"]),
+            parse_mode=None,
         )
 
     @admin_router.callback_query(F.data.startswith("task:"))
@@ -2193,7 +2223,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
                 if service_id == "assembly":
                     context.group_chat_id = service["group_chat_id"]
-                await _send_dialog(callback.message, f"{service_label(service)} отключено. Сохранённый чат не изменён.",
+                await _send_dialog(
+                    callback.message,
+                    f"{service_label(service)} отключено. "
+                    "Сохранённый чат не изменён.",
+                    reply_markup=service_result_keyboard(service_id),
                     parse_mode=None,
                 )
             elif operation == "test_notify":
@@ -2284,6 +2318,20 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         ):
             await _answer_callback(callback,"⚠️ Настройка устарела.")
             return
+        step = pending.get("step")
+        allowed_steps = {
+            "root_back": {"reminder_menu"},
+            "back": {"reminder_options", "reminder_delete"},
+            "add": {"reminder_menu"},
+            "edit": {"reminder_menu"},
+            "days": {"reminder_options"},
+            "time": {"reminder_options"},
+            "delete_prompt": {"reminder_menu"},
+            "delete": {"reminder_delete"},
+        }
+        if step not in allowed_steps.get(action, set()):
+            await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
+            return
         try:
             if not is_service_admin(callback.from_user.id, service_id):
                 await _answer_callback(callback,"❌ Недостаточно прав.")
@@ -2308,8 +2356,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ),
             None,
         )
-        if action == "back":
+        if action == "root_back":
             await show_notification_settings_menu(
+                callback.message, callback.from_user.id, service_id
+            )
+        elif action == "back":
+            await show_reminder_rules_menu(
                 callback.message, callback.from_user.id, service_id
             )
         elif action == "add":
@@ -2350,6 +2402,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 parse_mode=None,
             )
         elif action == "edit" and reminder is not None:
+            pending["step"] = "reminder_options"
             buttons = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
@@ -2385,6 +2438,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         elif action in {"days", "time"} and reminder is not None:
             pending["active_reminder_id"] = reminder_id
             pending["reminder_operation"] = "edit"
+            pending["active_reminder_original"] = {
+                "reminder_days": reminder["reminder_days"],
+                "reminder_time": reminder["reminder_time"],
+            }
             pending["step"] = f"reminder_{action}"
             prompt = (
                 f"Введите число дней до события от 0 до 6. "
@@ -2400,6 +2457,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 parse_mode=None,
             )
         elif action == "delete_prompt" and reminder is not None:
+            pending["step"] = "reminder_delete"
             buttons = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
@@ -2434,6 +2492,77 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await _answer_callback(callback,"⚠️ Настройка устарела.")
             return
         await _answer_callback(callback,)
+
+    @admin_router.callback_query(F.data.startswith("notify_back:"))
+    async def on_notification_edit_back(callback: CallbackQuery) -> None:
+        if (
+            not callback.from_user
+            or not callback.message
+            or callback.message.chat.type != ChatType.PRIVATE
+        ):
+            await _answer_callback(callback)
+            return
+        parts = callback.data.split(":", 2)
+        if len(parts) != 3:
+            await _answer_callback(callback, "⚠️ Настройка устарела.")
+            return
+        _, service_id, session_id = parts
+        actor_id = callback.from_user.id
+        pending = pending_inputs.get(actor_id)
+        if (
+            pending is None
+            or pending.get("operation") != "service_notify"
+            or pending.get("service_id") != service_id
+            or pending.get("session_id") != session_id
+        ):
+            await _answer_callback(callback, "⚠️ Настройка устарела.")
+            return
+        try:
+            if not is_service_admin(actor_id, service_id):
+                await _answer_callback(callback, "❌ Недостаточно прав.")
+                return
+        except sqlite3.Error:
+            debug.exception("Не удалось проверить доступ к настройкам")
+            await _answer_callback(callback, "❌ Не удалось проверить права.")
+            return
+
+        step = pending.get("step")
+        if step in {"reminder_days", "reminder_time"}:
+            active_id = pending.get("active_reminder_id")
+            reminder = next(
+                (
+                    item for item in pending["reminders"]
+                    if item.get("id") == active_id
+                    or item.get("draft_id") == active_id
+                ),
+                None,
+            )
+            if pending.get("reminder_operation") == "add":
+                if reminder is not None:
+                    pending["reminders"].remove(reminder)
+            elif reminder is not None:
+                original = pending.get("active_reminder_original", {})
+                reminder.update(original)
+            pending.pop("active_reminder_original", None)
+            pending.pop("active_reminder_id", None)
+            pending.pop("reminder_operation", None)
+            pending["step"] = "menu"
+            await show_reminder_rules_menu(callback.message, actor_id, service_id)
+        elif step == "notify_template":
+            pending.pop("active_task", None)
+            pending["step"] = "choose_notify_task"
+            await send_task_choices_page(
+                callback.message, actor_id, service_id, "service_notify"
+            )
+        elif step in {"days", "time", "group_template"}:
+            pending["step"] = "menu"
+            await show_notification_settings_menu(
+                callback.message, actor_id, service_id
+            )
+        else:
+            await _answer_callback(callback, "⚠️ Нет активного шага для отмены.")
+            return
+        await _answer_callback(callback, "Изменения шага отменены")
 
     @admin_router.callback_query(F.data.startswith("notify_edit:"))
     async def on_notification_setting_edit(callback: CallbackQuery) -> None:
@@ -2472,6 +2601,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("operation") != "service_notify"
             or pending.get("service_id") != service_id
             or pending.get("session_id") != session_id
+            or pending.get("step") != "menu"
         ):
             await _answer_callback(callback,"⚠️ Настройка устарела. Запустите её заново.")
             return
@@ -2513,6 +2643,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("operation") != "service_notify"
             or pending.get("service_id") != service_id
             or pending.get("session_id") != session_id
+            or pending.get("step") != "menu"
         ):
             await _answer_callback(callback,"⚠️ Настройка устарела. Запустите её заново.")
             return
@@ -2565,6 +2696,39 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         )
         await _answer_callback(callback,)
 
+    @admin_router.callback_query(
+        F.data.startswith("notify_duplicate_back:")
+    )
+    async def on_notification_duplicate_back(
+        callback: CallbackQuery,
+    ) -> None:
+        if (
+            not callback.from_user
+            or not callback.message
+            or callback.message.chat.type != ChatType.PRIVATE
+        ):
+            await _answer_callback(callback)
+            return
+        parts = callback.data.split(":")
+        if len(parts) != 3:
+            await _answer_callback(callback, "⚠️ Подтверждение устарело.")
+            return
+        _, service_id, session_id = parts
+        pending = pending_inputs.get(callback.from_user.id)
+        if (
+            pending is None
+            or pending.get("operation") != "service_notify"
+            or pending.get("service_id") != service_id
+            or pending.get("session_id") != session_id
+            or pending.get("step") != "menu"
+        ):
+            await _answer_callback(callback, "⚠️ Подтверждение устарело.")
+            return
+        await show_notification_settings_menu(
+            callback.message, callback.from_user.id, service_id
+        )
+        await _answer_callback(callback)
+
     @admin_router.callback_query(F.data.startswith("notify_cancel:"))
     async def on_notification_setting_cancel(callback: CallbackQuery) -> None:
         if not callback.from_user or not callback.message:
@@ -2582,11 +2746,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("operation") != "service_notify"
             or pending.get("service_id") != service_id
             or pending.get("session_id") != session_id
+            or pending.get("step") != "menu"
         ):
             await _answer_callback(callback,"⚠️ Настройка устарела.")
             return
         clear_pending_actor(callback.from_user.id)
-        await _send_dialog(callback.message, "Изменения отменены, сохранённые настройки не изменены.",
+        await _send_dialog(
+            callback.message,
+            "✖️ Изменения отменены, сохранённые настройки не изменены.",
+            reply_markup=service_result_keyboard(service_id),
             parse_mode=None,
         )
         await _answer_callback(callback,)
@@ -2642,9 +2810,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         ) = selected_user
         if action_type == "cancel":
             if operation == "service_admin_add":
-                await _send_dialog(callback.message, "✅ Назначение отменено.", parse_mode=None
+                await _send_dialog(
+                    callback.message,
+                    "Изменение отменено. Выберите пользователя заново.",
+                    parse_mode=None,
                 )
-                pending_inputs.pop(callback.from_user.id, None)
+                await offer_user_selection(
+                    callback.message,
+                    callback.from_user.id,
+                    service_id,
+                )
             else:
                 contact_pending = pending_inputs.get(callback.from_user.id)
                 if contact_pending is not None:
@@ -2722,6 +2897,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             pending_inputs.pop(callback.from_user.id, None)
             await _send_dialog(callback.message, _status_text(
                     response, "✅" if assignment_saved else "❌"
+                ),
+                reply_markup=(
+                    service_result_keyboard(service_id)
+                    if assignment_saved
+                    else None
                 ),
                 parse_mode=None,
             )
@@ -3015,11 +3195,19 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if pending[2] == "assembly":
             context.group_chat_id = shared_chat.chat_id
         title = shared_chat.title or "Групповой чат"
-        await _send_dialog(message, f"✅ Чат сохранён · {title}\n"
+        await _send_dialog(
+            message,
+            f"✅ Чат сохранён · {title}\n"
             f"📡 ID чата · {ui_code(shared_chat.chat_id)}\n"
             "🟢 Служение включено",
             parse_mode=None,
             reply_markup=ReplyKeyboardRemove(),
+        )
+        await _send_dialog(
+            message,
+            "Выберите следующий шаг.",
+            reply_markup=service_result_keyboard(pending[2]),
+            parse_mode=None,
         )
 
     @admin_router.message(F.text & ~F.text.startswith("/"))
@@ -3156,6 +3344,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             parse_mode=None,
                         )
                     else:
+                        pending.pop("active_reminder_original", None)
+                        pending.pop("active_reminder_id", None)
+                        pending.pop("reminder_operation", None)
                         pending["step"] = "menu"
                         await show_reminder_rules_menu(
                             message, message.from_user.id, service_id
@@ -3207,6 +3398,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         )
                     reminder["reminder_time"] = text
                     reminder["complete"] = True
+                    pending.pop("active_reminder_original", None)
+                    pending.pop("active_reminder_id", None)
                     pending["reminder_operation"] = None
                     pending["step"] = "menu"
                     await show_reminder_rules_menu(
@@ -3264,7 +3457,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
 
         pending_inputs.pop(message.from_user.id, None)
-        await _send_dialog(message, _status_text(response, "✅"), parse_mode=None)
+        await _send_dialog(
+            message,
+            _status_text(response, "✅"),
+            reply_markup=service_result_keyboard(service_id),
+            parse_mode=None,
+        )
 
     @admin_router.message(Command("service_sync"))
     async def on_service_sync(message: Message) -> None:
@@ -3287,6 +3485,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             group_chat_id = service["group_chat_id"]
             if group_chat_id is None:
                 await _send_dialog(message, "Для этого служения не настроен групповой чат.",
+                    reply_markup=test_result_keyboard(service["id"]),
                     parse_mode=None,
                 )
                 return
@@ -3300,11 +3499,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             except TelegramAPIError as exc:
                 debug.exception("Тестовая отправка в группу не удалась")
                 await _send_dialog(message, f"Не удалось отправить тест в группу: {type(exc).__name__}.",
+                    reply_markup=test_result_keyboard(service["id"]),
                     parse_mode=None,
                 )
             else:
                 await _send_dialog(message, f"Тестовое сообщение службы «{service['name']}» отправлено "
                     "в настроенную группу. Рассылка участникам не запускалась.",
+                    reply_markup=test_result_keyboard(service["id"]),
                     parse_mode=None,
                 )
             return
@@ -3314,6 +3515,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         )
         if not callable(prepare_previews):
             await _send_dialog(message, "Предпросмотр сообщений для служений недоступен.",
+                reply_markup=test_result_keyboard(service["id"]),
                 parse_mode=None,
             )
             return
@@ -3335,6 +3537,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 service["id"],
             )
             await _send_dialog(message, f"Не удалось подготовить предпросмотр: {type(exc).__name__}.",
+                reply_markup=test_result_keyboard(service["id"]),
                 parse_mode=None,
             )
             return
@@ -3363,11 +3566,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     service["id"],
                 )
                 await _send_dialog(message, "Не удалось доставить администратору полный предпросмотр.",
+                    reply_markup=test_result_keyboard(service["id"]),
                     parse_mode=None,
                 )
                 return
         await _send_dialog(message, "Предпросмотр выбранной службы отправлен вам в личные сообщения. "
             "Сообщения в группу и участникам не отправлялись.",
+            reply_markup=test_result_keyboard(service["id"]),
             parse_mode=None,
         )
 

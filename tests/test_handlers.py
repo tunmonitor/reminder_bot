@@ -783,6 +783,93 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_notification_step_back_keeps_session_and_root_close_has_navigation(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 12345)
+            command = self.message(12345, "/service_notify")
+            await self.admin_router.message.handlers[6].callback(command)
+            service_callback = SimpleNamespace(
+                data="service:service_notify:sound",
+                from_user=SimpleNamespace(id=12345),
+                message=self.message(12345, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_selected")(service_callback)
+            root_markup = service_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            group_button = next(
+                button
+                for row in root_markup.inline_keyboard
+                for button in row
+                if button.callback_data.startswith("notify_edit:group_template:")
+            )
+            edit_callback = SimpleNamespace(
+                data=group_button.callback_data,
+                from_user=SimpleNamespace(id=12345),
+                message=self.message(12345, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_notification_setting_edit")(
+                edit_callback
+            )
+            prompt_markup = edit_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            back_button = next(
+                button
+                for row in prompt_markup.inline_keyboard
+                for button in row
+                if button.callback_data.startswith("notify_back:")
+            )
+            back_callback = SimpleNamespace(
+                data=back_button.callback_data,
+                from_user=SimpleNamespace(id=12345),
+                message=self.message(12345, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_notification_edit_back")(
+                back_callback
+            )
+            returned_markup = back_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            self.assertTrue(
+                any(
+                    button.callback_data.startswith("notify_finish:")
+                    for row in returned_markup.inline_keyboard
+                    for button in row
+                )
+            )
+            self.assertEqual(
+                self.registry.get_service("sound")["group_template"], None
+            )
+
+            close_button = next(
+                button
+                for row in returned_markup.inline_keyboard
+                for button in row
+                if button.text == "✖️ Закрыть без сохранения"
+            )
+            close_callback = SimpleNamespace(
+                data=close_button.callback_data,
+                from_user=SimpleNamespace(id=12345),
+                message=self.message(12345, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_notification_setting_cancel")(
+                close_callback
+            )
+            result_markup = close_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            self.assertEqual(
+                len(result_markup.inline_keyboard),
+                2,
+            )
+
+        asyncio.run(run())
+
     def test_service_admin_can_use_guided_notification_setup(self):
         async def run():
             self.registry.add_service_admin(67890, "sound", 12345)
@@ -878,20 +965,39 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 days_callback
             )
             self.assertIn("0 до 6", days_callback.message.answer.await_args.args[0])
-            controls = days_callback.message.answer.await_args.kwargs[
-                "reply_markup"
-            ]
-
             staged_input = next(
                 item.callback
                 for item in self.admin_router.message.handlers
                 if item.callback.__name__ == "on_service_parameter"
             )
             await staged_input(self.message(12345, "7"))
-            await staged_input(self.message(12345, "3"))
+            updated_days = self.message(12345, "3")
+            await staged_input(updated_days)
+            rules_markup = updated_days.answer.await_args.kwargs["reply_markup"]
+            root_back = next(
+                button
+                for row in rules_markup.inline_keyboard
+                for button in row
+                if button.callback_data.startswith("notify_rule:root_back:")
+            )
+            root_callback = SimpleNamespace(
+                data=root_back.callback_data,
+                from_user=SimpleNamespace(id=12345),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_notification_rule_action")(
+                root_callback
+            )
+            root_menu = root_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
             finish_button = next(
                 button
-                for row in controls.inline_keyboard
+                for row in root_menu.inline_keyboard
                 for button in row
                 if button.text == "✅ Завершить и сохранить"
             )
@@ -920,6 +1026,17 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 },
             )
             self.context.load_service_task_assignments.assert_not_awaited()
+            result_markup = finish_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            self.assertEqual(
+                {
+                    button.text
+                    for row in result_markup.inline_keyboard
+                    for button in row
+                },
+                {"⚙️ К настройкам служения", "📋 К списку служений"},
+            )
 
             retry_command = self.message(12345, "/service_notify")
             await self.admin_router.message.handlers[6].callback(retry_command)
@@ -942,7 +1059,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 button
                 for row in retry_menu.inline_keyboard
                 for button in row
-                if button.text == "✖️ Отмена"
+                if button.text == "✖️ Закрыть без сохранения"
             )
             cancel_callback = SimpleNamespace(
                 data=cancel_button.callback_data,
@@ -1025,7 +1142,6 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             await parameter_handler(self.message(12345, "3"))
             draft_time_message = self.message(12345, "09:00")
             await parameter_handler(draft_time_message)
-            session_id = add_callback.data.split(":")[3]
             draft_list_markup = draft_time_message.answer.await_args.kwargs[
                 "reply_markup"
             ]
@@ -1067,10 +1183,38 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     answer=AsyncMock(),
                 )
             )
-            await parameter_handler(self.message(12345, "10:30"))
+            saved_time_input = self.message(12345, "10:30")
+            await parameter_handler(saved_time_input)
+
+            rules_keyboard = saved_time_input.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            root_button = next(
+                button
+                for row in rules_keyboard.inline_keyboard
+                for button in row
+                if button.callback_data.startswith("notify_rule:root_back:")
+            )
+            root_callback = SimpleNamespace(
+                data=root_button.callback_data,
+                from_user=SimpleNamespace(id=12345),
+                message=self.message(12345, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_notification_rule_action")(
+                root_callback
+            )
+            finish_button = next(
+                button
+                for row in root_callback.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith("notify_finish:")
+            )
 
             finish = SimpleNamespace(
-                data=f"notify_finish:sound:{session_id}",
+                data=finish_button.callback_data,
                 from_user=SimpleNamespace(id=12345),
                 message=SimpleNamespace(
                     chat=SimpleNamespace(type="private"),
@@ -3043,7 +3187,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             sound = self.registry.get_service("sound")
             self.assertEqual(sound["group_chat_id"], -1002233)
             self.assertTrue(sound["enabled"])
-            self.assertIn("-1002233", shared_chat.answer.await_args.args[0])
+            self.assertIn(
+                "-1002233",
+                shared_chat.answer.await_args_list[0].args[0],
+            )
 
             disable = self.message(67890, "/service_chat sound off")
             await self.admin_router.message.handlers[4].callback(disable)
