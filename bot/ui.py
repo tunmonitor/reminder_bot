@@ -133,6 +133,7 @@ async def send_telegram_screen(
     send_message: Callable[..., Awaitable[Any]],
     chat_id: int,
     text: str,
+    limit: int = MAX_SCREEN_UNITS,
     **kwargs,
 ) -> Any:
     """Send a safe HTML screen, splitting long text at Telegram UI boundaries."""
@@ -140,7 +141,7 @@ async def send_telegram_screen(
     markup = kwargs.pop("reply_markup", None)
     if isinstance(markup, InlineKeyboardMarkup):
         validate_inline_keyboard(markup.inline_keyboard)
-    chunks = render_screen_chunks(text)
+    chunks = render_screen_chunks(text, limit=limit)
     result = None
     for index, chunk in enumerate(chunks):
         result = await send_message(
@@ -155,9 +156,11 @@ async def send_telegram_screen(
     return result
 
 
-def render_edit_screen(text: str) -> str:
+def render_edit_screen(
+    text: str, limit: int = MAX_SCREEN_UNITS
+) -> str:
     """Render one editable HTML screen; reject content that needs pagination."""
-    chunks = render_screen_chunks(text)
+    chunks = render_screen_chunks(text, limit=limit)
     if len(chunks) != 1:
         raise ValueError("Длинное сообщение нельзя обновить одним экраном.")
     return chunks[0]

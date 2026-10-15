@@ -112,14 +112,27 @@ async def send_assignments(
     # --- 1) Общее сообщение в группу ---
     general_text = build_general_message(assignments, templates, sunday_str)
     debug_logger.debug("Подготовлено сообщение в групповой чат:\n%s", general_text)
-    if state.get("general_sent"):
+    if _utf16_length(general_text) > TELEGRAM_TEXT_LIMIT:
+        delivery_state_persisted = False
+        message = (
+            "Общее уведомление не отправлено: длина превышает лимит Telegram "
+            f"в {TELEGRAM_TEXT_LIMIT} единиц UTF-16"
+        )
+        debug_logger.error(message)
+        await _notify_admin(bot, admin_id, message, debug_logger)
+    elif state.get("general_sent"):
         if state.get("general_text") != general_text:
             try:
-                rendered_text = render_edit_screen(general_text)
+                rendered_text = render_edit_screen(
+                    general_text, limit=TELEGRAM_TEXT_LIMIT
+                )
             except ValueError:
                 try:
                     general_msg = await send_telegram_screen(
-                        bot.send_message, group_chat_id, general_text
+                        bot.send_message,
+                        group_chat_id,
+                        general_text,
+                        limit=TELEGRAM_TEXT_LIMIT,
                     )
                 except TelegramAPIError as exc:
                     delivery_state_persisted = False
@@ -163,7 +176,10 @@ async def send_assignments(
     else:
         try:
             general_msg = await send_telegram_screen(
-                bot.send_message, group_chat_id, general_text
+                bot.send_message,
+                group_chat_id,
+                general_text,
+                limit=TELEGRAM_TEXT_LIMIT,
             )
         except TelegramAPIError as exc:
             debug_logger.exception("Не удалось отправить сообщение в группу")
@@ -203,6 +219,7 @@ async def send_assignments(
                 bot.send_message,
                 info["tg_id"],
                 text,
+                limit=TELEGRAM_TEXT_LIMIT,
                 reply_markup=build_confirm_kb(role, sunday_iso),
             )
             participant_state["message_id"] = msg.message_id

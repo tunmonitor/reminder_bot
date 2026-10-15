@@ -672,7 +672,10 @@ async def _process_service_reminder(
         else:
             try:
                 await send_telegram_screen(
-                    bot.send_message, group_chat_id, group_text
+                    bot.send_message,
+                    group_chat_id,
+                    group_text,
+                    limit=TELEGRAM_TEXT_LIMIT,
                 )
             except Exception as exc:
                 debug_logger.exception(
@@ -766,7 +769,11 @@ async def _process_service_reminder(
                         confirmation[0], event_date.isoformat()
                     )
                 sent_message = await send_telegram_screen(
-                    bot.send_message, telegram_id, personal_text, **send_kwargs
+                    bot.send_message,
+                    telegram_id,
+                    personal_text,
+                    limit=TELEGRAM_TEXT_LIMIT,
+                    **send_kwargs,
                 )
             except Exception as exc:
                 debug_logger.exception(
@@ -797,7 +804,25 @@ async def _process_service_reminder(
                     participant["chat_id"] = getattr(
                         getattr(sent_message, "chat", None), "id", telegram_id
                     )
-                    state_cache.save()
+                    try:
+                        state_cache.save()
+                    except OSError as exc:
+                        debug_logger.exception(
+                            "Не удалось сохранить подтверждение отправки "
+                            "служения «%s» для участника %s",
+                            service["name"],
+                            name,
+                        )
+                        await _notify_admin(
+                            bot,
+                            credentials.admin_tg_id,
+                            f"Уведомление «{service['name']}» для {name} "
+                            f"отправлено, но состояние подтверждения не "
+                            f"сохранено: {exc}. Доставка остальным участникам "
+                            "продолжается; подтверждение может быть недоступно "
+                            "до успешного сохранения кэша.",
+                            debug_logger,
+                        )
                 interaction_logger.info(
                     "Личное уведомление служения %s для задачи %s отправлено",
                     service_id,

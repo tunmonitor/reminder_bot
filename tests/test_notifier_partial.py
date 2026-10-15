@@ -176,6 +176,96 @@ class PartialNotificationTest(unittest.TestCase):
 
         asyncio.run(send())
 
+    def test_long_group_update_edits_one_message_instead_of_sending_chunks(self):
+        async def send():
+            bot = SimpleNamespace(
+                send_message=AsyncMock(),
+                edit_message_text=AsyncMock(),
+            )
+            assignments = {
+                "Ответственный": {
+                    "name": "Алексей",
+                    "username": "a" * 700,
+                    "tg_id": None,
+                }
+            }
+            state = {
+                "general_sent": True,
+                "general_message_id": 77,
+                "general_text": "Старый текст",
+                "participants": {"Ответственный": {"delivered": True}},
+            }
+            templates = {
+                "general": "Ответственный: @{tg_responsible}",
+                "roles": {},
+            }
+
+            await send_assignments(
+                bot=bot,
+                group_chat_id=-100,
+                admin_id=67890,
+                assignments=assignments,
+                state=state,
+                templates=templates,
+                sunday_str="11.10.2026",
+                sunday_iso="2026-10-11",
+                interaction_logger=MagicMock(),
+                debug_logger=MagicMock(),
+            )
+
+            bot.edit_message_text.assert_awaited_once()
+            self.assertEqual(
+                bot.edit_message_text.await_args.kwargs["message_id"], 77
+            )
+            self.assertEqual(bot.send_message.await_count, 0)
+            self.assertEqual(state["general_text"], "Ответственный: @" + "a" * 700)
+
+        asyncio.run(send())
+
+    def test_oversized_group_message_is_not_split_or_marked_delivered(self):
+        async def send():
+            bot = SimpleNamespace(
+                send_message=AsyncMock(
+                    return_value=SimpleNamespace(message_id=10)
+                ),
+                edit_message_text=AsyncMock(),
+            )
+            state = {
+                "general_sent": False,
+                "general_message_id": None,
+                "general_text": None,
+                "participants": {"Ответственный": {"delivered": False}},
+            }
+
+            complete = await send_assignments(
+                bot=bot,
+                group_chat_id=-100,
+                admin_id=67890,
+                assignments={
+                    "Ответственный": {
+                        "name": "Алексей",
+                        "username": "a" * 4100,
+                        "tg_id": None,
+                    }
+                },
+                state=state,
+                templates={
+                    "general": "Ответственный: @{tg_responsible}",
+                    "roles": {},
+                },
+                sunday_str="11.10.2026",
+                sunday_iso="2026-10-11",
+                interaction_logger=MagicMock(),
+                debug_logger=MagicMock(),
+            )
+
+            self.assertFalse(complete)
+            self.assertEqual(bot.send_message.await_count, 1)
+            self.assertEqual(bot.send_message.await_args.args[0], 67890)
+            self.assertFalse(state["general_sent"])
+
+        asyncio.run(send())
+
     def test_failed_personal_delivery_retries_without_resending_successes(self):
         from aiogram.exceptions import TelegramAPIError
 

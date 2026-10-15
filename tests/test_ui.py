@@ -89,6 +89,27 @@ class DialogRenderingTest(unittest.TestCase):
 
         asyncio.run(send())
 
+    def test_custom_telegram_limit_keeps_scheduled_message_atomic(self):
+        async def send():
+            send_message = AsyncMock(
+                return_value=SimpleNamespace(message_id=2)
+            )
+
+            await send_telegram_screen(
+                send_message,
+                42,
+                "Заголовок\n" + "x" * 700,
+                limit=4096,
+            )
+
+            send_message.assert_awaited_once()
+            self.assertLessEqual(
+                len(send_message.await_args.args[1].replace("<b>", "").replace("</b>", "")),
+                4096,
+            )
+
+        asyncio.run(send())
+
 
 if __name__ == "__main__":
     unittest.main()

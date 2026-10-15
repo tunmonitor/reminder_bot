@@ -19,6 +19,7 @@ from bot.backup import (
     BackupManager,
     MAX_SNAPSHOTS_PER_ENVIRONMENT,
     MIN_RETAINED_SNAPSHOTS,
+    STALE_SNAPSHOT_STAGE_AGE,
     application_instance_lock,
     assert_bot_stopped,
 )
@@ -176,6 +177,23 @@ class BackupManagerTest(unittest.TestCase):
         self.assertFalse(valid_snapshots[0].exists())
         self.assertFalse(valid_snapshots[1].exists())
         self.assertFalse(valid_snapshots[2].exists())
+
+    def test_prunes_only_abandoned_staging_directories_older_than_cutoff(self):
+        backup_dir = self.backup_base / "test"
+        backup_dir.mkdir(parents=True, mode=0o700)
+        stale_stage = backup_dir / ".snapshot-abandoned"
+        stale_stage.mkdir(mode=0o700)
+        recent_stage = backup_dir / ".snapshot-active"
+        recent_stage.mkdir(mode=0o700)
+        stale_time = datetime.now().timestamp() - (
+            STALE_SNAPSHOT_STAGE_AGE.total_seconds() + 60
+        )
+        os.utime(stale_stage, (stale_time, stale_time))
+
+        self.manager._prune_abandoned_stages(backup_dir)
+
+        self.assertFalse(stale_stage.exists())
+        self.assertTrue(recent_stage.exists())
 
     def test_restore_replaces_database_schedule_and_state(self):
         snapshot = asyncio.run(self.manager.create_snapshot("test"))

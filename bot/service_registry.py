@@ -816,6 +816,8 @@ class ServiceRegistry:
             reminder["id"]: reminder for reminder in final_reminders
         }
         final_ids = set(final_by_id)
+        existing_by_id = {row["id"]: row for row in existing_rows}
+        changed_ids = set()
         for existing_row in existing_rows:
             reminder_id = existing_row["id"]
             final = final_by_id.get(reminder_id)
@@ -829,39 +831,65 @@ class ServiceRegistry:
             if unchanged:
                 continue
 
-            survivors = [
-                reminder
-                for reminder in final_reminders
-                if (
-                    reminder["reminder_days"],
-                    reminder["reminder_time"],
-                ) == old_schedule
-            ]
-            for survivor in survivors:
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO service_reminder_deliveries (
-                        service_id, reminder_id, event_date,
-                        recipient_key, delivered_at
-                    )
-                    SELECT service_id, ?, event_date, recipient_key,
-                           delivered_at
-                    FROM service_reminder_deliveries
-                    WHERE service_id = ? AND reminder_id = ?
-                    """,
-                    (survivor["id"], service_id, reminder_id),
-                )
+            changed_ids.add(reminder_id)
+
+        if changed_ids:
+            placeholders = ",".join("?" for _ in changed_ids)
+            original_deliveries = connection.execute(
+                "SELECT reminder_id, event_date, recipient_key, delivered_at "
+                "FROM service_reminder_deliveries "
+                "WHERE service_id = ? AND reminder_id IN "
+                f"({placeholders})",
+                (service_id, *sorted(changed_ids)),
+            ).fetchall()
+            deliveries_by_source = {}
+            for delivery in original_deliveries:
+                deliveries_by_source.setdefault(
+                    delivery["reminder_id"], []
+                ).append(delivery)
+
+            # Remove all changing histories before copying the original rows,
+            # so a two-way schedule swap cannot consume rows copied earlier.
             connection.execute(
                 "DELETE FROM service_reminder_deliveries "
-                "WHERE service_id = ? AND reminder_id = ?",
-                (service_id, reminder_id),
+                "WHERE service_id = ? AND reminder_id IN "
+                f"({placeholders})",
+                (service_id, *sorted(changed_ids)),
             )
+            for reminder_id in changed_ids:
+                old_row = existing_by_id[reminder_id]
+                old_schedule = (
+                    old_row["reminder_days"],
+                    old_row["reminder_time"],
+                )
+                survivors = [
+                    reminder
+                    for reminder in final_reminders
+                    if (
+                        reminder["reminder_days"],
+                        reminder["reminder_time"],
+                    ) == old_schedule
+                ]
+                for survivor in survivors:
+                    for delivery in deliveries_by_source.get(reminder_id, ()):
+                        connection.execute(
+                            """
+                            INSERT OR IGNORE INTO service_reminder_deliveries (
+                                service_id, reminder_id, event_date,
+                                recipient_key, delivered_at
+                            ) VALUES (?, ?, ?, ?, ?)
+                            """,
+                            (
+                                service_id,
+                                survivor["id"],
+                                delivery["event_date"],
+                                delivery["recipient_key"],
+                                delivery["delivered_at"],
+                            ),
+                        )
 
         for reminder in final_reminders:
-            existing_row = next(
-                (row for row in existing_rows if row["id"] == reminder["id"]),
-                None,
-            )
+            existing_row = existing_by_id.get(reminder["id"])
             if existing_row is None:
                 continue
             if (

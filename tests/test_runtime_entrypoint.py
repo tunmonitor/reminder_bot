@@ -118,7 +118,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
 
         asyncio.run(prepare())
 
-    def test_service_reminder_sends_group_and_personal_once(self):
+    def test_cache_save_failure_does_not_stop_later_reminder_recipients(self):
         from bot import app
         from bot.service_registry import ServiceRegistry
 
@@ -129,36 +129,45 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 registry.set_responsible_contact(
                     1001, "assembly", "Камеры", "Анна", 2002, "anna"
                 )
+                registry.set_responsible_contact(
+                    1001, "assembly", "Камеры", "Борис", 2003, "boris"
+                )
                 reminder = registry.get_service("assembly")["reminders"][0]
                 bot = SimpleNamespace(send_message=AsyncMock())
                 credentials = SimpleNamespace(admin_tg_id=1001)
                 logger = MagicMock()
-                state_cache = SimpleNamespace(state={}, save=MagicMock())
-                assignments = {"Камеры": ["Анна"]}
+                state_cache = SimpleNamespace(
+                    state={},
+                    save=MagicMock(
+                        side_effect=[None, OSError("disk full"), None]
+                    ),
+                )
+                assignments = {"Камеры": ["Анна", "Борис"]}
                 with patch.object(
                     app,
                     "_load_service_task_assignments",
                     new=AsyncMock(return_value=(assignments, True)),
-                ) as load_assignments:
-                    for _ in range(2):
-                        await app._process_service_reminder(
-                            bot,
-                            credentials,
-                            Path(tmp_dir),
-                            ZoneInfo("UTC"),
-                            registry,
-                            "assembly",
-                            reminder,
-                            logger,
-                            logger,
-                            run_date=(
-                                date(2026, 10, 11)
-                                - timedelta(days=reminder["reminder_days"])
-                            ),
-                            state_cache=state_cache,
-                        )
+                ) as load_assignments, patch.object(
+                    app, "_notify_admin", new=AsyncMock()
+                ) as notify_admin:
+                    await app._process_service_reminder(
+                        bot,
+                        credentials,
+                        Path(tmp_dir),
+                        ZoneInfo("UTC"),
+                        registry,
+                        "assembly",
+                        reminder,
+                        logger,
+                        logger,
+                        run_date=(
+                            date(2026, 10, 11)
+                            - timedelta(days=reminder["reminder_days"])
+                        ),
+                        state_cache=state_cache,
+                    )
 
-                self.assertEqual(bot.send_message.await_count, 2)
+                self.assertEqual(bot.send_message.await_count, 3)
                 self.assertEqual(
                     bot.send_message.await_args_list[0].args[0], -10001
                 )
@@ -174,12 +183,18 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 self.assertTrue(
                     confirmation_data.startswith("scf:2026-10-11:service_")
                 )
-                participant = next(
-                    iter(state_cache.state["participants"].values())
+                self.assertEqual(
+                    bot.send_message.await_args_list[2].args[0], 2003
                 )
-                self.assertTrue(participant["delivered"])
-                self.assertEqual(participant["tg_id"], 2002)
-                self.assertEqual(load_assignments.await_count, 2)
+                self.assertTrue(
+                    all(
+                        participant["delivered"]
+                        for participant in state_cache.state["participants"].values()
+                    )
+                )
+                self.assertEqual(state_cache.save.call_count, 3)
+                notify_admin.assert_awaited_once()
+                self.assertEqual(load_assignments.await_count, 1)
 
         asyncio.run(send_reminder())
 

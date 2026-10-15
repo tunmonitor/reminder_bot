@@ -29,8 +29,10 @@ BACKUP_BASE = BACKUP_MOUNT / "reminder_bot" / "backups"
 SNAPSHOT_FORMAT_VERSION = 1
 BOT_PID_FILENAME = "reminder_bot_bot.pid"
 INSTANCE_LOCK_FILENAME = "reminder_bot_instance.lock"
+BACKUP_LOCK_FILENAME = ".backup.lock"
 MAX_SNAPSHOTS_PER_ENVIRONMENT = 14
 MIN_RETAINED_SNAPSHOTS = 7
+STALE_SNAPSHOT_STAGE_AGE = timedelta(hours=24)
 
 
 @contextmanager
@@ -344,6 +346,27 @@ class BackupManager:
         _secure_directory(self.backup_base)
         _secure_directory(backup_dir)
         _secure_directory(self.shm_dir)
+        lock_fd = os.open(
+            backup_dir / BACKUP_LOCK_FILENAME,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            lock_info = os.fstat(lock_fd)
+            if (
+                not stat.S_ISREG(lock_info.st_mode)
+                or lock_info.st_uid != os.geteuid()
+                or lock_info.st_nlink != 1
+                or stat.S_IMODE(lock_info.st_mode) & 0o077
+            ):
+                raise PermissionError("Файл блокировки резервной копии небезопасен")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            self._require_external_mount()
+            return self._create_snapshot_locked(backup_dir)
+        finally:
+            os.close(lock_fd)
+
+    def _create_snapshot_locked(self, backup_dir: Path) -> Path:
         db_path = self.registry_path
         xlsx_path = self.shm_dir / "reminder_bot_current.xlsx"
         if not _is_regular_private_file(db_path):
@@ -419,7 +442,7 @@ class BackupManager:
                 stage / "manifest.json",
                 json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
             )
-            self._validate_snapshot(stage, self.environment)
+            manifest = self._validate_snapshot(stage, self.environment)
             self._require_external_mount()
 
             final = backup_dir / timestamp
@@ -433,15 +456,19 @@ class BackupManager:
                 os.fsync(directory_fd)
             finally:
                 os.close(directory_fd)
-            self._prune_old_snapshots(backup_dir, final)
+            self._prune_old_snapshots(backup_dir, final, manifest)
             return final
         except BaseException:
             shutil.rmtree(stage, ignore_errors=True)
             raise
 
     def _prune_old_snapshots(
-        self, backup_dir: Path, committed_snapshot: Path
+        self,
+        backup_dir: Path,
+        committed_snapshot: Path,
+        committed_manifest: dict | None = None,
     ) -> None:
+        self._prune_abandoned_stages(backup_dir)
         snapshots = []
         try:
             candidates = tuple(backup_dir.iterdir())
@@ -460,7 +487,7 @@ class BackupManager:
             if candidate.is_symlink() or not candidate.is_dir():
                 continue
             try:
-                manifest = self._validate_snapshot(
+                manifest = self._read_snapshot_metadata(
                     candidate, self.environment
                 )
                 created_at = datetime.fromisoformat(manifest["created_at"])
@@ -468,7 +495,7 @@ class BackupManager:
                     raise ValueError("created_at не содержит часовой пояс")
             except Exception:
                 self.logger.warning(
-                    "Старый снимок не прошёл проверку; оставляю его без изменений: %s",
+                    "Метаданные старого снимка некорректны; оставляю его без изменений: %s",
                     candidate,
                     exc_info=True,
                 )
@@ -476,9 +503,10 @@ class BackupManager:
             snapshots.append((created_at, candidate.name, candidate))
 
         try:
-            committed_manifest = self._validate_snapshot(
-                committed_snapshot, self.environment
-            )
+            if committed_manifest is None:
+                committed_manifest = self._read_snapshot_metadata(
+                    committed_snapshot, self.environment
+                )
             committed_at = datetime.fromisoformat(
                 committed_manifest["created_at"]
             )
@@ -522,7 +550,8 @@ class BackupManager:
                     old_snapshot,
                 )
                 continue
-            self.logger.info("Удалён старый проверенный снимок: %s", old_snapshot)
+            self.logger.info(            "Удалён старый снимок с корректными метаданными: %s",
+            old_snapshot,)
             removed_any = True
 
         if removed_any:
@@ -538,6 +567,94 @@ class BackupManager:
                 self.logger.exception(
                     "Не удалось синхронизировать каталог после очистки снимков"
                 )
+
+    def _prune_abandoned_stages(self, backup_dir: Path) -> None:
+        cutoff = datetime.now().timestamp() - STALE_SNAPSHOT_STAGE_AGE.total_seconds()
+        try:
+            candidates = tuple(backup_dir.iterdir())
+        except OSError:
+            self.logger.exception(
+                "Не удалось проверить незавершённые резервные копии: %s",
+                backup_dir,
+            )
+            return
+
+        for candidate in candidates:
+            if not candidate.name.startswith(".snapshot-"):
+                continue
+            try:
+                info = candidate.stat(follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) & 0o077
+                    or info.st_mtime > cutoff
+                ):
+                    continue
+                shutil.rmtree(candidate)
+            except OSError:
+                self.logger.exception(
+                    "Не удалось удалить старый незавершённый снимок: %s",
+                    candidate,
+                )
+            else:
+                self.logger.info(
+                    "Удалён незавершённый снимок старше %s: %s",
+                    STALE_SNAPSHOT_STAGE_AGE,
+                    candidate,
+                )
+
+    @staticmethod
+    def _read_snapshot_metadata(
+        snapshot: Path, expected_environment: str
+    ) -> dict:
+        """Check retention metadata and file sizes without rehashing full backups."""
+        if snapshot.is_symlink() or not snapshot.is_dir():
+            raise RuntimeError(f"Каталог снимка небезопасен: {snapshot}")
+        directory_info = snapshot.stat()
+        if (
+            directory_info.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_info.st_mode) & 0o077
+        ):
+            raise PermissionError(f"Каталог снимка имеет небезопасные права: {snapshot}")
+        manifest_path = snapshot / "manifest.json"
+        if not _is_regular_private_file(manifest_path):
+            raise RuntimeError("Manifest отсутствует или небезопасен")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (
+            manifest.get("format_version") != SNAPSHOT_FORMAT_VERSION
+            or manifest.get("environment") != expected_environment
+            or not isinstance(manifest.get("sqlite_user_version"), int)
+            or not isinstance(manifest.get("files"), dict)
+        ):
+            raise RuntimeError("Manifest имеет неизвестный формат или окружение")
+
+        required = {
+            "database.sqlite3",
+            "database.sql",
+            "schedule.xlsx",
+            "schedule.json",
+        }
+        files = manifest["files"]
+        if (
+            not required.issubset(files)
+            or set(files) - required - {"reminder_state_cache.json"}
+        ):
+            raise RuntimeError("Manifest содержит неверный набор файлов")
+        if {path.name for path in snapshot.iterdir()} != set(files) | {
+            "manifest.json"
+        }:
+            raise RuntimeError("Каталог снимка содержит незаявленные файлы")
+        for name, details in files.items():
+            path = snapshot / name
+            if not _is_regular_private_file(path) or not isinstance(details, dict):
+                raise RuntimeError(f"Файл снимка небезопасен: {name}")
+            if path.stat().st_size != details.get("size_bytes"):
+                raise RuntimeError(f"Размер файла снимка не совпадает: {name}")
+        created_at = datetime.fromisoformat(manifest["created_at"])
+        if created_at.tzinfo is None or created_at.utcoffset() is None:
+            raise ValueError("created_at не содержит часовой пояс")
+        return manifest
 
     def _parse_schedule(self, xlsx_path: Path):
         today = datetime.now(self.timezone).date()
