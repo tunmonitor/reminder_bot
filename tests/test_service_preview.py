@@ -66,9 +66,9 @@ class ServicePreviewTest(unittest.TestCase):
             preview = asyncio.run(run())
 
             self.assertIn("Звук", preview["group_text"])
-            self.assertIn("├ Микшер 🎚️\n├ Алексей (@alex)", preview["group_text"])
+            self.assertIn("🎚️ Микшер\n• Алексей (@alex)", preview["group_text"])
             self.assertNotIn("12345", preview["group_text"])
-            self.assertIn("├ Мария (Telegram не привязан)", preview["group_text"])
+            self.assertIn("• Мария · не привязан", preview["group_text"])
             self.assertIn("{task_assignments}", preview["example_group_template"])
             self.assertIn("Алексей (@alex)", preview["example_group_text"])
             self.assertNotIn("12345", preview["example_group_text"])

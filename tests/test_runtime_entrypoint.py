@@ -6,7 +6,7 @@ import stat
 import tempfile
 import unittest
 from contextlib import ExitStack
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -133,6 +133,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 bot = SimpleNamespace(send_message=AsyncMock())
                 credentials = SimpleNamespace(admin_tg_id=1001)
                 logger = MagicMock()
+                state_cache = SimpleNamespace(state={}, save=MagicMock())
                 assignments = {"Камеры": ["Анна"]}
                 with patch.object(
                     app,
@@ -150,6 +151,11 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                             reminder,
                             logger,
                             logger,
+                            run_date=(
+                                date(2026, 10, 11)
+                                - timedelta(days=reminder["reminder_days"])
+                            ),
+                            state_cache=state_cache,
                         )
 
                 self.assertEqual(bot.send_message.await_count, 2)
@@ -159,6 +165,20 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 self.assertEqual(
                     bot.send_message.await_args_list[1].args[0], 2002
                 )
+                confirmation_markup = bot.send_message.await_args_list[
+                    1
+                ].kwargs["reply_markup"]
+                confirmation_data = (
+                    confirmation_markup.inline_keyboard[0][0].callback_data
+                )
+                self.assertTrue(
+                    confirmation_data.startswith("scf:2026-10-11:service_")
+                )
+                participant = next(
+                    iter(state_cache.state["participants"].values())
+                )
+                self.assertTrue(participant["delivered"])
+                self.assertEqual(participant["tg_id"], 2002)
                 self.assertEqual(load_assignments.await_count, 2)
 
         asyncio.run(send_reminder())

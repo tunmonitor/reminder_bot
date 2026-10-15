@@ -12,7 +12,7 @@ from bot.notifier import (
 
 
 class PartialNotificationTest(unittest.TestCase):
-    def test_admin_warning_uses_plain_text_parse_mode(self):
+    def test_admin_warning_uses_safe_html_screen(self):
         async def notify():
             bot = SimpleNamespace(send_message=AsyncMock())
 
@@ -25,8 +25,9 @@ class PartialNotificationTest(unittest.TestCase):
 
             bot.send_message.assert_awaited_once_with(
                 12345,
-                "⚠️ Ошибка: <untrusted diagnostic>",
-                parse_mode=None,
+                "<b>⚠️ Ошибка: &lt;untrusted diagnostic&gt;</b>",
+                parse_mode="HTML",
+                reply_markup=None,
             )
 
         asyncio.run(notify())
@@ -49,8 +50,8 @@ class PartialNotificationTest(unittest.TestCase):
             "11.10.2026",
         )
 
-        self.assertEqual(group_text, "Ответственный: @&lt;b&gt;alex&lt;/b&gt;")
-        self.assertEqual(personal_text, "🔔 &lt;b&gt;Алексей&lt;/b&gt;")
+        self.assertEqual(group_text, "Ответственный: @<b>alex</b>")
+        self.assertEqual(personal_text, "🔔 <b>Алексей</b>")
 
     def test_sends_group_and_available_participant_with_missing_roles(self):
         async def send():
@@ -110,7 +111,7 @@ class PartialNotificationTest(unittest.TestCase):
             self.assertEqual(len(bot.send_message.await_args_list), 2)
             self.assertEqual(
                 bot.send_message.await_args_list[1].args,
-                (12345, "🔔 Алексей, 11.10.2026"),
+                (12345, "<b>🔔 Алексей, 11.10.2026</b>"),
             )
             self.assertEqual(state["participants"]["Ответственный"]["message_id"], 11)
             self.assertEqual(
@@ -129,10 +130,9 @@ class PartialNotificationTest(unittest.TestCase):
         async def send():
             bot = SimpleNamespace(
                 send_message=AsyncMock(
-                    side_effect=[
-                        SimpleNamespace(message_id=10),
-                        SimpleNamespace(message_id=11, chat=SimpleNamespace(id=67890)),
-                    ]
+                    return_value=SimpleNamespace(
+                        message_id=10, chat=SimpleNamespace(id=67890)
+                    )
                 )
             )
             assignments = {
@@ -167,12 +167,11 @@ class PartialNotificationTest(unittest.TestCase):
                     interaction_logger=MagicMock(),
                     debug_logger=MagicMock(),
                 )
-            self.assertEqual(bot.send_message.await_count, 2)
-            self.assertEqual(bot.send_message.await_args_list[1].args[0], 67890)
-            self.assertIn(
-                "не отправлено",
-                bot.send_message.await_args_list[1].args[1],
-            )
+            self.assertGreater(bot.send_message.await_count, 2)
+            self.assertEqual(bot.send_message.await_args_list[0].args[0], -100)
+            warning_chunks = bot.send_message.await_args_list[1:]
+            self.assertTrue(all(call.args[0] == 67890 for call in warning_chunks))
+            self.assertIn("не отправлено", warning_chunks[-1].args[1])
             self.assertFalse(state["participants"]["Ответственный"].get("delivered"))
 
         asyncio.run(send())
@@ -244,7 +243,7 @@ class PartialNotificationTest(unittest.TestCase):
             self.assertEqual(bot.send_message.await_count, 4)
             self.assertEqual(
                 bot.send_message.await_args_list[3].args,
-                (23456, "🔔 Павел"),
+                (23456, "<b>🔔 Павел</b>"),
             )
             bot.edit_message_text.assert_not_awaited()
             self.assertTrue(state["participants"]["Ведущий"]["delivered"])

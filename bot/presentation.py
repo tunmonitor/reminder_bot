@@ -35,21 +35,21 @@ def format_task_assignments(
     mark_unlinked: bool = False,
 ) -> str:
     if not assignments:
-        return "└ Ответственные не указаны"
+        return "⚪ Ответственные не указаны"
 
     groups = []
     for task, names in assignments.items():
-        lines = [f"├ {task} {task_emoji(task)}"]
+        lines = [f"{task_emoji(task)} {task}"]
         if not names:
-            lines.append("├ Ответственные не указаны")
+            lines.append("• Ответственные не указаны")
         for name in names:
             contact = (contacts or {}).get((task, name))
             username = contact.get("username") if contact else None
             suffix = f" (@{username})" if username else (
-                " (Telegram не привязан)"
+                " · не привязан"
                 if mark_unlinked and contact is None
                 else ""
             )
-            lines.append(f"├ {name}{suffix}")
+            lines.append(f"• {name}{suffix}")
         groups.append("\n".join(lines))
     return "\n\n".join(groups)

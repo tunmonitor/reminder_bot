@@ -737,6 +737,7 @@ class ServiceRegistry:
             raise ValueError("Настройки уведомлений имеют неверный формат.")
         normalized = []
         seen: set[tuple[int, str]] = set()
+        seen_ids: set[int] = set()
         for reminder in reminders:
             if not isinstance(reminder, dict):
                 raise ValueError("Настройка уведомления имеет неверный формат.")
@@ -763,6 +764,10 @@ class ServiceRegistry:
                 or reminder_id <= 0
             ):
                 raise ValueError("Идентификатор уведомления некорректен.")
+            if reminder_id is not None and reminder_id in seen_ids:
+                raise ValueError("Идентификатор уведомления указан повторно.")
+            if reminder_id is not None:
+                seen_ids.add(reminder_id)
             normalized.append(
                 {
                     "id": reminder_id,
@@ -791,49 +796,10 @@ class ServiceRegistry:
         }
         if requested_ids - existing:
             raise ValueError("Одно из уведомлений устарело; обновите настройки.")
-        removed_ids = existing - requested_ids
-        if removed_ids:
-            requested_by_id = {
-                reminder["id"]: reminder for reminder in reminders
-                if reminder["id"] is not None
-            }
-            for row in existing_rows:
-                if row["id"] not in removed_ids:
-                    continue
-                survivors = [
-                    reminder for reminder in requested_by_id.values()
-                    if reminder["reminder_days"] == row["reminder_days"]
-                    and reminder["reminder_time"] == row["reminder_time"]
-                ]
-                for survivor in survivors:
-                    connection.execute(
-                        """
-                        INSERT OR IGNORE INTO service_reminder_deliveries (
-                            service_id, reminder_id, event_date,
-                            recipient_key, delivered_at
-                        )
-                        SELECT service_id, ?, event_date, recipient_key,
-                               delivered_at
-                        FROM service_reminder_deliveries
-                        WHERE service_id = ? AND reminder_id = ?
-                        """,
-                        (survivor["id"], service_id, row["id"]),
-                    )
-            placeholders = ",".join("?" for _ in removed_ids)
-            connection.execute(
-                "DELETE FROM service_reminder_deliveries "
-                "WHERE service_id = ? AND reminder_id IN "
-                f"({placeholders})",
-                (service_id, *sorted(removed_ids)),
-            )
-            connection.execute(
-                "DELETE FROM service_reminders WHERE service_id = ? "
-                f"AND id IN ({placeholders})",
-                (service_id, *sorted(removed_ids)),
-            )
+        final_reminders = []
         for reminder in reminders:
             if reminder["id"] is None:
-                connection.execute(
+                cursor = connection.execute(
                     "INSERT INTO service_reminders "
                     "(service_id, reminder_days, reminder_time) VALUES (?, ?, ?)",
                     (
@@ -842,7 +808,66 @@ class ServiceRegistry:
                         reminder["reminder_time"],
                     ),
                 )
+                final_reminders.append({**reminder, "id": cursor.lastrowid})
             else:
+                final_reminders.append(reminder)
+
+        final_by_id = {
+            reminder["id"]: reminder for reminder in final_reminders
+        }
+        final_ids = set(final_by_id)
+        for existing_row in existing_rows:
+            reminder_id = existing_row["id"]
+            final = final_by_id.get(reminder_id)
+            old_schedule = (
+                existing_row["reminder_days"],
+                existing_row["reminder_time"],
+            )
+            unchanged = final is not None and (
+                final["reminder_days"], final["reminder_time"]
+            ) == old_schedule
+            if unchanged:
+                continue
+
+            survivors = [
+                reminder
+                for reminder in final_reminders
+                if (
+                    reminder["reminder_days"],
+                    reminder["reminder_time"],
+                ) == old_schedule
+            ]
+            for survivor in survivors:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO service_reminder_deliveries (
+                        service_id, reminder_id, event_date,
+                        recipient_key, delivered_at
+                    )
+                    SELECT service_id, ?, event_date, recipient_key,
+                           delivered_at
+                    FROM service_reminder_deliveries
+                    WHERE service_id = ? AND reminder_id = ?
+                    """,
+                    (survivor["id"], service_id, reminder_id),
+                )
+            connection.execute(
+                "DELETE FROM service_reminder_deliveries "
+                "WHERE service_id = ? AND reminder_id = ?",
+                (service_id, reminder_id),
+            )
+
+        for reminder in final_reminders:
+            existing_row = next(
+                (row for row in existing_rows if row["id"] == reminder["id"]),
+                None,
+            )
+            if existing_row is None:
+                continue
+            if (
+                existing_row["reminder_days"] != reminder["reminder_days"]
+                or existing_row["reminder_time"] != reminder["reminder_time"]
+            ):
                 connection.execute(
                     "UPDATE service_reminders "
                     "SET reminder_days = ?, reminder_time = ? "
@@ -854,6 +879,14 @@ class ServiceRegistry:
                         reminder["id"],
                     ),
                 )
+        removed_ids = existing - final_ids
+        if removed_ids:
+            placeholders = ",".join("?" for _ in removed_ids)
+            connection.execute(
+                "DELETE FROM service_reminders WHERE service_id = ? "
+                f"AND id IN ({placeholders})",
+                (service_id, *sorted(removed_ids)),
+            )
 
     def set_responsible_contact(
         self,

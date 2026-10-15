@@ -328,6 +328,70 @@ class ServiceRegistryTest(unittest.TestCase):
             )
         )
 
+    def test_editing_reminder_clears_history_for_old_schedule(self):
+        reminder = self.registry.get_service("sound")["reminders"][0]
+        event_date = "2026-10-18"
+        recipient = "group:-10001"
+        self.registry.mark_service_reminder_delivered(
+            "sound", reminder["id"], event_date, recipient
+        )
+
+        self.registry.set_notification_settings(
+            1001,
+            "sound",
+            reminder_days=2,
+            reminder_time="09:00",
+            group_template=None,
+            personal_templates={},
+            reminders=[
+                {
+                    "id": reminder["id"],
+                    "reminder_days": 2,
+                    "reminder_time": "09:00",
+                }
+            ],
+        )
+
+        edited = self.registry.get_service("sound")["reminders"][0]
+        self.assertEqual(edited["id"], reminder["id"])
+        self.assertFalse(
+            self.registry.is_service_reminder_delivered(
+                "sound", edited["id"], event_date, recipient
+            )
+        )
+
+    def test_replacing_rule_with_same_schedule_carries_delivery_history(self):
+        reminder = self.registry.get_service("sound")["reminders"][0]
+        event_date = "2026-10-18"
+        recipient = "group:-10001"
+        self.registry.mark_service_reminder_delivered(
+            "sound", reminder["id"], event_date, recipient
+        )
+
+        self.registry.set_notification_settings(
+            1001,
+            "sound",
+            reminder_days=reminder["reminder_days"],
+            reminder_time=reminder["reminder_time"],
+            group_template=None,
+            personal_templates={},
+            reminders=[
+                {
+                    "id": None,
+                    "reminder_days": reminder["reminder_days"],
+                    "reminder_time": reminder["reminder_time"],
+                }
+            ],
+        )
+
+        replacement = self.registry.get_service("sound")["reminders"][0]
+        self.assertNotEqual(replacement["id"], reminder["id"])
+        self.assertTrue(
+            self.registry.is_service_reminder_delivered(
+                "sound", replacement["id"], event_date, recipient
+            )
+        )
+
     def test_legacy_unique_reminder_constraint_is_migrated(self):
         legacy_path = Path(self.temp_dir.name) / "legacy" / "services.sqlite3"
         legacy_path.parent.mkdir(mode=0o700)

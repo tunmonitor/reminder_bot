@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import logging
 from collections.abc import Callable
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+from .ui import render_edit_screen, send_telegram_screen
 
 RATE_LIMIT_DELAY = 0.05         # согласно ТЗ — защита от HTTP 429
 CONFIRM_PREFIX = "cfm"          # короткий префикс для callback_data
@@ -23,6 +24,15 @@ def build_confirm_kb(role: str, sunday_iso: str) -> InlineKeyboardMarkup:
     data = f"{CONFIRM_PREFIX}:{sunday_iso}:{role}"
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Принял, буду", callback_data=data),
+    ]])
+
+
+def build_service_confirm_kb(token: str, event_date_iso: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="✅ Принял, буду",
+            callback_data=f"scf:{event_date_iso}:{token}",
+        ),
     ]])
 
 
@@ -41,7 +51,7 @@ def build_general_message(
         username = assignments.get(role, {}).get("username")
         mention = f"@{username}" if username else "не найден"
         template = template.replace(f"@{{{placeholder}}}", f"{{{placeholder}}}")
-        mentions[placeholder] = html.escape(mention)
+        mentions[placeholder] = mention
     return template.format(sunday_date=sunday_str, **mentions)
 
 
@@ -52,7 +62,7 @@ def build_personal_message(
     sunday_str: str,
 ) -> str:
     text = templates["roles"][role].format(
-        name=html.escape(info["name"]), sunday_date=sunday_str,
+        name=info["name"], sunday_date=sunday_str,
     )
     return text if text.startswith("🔔") else f"🔔 {text}"
 
@@ -60,7 +70,9 @@ def build_personal_message(
 async def _notify_admin(bot: Bot, admin_id: int, text: str,
                         debug_logger: logging.Logger) -> None:
     try:
-        await bot.send_message(admin_id, f"⚠️ {text}", parse_mode=None)
+        await send_telegram_screen(
+            bot.send_message, admin_id, f"⚠️ {text}"
+        )
     except Exception:  # noqa: BLE001
         debug_logger.exception("Не удалось уведомить администратора")
 
@@ -103,30 +115,56 @@ async def send_assignments(
     if state.get("general_sent"):
         if state.get("general_text") != general_text:
             try:
-                await bot.edit_message_text(
-                    general_text,
-                    chat_id=group_chat_id,
-                    message_id=state["general_message_id"],
-                )
-            except TelegramAPIError as exc:
-                delivery_state_persisted = False
-                debug_logger.exception("Не удалось обновить сообщение в группе")
-                await _notify_admin(
-                    bot,
-                    admin_id,
-                    f"Ошибка обновления сообщения в группе: {exc}",
-                    debug_logger,
-                )
+                rendered_text = render_edit_screen(general_text)
+            except ValueError:
+                try:
+                    general_msg = await send_telegram_screen(
+                        bot.send_message, group_chat_id, general_text
+                    )
+                except TelegramAPIError as exc:
+                    delivery_state_persisted = False
+                    debug_logger.exception(
+                        "Не удалось отправить обновлённое сообщение в группе"
+                    )
+                    await _notify_admin(
+                        bot,
+                        admin_id,
+                        f"Ошибка обновления сообщения в группе: {exc}",
+                        debug_logger,
+                    )
+                else:
+                    state["general_message_id"] = general_msg.message_id
+                    state["general_text"] = general_text
+                    await persist_progress()
             else:
-                state["general_text"] = general_text
-                await persist_progress()
-                interaction_logger.info(
-                    "Обновлено общее уведомление в чате %s (msg_id=%s)",
-                    group_chat_id, state["general_message_id"],
-                )
+                try:
+                    await bot.edit_message_text(
+                        rendered_text,
+                        chat_id=group_chat_id,
+                        message_id=state["general_message_id"],
+                        parse_mode="HTML",
+                    )
+                except TelegramAPIError as exc:
+                    delivery_state_persisted = False
+                    debug_logger.exception("Не удалось обновить сообщение в группе")
+                    await _notify_admin(
+                        bot,
+                        admin_id,
+                        f"Ошибка обновления сообщения в группе: {exc}",
+                        debug_logger,
+                    )
+                else:
+                    state["general_text"] = general_text
+                    await persist_progress()
+                    interaction_logger.info(
+                        "Обновлено общее уведомление в чате %s (msg_id=%s)",
+                        group_chat_id, state["general_message_id"],
+                    )
     else:
         try:
-            general_msg = await bot.send_message(group_chat_id, general_text)
+            general_msg = await send_telegram_screen(
+                bot.send_message, group_chat_id, general_text
+            )
         except TelegramAPIError as exc:
             debug_logger.exception("Не удалось отправить сообщение в группу")
             await _notify_admin(
@@ -161,8 +199,10 @@ async def send_assignments(
             await _notify_admin(bot, admin_id, message, debug_logger)
             continue
         try:
-            msg = await bot.send_message(
-                info["tg_id"], text,
+            msg = await send_telegram_screen(
+                bot.send_message,
+                info["tg_id"],
+                text,
                 reply_markup=build_confirm_kb(role, sunday_iso),
             )
             participant_state["message_id"] = msg.message_id

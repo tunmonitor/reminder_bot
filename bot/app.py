@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import stat
 import tempfile
@@ -43,15 +44,25 @@ if __package__:
         _utf16_length,
         build_general_message,
         build_personal_message,
+        build_service_confirm_kb,
         send_assignments,
     )
     from .presentation import format_task_assignments
+    from .ui import send_telegram_screen
     from .secure_fs import open_private_directory
-    from .scheduler import add_service_reminder_jobs, build_scheduler
+    from .scheduler import (
+        add_service_reminder_jobs,
+        build_scheduler,
+        scheduled_reminder_date,
+    )
     from .service_registry import ServiceRegistry
     from .state import StateCache
     from .yandex_disk import download_public
-    from .backup import BackupManager, environment_name
+    from .backup import (
+        BackupManager,
+        application_instance_lock,
+        environment_name,
+    )
 else:  # pragma: no cover - поддержка запуска файла напрямую
     from bot.cli import CliArgs
     from bot.config import (
@@ -78,15 +89,25 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         _utf16_length,
         build_general_message,
         build_personal_message,
+        build_service_confirm_kb,
         send_assignments,
     )
     from bot.presentation import format_task_assignments
+    from bot.ui import send_telegram_screen
     from bot.secure_fs import open_private_directory
-    from bot.scheduler import add_service_reminder_jobs, build_scheduler
+    from bot.scheduler import (
+        add_service_reminder_jobs,
+        build_scheduler,
+        scheduled_reminder_date,
+    )
     from bot.service_registry import ServiceRegistry
     from bot.state import StateCache
     from bot.yandex_disk import download_public
-    from bot.backup import BackupManager, environment_name
+    from bot.backup import (
+        BackupManager,
+        application_instance_lock,
+        environment_name,
+    )
 
 
 def _next_sunday_in_tz(tz) -> date:
@@ -445,6 +466,13 @@ class _TemplateValues(dict):
         return "{" + key + "}"
 
 
+def _service_confirmation_key(service_id: str, task: str, telegram_id: int) -> str:
+    digest = hashlib.sha256(
+        f"{service_id}\0{task}\0{telegram_id}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"service_{digest}"
+
+
 async def _process_service_reminder(
     bot: Bot,
     credentials,
@@ -455,11 +483,14 @@ async def _process_service_reminder(
     reminder: dict,
     interaction_logger,
     debug_logger,
+    *,
+    run_date: date | None = None,
+    state_cache: StateCache | None = None,
 ) -> None:
     service = registry.get_service(service_id)
     if service is None or not service["enabled"]:
         return
-    event_date = datetime.now(tz).date() + timedelta(
+    event_date = (run_date or datetime.now(tz).date()) + timedelta(
         days=reminder["reminder_days"]
     )
     try:
@@ -514,6 +545,76 @@ async def _process_service_reminder(
         (contact["task"], contact["name"]): contact for contact in contacts
     }
     date_text = event_date.strftime("%d.%m.%Y")
+    confirmation_participants = {}
+    confirmation_state_ready = service_id != "assembly" or state_cache is None
+    if service_id == "assembly" and state_cache is not None:
+        event_iso = event_date.isoformat()
+        current_state = state_cache.state
+        if not current_state or current_state.get("sunday_date") != event_iso:
+            current_state = {
+                "sunday_date": event_iso,
+                "group_chat_id": service["group_chat_id"],
+                "general_message_id": None,
+                "general_sent": False,
+                "general_text": None,
+                "complete": False,
+                "participants": {},
+            }
+            state_cache.state = current_state
+        participants = current_state.setdefault("participants", {})
+        previous_participants = dict(participants)
+        for key, participant in tuple(participants.items()):
+            if participant.get("service_id") == service_id:
+                del participants[key]
+        current_state["group_chat_id"] = service["group_chat_id"]
+        for task, names in assignments.items():
+            for name in names:
+                contact = contacts_by_name.get((task, name))
+                if contact is None:
+                    continue
+                telegram_id = contact["telegram_id"]
+                key = _service_confirmation_key(
+                    service_id, task, telegram_id
+                )
+                participant = {
+                    "name": name,
+                    "username": contact["username"],
+                    "tg_id": telegram_id,
+                    "task": task,
+                    "service_id": service_id,
+                    "delivered": False,
+                    "confirmed": False,
+                    "message_id": None,
+                    "chat_id": None,
+                    "group_chat_id": service["group_chat_id"],
+                }
+                participant.update(previous_participants.get(key, {}))
+                participant.update({
+                    "name": name,
+                    "username": contact["username"],
+                    "tg_id": telegram_id,
+                    "task": task,
+                    "service_id": service_id,
+                    "group_chat_id": service["group_chat_id"],
+                })
+                participants[key] = participant
+                confirmation_participants[(task, name)] = (key, participant)
+        try:
+            state_cache.save()
+            confirmation_state_ready = True
+        except OSError:
+            debug_logger.exception(
+                "Не удалось сохранить состояние подтверждений служения «Собрание»"
+            )
+            await _notify_admin(
+                bot,
+                credentials.admin_tg_id,
+                "Не удалось сохранить состояние подтверждений «Собрания»; "
+                "личные уведомления не отправлены.",
+                debug_logger,
+            )
+            confirmation_state_ready = False
+
     assignment_text = format_task_assignments(
         assignments, contacts_by_name, mark_unlinked=True
     )
@@ -570,8 +671,8 @@ async def _process_service_reminder(
             )
         else:
             try:
-                await bot.send_message(
-                    group_chat_id, group_text, parse_mode=None
+                await send_telegram_screen(
+                    bot.send_message, group_chat_id, group_text
                 )
             except Exception as exc:
                 debug_logger.exception(
@@ -619,6 +720,8 @@ async def _process_service_reminder(
                 service_id, reminder["id"], event_date.isoformat(), recipient
             ):
                 continue
+            if service_id == "assembly" and not confirmation_state_ready:
+                continue
             template = service["personal_templates"].get(
                 task,
                 "{name}, вы назначены на задачу «{task}» службы "
@@ -656,8 +759,14 @@ async def _process_service_reminder(
                 )
                 continue
             try:
-                await bot.send_message(
-                    telegram_id, personal_text, parse_mode=None
+                send_kwargs = {}
+                confirmation = confirmation_participants.get((task, name))
+                if confirmation:
+                    send_kwargs["reply_markup"] = build_service_confirm_kb(
+                        confirmation[0], event_date.isoformat()
+                    )
+                sent_message = await send_telegram_screen(
+                    bot.send_message, telegram_id, personal_text, **send_kwargs
                 )
             except Exception as exc:
                 debug_logger.exception(
@@ -679,6 +788,16 @@ async def _process_service_reminder(
                     event_date.isoformat(),
                     recipient,
                 )
+                if confirmation:
+                    participant = confirmation[1]
+                    participant["delivered"] = True
+                    participant["message_id"] = getattr(
+                        sent_message, "message_id", None
+                    )
+                    participant["chat_id"] = getattr(
+                        getattr(sent_message, "chat", None), "id", telegram_id
+                    )
+                    state_cache.save()
                 interaction_logger.info(
                     "Личное уведомление служения %s для задачи %s отправлено",
                     service_id,
@@ -954,7 +1073,7 @@ async def _process_upcoming_sunday(
         raise
 
 
-async def run(args: CliArgs) -> None:
+async def _run_locked(args: CliArgs) -> None:
     shm_dir = Path(args.shm_dir)
     log_dir = Path(args.log_dir)
     for directory in (shm_dir, log_dir):
@@ -1004,6 +1123,7 @@ async def run(args: CliArgs) -> None:
     nightly_backup_task: asyncio.Task | None = None
     pid_created = False
     active_jobs: set[asyncio.Task[None]] = set()
+    service_reminder_locks: dict[tuple[str, date], asyncio.Lock] = {}
 
     try:
         bot = Bot(
@@ -1172,21 +1292,33 @@ async def run(args: CliArgs) -> None:
             async def scheduled_service_reminder(
                 service_id: str, reminder: dict
             ) -> None:
+                run_date = scheduled_reminder_date(
+                    datetime.now(tz), reminder["reminder_time"]
+                )
+                event_date = run_date + timedelta(
+                    days=reminder["reminder_days"]
+                )
+                lock = service_reminder_locks.setdefault(
+                    (service_id, event_date), asyncio.Lock()
+                )
                 task = asyncio.current_task()
                 if task is not None:
                     active_jobs.add(task)
                 try:
-                    await _process_service_reminder(
-                        bot,
-                        credentials,
-                        shm_dir,
-                        tz,
-                        service_registry,
-                        service_id,
-                        reminder,
-                        interaction_logger,
-                        debug_logger,
-                    )
+                    async with lock:
+                        await _process_service_reminder(
+                            bot,
+                            credentials,
+                            shm_dir,
+                            tz,
+                            service_registry,
+                            service_id,
+                            reminder,
+                            interaction_logger,
+                            debug_logger,
+                            run_date=run_date,
+                            state_cache=state_cache,
+                        )
                 except Exception:
                     debug_logger.exception(
                         "Ошибка обработки напоминания служения %s",
@@ -1203,10 +1335,10 @@ async def run(args: CliArgs) -> None:
                     if task is not None:
                         active_jobs.discard(task)
 
-            def refresh_service_reminders() -> None:
+            async def refresh_service_reminders() -> None:
                 if service_registry is None or scheduler is None:
                     return
-                add_service_reminder_jobs(
+                await add_service_reminder_jobs(
                     scheduler,
                     service_registry.list_services(),
                     scheduled_service_reminder,
@@ -1238,7 +1370,7 @@ async def run(args: CliArgs) -> None:
             raise FileExistsError(message) from exc
 
         if service_registry is not None:
-            refresh_service_reminders()
+            await refresh_service_reminders()
         scheduler.start()
         await _configure_webapp_menu(bot, PROJECT_DIR, debug_logger)
         if backup_manager is not None:
@@ -1280,6 +1412,11 @@ async def run(args: CliArgs) -> None:
                 finally:
                     if pid_created:
                         _remove_pid_if_owned(pid_file)
+
+
+async def run(args: CliArgs) -> None:
+    with application_instance_lock(Path(args.shm_dir)):
+        await _run_locked(args)
 
 
 __all__ = ["run"]

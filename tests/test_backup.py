@@ -14,7 +14,11 @@ from zoneinfo import ZoneInfo
 
 from openpyxl import Workbook
 
-from bot.backup import BackupManager, assert_bot_stopped
+from bot.backup import (
+    BackupManager,
+    application_instance_lock,
+    assert_bot_stopped,
+)
 from bot.excel_parser import _MONTH_SHEETS
 
 
@@ -144,6 +148,13 @@ class BackupManagerTest(unittest.TestCase):
         self.assertEqual(value, "original")
         self.assertEqual(json.loads(self.cache.read_text("utf-8"))["sunday_date"], "2030-01-06")
         self.assertTrue(self.xlsx.read_bytes().startswith(b"PK"))
+
+    def test_restore_cannot_overlap_a_running_instance(self):
+        snapshot = asyncio.run(self.manager.create_snapshot("test"))
+
+        with application_instance_lock(self.shm_dir):
+            with self.assertRaisesRegex(RuntimeError, "уже выполняется"):
+                self.manager.restore_snapshot(snapshot)
 
     def test_rejects_tampered_snapshot_before_restore(self):
         snapshot = asyncio.run(self.manager.create_snapshot("test"))

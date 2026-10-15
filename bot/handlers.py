@@ -25,14 +25,26 @@ from aiogram.types import (
 )
 
 from .notifier import CONFIRM_PREFIX, _notify_admin
-from .presentation import format_task_assignments
+from .presentation import format_task_assignments, task_emoji
+from .ui import code as ui_code
 from .service_registry import (
     GROUP_TEMPLATE_FIELDS,
     PERSONAL_TEMPLATE_FIELDS,
     validate_notification_template,
 )
+from .ui import callback_text, render_screen_chunks, validate_inline_keyboard
 
 router = Router()
+
+
+async def _answer_callback(
+    callback: CallbackQuery, text: str | None = None, **kwargs
+) -> None:
+    normalized = callback_text(text)
+    if normalized is None:
+        await callback.answer(**kwargs)
+    else:
+        await callback.answer(normalized, **kwargs)
 
 
 def _status_text(text: str, icon: str) -> str:
@@ -94,6 +106,127 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     ] = {}
     pending_contact_navigation: dict[str, tuple[int, str, str]] = {}
     pending_notify_task_choices: dict[str, tuple[int, str, str | None]] = {}
+    pending_dialog_pages: dict[str, tuple[int, str, InlineKeyboardMarkup, int]] = {}
+
+    async def _send_dialog(
+        target: Message,
+        text: str,
+        *,
+        _dialog_page: int = 0,
+        **kwargs,
+    ) -> None:
+        kwargs.pop("parse_mode", None)
+        markup = kwargs.pop("reply_markup", None)
+        if isinstance(markup, InlineKeyboardMarkup):
+            actor_id = getattr(getattr(target, "chat", None), "id", None)
+            for token, page_state in list(pending_dialog_pages.items()):
+                if page_state[0] == actor_id:
+                    pending_dialog_pages.pop(token, None)
+            buttons = [
+                button
+                for row in markup.inline_keyboard
+                for button in row
+            ]
+            for button in buttons:
+                label = button.text
+                if not label.startswith(
+                    (
+                        "✅", "❌", "⚠️", "ℹ️", "⏳", "🟢", "🔴", "⚪",
+                        "⚙️", "🔗", "👥", "👤", "📡", "🔔", "📝", "📊",
+                        "📋", "📅", "🕒", "🎤", "📖", "🍞", "🧪", "👁",
+                        "⏰", "📷", "🎛️", "💻", "🎬", "🎚️", "🖥️",
+                        "🍽️", "☕", "📌",
+                        "🔧", "🧹", "🔄", "⬅️", "➡️", "🏠", "✖️", "➕",
+                        "➖", "🗑", "✏️", "1️⃣", "2️⃣", "3️⃣", "4️⃣",
+                    )
+                ):
+                    button.text = f"📋 {label}"
+
+            rows = [list(row) for row in markup.inline_keyboard]
+            if any(len(row) > 3 for row in rows):
+                rows = [[button] for button in buttons]
+            if len(buttons) > 6:
+                page_size = 4
+                pinned_buttons = [
+                    button
+                    for button in buttons
+                    if button.text.startswith(("⬅️ К ", "↩️ К "))
+                ]
+                if pinned_buttons:
+                    page_size = 3
+                pageable_buttons = [
+                    button for button in buttons
+                    if button not in pinned_buttons
+                ]
+                page_count = max(
+                    1, (len(pageable_buttons) + page_size - 1) // page_size
+                )
+                _dialog_page = min(max(_dialog_page, 0), page_count - 1)
+                page_buttons = pageable_buttons[
+                    _dialog_page * page_size:(_dialog_page + 1) * page_size
+                ]
+                rows = [[button] for button in page_buttons]
+                navigation = []
+                for action, next_page, label in (
+                    ("prev", _dialog_page - 1, "⬅️ Назад"),
+                    ("next", _dialog_page + 1, "Далее ➡️"),
+                ):
+                    if 0 <= next_page < page_count:
+                        token = secrets.token_urlsafe(8)
+                        if actor_id is not None:
+                            pending_dialog_pages[token] = (
+                                actor_id, text, markup, next_page
+                            )
+                        navigation.append(
+                            InlineKeyboardButton(
+                                text=label,
+                                callback_data=f"ui_page:{token}",
+                            )
+                        )
+                if navigation:
+                    rows.append(navigation)
+                if pinned_buttons:
+                    rows.extend([[button] for button in pinned_buttons])
+                validate_inline_keyboard(rows)
+                markup = InlineKeyboardMarkup(inline_keyboard=rows)
+                text = f"{text}\n📊 Страница {_dialog_page + 1}/{page_count}"
+            else:
+                validate_inline_keyboard(rows)
+
+        chunks = render_screen_chunks(text)
+        for index, chunk in enumerate(chunks):
+            await target.answer(
+                chunk,
+                parse_mode="HTML",
+                reply_markup=(
+                    markup if index == len(chunks) - 1 else None
+                ),
+                **kwargs,
+            )
+
+    @admin_router.callback_query(F.data.startswith("ui_page:"))
+    async def on_dialog_page(callback: CallbackQuery) -> None:
+        if (
+            not callback.from_user
+            or not callback.message
+            or callback.message.chat.type != ChatType.PRIVATE
+        ):
+            await _answer_callback(callback)
+            return
+        _, token = callback.data.split(":", 1)
+        page_state = pending_dialog_pages.pop(token, None)
+        if page_state is None or page_state[0] != callback.from_user.id:
+            await _answer_callback(callback, "Выбор устарел")
+            return
+        _, text, markup, page = page_state
+        await _send_dialog(
+            callback.message,
+            text,
+            reply_markup=markup,
+            _dialog_page=page,
+        )
+        await _answer_callback(callback)
+
     def new_share_request_id() -> int:
         registry = service_registry()
         if registry is None:
@@ -102,6 +235,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     def clear_pending_actor(actor_id: int) -> None:
         pending_inputs.pop(actor_id, None)
+        for token, page in list(pending_dialog_pages.items()):
+            if page[0] == actor_id:
+                pending_dialog_pages.pop(token, None)
         for request_id, pending in list(pending_shares.items()):
             if pending[0] == actor_id:
                 pending_shares.pop(request_id, None)
@@ -160,7 +296,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             raise ValueError("Служение не найдено.")
         enabled_status = "🟢 включено" if service["enabled"] else "🔴 выключено"
         group_template_status = (
-            "🟢 задан" if service["group_template"] else "⚪ не задан"
+            "🟢 задан"
+            if service["group_template"]
+            else "⚪ свой текст не задан · используется шаблон по умолчанию"
         )
         personal_templates = service["personal_templates"]
         personal_template_status = (
@@ -169,64 +307,39 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             else "⚪ не заданы"
         )
         lines = [
-            f"⚙️ {service_label(service)} · статус: {enabled_status}",
+            f"⚙️ {service_label(service)} · {enabled_status}",
             "",
             "📡 Настройки",
-            "├ Групповой чат: "
+            "Групповой чат · "
             + (
-                str(service["group_chat_id"])
+                ui_code(service["group_chat_id"])
                 if service["group_chat_id"] is not None
-                else "⚪ не задан"
+                else ui_code(None)
             ),
-            f"├ Напоминание: за {service['reminder_days']} дн. "
+            f"🔔 Напоминание · за {service['reminder_days']} дн. "
             f"в {service['reminder_time']}",
-            f"├ Текст для группы: {group_template_status}",
-            f"└ Личные шаблоны: {personal_template_status}",
+            f"📝 Свой текст для группы · {group_template_status}",
+            f"📝 Личные шаблоны · {personal_template_status}",
         ]
         if service["group_template"]:
-            lines.extend(["", "📝 Текст группового уведомления", service["group_template"]])
-        if personal_templates:
-            lines.extend(["", "📝 Тексты личных уведомлений"])
             lines.extend(
-                f"├ {role}: {template}"
-                for role, template in personal_templates.items()
+                ["", "Текущий групповой шаблон:", service["group_template"]]
             )
-        if registry.is_super_admin(actor_id):
-            admins = registry.list_service_admin_details(service_id)
-            contacts = registry.list_responsible_contacts(
-                actor_id, service_id
+        if personal_templates:
+            lines.extend(
+                [
+                    "",
+                    "Текущие личные шаблоны:",
+                    *(
+                        f"{task}: {template}"
+                        for task, template in sorted(personal_templates.items())
+                    ),
+                ]
             )
-            lines.extend(["", "👤 Администраторы"])
-            if admins:
-                lines.extend(
-                    f"├ @{admin['username']}"
-                    if admin["username"]
-                    else "├ пользователь (username не указан)"
-                    for admin in admins
-                )
-            else:
-                lines.append("└ ⚪ не назначены")
-
-            lines.extend(["", "👥 Ответственные"])
-            if not contacts:
-                lines.append("└ ⚪ не назначены")
-            else:
-                contacts_by_task: dict[str, list[str]] = {}
-                for contact in contacts:
-                    contacts_by_task.setdefault(contact["task"], []).append(
-                        contact["name"]
-                    )
-                contacts_by_name = {
-                    (contact["task"], contact["name"]): contact
-                    for contact in contacts
-                }
-                lines.append(
-                    format_task_assignments(contacts_by_task, contacts_by_name)
-                )
         lines.extend(
             [
                 "",
-                "ℹ️ Чтобы изменить дни, время или тексты, нажмите кнопку ниже.",
+                "ℹ️ Выберите параметр для изменения.",
             ]
         )
         return "\n".join(lines)
@@ -239,8 +352,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     ) -> None:
         registry = service_registry()
         if registry is None:
-            await message.answer(
-                "Реестр настроек служений недоступен. "
+            await _send_dialog(message, "Реестр настроек служений недоступен. "
                 "Попробуйте позже или сообщите супер-администратору.",
                 parse_mode=None,
             )
@@ -307,12 +419,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     "Эта команда доступна только супер-администратору."
                 )
         except (PermissionError, ValueError) as exc:
-            await message.answer(_status_text(str(exc), "❌"), parse_mode=None)
+            await _send_dialog(message, _status_text(str(exc), "❌"), parse_mode=None)
             return
         except sqlite3.Error:
             debug.exception("Не удалось загрузить список служений")
-            await message.answer(
-                "Не удалось загрузить список служений.", parse_mode=None
+            await _send_dialog(message, "Не удалось загрузить список служений.", parse_mode=None
             )
             return
 
@@ -320,7 +431,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text=service_label(service),
+                        text=(
+                            f"{'🟢' if service['enabled'] else '🔴'} "
+                            f"{service_label(service)}"
+                        ),
                         callback_data=f"service:{operation}:{service['id']}",
                     )
                 ]
@@ -328,16 +442,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ]
         )
         descriptions = {
-            "service_settings": "ℹ️ Выберите служение, чтобы открыть его настройки.",
-            "service_admin_add": "ℹ️ Выберите служение, затем пользователя Telegram для назначения администратором.",
-            "service_admin_remove": "ℹ️ Выберите служение, затем укажите Telegram ID администратора.",
-            "service_chat": "ℹ️ Выберите служение, чтобы настроить или отключить групповой чат.",
-            "service_contact": "ℹ️ Выберите служение, задачу и ответственного из графика.",
-            "service_sync": "ℹ️ Выберите служение, чтобы сверить график и привязки ответственных.",
-            "service_notify": "ℹ️ Выберите служение и параметр уведомлений для изменения.",
+            "service_settings": "ℹ️ Выберите служение для просмотра настроек.",
+            "service_admin_add": "ℹ️ Выберите служение для назначения администратора.",
+            "service_admin_remove": "ℹ️ Выберите служение для снятия администратора.",
+            "service_chat": "ℹ️ Выберите служение для настройки группового чата.",
+            "service_contact": "ℹ️ Выберите служение для привязки ответственных.",
+            "service_sync": "ℹ️ Выберите служение для сверки привязок.",
+            "service_notify": "ℹ️ Выберите служение для настройки уведомлений.",
         }
-        await message.answer(
-            descriptions[operation],
+        await _send_dialog(message, descriptions[operation],
             reply_markup=keyboard,
             parse_mode=None,
         )
@@ -372,8 +485,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 resize_keyboard=True,
                 one_time_keyboard=True,
             )
-            await message.answer(
-                f"ℹ️ {label}: нажмите кнопку и выберите группу, в которой "
+            await _send_dialog(message, f"ℹ️ {label}: нажмите кнопку и выберите группу, в которой "
                 "бот уже состоит. После выбора служение будет включено.",
                 reply_markup=keyboard,
                 parse_mode=None,
@@ -382,8 +494,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
         registry = service_registry()
         if registry is None:
-            await message.answer(
-                "Реестр настроек служений недоступен.", parse_mode=None
+            await _send_dialog(message, "Реестр настроек служений недоступен.", parse_mode=None
             )
             return
         prompts = {
@@ -438,33 +549,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "step": "choose_task",
             }
             if operation == "service_sync":
-                await message.answer(
-                    f"⏳ {label}: загружаю и проверяю актуальный график...",
+                await _send_dialog(message, f"⏳ {label}: загружаю и проверяю актуальный график...",
                     parse_mode=None,
                 )
                 await offer_contact_task_choices(
                     message,
                     actor_id,
                     service_id,
-                    success_prompt=(
-                        "✅ График загружен. Сверьте задачи и ответственных "
-                        "с показанными привязками; выберите имя, если "
-                        "требуется добавить или изменить Telegram."
-                    ),
                 )
                 return
-            prompt = (
-                    f"ℹ️ {label}: выберите задачу и ответственного из "
-                    "актуального файла графика, чтобы привязать пользователя "
-                    "Telegram."
-            )
-            await message.answer(
-                prompt,
-                parse_mode=None,
-            )
             await offer_contact_task_choices(message, actor_id, service_id)
             return
-        await message.answer(prompts[operation], parse_mode=None)
+        await _send_dialog(message, prompts[operation], parse_mode=None)
 
     async def run_registry_command(
         message: Message,
@@ -479,8 +575,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         clear_pending_actor(message.from_user.id)
         if service_registry() is None:
-            await message.answer(
-                "Реестр настроек служений недоступен. "
+            await _send_dialog(message, "Реестр настроек служений недоступен. "
                 "Попробуйте позже или сообщите супер-администратору.",
                 parse_mode=None,
             )
@@ -488,12 +583,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         try:
             response = operation(message.from_user.id)
         except (PermissionError, ValueError) as exc:
-            await message.answer(_status_text(str(exc), "❌"), parse_mode=None)
+            await _send_dialog(message, _status_text(str(exc), "❌"), parse_mode=None)
             return
         except sqlite3.Error:
             debug.exception("Ошибка выполнения команды управления служениями")
-            await message.answer(
-                "Не удалось выполнить команду из-за ошибки базы настроек.",
+            await _send_dialog(message, "Не удалось выполнить команду из-за ошибки базы настроек.",
                 parse_mode=None,
             )
             return
@@ -504,8 +598,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         )
         chunks = _telegram_text_chunks(formatted_response)
         for index, chunk in enumerate(chunks):
-            await message.answer(
-                chunk,
+            await _send_dialog(message, chunk,
                 parse_mode=None,
                 reply_markup=reply_markup if index == len(chunks) - 1 else None,
             )
@@ -539,7 +632,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         token = secrets.token_urlsafe(8)
         task_choices[token] = (actor_id, operation, service_id, task)
         return InlineKeyboardButton(
-            text=task if len(task) <= 48 else task[:45] + "...",
+            text=(
+                f"{task_emoji(task)} {task}"
+                if len(task) <= 44
+                else f"{task_emoji(task)} {task[:41]}..."
+            ),
             callback_data=f"task:{operation}:{token}",
         )
 
@@ -571,51 +668,24 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("operation") != operation
             or pending.get("service_id") != service_id
         ):
-            await message.answer(
-                "Выбор задач устарел. Запустите команду заново.",
+            await _send_dialog(message, "Выбор задач устарел. Запустите команду заново.",
                 parse_mode=None,
             )
             return
 
         tasks = pending.get("schedule_tasks", [])
-        page_size = 10
+        page_size = 3
         page_count = max(1, (len(tasks) + page_size - 1) // page_size)
         page = min(max(page, 0), page_count - 1)
         page_tasks = tasks[page * page_size:(page + 1) * page_size]
+        registry = service_registry()
+        service = (
+            service_by_id(registry, service_id) if registry is not None else None
+        )
+        service_context = (
+            service_label(service) if service is not None else service_id.upper()
+        )
         rows = []
-        if operation == "service_contact":
-            assignments = pending.get("schedule_assignments", {})
-            registered = pending.get("registered_contacts", {})
-            details = []
-            for task in page_tasks:
-                schedule_names = ", ".join(assignments.get(task, []))
-                saved_contacts = registered.get(task, [])
-                saved_text = ", ".join(
-                    f"{contact['name']}"
-                    + (
-                        f" (@{contact['username']})"
-                        if contact["username"]
-                        else ""
-                    )
-                    for contact in saved_contacts
-                ) if saved_contacts else "не привязаны"
-                details.append(
-                    f"• {task} — по расписанию: {schedule_names}; "
-                    f"в боте: {saved_text}"
-                )
-            if details:
-                intro = (
-                    "👥 Задачи из графика и привязанные в боте ответственные:\n"
-                )
-                for chunk in _telegram_text_chunks(intro + "\n".join(details)):
-                    await message.answer(chunk, parse_mode=None)
-            elif not tasks:
-                await message.answer(
-                    "В расписании нет задач с назначенными ответственными "
-                    "для этого служения.",
-                    parse_mode=None,
-                )
-
         if operation == "service_contact":
             rows.extend(
                 [
@@ -643,7 +713,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 label = task if len(task) <= 48 else task[:45] + "..."
                 rows.append([
                     InlineKeyboardButton(
-                        text=label,
+                        text=f"{task_emoji(task)} {label}",
                         callback_data=f"notify_task:{token}",
                     )
                 ])
@@ -674,7 +744,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             navigation.append(
                 InlineKeyboardButton(
-                    text="Далее ➡️", callback_data=f"task_page:{token}"
+                    text="➡️ Далее", callback_data=f"task_page:{token}"
                 )
             )
         if navigation:
@@ -682,21 +752,26 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
         if operation == "service_contact":
             prompt = (
-                f"ℹ️ Выберите задачу из графика "
-                f"(страница {page + 1}/{page_count})."
+                f"🔗 Привязка ответственных · "
+                f"{service_context}"
+                f"\n📊 Задачи {page * page_size + 1}-"
+                f"{min((page + 1) * page_size, len(tasks))} из {len(tasks)}"
+                "\nℹ️ Выберите задачу из графика."
                 if tasks
-                else "ℹ️ Для этого служения пока нет задач с ответственными в графике."
+                else "🔗 Привязка ответственных\n"
+                "⚪ В графике нет задач с ответственными."
             )
         else:
             prompt = (
-                "ℹ️ Выберите задачу из графика для индивидуального текста "
-                f"(страница {page + 1}/{page_count})."
+                "📝 Личный шаблон\n"
+                f"📊 Задачи {page * page_size + 1}-"
+                f"{min((page + 1) * page_size, len(tasks))} из {len(tasks)}"
+                "\nℹ️ Выберите задачу из графика."
                 if tasks
-                else "ℹ️ В расписании пока нет задач с назначенными "
-                "ответственными. Можно завершить и сохранить настройки."
+                else "📝 Личный шаблон\n"
+                "⚪ В графике нет задач с ответственными."
             )
-        await message.answer(
-            prompt,
+        await _send_dialog(message, prompt,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             parse_mode=None,
         )
@@ -715,8 +790,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("service_id") != service_id
             or task not in pending.get("schedule_assignments", {})
         ):
-            await message.answer(
-                "Задача отсутствует в актуальном файле расписания.",
+            await _send_dialog(message, "Задача отсутствует в актуальном файле расписания.",
                 parse_mode=None,
             )
             return
@@ -734,28 +808,28 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             contact["name"]: contact for contact in registered
         }
         rows = []
-        details = []
-        for person_name in pending["schedule_assignments"][task]:
+        bound_count = 0
+        names = pending["schedule_assignments"][task]
+        for person_name in names:
             contact = contacts_by_name.get(person_name)
             if contact:
-                status = (
-                    "уже привязан"
-                    + (f" (@{contact['username']})" if contact["username"] else "")
+                bound_count += 1
+                status = "✅"
+                suffix = (
+                    f" · @{contact['username']}"
+                    if contact["username"]
+                    else " · привязан"
                 )
-                action = "Изменить привязку"
             else:
-                status = "данные Telegram не указаны"
-                action = "Выбрать пользователя"
-            details.append(f"• {person_name} — {status}")
+                status = "⚪"
+                suffix = " · не привязан"
             token = secrets.token_urlsafe(8)
             pending_contact_person_choices[token] = (
                 actor_id, service_id, task, person_name
             )
-            label = (
-                f"{action}: {person_name}"
-                if len(person_name) <= 40
-                else f"{action}: {person_name[:37]}..."
-            )
+            label = f"{status} {person_name}{suffix}"
+            if len(label) > 60:
+                label = label[:57] + "..."
             rows.append([
                 InlineKeyboardButton(
                     text=label,
@@ -766,16 +840,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             contact_navigation_button(actor_id, service_id, "tasks")
         ])
         text = (
-            "👥 Ответственные за задачу «"
-            + task
-            + "» по файлу расписания:\n"
-            + "\n".join(details)
-            + "\nℹ️ Выберите имя, чтобы привязать или изменить пользователя Telegram."
+            f"👥 Ответственные · {task_emoji(task)} {task}\n"
+            f"📊 Привязано {bound_count} из {len(names)} участников\n"
+            "ℹ️ Выберите имя для привязки или изменения."
         )
         if notice:
             text = notice + "\n\n" + text
-        await message.answer(
-            text,
+        await _send_dialog(message, text,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             parse_mode=None,
         )
@@ -784,18 +855,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         message: Message,
         actor_id: int,
         service_id: str,
-        success_prompt: str | None = None,
     ) -> bool:
         registry = service_registry()
         if registry is None:
-            await message.answer(
-                "Реестр настроек служений недоступен.", parse_mode=None
+            await _send_dialog(message, "Реестр настроек служений недоступен.", parse_mode=None
             )
             return False
         task_loader = getattr(context, "load_service_task_assignments", None)
         if not callable(task_loader):
-            await message.answer(
-                "Загрузка задач из файла расписания недоступна.",
+            await _send_dialog(message, "Загрузка задач из файла расписания недоступна.",
                 parse_mode=None,
             )
             return False
@@ -805,8 +873,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or current_pending.get("operation") != "service_contact"
             or current_pending.get("service_id") != service_id
         ):
-            await message.answer(
-                "Сценарий выбора служения отменён или устарел.",
+            await _send_dialog(message, "Сценарий выбора служения отменён или устарел.",
                 parse_mode=None,
             )
             return False
@@ -814,12 +881,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         try:
             assignments = await task_loader(service_id)
         except (PermissionError, ValueError) as exc:
-            await message.answer(_status_text(str(exc), "❌"), parse_mode=None)
+            await _send_dialog(message, _status_text(str(exc), "❌"), parse_mode=None)
             return False
         except Exception:
             debug.exception("Не удалось прочитать задачи из графика служений")
-            await message.answer(
-                "Не удалось прочитать файл графика служений. "
+            await _send_dialog(message, "Не удалось прочитать файл графика служений. "
                 "Проверьте доступность расписания и попробуйте снова.",
                 parse_mode=None,
             )
@@ -827,12 +893,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         try:
             contacts = registry.list_responsible_contacts(actor_id, service_id)
         except (PermissionError, ValueError) as exc:
-            await message.answer(_status_text(str(exc), "❌"), parse_mode=None)
+            await _send_dialog(message, _status_text(str(exc), "❌"), parse_mode=None)
             return False
         except sqlite3.Error:
             debug.exception("Не удалось прочитать привязки ответственных")
-            await message.answer(
-                "Не удалось прочитать список привязанных пользователей.",
+            await _send_dialog(message, "Не удалось прочитать список привязанных пользователей.",
                 parse_mode=None,
             )
             return False
@@ -843,8 +908,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("service_id") != service_id
             or pending.get("session_id") != session_id
         ):
-            await message.answer(
-                "Сценарий выбора служения был отменён во время загрузки графика.",
+            await _send_dialog(message, "Сценарий выбора служения был отменён во время загрузки графика.",
                 parse_mode=None,
             )
             return False
@@ -855,8 +919,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             pending["registered_contacts"].setdefault(
                 contact["task"], []
             ).append(contact)
-        if success_prompt:
-            await message.answer(success_prompt, parse_mode=None)
         await send_task_choices_page(
             message, actor_id, service_id, "service_contact"
         )
@@ -872,8 +934,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("operation") != "service_notify"
             or registry is None
         ):
-            await message.answer(
-                "Пошаговая настройка уведомлений завершена или недоступна.",
+            await _send_dialog(message, "Пошаговая настройка уведомлений завершена или недоступна.",
                 parse_mode=None,
             )
             return False
@@ -882,8 +943,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         else:
             task_loader = getattr(context, "load_service_task_assignments", None)
             if not callable(task_loader):
-                await message.answer(
-                    "Загрузка задач из файла расписания недоступна.",
+                await _send_dialog(message, "Загрузка задач из файла расписания недоступна.",
                     parse_mode=None,
                 )
                 return False
@@ -891,8 +951,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 assignments = await task_loader(service_id)
             except Exception:
                 debug.exception("Не удалось прочитать задачи из графика служений")
-                await message.answer(
-                    "Не удалось прочитать файл графика служений. "
+                await _send_dialog(message, "Не удалось прочитать файл графика служений. "
                     "Проверьте доступность расписания и попробуйте снова.",
                     parse_mode=None,
                 )
@@ -914,14 +973,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("operation") != "service_notify"
             or pending.get("service_id") != service_id
         ):
-            await message.answer(
-                "Настройка устарела. Запустите /service_notify заново.",
+            await _send_dialog(message, "Настройка устарела. Запустите /service_notify заново.",
                 parse_mode=None,
             )
             return
         service = service_by_id(service_registry(), service_id)
         if service is None:
-            await message.answer("Служение не найдено.", parse_mode=None)
+            await _send_dialog(message, "Служение не найдено.", parse_mode=None)
             return
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -978,8 +1036,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 ],
             ]
         )
-        await message.answer(
-            f"🔔 {service_label(service)}\n"
+        await _send_dialog(message, f"🔔 {service_label(service)}\n"
             "ℹ️ Выберите, что изменить. Текущие значения сохраняются, "
             "пока вы их не измените.",
             reply_markup=keyboard,
@@ -995,8 +1052,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("operation") != "service_notify"
             or pending.get("service_id") != service_id
         ):
-            await message.answer(
-                "Настройка устарела. Запустите /service_notify заново.",
+            await _send_dialog(message, "Настройка устарела. Запустите /service_notify заново.",
                 parse_mode=None,
             )
             return
@@ -1009,32 +1065,23 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             reminder_id = reminder.get("id")
             if reminder_id is None:
                 label += " · новое"
-                rows.append([
-                    InlineKeyboardButton(
-                        text=f"📅 {label}",
-                        callback_data=(
-                            f"notify_rule:days:{service_id}:"
-                            f"{pending['session_id']}:new"
-                        ),
-                    )
-                ])
-            else:
-                rows.append([
-                    InlineKeyboardButton(
-                        text=f"✏️ {label}",
-                        callback_data=(
-                            f"notify_rule:edit:{service_id}:"
-                            f"{pending['session_id']}:{reminder_id}"
-                        ),
+                reminder_id = reminder["draft_id"]
+            rows.append([
+                InlineKeyboardButton(
+                    text=f"✏️ {label}",
+                    callback_data=(
+                        f"notify_rule:edit:{service_id}:"
+                        f"{pending['session_id']}:{reminder_id}"
                     ),
-                    InlineKeyboardButton(
-                        text="🗑",
-                        callback_data=(
-                            f"notify_rule:delete_prompt:{service_id}:"
-                            f"{pending['session_id']}:{reminder_id}"
-                        ),
+                ),
+                InlineKeyboardButton(
+                    text="🗑",
+                    callback_data=(
+                        f"notify_rule:delete_prompt:{service_id}:"
+                        f"{pending['session_id']}:{reminder_id}"
                     ),
-                ])
+                ),
+            ])
         rows.extend(
             [
                 [
@@ -1073,8 +1120,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 ],
             ]
         )
-        await message.answer(
-            "⏰ Расписание уведомлений\n"
+        await _send_dialog(message, "⏰ Расписание уведомлений\n"
             "Каждое правило задаёт срок до события и локальное время.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             parse_mode=None,
@@ -1186,8 +1232,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("operation") != "service_notify"
             or pending.get("service_id") != service_id
         ):
-            await message.answer(
-                "Настройка устарела. Запустите /service_notify заново.",
+            await _send_dialog(message, "Настройка устарела. Запустите /service_notify заново.",
                 parse_mode=None,
             )
             return
@@ -1201,8 +1246,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     context, "load_service_task_assignments", None
                 )
                 if not callable(task_loader):
-                    await message.answer(
-                        "Загрузка задач из файла расписания недоступна.",
+                    await _send_dialog(message, "Загрузка задач из файла расписания недоступна.",
                         parse_mode=None,
                     )
                     return
@@ -1214,8 +1258,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     debug.exception(
                         "Не удалось прочитать задачи для личных шаблонов"
                     )
-                    await message.answer(
-                        "Не удалось прочитать файл графика. "
+                    await _send_dialog(message, "Не удалось прочитать файл графика. "
                         "Попробуйте выбрать этот пункт ещё раз.",
                         parse_mode=None,
                     )
@@ -1246,7 +1289,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ),
         }
         if field not in prompts:
-            await message.answer("Неизвестный параметр.", parse_mode=None)
+            await _send_dialog(message, "Неизвестный параметр.", parse_mode=None)
             return
         pending["step"] = field
         text = prompts[field]
@@ -1272,8 +1315,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
         chunks = _telegram_text_chunks(text)
         for index, chunk in enumerate(chunks):
-            await message.answer(
-                chunk,
+            await _send_dialog(message, chunk,
                 reply_markup=(
                     notification_edit_controls(
                         service_id, pending["session_id"]
@@ -1307,8 +1349,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     ) -> None:
         pending = pending_inputs.get(actor_id)
         if pending is None or pending.get("operation") != "service_notify":
-            await message.answer(
-                "Запрос настройки устарел. Запустите /service_notify заново.",
+            await _send_dialog(message, "Запрос настройки устарел. Запустите /service_notify заново.",
                 parse_mode=None,
             )
             return
@@ -1324,8 +1365,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         )
         chunks = _telegram_text_chunks(text)
         for index, chunk in enumerate(chunks):
-            await message.answer(
-                chunk,
+            await _send_dialog(message, chunk,
                 reply_markup=(
                     notification_edit_controls(
                         service_id, pending["session_id"]
@@ -1346,8 +1386,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("operation") != "service_notify"
             or registry is None
         ):
-            await message.answer(
-                "Пошаговая настройка уведомлений устарела.",
+            await _send_dialog(message, "Пошаговая настройка уведомлений устарела.",
                 parse_mode=None,
             )
             return
@@ -1356,8 +1395,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             and not reminder.get("complete")
             for reminder in pending["reminders"]
         ):
-            await message.answer(
-                "Сначала завершите ввод срока и времени нового уведомления "
+            await _send_dialog(message, "Сначала завершите ввод срока и времени нового уведомления "
                 "или отмените настройку.",
                 parse_mode=None,
             )
@@ -1386,7 +1424,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 context, "refresh_service_reminder_jobs", None
             )
             if callable(refresh_reminders):
-                refresh_reminders()
+                await refresh_reminders()
         except (PermissionError, ValueError) as exc:
             if (
                 isinstance(exc, ValueError)
@@ -1407,8 +1445,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         ]
                     ]
                 )
-                await message.answer(
-                    "⚠️ Есть уведомления с одинаковыми сроком и временем. "
+                await _send_dialog(message, "⚠️ Есть уведомления с одинаковыми сроком и временем. "
                     "При подтверждении для одного события одинаковые "
                     "уведомления не будут отправляться дважды. "
                     "Сохранить расписание?",
@@ -1416,18 +1453,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     parse_mode=None,
                 )
                 return
-            await message.answer(_status_text(str(exc), "❌"), parse_mode=None)
+            await _send_dialog(message, _status_text(str(exc), "❌"), parse_mode=None)
             return
         except sqlite3.Error:
             debug.exception("Не удалось сохранить настройки уведомлений")
-            await message.answer(
-                "Не удалось сохранить настройки уведомлений из-за ошибки базы.",
+            await _send_dialog(message, "Не удалось сохранить настройки уведомлений из-за ошибки базы.",
                 parse_mode=None,
             )
             return
         pending_inputs.pop(actor_id, None)
-        await message.answer(
-            "✅ Настройки уведомлений сохранены.", parse_mode=None
+        await _send_dialog(message, "✅ Настройки уведомлений сохранены.", parse_mode=None
         )
 
     @admin_router.callback_query(F.data.startswith("task:"))
@@ -1437,11 +1472,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or not callback.message
             or callback.message.chat.type != ChatType.PRIVATE
         ):
-            await callback.answer()
+            await _answer_callback(callback,)
             return
         parts = callback.data.split(":")
         if len(parts) != 3:
-            await callback.answer("❌ Некорректный выбор задачи.")
+            await _answer_callback(callback,"❌ Некорректный выбор задачи.")
             return
         _, operation, token = parts
         selection = pending_task_choices.pop(token, None)
@@ -1450,7 +1485,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or selection[0] != callback.from_user.id
             or selection[1] != operation
         ):
-            await callback.answer("⚠️ Выбор устарел. Начните команду заново.")
+            await _answer_callback(callback,"⚠️ Выбор устарел. Начните команду заново.")
             return
         _, _, service_id, task = selection
         pending = pending_inputs.get(callback.from_user.id)
@@ -1462,12 +1497,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or task is None
             or task not in pending.get("schedule_tasks", [])
         ):
-            await callback.answer("⚠️ Запрос задачи устарел.")
+            await _answer_callback(callback,"⚠️ Запрос задачи устарел.")
             return
         await offer_contact_name_choices(
             callback.message, callback.from_user.id, service_id, task
         )
-        await callback.answer()
+        await _answer_callback(callback,)
 
     @admin_router.callback_query(F.data.startswith("notify_task:"))
     async def on_notify_task_choice(callback: CallbackQuery) -> None:
@@ -1476,7 +1511,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or not callback.message
             or callback.message.chat.type != ChatType.PRIVATE
         ):
-            await callback.answer()
+            await _answer_callback(callback,)
             return
         token = callback.data.partition(":")[2]
         selection = pending_notify_task_choices.pop(token, None)
@@ -1493,7 +1528,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 and selection[2] not in pending.get("schedule_tasks", [])
             )
         ):
-            await callback.answer("⚠️ Выбор устарел. Начните настройку заново.")
+            await _answer_callback(callback,"⚠️ Выбор устарел. Начните настройку заново.")
             return
         task = selection[2]
         if task is None:
@@ -1504,11 +1539,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await begin_notify_template(
                 callback.message, callback.from_user.id, selection[1], task
             )
-        await callback.answer()
+        await _answer_callback(callback,)
 
     @admin_router.callback_query(F.data.startswith("notify_task_new:"))
     async def on_notify_new_task(callback: CallbackQuery) -> None:
-        await callback.answer(
+        await _answer_callback(callback,
             "Добавление произвольных задач отключено. "
             "Используйте задачи из файла расписания."
         )
@@ -1543,8 +1578,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             resize_keyboard=True,
             one_time_keyboard=True,
         )
-        await message.answer(
-            "Нажмите кнопку и выберите пользователя в Telegram. "
+        await _send_dialog(message, "Нажмите кнопку и выберите пользователя в Telegram. "
             "Либо отправьте его Telegram ID, при желании дополнив "
             "username через пробел: 123456789 @username. "
             "Администратор также может назначить самого себя. "
@@ -1567,8 +1601,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("service_id") != service_id
             or pending.get("active_task") != task
         ):
-            await message.answer(
-                "Сценарий привязки устарел. Запустите /service_contact заново.",
+            await _send_dialog(message, "Сценарий привязки устарел. Запустите /service_contact заново.",
                 parse_mode=None,
             )
             return
@@ -1596,8 +1629,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             resize_keyboard=True,
             one_time_keyboard=True,
         )
-        await message.answer(
-            f"Нажмите кнопку и выберите пользователя Telegram для имени "
+        await _send_dialog(message, f"Нажмите кнопку и выберите пользователя Telegram для имени "
             f"«{contact_name}» (задача «{task}»). "
             "Или отправьте Telegram ID, при желании дополнив username "
             "через пробел: 123456789 @username. "
@@ -1686,10 +1718,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
         )
         user_display = display_name or f"Пользователь {user_id}"
-        await message.answer(
-            f"ℹ️ Подтвердите действие: {title}: {user_display}"
-            + (f" (@{username})" if username else "")
-            + "?",
+        await _send_dialog(message, f"ℹ️ Подтвердите: {title}\n"
+            f"👤 Пользователь · {user_display}"
+            + (f" · @{username}" if username else "")
+            + (
+                f"\n🆔 Telegram ID · {ui_code(user_id)}"
+                if display_name is None
+                else ""
+            ),
             reply_markup=keyboard,
             parse_mode=None,
         )
@@ -1702,8 +1738,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         ):
             return
         if service_registry() is None:
-            await message.answer(
-                "Реестр настроек служений недоступен. "
+            await _send_dialog(message, "Реестр настроек служений недоступен. "
                 "Попробуйте позже или сообщите супер-администратору.",
                 parse_mode=None,
             )
@@ -1721,45 +1756,36 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
             ]
             if not visible:
-                await message.answer(
-                    "ℹ️ Вы не назначены администратором служений.",
+                await _send_dialog(message, "ℹ️ Вы не назначены администратором служений.",
                     parse_mode=None,
                 )
                 return
-
-            lines = ["📋 Служения"]
-            for index, service in enumerate(visible):
-                state = "🟢 включено" if service["enabled"] else "🔴 выключено"
-                lines.append(f"⚙️ {service_label(service)} · {state}")
-                if is_super_admin:
-                    admins = registry.list_service_admin_details(
-                        service["id"]
-                    )
-                    admin_text = ", ".join(
-                        f"{admin['telegram_id']}"
-                        + (
-                            f" (@{admin['username']})"
-                            if admin["username"]
-                            else ""
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text=(
+                                f"{'🟢' if service['enabled'] else '🔴'} "
+                                f"{service_label(service)}"
+                            ),
+                            callback_data=(
+                                f"service:service_settings:{service['id']}"
+                            ),
                         )
-                        for admin in admins
-                    )
-                    lines.append(
-                        "  📡 Групповой чат: "
-                        f"{service['group_chat_id'] or '⚪ не задан'}; "
-                        "👤 администраторы: "
-                        f"{admin_text or 'не назначены'}"
-                    )
-                if index + 1 < len(visible):
-                    lines.append("")
+                    ]
+                    for service in visible
+                ]
+            )
         except sqlite3.Error:
             debug.exception("Не удалось прочитать список служений")
-            await message.answer(
-                "Не удалось прочитать реестр служений.", parse_mode=None
+            await _send_dialog(message, "Не удалось прочитать реестр служений.", parse_mode=None
             )
             return
-        for chunk in _telegram_text_chunks("\n".join(lines)):
-            await message.answer(chunk, parse_mode=None)
+        await _send_dialog(
+            message,
+            "📋 Служения\nℹ️ Выберите служение для просмотра настроек.",
+            reply_markup=keyboard,
+        )
 
     @admin_router.message(Command("service_settings"))
     async def on_service_settings(message: Message) -> None:
@@ -1789,8 +1815,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             return
         if len(parts) not in {3, 4}:
-            await message.answer(
-                "Укажите ID пользователя и необязательный username.",
+            await _send_dialog(message, "Укажите ID пользователя и необязательный username.",
                 parse_mode=None,
             )
             return
@@ -1808,12 +1833,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             if service is None:
                 raise ValueError("Служение не найдено.")
         except (PermissionError, ValueError) as exc:
-            await message.answer(_status_text(str(exc), "❌"), parse_mode=None)
+            await _send_dialog(message, _status_text(str(exc), "❌"), parse_mode=None)
             return
         except sqlite3.Error:
             debug.exception("Не удалось проверить прямое назначение администратора")
-            await message.answer(
-                "Не удалось проверить служение и права из-за ошибки базы данных.",
+            await _send_dialog(message, "Не удалось проверить служение и права из-за ошибки базы данных.",
                 parse_mode=None,
             )
             return
@@ -1841,7 +1865,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             return
         if len(parts) != 3:
-            await message.answer("Лишние параметры. Запустите команду ещё раз.", parse_mode=None)
+            await _send_dialog(message, "Лишние параметры. Запустите команду ещё раз.", parse_mode=None)
             return
         service_id, raw_telegram_id = parts[1:]
 
@@ -1864,8 +1888,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         if len(parts) == 2:
             if parts[1] == "off":
-                await message.answer(
-                    "Выберите служение в команде /service_chat и нажмите "
+                await _send_dialog(message, "Выберите служение в команде /service_chat и нажмите "
                     "«Отключить служение».",
                     parse_mode=None,
                 )
@@ -1887,8 +1910,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await run_registry_command(message, disable_service)
             return
         if len(parts) != 4:
-            await message.answer(
-                "Используйте /service_chat, чтобы выбрать служение и "
+            await _send_dialog(message, "Используйте /service_chat, чтобы выбрать служение и "
                 "действие кнопками.",
                 parse_mode=None,
             )
@@ -1930,8 +1952,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             return
         if len(prefix_parts) != 1 or details:
-            await message.answer(
-                "Ручной ввод задач и ответственных отключён. "
+            await _send_dialog(message, "Ручной ввод задач и ответственных отключён. "
                 "Укажите только служение, например /service_contact sound; "
                 "задачу и имя нужно выбрать из файла расписания.",
                 parse_mode=None,
@@ -1951,8 +1972,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if len(fields) == 1:
             service_parts = fields[0].split()
             if len(service_parts) != 1:
-                await message.answer(
-                    "ℹ️ Настройки вводятся пошагово; индивидуальные задачи "
+                await _send_dialog(message, "ℹ️ Настройки вводятся пошагово; индивидуальные задачи "
                     "выбираются из файла расписания. Используйте "
                     "/service_notify <service_id>.",
                     parse_mode=None,
@@ -1962,8 +1982,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 message, "service_notify", service_parts[0]
             )
             return
-        await message.answer(
-            "ℹ️ Настройки вводятся пошагово; индивидуальные задачи "
+        await _send_dialog(message, "ℹ️ Настройки вводятся пошагово; индивидуальные задачи "
             "выбираются из файла расписания. Используйте /service_notify "
             "<service_id>.",
             parse_mode=None,
@@ -2006,12 +2025,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 pending_notify_task_choices.pop(key, None)
                 had_request = True
         if not had_request:
-            await message.answer(
-                "ℹ️ Нет активного запроса параметров.", parse_mode=None
+            await _send_dialog(message, "ℹ️ Нет активного запроса параметров.", parse_mode=None
             )
             return
-        await message.answer(
-            "✅ Текущий запрос отменён.",
+        await _send_dialog(message, "✅ Текущий запрос отменён.",
             parse_mode=None,
             reply_markup=ReplyKeyboardRemove(),
         )
@@ -2021,8 +2038,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
         clear_pending_actor(message.from_user.id)
-        await message.answer(
-            "👋 Здравствуйте! Для управления служениями используйте команды "
+        await _send_dialog(message, "👋 Здравствуйте! Для управления служениями используйте команды "
             "из меню бота.",
             parse_mode=None,
         )
@@ -2034,11 +2050,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or not callback.message
             or callback.message.chat.type != ChatType.PRIVATE
         ):
-            await callback.answer()
+            await _answer_callback(callback,)
             return
         callback_parts = callback.data.split(":", 2)
         if len(callback_parts) != 3:
-            await callback.answer("❌ Некорректный выбор служения.")
+            await _answer_callback(callback,"❌ Некорректный выбор служения.")
             return
         _, operation, service_id = callback_parts
         clear_pending_actor(callback.from_user.id)
@@ -2046,8 +2062,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             clear_pending_actor(callback.from_user.id)
             registry = service_registry()
             if registry is None:
-                await callback.message.answer(
-                    "Реестр настроек служений недоступен.",
+                await _send_dialog(callback.message, "Реестр настроек служений недоступен.",
                     parse_mode=None,
                 )
             else:
@@ -2067,7 +2082,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         inline_keyboard=[
                             [
                                 InlineKeyboardButton(
-                                    text=service_label(service),
+                                    text=(
+                                        f"{'🟢' if service['enabled'] else '🔴'} "
+                                        f"{service_label(service)}"
+                                    ),
                                     callback_data=(
                                         "service:service_settings:"
                                         f"{service['id']}"
@@ -2077,8 +2095,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             for service in services
                         ]
                     )
-                    await callback.message.answer(
-                        "Выберите служение, чтобы посмотреть его настройки.",
+                    await _send_dialog(callback.message, "📋 Служения\nℹ️ Выберите служение для просмотра настроек.",
                         reply_markup=keyboard,
                         parse_mode=None,
                     )
@@ -2086,11 +2103,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     debug.exception(
                         "Не удалось загрузить список служений для возврата"
                     )
-                    await callback.message.answer(
-                        "Не удалось прочитать реестр служений.",
+                    await _send_dialog(callback.message, "Не удалось прочитать реестр служений.",
                         parse_mode=None,
                     )
-            await callback.answer()
+            await _answer_callback(callback,)
             return
         if operation not in {
             "service_settings",
@@ -2105,15 +2121,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "service_notify",
             "test_notify",
         }:
-            await callback.answer("❌ Неизвестное действие.")
+            await _answer_callback(callback,"❌ Неизвестное действие.")
             return
         registry = service_registry()
         if registry is None:
-            await callback.message.answer(
-                "Реестр настроек служений недоступен. Попробуйте позже.",
+            await _send_dialog(callback.message, "Реестр настроек служений недоступен. Попробуйте позже.",
                 parse_mode=None,
             )
-            await callback.answer()
+            await _answer_callback(callback,)
             return
         try:
             service = service_by_id(registry, service_id)
@@ -2125,8 +2140,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
                 chunks = _telegram_text_chunks(response)
                 for index, chunk in enumerate(chunks):
-                    await callback.message.answer(
-                        chunk,
+                    await _send_dialog(callback.message, chunk,
                         parse_mode=None,
                         reply_markup=(
                             settings_keyboard(service_id)
@@ -2153,8 +2167,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     raise PermissionError(
                         "Эта команда доступна только супер-администратору."
                     )
-                await callback.message.answer(
-                    f"{service_label(service)}: выберите действие.",
+                await _send_dialog(callback.message, f"{service_label(service)}: выберите действие.",
                     reply_markup=service_chat_keyboard(service_id),
                     parse_mode=None,
                 )
@@ -2180,8 +2193,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
                 if service_id == "assembly":
                     context.group_chat_id = service["group_chat_id"]
-                await callback.message.answer(
-                    f"{service_label(service)} отключено. Сохранённый чат не изменён.",
+                await _send_dialog(callback.message, f"{service_label(service)} отключено. Сохранённый чат не изменён.",
                     parse_mode=None,
                 )
             elif operation == "test_notify":
@@ -2205,8 +2217,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         callback_data=f"test_action:preview:{service_id}",
                     )
                 ])
-                await callback.message.answer(
-                    f"{service_label(service)}: выберите проверку.",
+                await _send_dialog(callback.message, f"{service_label(service)}: выберите проверку.",
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
                     parse_mode=None,
                 )
@@ -2242,15 +2253,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         service_label(service),
                     )
         except (PermissionError, ValueError) as exc:
-            await callback.message.answer(
-                _status_text(str(exc), "❌"), parse_mode=None
+            await _send_dialog(callback.message, _status_text(str(exc), "❌"), parse_mode=None
             )
         except sqlite3.Error:
             debug.exception("Не удалось обработать выбор служения")
-            await callback.message.answer(
-                "Не удалось прочитать реестр служений.", parse_mode=None
+            await _send_dialog(callback.message, "Не удалось прочитать реестр служений.", parse_mode=None
             )
-        await callback.answer()
+        await _answer_callback(callback,)
 
     @admin_router.callback_query(F.data.startswith("notify_rule:"))
     async def on_notification_rule_action(callback: CallbackQuery) -> None:
@@ -2259,11 +2268,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or not callback.message
             or callback.message.chat.type != ChatType.PRIVATE
         ):
-            await callback.answer()
+            await _answer_callback(callback,)
             return
         parts = callback.data.split(":")
         if len(parts) not in {4, 5}:
-            await callback.answer("⚠️ Настройка устарела.")
+            await _answer_callback(callback,"⚠️ Настройка устарела.")
             return
         _, action, service_id, session_id, *raw_id = parts
         pending = pending_inputs.get(callback.from_user.id)
@@ -2273,28 +2282,29 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("service_id") != service_id
             or pending.get("session_id") != session_id
         ):
-            await callback.answer("⚠️ Настройка устарела.")
+            await _answer_callback(callback,"⚠️ Настройка устарела.")
             return
         try:
             if not is_service_admin(callback.from_user.id, service_id):
-                await callback.answer("❌ Недостаточно прав.")
+                await _answer_callback(callback,"❌ Недостаточно прав.")
                 return
         except sqlite3.Error:
             debug.exception("Не удалось проверить права на расписание уведомлений")
-            await callback.answer("❌ Не удалось проверить права.")
+            await _answer_callback(callback,"❌ Не удалось проверить права.")
             return
 
         reminder_id = None
-        if raw_id and raw_id[0] != "new":
+        if raw_id:
             try:
                 reminder_id = int(raw_id[0])
             except ValueError:
-                await callback.answer("❌ Некорректный идентификатор.")
+                await _answer_callback(callback,"❌ Некорректный идентификатор.")
                 return
         reminder = next(
             (
                 item for item in pending["reminders"]
                 if item.get("id") == reminder_id
+                or item.get("draft_id") == reminder_id
             ),
             None,
         )
@@ -2303,24 +2313,36 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 callback.message, callback.from_user.id, service_id
             )
         elif action == "add":
-            if any(item.get("id") is None for item in pending["reminders"]):
-                await callback.answer(
+            if any(
+                item.get("id") is None and not item.get("complete")
+                for item in pending["reminders"]
+            ):
+                await _answer_callback(callback,
                     "Сначала завершите настройку нового уведомления."
                 )
                 return
             pending["reminders"].append(
                 {
                     "id": None,
+                    "draft_id": min(
+                        (
+                            item["draft_id"]
+                            for item in pending["reminders"]
+                            if item.get("id") is None
+                        ),
+                        default=0,
+                    ) - 1,
                     "reminder_days": 1,
                     "reminder_time": "18:00",
                     "complete": False,
                 }
             )
-            pending["active_reminder_id"] = None
+            pending["active_reminder_id"] = pending["reminders"][-1][
+                "draft_id"
+            ]
             pending["reminder_operation"] = "add"
             pending["step"] = "reminder_days"
-            await callback.message.answer(
-                "Введите число дней до события для нового уведомления "
+            await _send_dialog(callback.message, "Введите число дней до события для нового уведомления "
                 "(от 0 до 6).",
                 reply_markup=notification_edit_controls(
                     service_id, session_id
@@ -2348,7 +2370,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     ],
                     [
                         InlineKeyboardButton(
-                            text="↩️ К списку",
+                            text="⬅️ К списку",
                             callback_data=(
                                 f"notify_rule:back:{service_id}:{session_id}"
                             ),
@@ -2356,8 +2378,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     ],
                 ]
             )
-            await callback.message.answer(
-                "Выберите параметр уведомления для изменения.",
+            await _send_dialog(callback.message, "Выберите параметр уведомления для изменения.",
                 reply_markup=buttons,
                 parse_mode=None,
             )
@@ -2372,16 +2393,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 else "Введите время в формате HH:MM, например 09:00. "
                 f"Текущее значение: {reminder['reminder_time']}."
             )
-            await callback.message.answer(
-                prompt,
+            await _send_dialog(callback.message, prompt,
                 reply_markup=notification_edit_controls(
                     service_id, session_id
                 ),
                 parse_mode=None,
             )
-        elif action == "days" and raw_id and raw_id[0] == "new":
-            await callback.answer("Новая настройка устарела.")
-            return
         elif action == "delete_prompt" and reminder is not None:
             buttons = InlineKeyboardMarkup(
                 inline_keyboard=[
@@ -2402,8 +2419,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     ]
                 ]
             )
-            await callback.message.answer(
-                f"Удалить уведомление за {reminder['reminder_days']} дн. "
+            await _send_dialog(callback.message, f"Удалить уведомление за {reminder['reminder_days']} дн. "
                 f"в {reminder['reminder_time']}?",
                 reply_markup=buttons,
                 parse_mode=None,
@@ -2415,9 +2431,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 callback.message, callback.from_user.id, service_id
             )
         else:
-            await callback.answer("⚠️ Настройка устарела.")
+            await _answer_callback(callback,"⚠️ Настройка устарела.")
             return
-        await callback.answer()
+        await _answer_callback(callback,)
 
     @admin_router.callback_query(F.data.startswith("notify_edit:"))
     async def on_notification_setting_edit(callback: CallbackQuery) -> None:
@@ -2426,16 +2442,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or not callback.message
             or callback.message.chat.type != ChatType.PRIVATE
         ):
-            await callback.answer()
+            await _answer_callback(callback,)
             return
         parts = callback.data.split(":", 3)
         if len(parts) != 4:
-            await callback.answer("⚠️ Настройка устарела. Запустите её заново.")
+            await _answer_callback(callback,"⚠️ Настройка устарела. Запустите её заново.")
             return
         _, field, service_id, session_id = parts
         registry = service_registry()
         if registry is None:
-            await callback.answer("❌ Реестр настроек недоступен.")
+            await _answer_callback(callback,"❌ Реестр настроек недоступен.")
             return
         try:
             has_access = is_service_admin(
@@ -2445,10 +2461,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             debug.exception(
                 "Не удалось проверить права на изменение настроек служения"
             )
-            await callback.answer("❌ Не удалось проверить права.")
+            await _answer_callback(callback,"❌ Не удалось проверить права.")
             return
         if not has_access:
-            await callback.answer("❌ Недостаточно прав.")
+            await _answer_callback(callback,"❌ Недостаточно прав.")
             return
         pending = pending_inputs.get(callback.from_user.id)
         if (
@@ -2457,12 +2473,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("service_id") != service_id
             or pending.get("session_id") != session_id
         ):
-            await callback.answer("⚠️ Настройка устарела. Запустите её заново.")
+            await _answer_callback(callback,"⚠️ Настройка устарела. Запустите её заново.")
             return
         await begin_notification_edit(
             callback.message, callback.from_user.id, service_id, field
         )
-        await callback.answer()
+        await _answer_callback(callback,)
 
     @admin_router.callback_query(F.data.startswith("notify_finish:"))
     async def on_notification_setting_finish(callback: CallbackQuery) -> None:
@@ -2471,11 +2487,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or not callback.message
             or callback.message.chat.type != ChatType.PRIVATE
         ):
-            await callback.answer()
+            await _answer_callback(callback,)
             return
         parts = callback.data.split(":", 2)
         if len(parts) != 3:
-            await callback.answer("⚠️ Настройка устарела. Запустите её заново.")
+            await _answer_callback(callback,"⚠️ Настройка устарела. Запустите её заново.")
             return
         _, service_id, session_id = parts
         pending = pending_inputs.get(callback.from_user.id)
@@ -2487,10 +2503,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             debug.exception(
                 "Не удалось проверить права на сохранение настроек служения"
             )
-            await callback.answer("❌ Не удалось проверить права.")
+            await _answer_callback(callback,"❌ Не удалось проверить права.")
             return
         if not has_access:
-            await callback.answer("❌ Недостаточно прав.")
+            await _answer_callback(callback,"❌ Недостаточно прав.")
             return
         if (
             pending is None
@@ -2498,12 +2514,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("service_id") != service_id
             or pending.get("session_id") != session_id
         ):
-            await callback.answer("⚠️ Настройка устарела. Запустите её заново.")
+            await _answer_callback(callback,"⚠️ Настройка устарела. Запустите её заново.")
             return
         await save_notification_setup(
             callback.message, callback.from_user.id
         )
-        await callback.answer()
+        await _answer_callback(callback,)
 
     @admin_router.callback_query(
         F.data.startswith("notify_duplicate_confirm:")
@@ -2516,11 +2532,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or not callback.message
             or callback.message.chat.type != ChatType.PRIVATE
         ):
-            await callback.answer()
+            await _answer_callback(callback,)
             return
         parts = callback.data.split(":")
         if len(parts) != 3:
-            await callback.answer("⚠️ Подтверждение устарело.")
+            await _answer_callback(callback,"⚠️ Подтверждение устарело.")
             return
         _, service_id, session_id = parts
         pending = pending_inputs.get(callback.from_user.id)
@@ -2530,33 +2546,33 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("service_id") != service_id
             or pending.get("session_id") != session_id
         ):
-            await callback.answer("⚠️ Подтверждение устарело.")
+            await _answer_callback(callback,"⚠️ Подтверждение устарело.")
             return
         try:
             if not is_service_admin(callback.from_user.id, service_id):
-                await callback.answer("❌ Недостаточно прав.")
+                await _answer_callback(callback,"❌ Недостаточно прав.")
                 return
         except sqlite3.Error:
             debug.exception(
                 "Не удалось проверить права на настройки уведомлений"
             )
-            await callback.answer("❌ Не удалось проверить права.")
+            await _answer_callback(callback,"❌ Не удалось проверить права.")
             return
         await save_notification_setup(
             callback.message,
             callback.from_user.id,
             allow_duplicates=True,
         )
-        await callback.answer()
+        await _answer_callback(callback,)
 
     @admin_router.callback_query(F.data.startswith("notify_cancel:"))
     async def on_notification_setting_cancel(callback: CallbackQuery) -> None:
         if not callback.from_user or not callback.message:
-            await callback.answer()
+            await _answer_callback(callback,)
             return
         parts = callback.data.split(":", 2)
         if len(parts) != 3:
-            await callback.answer("⚠️ Настройка устарела.")
+            await _answer_callback(callback,"⚠️ Настройка устарела.")
             return
         _, service_id, session_id = parts
         pending = pending_inputs.get(callback.from_user.id)
@@ -2567,14 +2583,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("service_id") != service_id
             or pending.get("session_id") != session_id
         ):
-            await callback.answer("⚠️ Настройка устарела.")
+            await _answer_callback(callback,"⚠️ Настройка устарела.")
             return
         clear_pending_actor(callback.from_user.id)
-        await callback.message.answer(
-            "Изменения отменены, сохранённые настройки не изменены.",
+        await _send_dialog(callback.message, "Изменения отменены, сохранённые настройки не изменены.",
             parse_mode=None,
         )
-        await callback.answer()
+        await _answer_callback(callback,)
 
     @admin_router.callback_query(
         F.data.startswith("service_admin_confirm:")
@@ -2588,18 +2603,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or not callback.message
             or callback.message.chat.type != ChatType.PRIVATE
         ):
-            await callback.answer()
+            await _answer_callback(callback,)
             return
         parts = callback.data.split(":")
         if len(parts) != 4:
-            await callback.answer("❌ Некорректное подтверждение.")
+            await _answer_callback(callback,"❌ Некорректное подтверждение.")
             return
         action, service_id, raw_user_id, confirmation_id = parts
         action_type = action.rsplit("_", 1)[1]
         try:
             user_id = int(raw_user_id)
         except ValueError:
-            await callback.answer("❌ Некорректный Telegram ID.")
+            await _answer_callback(callback,"❌ Некорректный Telegram ID.")
             return
         key = (callback.from_user.id, service_id, user_id)
         selected_user = pending_admin_confirmations.get(key)
@@ -2614,7 +2629,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or selected_user[5] != confirmation_id
             or action.rsplit("_", 1)[0] != expected_prefix
         ):
-            await callback.answer("⚠️ Запрос устарел. Начните команду заново.")
+            await _answer_callback(callback,"⚠️ Запрос устарел. Начните команду заново.")
             return
         pending_admin_confirmations.pop(key, None)
         (
@@ -2627,8 +2642,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         ) = selected_user
         if action_type == "cancel":
             if operation == "service_admin_add":
-                await callback.message.answer(
-                    "✅ Назначение отменено.", parse_mode=None
+                await _send_dialog(callback.message, "✅ Назначение отменено.", parse_mode=None
                 )
                 pending_inputs.pop(callback.from_user.id, None)
             else:
@@ -2643,13 +2657,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     task or "",
                     notice="✅ Назначение отменено.",
                 )
-            await callback.answer()
+            await _answer_callback(callback,)
             return
         registry = service_registry()
         if registry is None:
             if operation == "service_admin_add":
-                await callback.message.answer(
-                    "Реестр настроек служений недоступен.",
+                await _send_dialog(callback.message, "Реестр настроек служений недоступен.",
                     parse_mode=None,
                 )
             else:
@@ -2664,7 +2677,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     task or "",
                     notice="Реестр настроек служений недоступен.",
                 )
-            await callback.answer()
+            await _answer_callback(callback,)
             return
         response = ""
         assignment_saved = False
@@ -2707,8 +2720,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
         if operation == "service_admin_add":
             pending_inputs.pop(callback.from_user.id, None)
-            await callback.message.answer(
-                _status_text(
+            await _send_dialog(callback.message, _status_text(
                     response, "✅" if assignment_saved else "❌"
                 ),
                 parse_mode=None,
@@ -2745,7 +2757,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     task,
                     notice=response,
                 )
-        await callback.answer()
+        await _answer_callback(callback,)
 
     @admin_router.callback_query(F.data.startswith("task_page:"))
     async def on_task_page(callback: CallbackQuery) -> None:
@@ -2754,12 +2766,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or not callback.message
             or callback.message.chat.type != ChatType.PRIVATE
         ):
-            await callback.answer()
+            await _answer_callback(callback,)
             return
         token = callback.data.partition(":")[2]
         selection = pending_task_pages.pop(token, None)
         if selection is None or selection[0] != callback.from_user.id:
-            await callback.answer("⚠️ Список устарел. Запустите команду заново.")
+            await _answer_callback(callback,"⚠️ Список устарел. Запустите команду заново.")
             return
         _, operation, service_id, page = selection
         pending = pending_inputs.get(callback.from_user.id)
@@ -2774,7 +2786,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("service_id") != service_id
             or pending.get("step") != expected_step
         ):
-            await callback.answer("⚠️ Список устарел. Запустите команду заново.")
+            await _answer_callback(callback,"⚠️ Список устарел. Запустите команду заново.")
             return
         await send_task_choices_page(
             callback.message,
@@ -2783,7 +2795,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             operation,
             page,
         )
-        await callback.answer()
+        await _answer_callback(callback,)
 
     @admin_router.callback_query(F.data.startswith("contact_person:"))
     async def on_contact_person_choice(callback: CallbackQuery) -> None:
@@ -2792,7 +2804,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or not callback.message
             or callback.message.chat.type != ChatType.PRIVATE
         ):
-            await callback.answer()
+            await _answer_callback(callback,)
             return
         token = callback.data.partition(":")[2]
         selection = pending_contact_person_choices.pop(token, None)
@@ -2810,7 +2822,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 selection[2], []
             )
         ):
-            await callback.answer("⚠️ Выбор устарел. Начните команду заново.")
+            await _answer_callback(callback,"⚠️ Выбор устарел. Начните команду заново.")
             return
         try:
             await offer_contact_user_selection(
@@ -2821,18 +2833,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 selection[3],
             )
         except ValueError as exc:
-            await callback.message.answer(
-                _status_text(str(exc), "❌"), parse_mode=None
+            await _send_dialog(callback.message, _status_text(str(exc), "❌"), parse_mode=None
             )
         except sqlite3.Error:
             debug.exception(
                 "Не удалось создать запрос выбора ответственного"
             )
-            await callback.message.answer(
-                "Не удалось открыть выбор пользователя из-за ошибки базы.",
+            await _send_dialog(callback.message, "Не удалось открыть выбор пользователя из-за ошибки базы.",
                 parse_mode=None,
             )
-        await callback.answer()
+        await _answer_callback(callback,)
 
     @admin_router.callback_query(F.data.startswith("contact_nav:"))
     async def on_contact_navigation(callback: CallbackQuery) -> None:
@@ -2841,7 +2851,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or not callback.message
             or callback.message.chat.type != ChatType.PRIVATE
         ):
-            await callback.answer()
+            await _answer_callback(callback,)
             return
         token = callback.data.partition(":")[2]
         selection = pending_contact_navigation.pop(token, None)
@@ -2859,7 +2869,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 else "choose_contact_person"
             )
         ):
-            await callback.answer("⚠️ Выбор устарел. Начните команду заново.")
+            await _answer_callback(callback,"⚠️ Выбор устарел. Начните команду заново.")
             return
         _, service_id, action = selection
         if action == "tasks":
@@ -2879,7 +2889,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "service_contact",
                 actor_id=callback.from_user.id,
             )
-        await callback.answer()
+        await _answer_callback(callback,)
 
     @admin_router.message(F.users_shared)
     async def on_users_shared(message: Message) -> None:
@@ -2896,16 +2906,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending[0] != message.from_user.id
             or pending[1] not in {"service_admin_add", "service_contact"}
         ):
-            await message.answer(
-                "Выбор пользователя не соответствует активному запросу. "
+            await _send_dialog(message, "Выбор пользователя не соответствует активному запросу. "
                 "Запустите команду назначения заново.",
                 parse_mode=None,
                 reply_markup=ReplyKeyboardRemove(),
             )
             return
         if len(message.users_shared.users) != 1:
-            await message.answer(
-                "Нужно выбрать ровно одного пользователя.",
+            await _send_dialog(message, "Нужно выбрать ровно одного пользователя.",
                 parse_mode=None,
                 reply_markup=ReplyKeyboardRemove(),
             )
@@ -2929,15 +2937,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
             )
         ):
-            await message.answer(
-                "Выбор пользователя устарел. Выберите задачу и имя заново.",
+            await _send_dialog(message, "Выбор пользователя устарел. Выберите задачу и имя заново.",
                 parse_mode=None,
                 reply_markup=ReplyKeyboardRemove(),
             )
             return
         if operation == "service_contact" and (not task or not contact_name):
-            await message.answer(
-                "Не удалось определить задачу. Запустите привязку заново.",
+            await _send_dialog(message, "Не удалось определить задачу. Запустите привязку заново.",
                 parse_mode=None,
                 reply_markup=ReplyKeyboardRemove(),
             )
@@ -2976,8 +2982,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending[0] != message.from_user.id
             or pending[1] != "service_chat"
         ):
-            await message.answer(
-                "Выбор чата не соответствует активному запросу. "
+            await _send_dialog(message, "Выбор чата не соответствует активному запросу. "
                 "Запустите /service_chat заново.",
                 parse_mode=None,
                 reply_markup=ReplyKeyboardRemove(),
@@ -2985,8 +2990,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         registry = service_registry()
         if registry is None:
-            await message.answer(
-                "Реестр настроек служений недоступен.",
+            await _send_dialog(message, "Реестр настроек служений недоступен.",
                 parse_mode=None,
                 reply_markup=ReplyKeyboardRemove(),
             )
@@ -3000,21 +3004,20 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 enabled=True,
             )
         except (PermissionError, ValueError) as exc:
-            await message.answer(_status_text(str(exc), "❌"), parse_mode=None)
+            await _send_dialog(message, _status_text(str(exc), "❌"), parse_mode=None)
             return
         except sqlite3.Error:
             debug.exception("Не удалось сохранить выбранный групповой чат")
-            await message.answer(
-                "Не удалось сохранить групповой чат из-за ошибки базы данных.",
+            await _send_dialog(message, "Не удалось сохранить групповой чат из-за ошибки базы данных.",
                 parse_mode=None,
             )
             return
         if pending[2] == "assembly":
             context.group_chat_id = shared_chat.chat_id
-        title = shared_chat.title or str(shared_chat.chat_id)
-        await message.answer(
-            f"Для служения сохранён чат «{title}» "
-            f"(ID {shared_chat.chat_id}); служение включено.",
+        title = shared_chat.title or "Групповой чат"
+        await _send_dialog(message, f"✅ Чат сохранён · {title}\n"
+            f"📡 ID чата · {ui_code(shared_chat.chat_id)}\n"
+            "🟢 Служение включено",
             parse_mode=None,
             reply_markup=ReplyKeyboardRemove(),
         )
@@ -3035,8 +3038,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         registry = service_registry()
         if registry is None:
             pending_inputs.pop(message.from_user.id, None)
-            await message.answer(
-                "Реестр настроек служений недоступен. Попробуйте позже.",
+            await _send_dialog(message, "Реестр настроек служений недоступен. Попробуйте позже.",
                 parse_mode=None,
             )
             return
@@ -3132,9 +3134,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     reminder = next(
                         (
                             item for item in pending["reminders"]
-                            if item.get("id") == pending.get(
-                                "active_reminder_id"
-                            )
+                            if item.get("id")
+                            == pending.get("active_reminder_id")
+                            or item.get("draft_id")
+                            == pending.get("active_reminder_id")
                         ),
                         None,
                     )
@@ -3145,8 +3148,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     reminder["reminder_days"] = days
                     if pending.get("reminder_operation") == "add":
                         pending["step"] = "reminder_time"
-                        await message.answer(
-                            "Введите локальное время отправки в формате HH:MM, "
+                        await _send_dialog(message, "Введите локальное время отправки в формате HH:MM, "
                             "например 09:00.",
                             reply_markup=notification_edit_controls(
                                 service_id, pending["session_id"]
@@ -3192,9 +3194,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     reminder = next(
                         (
                             item for item in pending["reminders"]
-                            if item.get("id") == pending.get(
-                                "active_reminder_id"
-                            )
+                            if item.get("id")
+                            == pending.get("active_reminder_id")
+                            or item.get("draft_id")
+                            == pending.get("active_reminder_id")
                         ),
                         None,
                     )
@@ -3251,18 +3254,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 pending_inputs.pop(message.from_user.id, None)
                 return
         except (PermissionError, ValueError) as exc:
-            await message.answer(_status_text(str(exc), "❌"), parse_mode=None)
+            await _send_dialog(message, _status_text(str(exc), "❌"), parse_mode=None)
             return
         except sqlite3.Error:
             debug.exception("Ошибка сохранения настроек служения")
-            await message.answer(
-                "Не удалось сохранить настройки из-за ошибки базы данных.",
+            await _send_dialog(message, "Не удалось сохранить настройки из-за ошибки базы данных.",
                 parse_mode=None,
             )
             return
 
         pending_inputs.pop(message.from_user.id, None)
-        await message.answer(_status_text(response, "✅"), parse_mode=None)
+        await _send_dialog(message, _status_text(response, "✅"), parse_mode=None)
 
     @admin_router.message(Command("service_sync"))
     async def on_service_sync(message: Message) -> None:
@@ -3271,8 +3273,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         clear_pending_actor(message.from_user.id)
         payload = (message.text or "").partition(" ")[2].strip()
         if payload:
-            await message.answer(
-                "Служение нужно выбрать кнопкой. Используйте /service_sync "
+            await _send_dialog(message, "Служение нужно выбрать кнопкой. Используйте /service_sync "
                 "без параметров.",
                 parse_mode=None,
             )
@@ -3285,8 +3286,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if action == "group":
             group_chat_id = service["group_chat_id"]
             if group_chat_id is None:
-                await message.answer(
-                    "Для этого служения не настроен групповой чат.",
+                await _send_dialog(message, "Для этого служения не настроен групповой чат.",
                     parse_mode=None,
                 )
                 return
@@ -3299,13 +3299,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
             except TelegramAPIError as exc:
                 debug.exception("Тестовая отправка в группу не удалась")
-                await message.answer(
-                    f"Не удалось отправить тест в группу: {type(exc).__name__}.",
+                await _send_dialog(message, f"Не удалось отправить тест в группу: {type(exc).__name__}.",
                     parse_mode=None,
                 )
             else:
-                await message.answer(
-                    f"Тестовое сообщение службы «{service['name']}» отправлено "
+                await _send_dialog(message, f"Тестовое сообщение службы «{service['name']}» отправлено "
                     "в настроенную группу. Рассылка участникам не запускалась.",
                     parse_mode=None,
                 )
@@ -3315,8 +3313,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             context, "prepare_service_test_previews", None
         )
         if not callable(prepare_previews):
-            await message.answer(
-                "Предпросмотр сообщений для служений недоступен.",
+            await _send_dialog(message, "Предпросмотр сообщений для служений недоступен.",
                 parse_mode=None,
             )
             return
@@ -3337,8 +3334,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "Не удалось подготовить предпросмотр службы %s",
                 service["id"],
             )
-            await message.answer(
-                f"Не удалось подготовить предпросмотр: {type(exc).__name__}.",
+            await _send_dialog(message, f"Не удалось подготовить предпросмотр: {type(exc).__name__}.",
                 parse_mode=None,
             )
             return
@@ -3366,13 +3362,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     "Не удалось отправить администратору предпросмотр службы %s",
                     service["id"],
                 )
-                await message.answer(
-                    "Не удалось доставить администратору полный предпросмотр.",
+                await _send_dialog(message, "Не удалось доставить администратору полный предпросмотр.",
                     parse_mode=None,
                 )
                 return
-        await message.answer(
-            "Предпросмотр выбранной службы отправлен вам в личные сообщения. "
+        await _send_dialog(message, "Предпросмотр выбранной службы отправлен вам в личные сообщения. "
             "Сообщения в группу и участникам не отправлялись.",
             parse_mode=None,
         )
@@ -3386,8 +3380,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         clear_pending_actor(message.from_user.id)
         registry = service_registry()
         if registry is None:
-            await message.answer(
-                "Реестр служений недоступен; нельзя выбрать чат проверки.",
+            await _send_dialog(message, "Реестр служений недоступен; нельзя выбрать чат проверки.",
                 parse_mode=None,
             )
             return
@@ -3395,8 +3388,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             services = registry.list_services()
         except sqlite3.Error:
             debug.exception("Не удалось загрузить служения для теста доставки")
-            await message.answer(
-                "Не удалось прочитать список служений.", parse_mode=None
+            await _send_dialog(message, "Не удалось прочитать список служений.", parse_mode=None
             )
             return
         keyboard = InlineKeyboardMarkup(
@@ -3410,8 +3402,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 for service in services
             ]
         )
-        await message.answer(
-            "🧪 Сначала выберите служение, затем — вид проверки.",
+        await _send_dialog(message, "🧪 Сначала выберите служение, затем — вид проверки.",
             reply_markup=keyboard,
             parse_mode=None,
         )
@@ -3424,12 +3415,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or not callback.message
             or callback.message.chat.type != ChatType.PRIVATE
         ):
-            await callback.answer()
+            await _answer_callback(callback,)
             return
         _, action, service_id = callback.data.split(":", 2)
         registry = service_registry()
         if registry is None:
-            await callback.answer("❌ Реестр служений недоступен.")
+            await _answer_callback(callback,"❌ Реестр служений недоступен.")
             return
         try:
             service = service_by_id(registry, service_id)
@@ -3441,16 +3432,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 callback.message, service, action
             )
         except (ValueError, sqlite3.Error) as exc:
-            await callback.message.answer(
-                _status_text(str(exc), "❌"), parse_mode=None
+            await _send_dialog(callback.message, _status_text(str(exc), "❌"), parse_mode=None
             )
-        await callback.answer()
+        await _answer_callback(callback,)
 
     @router.callback_query(F.data.startswith(f"{CONFIRM_PREFIX}:"))
     async def on_confirm(cb: CallbackQuery) -> None:  # noqa: D401
         parts = cb.data.split(":", 2)
         if len(parts) != 3:
-            await cb.answer("❌ Некорректные данные кнопки")
+            await _answer_callback(cb,"❌ Некорректные данные кнопки")
             return
         _, sunday_iso, role = parts
         state = context.state_cache.state
@@ -3474,6 +3464,35 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         async with lock:
             await _confirm_locked(cb, context, sunday_iso, role, interaction, debug)
 
+    @router.callback_query(F.data.startswith("scf:"))
+    async def on_service_confirm(cb: CallbackQuery) -> None:
+        if not cb.from_user:
+            await _answer_callback(cb,"❌ Не удалось определить пользователя")
+            return
+        parts = cb.data.split(":", 2)
+        if len(parts) != 3:
+            await _answer_callback(cb,"❌ Некорректные данные кнопки")
+            return
+        _, event_date, participant_key = parts
+        if (
+            len(event_date) != 10
+            or event_date[4] != "-"
+            or event_date[7] != "-"
+            or not participant_key.startswith("service_")
+        ):
+            await _answer_callback(cb,"❌ Некорректные данные кнопки")
+            return
+        locks = getattr(context, "confirmation_locks", None)
+        if locks is None:
+            locks = {}
+            context.confirmation_locks = locks
+        lock_key = (event_date, participant_key)
+        lock = locks.setdefault(lock_key, asyncio.Lock())
+        async with lock:
+            await _confirm_locked(
+                cb, context, event_date, participant_key, interaction, debug
+            )
+
     dispatcher.include_router(admin_router)
     dispatcher.include_router(router)
 
@@ -3488,12 +3507,12 @@ async def _confirm_locked(
 ) -> None:
     state = context.state_cache.state
     if not state or state.get("sunday_date") != sunday_iso:
-        await cb.answer("⚠️ Это уведомление устарело")
+        await _answer_callback(cb,"⚠️ Это уведомление устарело")
         return
 
     participant = state.get("participants", {}).get(role)
     if not participant or participant.get("tg_id") != cb.from_user.id:
-        await cb.answer("❌ Вы не назначены на эту роль")
+        await _answer_callback(cb,"❌ Вы не назначены на эту роль")
         return
 
     first_confirmation = not participant.get("confirmed")
@@ -3509,7 +3528,7 @@ async def _confirm_locked(
         confirmation_persisted = await _persist_confirmation(context, debug)
         if not confirmation_persisted:
             participant["confirmation_persisted"] = False
-            await cb.answer(
+            await _answer_callback(cb,
                 "❌ Не удалось сохранить подтверждение. "
                 "Нажмите кнопку повторно."
             )
@@ -3558,7 +3577,9 @@ async def _confirm_locked(
         try:
             await context.bot.send_message(
                 group_chat_id,
-                f"🔔 Участник {participant['name']} подтвердил роль {role}",
+                f"🔔 Участник {participant['name']} подтвердил "
+                f"{'задачу' if participant.get('task') else 'роль'} "
+                f"«{participant.get('task', role)}»",
                 parse_mode=None,
             )
         except Exception:  # noqa: BLE001
@@ -3581,23 +3602,23 @@ async def _confirm_locked(
     if participant.get("group_update_sent") and participant.get(
         "group_update_persisted", True
     ):
-        await cb.answer(
+        await _answer_callback(cb,
             "✅ Участие подтверждено"
             if newly_persisted
             else "ℹ️ Вы уже подтвердили участие"
         )
     elif participant.get("group_update_sent"):
-        await cb.answer(
+        await _answer_callback(cb,
             "⚠️ Уведомление отправлено, но состояние не удалось сохранить. "
             "Нажмите кнопку повторно для повтора сохранения."
         )
     elif group_update_blocked_reason:
-        await cb.answer(
+        await _answer_callback(cb,
             "⚠️ Подтверждение сохранено, но уведомление в группу не отправлено: "
             f"{group_update_blocked_reason}."
         )
     else:
-        await cb.answer(
+        await _answer_callback(cb,
             "⚠️ Подтверждение сохранено, но уведомление не отправлено. "
             "Нажмите кнопку повторно для повтора."
         )

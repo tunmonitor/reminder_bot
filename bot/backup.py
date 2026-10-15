@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import logging
@@ -12,7 +13,7 @@ import sqlite3
 import stat
 import tempfile
 import re
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Coroutine
@@ -20,12 +21,46 @@ from zoneinfo import ZoneInfo
 
 from .config import service_registry_path
 from .excel_parser import parse_people, parse_schedule
+from .secure_fs import open_private_directory
 
 
 BACKUP_MOUNT = Path("/mnt/external_data")
 BACKUP_BASE = BACKUP_MOUNT / "reminder_bot" / "backups"
 SNAPSHOT_FORMAT_VERSION = 1
 BOT_PID_FILENAME = "reminder_bot_bot.pid"
+INSTANCE_LOCK_FILENAME = "reminder_bot_instance.lock"
+
+
+@contextmanager
+def application_instance_lock(shm_dir: Path):
+    directory_fd = open_private_directory(shm_dir, create=True)
+    lock_fd = -1
+    try:
+        lock_fd = os.open(
+            INSTANCE_LOCK_FILENAME,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        info = os.fstat(lock_fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) & 0o077
+        ):
+            raise PermissionError("Файл блокировки экземпляра небезопасен")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                "Экземпляр бота или операция восстановления уже выполняется"
+            ) from exc
+        yield
+    finally:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        os.close(directory_fd)
 
 
 def assert_bot_stopped(project_dir: Path, shm_dir: Path) -> None:
@@ -161,6 +196,14 @@ def _write_private(path: Path, data: bytes) -> None:
     finally:
         if fd >= 0:
             os.close(fd)
+
+
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _sha256(path: Path) -> str:
@@ -482,6 +525,10 @@ class BackupManager:
         return manifest
 
     def restore_snapshot(self, snapshot: Path) -> None:
+        with application_instance_lock(self.shm_dir):
+            self._restore_snapshot_locked(snapshot)
+
+    def _restore_snapshot_locked(self, snapshot: Path) -> None:
         assert_bot_stopped(Path(__file__).resolve().parent.parent, self.shm_dir)
         self._require_external_mount()
         if snapshot.is_symlink():
@@ -546,18 +593,61 @@ class BackupManager:
                 if staged[destination] is not None:
                     os.replace(staged[destination], destination)
                     installed.add(destination)
-        except BaseException:
-            for destination, old_path in originals.items():
-                if old_path is not None and old_path.exists():
-                    destination.unlink(missing_ok=True)
-                    os.replace(old_path, destination)
-                elif old_path is None and destination in installed:
-                    destination.unlink(missing_ok=True)
-            raise
+            for parent in {path.parent for path in destinations.values()}:
+                _fsync_directory(parent)
+        except BaseException as install_error:
+            rollback_error = None
+            for destination, old_path in reversed(tuple(originals.items())):
+                try:
+                    if old_path is not None and old_path.exists():
+                        destination.unlink(missing_ok=True)
+                        os.replace(old_path, destination)
+                    elif old_path is None and destination in installed:
+                        destination.unlink(missing_ok=True)
+                except OSError as exc:
+                    rollback_error = rollback_error or exc
+                    self.logger.exception(
+                        "Не удалось откатить восстановление файла %s",
+                        destination,
+                    )
+            try:
+                for parent in {path.parent for path in destinations.values()}:
+                    _fsync_directory(parent)
+            except OSError as exc:
+                rollback_error = rollback_error or exc
+                self.logger.exception(
+                    "Не удалось синхронизировать каталог после отката"
+                )
+            if rollback_error is not None:
+                raise RuntimeError(
+                    "Восстановление не завершилось, а полный откат не удался; "
+                    "сохраните файлы .restore-old-* для ручного восстановления"
+                ) from rollback_error
+            raise install_error
         else:
+            cleanup_error = None
             for old_path in originals.values():
                 if old_path is not None:
-                    old_path.unlink(missing_ok=True)
+                    try:
+                        old_path.unlink(missing_ok=True)
+                    except OSError as exc:
+                        cleanup_error = cleanup_error or exc
+                        self.logger.exception(
+                            "Не удалось удалить временный оригинал %s", old_path
+                        )
+            try:
+                for parent in {path.parent for path in destinations.values()}:
+                    _fsync_directory(parent)
+            except OSError as exc:
+                cleanup_error = cleanup_error or exc
+                self.logger.exception(
+                    "Не удалось синхронизировать каталоги после очистки"
+                )
+            if cleanup_error is not None:
+                raise RuntimeError(
+                    "Файлы восстановлены и синхронизированы, но очистка "
+                    "временных оригиналов завершилась ошибкой"
+                ) from cleanup_error
         finally:
             for temp_path in staged.values():
                 if temp_path is not None:
