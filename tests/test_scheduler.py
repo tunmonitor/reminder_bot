@@ -4,8 +4,13 @@ from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
-from bot.scheduler import add_service_reminder_jobs, scheduled_reminder_date
+from bot.scheduler import (
+    add_service_reminder_jobs,
+    refresh_user_reminder_jobs,
+    scheduled_reminder_date,
+)
 
 
 class ServiceReminderSchedulerTest(unittest.IsolatedAsyncioTestCase):
@@ -82,6 +87,58 @@ class ServiceReminderSchedulerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             scheduler.get_job("service-reminder-assembly-11").args,
             ("assembly", new_rule),
+        )
+
+    async def test_user_reminder_jobs_are_independent_and_refreshable(self):
+        tz = ZoneInfo("UTC")
+        scheduler = AsyncIOScheduler(timezone=tz)
+        group_callback = AsyncMock()
+        user_callback = AsyncMock()
+        scheduler.add_job(
+            group_callback,
+            CronTrigger(hour=10, minute=0, timezone=tz),
+            id="service-reminder-assembly-11",
+        )
+        records = [
+            {
+                "schedule_id": 101,
+                "actor_id": 2001,
+                "reminder_time": "09:00",
+            },
+            {
+                "schedule_id": 102,
+                "actor_id": 2001,
+                "reminder_time": "18:00",
+            },
+        ]
+        registry = MagicMock()
+        registry.list_enabled_user_reminder_schedules.return_value = records
+
+        await refresh_user_reminder_jobs(
+            scheduler, registry, user_callback, tz, MagicMock()
+        )
+        await refresh_user_reminder_jobs(
+            scheduler, registry, user_callback, tz, MagicMock()
+        )
+
+        self.assertEqual(
+            {
+                job.id
+                for job in scheduler.get_jobs()
+                if job.id.startswith("user-reminder-")
+            },
+            {
+                "user-reminder-2001-schedule-101",
+                "user-reminder-2001-schedule-102",
+            },
+        )
+        registry.list_enabled_user_reminder_schedules.return_value = []
+        await refresh_user_reminder_jobs(
+            scheduler, registry, user_callback, tz, MagicMock()
+        )
+        self.assertEqual(
+            [job.id for job in scheduler.get_jobs()],
+            ["service-reminder-assembly-11"],
         )
 
     def test_delayed_cron_execution_recovers_previous_local_date(self):

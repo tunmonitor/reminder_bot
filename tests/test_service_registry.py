@@ -239,6 +239,202 @@ class ServiceRegistryTest(unittest.TestCase):
         self.assertIn("{service_name}", service["group_template"])
         self.assertIn("{telegram_id}", service["personal_templates"]["Микшер"])
 
+    def test_user_notification_preference_defaults_to_disabled_and_is_per_service(self):
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Алексей", 4004
+        )
+        self.registry.set_responsible_contact(
+            1001, "slides", "Слайды", "Алексей", 4004
+        )
+
+        self.assertFalse(
+            self.registry.get_user_notifications_enabled(4004, "sound")
+        )
+        self.assertEqual(
+            self.registry.list_users_with_notifications_enabled("sound"), []
+        )
+
+        self.registry.set_user_notifications_enabled(4004, "sound", True)
+
+        self.assertTrue(
+            self.registry.get_user_notifications_enabled(4004, "sound")
+        )
+        self.assertFalse(
+            self.registry.get_user_notifications_enabled(4004, "slides")
+        )
+        self.assertEqual(
+            self.registry.list_users_with_notifications_enabled("sound"),
+            [4004],
+        )
+
+        self.registry.set_user_notifications_enabled(4004, "sound", False)
+        self.assertEqual(
+            self.registry.list_users_with_notifications_enabled("sound"), []
+        )
+
+    def test_preference_table_migration_preserves_contacts_and_defaults_false(self):
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Алексей", 4004
+        )
+        with sqlite3.connect(self.path) as connection:
+            connection.execute("DROP TABLE user_notification_prefs")
+
+        self.registry.initialize(1001, -10001)
+
+        self.assertEqual(
+            self.registry.get_responsible_contact(
+                "sound", "Микшер", "Алексей"
+            )["telegram_id"],
+            4004,
+        )
+        self.assertFalse(
+            self.registry.get_user_notifications_enabled(4004, "sound")
+        )
+
+    def test_migrates_previous_preference_column_without_losing_enabled_value(self):
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Алексей", 4004
+        )
+        with sqlite3.connect(self.path) as connection:
+            connection.execute("DROP TABLE user_notification_prefs")
+            connection.execute(
+                """
+                CREATE TABLE user_notification_prefs (
+                    service_id TEXT NOT NULL,
+                    telegram_id INTEGER NOT NULL,
+                    user_notifications_enabled INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (service_id, telegram_id)
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO user_notification_prefs VALUES ('sound', 4004, 1)"
+            )
+
+        self.registry.initialize(1001, -10001)
+
+        self.assertTrue(
+            self.registry.is_user_notifications_enabled(4004, "sound")
+        )
+
+    def test_notification_preference_requires_registered_user_and_boolean(self):
+        with self.assertRaisesRegex(ValueError, "не привязан"):
+            self.registry.set_user_notifications_enabled(4004, "sound", True)
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Алексей", 4004
+        )
+        with self.assertRaisesRegex(ValueError, "должен быть bool"):
+            self.registry.set_user_notifications_enabled(4004, "sound", 1)
+
+    def test_user_notification_state_and_bulk_toggle_keep_services_independent(self):
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Алексей", 4004
+        )
+        self.registry.set_responsible_contact(
+            1001, "slides", "Слайды", "Алексей", 4004
+        )
+        sound_text_id = self.registry.upsert_user_text(
+            4004, "sound", "Микшер", None
+        )
+        self.registry.add_schedule(sound_text_id, 2, "09:00")
+        self.registry.add_schedule(sound_text_id, 0, "18:00")
+        slides_text_id = self.registry.upsert_user_text(
+            4004, "slides", "Слайды", None
+        )
+        self.registry.add_schedule(slides_text_id, 1, "07:00")
+
+        self.assertEqual(
+            self.registry.list_user_services(4004), ["slides", "sound"]
+        )
+        self.assertEqual(
+            self.registry.get_user_notifications_state(4004),
+            {
+                "total_services": 2,
+                "enabled_count": 0,
+                "disabled_count": 2,
+                "per_service": [
+                    {
+                        "service_id": "slides",
+                        "enabled": False,
+                        "texts_count": 1,
+                        "schedules_count": 1,
+                    },
+                    {
+                        "service_id": "sound",
+                        "enabled": False,
+                        "texts_count": 1,
+                        "schedules_count": 2,
+                    },
+                ],
+            },
+        )
+
+        self.registry.set_user_notifications_all(4004, True)
+        self.assertEqual(
+            self.registry.get_user_notifications_state(4004)["enabled_count"],
+            2,
+        )
+        self.registry.set_user_notifications_all(4004, False)
+        self.assertEqual(
+            self.registry.get_user_notifications_state(4004)["enabled_count"],
+            0,
+        )
+        self.assertEqual(len(self.registry.list_schedules(sound_text_id)), 2)
+        self.assertEqual(len(self.registry.list_schedules(slides_text_id)), 1)
+
+    def test_user_task_list_only_exposes_the_callers_assignments(self):
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Алексей", 4004
+        )
+        self.registry.set_responsible_contact(
+            1001, "sound", "Свет", "Борис", 5005
+        )
+
+        self.assertEqual(
+            self.registry.list_user_tasks(4004, "sound"), ["Микшер"]
+        )
+        self.assertEqual(self.registry.list_user_tasks(6006, "sound"), [])
+
+    def test_user_text_fallback_override_and_schedule_cascade(self):
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Алексей", 4004
+        )
+        template = "Default {name} for {task} at {service_name}, {sunday_date}"
+        text_id = self.registry.upsert_user_text(
+            4004, "sound", "Микшер", None
+        )
+        self.assertEqual(
+            self.registry.resolve_text_for_user(
+                4004, "sound", "Микшер", {"Микшер": template}
+            ),
+            template,
+        )
+        schedule = self.registry.add_schedule(text_id, 2, "09:00")
+        self.registry.add_schedule(text_id, 0, "18:00")
+        self.assertEqual(len(self.registry.list_schedules(text_id)), 2)
+
+        custom = "Personal {name}: {task}, {sunday_date}"
+        self.registry.upsert_user_text(4004, "sound", "Микшер", custom)
+        self.assertEqual(
+            self.registry.resolve_text_for_user(
+                4004, "sound", "Микшер", {"Микшер": template}
+            ),
+            custom,
+        )
+        self.registry.update_schedule(schedule["id"], enabled=False)
+        self.assertFalse(
+            self.registry.list_schedules(text_id)[0]["enabled"]
+        )
+        self.registry.delete_user_text(4004, "sound", "Микшер")
+        self.assertIsNone(self.registry.get_user_text(4004, "sound", "Микшер"))
+        with sqlite3.connect(self.path) as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM user_reminder_schedules "
+                "WHERE text_id = ?",
+                (text_id,),
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+
     def test_multiple_reminders_keep_ids_and_update_independently(self):
         current = self.registry.get_service("sound")["reminders"][0]
         self.registry.set_notification_settings(

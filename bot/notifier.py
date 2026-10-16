@@ -89,6 +89,8 @@ async def send_assignments(
     interaction_logger: logging.Logger,
     debug_logger: logging.Logger,
     save_state: Callable[[], None] | None = None,
+    user_notifications_enabled: Callable[[int], bool] | None = None,
+    send_personal_notifications: bool = True,
 ) -> bool:
     """Отправляет общее сообщение и ЛС. Обновляет state на месте."""
     delivery_state_persisted = True
@@ -201,6 +203,27 @@ async def send_assignments(
         participant_state = state["participants"][role]
         if not info.get("tg_id") or participant_state.get("delivered"):
             continue
+        if not send_personal_notifications:
+            participant_state["notification_skipped"] = True
+            debug_logger.debug(
+                "Традиционная личная отправка отключена: роль=%s tg_id=%s",
+                role,
+                info["tg_id"],
+            )
+            continue
+        if (
+            user_notifications_enabled is not None
+            and not user_notifications_enabled(info["tg_id"])
+        ):
+            participant_state["notification_skipped"] = True
+            debug_logger.debug(
+                "Личное уведомление пропущено по настройке пользователя: "
+                "role=%s tg_id=%s",
+                role,
+                info["tg_id"],
+            )
+            continue
+        participant_state["notification_skipped"] = False
         text = build_personal_message(role, info, templates, sunday_str)
         debug_logger.debug(
             "Подготовлено личное сообщение: роль=%s, tg_id=%s, username=@%s\n%s",

@@ -53,6 +53,7 @@ if __package__:
     from .scheduler import (
         add_service_reminder_jobs,
         build_scheduler,
+        refresh_user_reminder_jobs as refresh_user_reminder_schedule_jobs,
         scheduled_reminder_date,
     )
     from .service_registry import ServiceRegistry
@@ -98,6 +99,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
     from bot.scheduler import (
         add_service_reminder_jobs,
         build_scheduler,
+        refresh_user_reminder_jobs as refresh_user_reminder_schedule_jobs,
         scheduled_reminder_date,
     )
     from bot.service_registry import ServiceRegistry
@@ -289,6 +291,7 @@ def _build_state(
                 "username": info["username"],
                 "tg_id": info["tg_id"],
                 "delivered": False,
+                "notification_skipped": False,
                 "confirmed": False,
                 "message_id": None,
                 "chat_id": None,
@@ -332,6 +335,9 @@ def _merge_week_state(
             )
             participant["delivered"] = old.get(
                 "delivered", old.get("message_id") is not None
+            )
+            participant["notification_skipped"] = old.get(
+                "notification_skipped", False
             )
             participant["message_id"] = old.get("message_id")
             participant["chat_id"] = old.get("chat_id")
@@ -545,76 +551,6 @@ async def _process_service_reminder(
         (contact["task"], contact["name"]): contact for contact in contacts
     }
     date_text = event_date.strftime("%d.%m.%Y")
-    confirmation_participants = {}
-    confirmation_state_ready = service_id != "assembly" or state_cache is None
-    if service_id == "assembly" and state_cache is not None:
-        event_iso = event_date.isoformat()
-        current_state = state_cache.state
-        if not current_state or current_state.get("sunday_date") != event_iso:
-            current_state = {
-                "sunday_date": event_iso,
-                "group_chat_id": service["group_chat_id"],
-                "general_message_id": None,
-                "general_sent": False,
-                "general_text": None,
-                "complete": False,
-                "participants": {},
-            }
-            state_cache.state = current_state
-        participants = current_state.setdefault("participants", {})
-        previous_participants = dict(participants)
-        for key, participant in tuple(participants.items()):
-            if participant.get("service_id") == service_id:
-                del participants[key]
-        current_state["group_chat_id"] = service["group_chat_id"]
-        for task, names in assignments.items():
-            for name in names:
-                contact = contacts_by_name.get((task, name))
-                if contact is None:
-                    continue
-                telegram_id = contact["telegram_id"]
-                key = _service_confirmation_key(
-                    service_id, task, telegram_id
-                )
-                participant = {
-                    "name": name,
-                    "username": contact["username"],
-                    "tg_id": telegram_id,
-                    "task": task,
-                    "service_id": service_id,
-                    "delivered": False,
-                    "confirmed": False,
-                    "message_id": None,
-                    "chat_id": None,
-                    "group_chat_id": service["group_chat_id"],
-                }
-                participant.update(previous_participants.get(key, {}))
-                participant.update({
-                    "name": name,
-                    "username": contact["username"],
-                    "tg_id": telegram_id,
-                    "task": task,
-                    "service_id": service_id,
-                    "group_chat_id": service["group_chat_id"],
-                })
-                participants[key] = participant
-                confirmation_participants[(task, name)] = (key, participant)
-        try:
-            state_cache.save()
-            confirmation_state_ready = True
-        except OSError:
-            debug_logger.exception(
-                "Не удалось сохранить состояние подтверждений служения «Собрание»"
-            )
-            await _notify_admin(
-                bot,
-                credentials.admin_tg_id,
-                "Не удалось сохранить состояние подтверждений «Собрания»; "
-                "личные уведомления не отправлены.",
-                debug_logger,
-            )
-            confirmation_state_ready = False
-
     assignment_text = format_task_assignments(
         assignments, contacts_by_name, mark_unlinked=True
     )
@@ -704,130 +640,218 @@ async def _process_service_reminder(
                     event_date,
                 )
 
-    for task, names in assignments.items():
-        for name in names:
-            contact = contacts_by_name.get((task, name))
-            if contact is None:
-                await _notify_admin(
-                    bot,
-                    credentials.admin_tg_id,
-                    f"Не привязан Telegram для ответственного «{name}» "
-                    f"(задача «{task}», служение «{service['name']}», "
-                    f"{date_text}); личное уведомление пропущено.",
-                    debug_logger,
-                )
-                continue
-            telegram_id = contact["telegram_id"]
-            recipient = f"personal:{task}:{telegram_id}"
-            if registry.is_service_reminder_delivered(
-                service_id, reminder["id"], event_date.isoformat(), recipient
-            ):
-                continue
-            if service_id == "assembly" and not confirmation_state_ready:
-                continue
-            template = service["personal_templates"].get(
-                task,
-                "{name}, вы назначены на задачу «{task}» службы "
-                "«{service_name}» на {sunday_date}.",
+
+async def _process_user_reminder_schedule(
+    bot: Bot,
+    credentials,
+    shm_dir: Path,
+    tz,
+    registry: ServiceRegistry,
+    schedule_id: int,
+    interaction_logger,
+    debug_logger,
+    *,
+    run_date: date | None = None,
+    state_cache: StateCache | None = None,
+) -> None:
+    schedule = registry.get_user_reminder_schedule(schedule_id)
+    if (
+        schedule is None
+        or not schedule["schedule_enabled"]
+        or not schedule["notifications_enabled"]
+        or not schedule["service_enabled"]
+    ):
+        return
+    if schedule["name"] is None:
+        debug_logger.debug(
+            "Личное расписание %s пропущено: пользователь больше не привязан "
+            "к задаче %s",
+            schedule_id,
+            schedule["task"],
+        )
+        return
+    run_date = run_date or scheduled_reminder_date(
+        datetime.now(tz), schedule["reminder_time"]
+    )
+    event_date = run_date + timedelta(days=schedule["reminder_days"])
+    event_iso = event_date.isoformat()
+    if registry.is_user_reminder_delivered(schedule_id, event_iso):
+        return
+
+    try:
+        assignments, event_found = await _load_service_task_assignments(
+            credentials,
+            shm_dir,
+            tz,
+            schedule["service_id"],
+            debug_logger,
+            only_date=event_date,
+            return_event_found=True,
+        )
+    except Exception as exc:
+        debug_logger.exception(
+            "Не удалось загрузить назначения для личного расписания %s",
+            schedule_id,
+        )
+        await _notify_admin(
+            bot,
+            credentials.admin_tg_id,
+            f"Не удалось подготовить личное уведомление на "
+            f"{event_date:%d.%m.%Y}: {type(exc).__name__}.",
+            debug_logger,
+        )
+        return
+    if not event_found or schedule["name"] not in assignments.get(
+        schedule["task"], ()
+    ):
+        return
+
+    service = registry.get_service(schedule["service_id"])
+    if service is None or not service["enabled"]:
+        return
+    template = registry.resolve_text_for_user(
+        schedule["actor_id"],
+        schedule["service_id"],
+        schedule["task"],
+        service["personal_templates"],
+    )
+    try:
+        text = template.format_map(
+            _TemplateValues(
+                name=schedule["name"],
+                task=schedule["task"],
+                service_name=schedule["service_name"],
+                sunday_date=event_date.strftime("%d.%m.%Y"),
+                telegram_id=str(schedule["actor_id"]),
+                username=schedule["username"],
             )
-            try:
-                personal_text = template.format_map(
-                    _TemplateValues(
-                        name=name,
-                        task=task,
-                        service_name=service["name"],
-                        sunday_date=date_text,
-                        telegram_id=str(telegram_id),
-                        username=contact["username"],
-                    )
-                )
-            except (AttributeError, IndexError, KeyError, ValueError) as exc:
-                await _notify_admin(
-                    bot,
-                    credentials.admin_tg_id,
-                    f"Некорректный личный шаблон задачи «{task}» "
-                    f"служения «{service['name']}»: {type(exc).__name__}.",
-                    debug_logger,
-                )
-                continue
-            if not personal_text.startswith("🔔"):
-                personal_text = f"🔔 {personal_text}"
-            if _utf16_length(personal_text) > TELEGRAM_TEXT_LIMIT:
-                await _notify_admin(
-                    bot,
-                    credentials.admin_tg_id,
-                    f"Личное уведомление «{service['name']}» для {name} "
-                    f"на {date_text} превышает ограничение Telegram.",
-                    debug_logger,
-                )
-                continue
-            try:
-                send_kwargs = {}
-                confirmation = confirmation_participants.get((task, name))
-                if confirmation:
-                    send_kwargs["reply_markup"] = build_service_confirm_kb(
-                        confirmation[0], event_date.isoformat()
-                    )
-                sent_message = await send_telegram_screen(
-                    bot.send_message,
-                    telegram_id,
-                    personal_text,
-                    limit=TELEGRAM_TEXT_LIMIT,
-                    **send_kwargs,
-                )
-            except Exception as exc:
-                debug_logger.exception(
-                    "Не удалось отправить личное уведомление %s, задача %s",
-                    service_id,
-                    task,
-                )
-                await _notify_admin(
-                    bot,
-                    credentials.admin_tg_id,
-                    f"Не удалось отправить личное уведомление «{service['name']}» "
-                    f"для {name} на {date_text}: {type(exc).__name__}.",
-                    debug_logger,
-                )
-            else:
-                registry.mark_service_reminder_delivered(
-                    service_id,
-                    reminder["id"],
-                    event_date.isoformat(),
-                    recipient,
-                )
-                if confirmation:
-                    participant = confirmation[1]
-                    participant["delivered"] = True
-                    participant["message_id"] = getattr(
-                        sent_message, "message_id", None
-                    )
-                    participant["chat_id"] = getattr(
-                        getattr(sent_message, "chat", None), "id", telegram_id
-                    )
-                    try:
-                        state_cache.save()
-                    except OSError as exc:
-                        debug_logger.exception(
-                            "Не удалось сохранить подтверждение отправки "
-                            "служения «%s» для участника %s",
-                            service["name"],
-                            name,
-                        )
-                        await _notify_admin(
-                            bot,
-                            credentials.admin_tg_id,
-                            f"Уведомление «{service['name']}» для {name} "
-                            f"отправлено, но состояние подтверждения не "
-                            f"сохранено: {exc}. Доставка остальным участникам "
-                            "продолжается; подтверждение может быть недоступно "
-                            "до успешного сохранения кэша.",
-                            debug_logger,
-                        )
-                interaction_logger.info(
-                    "Личное уведомление служения %s для задачи %s отправлено",
-                    service_id,
-                    task,
-                )
+        )
+    except (AttributeError, IndexError, KeyError, ValueError) as exc:
+        debug_logger.exception(
+            "Некорректный личный текст для расписания %s", schedule_id
+        )
+        await _notify_admin(
+            bot,
+            credentials.admin_tg_id,
+            f"Личное уведомление для задачи «{schedule['task']}» "
+            f"не отправлено: {type(exc).__name__}.",
+            debug_logger,
+        )
+        return
+    if not text.startswith("🔔"):
+        text = f"🔔 {text}"
+    if _utf16_length(text) > TELEGRAM_TEXT_LIMIT:
+        await _notify_admin(
+            bot,
+            credentials.admin_tg_id,
+            f"Личное уведомление для задачи «{schedule['task']}» "
+            f"превышает лимит Telegram и не отправлено.",
+            debug_logger,
+        )
+        return
+
+    confirmation = None
+    if schedule["service_id"] == "assembly" and state_cache is not None:
+        key = _service_confirmation_key(
+            schedule["service_id"], schedule["task"], schedule["actor_id"]
+        )
+        current_state = state_cache.state
+        if not current_state or current_state.get("sunday_date") != event_iso:
+            current_state = {
+                "sunday_date": event_iso,
+                "group_chat_id": service["group_chat_id"],
+                "general_message_id": None,
+                "general_sent": False,
+                "general_text": None,
+                "complete": False,
+                "participants": {},
+            }
+            state_cache.state = current_state
+        participants = current_state.setdefault("participants", {})
+        participant = participants.setdefault(
+            key,
+            {
+                "name": schedule["name"],
+                "username": schedule["username"],
+                "tg_id": schedule["actor_id"],
+                "task": schedule["task"],
+                "service_id": schedule["service_id"],
+                "delivered": False,
+                "confirmed": False,
+                "message_id": None,
+                "chat_id": None,
+                "group_chat_id": service["group_chat_id"],
+            },
+        )
+        if participant.get("confirmed"):
+            return
+        confirmation = (key, participant)
+        try:
+            state_cache.save()
+        except OSError as exc:
+            debug_logger.exception(
+                "Не удалось подготовить состояние подтверждения служения"
+            )
+            await _notify_admin(
+                bot,
+                credentials.admin_tg_id,
+                f"Личное уведомление для {schedule['name']} не отправлено: "
+                f"не удалось сохранить состояние подтверждения ({exc}).",
+                debug_logger,
+            )
+            return
+
+    send_kwargs = {}
+    if confirmation:
+        send_kwargs["reply_markup"] = build_service_confirm_kb(
+            confirmation[0], event_iso
+        )
+    try:
+        sent_message = await send_telegram_screen(
+            bot.send_message,
+            schedule["actor_id"],
+            text,
+            limit=TELEGRAM_TEXT_LIMIT,
+            **send_kwargs,
+        )
+    except Exception as exc:
+        debug_logger.exception(
+            "Не удалось отправить личное расписание %s", schedule_id
+        )
+        await _notify_admin(
+            bot,
+            credentials.admin_tg_id,
+            f"Не удалось отправить личное уведомление для "
+            f"{schedule['name']}: {type(exc).__name__}.",
+            debug_logger,
+        )
+        return
+
+    registry.mark_user_reminder_delivered(schedule_id, event_iso)
+    if confirmation:
+        participant = confirmation[1]
+        participant["delivered"] = True
+        participant["message_id"] = getattr(sent_message, "message_id", None)
+        participant["chat_id"] = getattr(
+            getattr(sent_message, "chat", None), "id", schedule["actor_id"]
+        )
+        try:
+            state_cache.save()
+        except OSError:
+            debug_logger.exception(
+                "Не удалось сохранить подтверждение личного уведомления "
+                "для расписания %s",
+                schedule_id,
+            )
+    interaction_logger.info(
+        "Личное уведомление отправлено: service=%s task=%s tg_id=%s "
+        "event_date=%s schedule_id=%s",
+        schedule["service_id"],
+        schedule["task"],
+        schedule["actor_id"],
+        event_iso,
+        schedule_id,
+    )
 
 
 async def _prepare_service_test_previews(
@@ -1069,6 +1093,15 @@ async def _process_upcoming_sunday(
             interaction_logger=interaction_logger,
             debug_logger=debug_logger,
             save_state=state_cache.save,
+            user_notifications_enabled=(
+                lambda telegram_id: (
+                    service_registry is not None
+                    and service_registry.get_user_notifications_enabled(
+                        telegram_id, "assembly"
+                    )
+                )
+            ),
+            send_personal_notifications=False,
         )
         state["complete"] = (
             not assignment_issues
@@ -1076,6 +1109,7 @@ async def _process_upcoming_sunday(
             and state.get("general_sent") is True
             and all(
                 participant.get("delivered") is True
+                or participant.get("notification_skipped") is True
                 for participant in state["participants"].values()
                 if participant.get("tg_id")
             )
@@ -1149,6 +1183,7 @@ async def _run_locked(args: CliArgs) -> None:
     pid_created = False
     active_jobs: set[asyncio.Task[None]] = set()
     service_reminder_locks: dict[tuple[str, date], asyncio.Lock] = {}
+    user_reminder_locks: dict[tuple[int, date], asyncio.Lock] = {}
 
     try:
         bot = Bot(
@@ -1373,6 +1408,86 @@ async def _run_locked(args: CliArgs) -> None:
 
             context.refresh_service_reminder_jobs = refresh_service_reminders
 
+            async def scheduled_user_reminder(schedule_id: int) -> None:
+                schedule = service_registry.get_user_reminder_schedule(
+                    schedule_id
+                )
+                if schedule is None:
+                    return
+                run_date = scheduled_reminder_date(
+                    datetime.now(tz), schedule["reminder_time"]
+                )
+                event_date = run_date + timedelta(
+                    days=schedule["reminder_days"]
+                )
+                lock = user_reminder_locks.setdefault(
+                    (schedule["actor_id"], event_date), asyncio.Lock()
+                )
+                task = asyncio.current_task()
+                if task is not None:
+                    active_jobs.add(task)
+                try:
+                    async with lock:
+                        await _process_user_reminder_schedule(
+                            bot,
+                            credentials,
+                            shm_dir,
+                            tz,
+                            service_registry,
+                            schedule_id,
+                            interaction_logger,
+                            debug_logger,
+                            run_date=run_date,
+                            state_cache=state_cache,
+                        )
+                except Exception:
+                    debug_logger.exception(
+                        "Ошибка обработки личного расписания %s",
+                        schedule_id,
+                    )
+                    await _notify_admin(
+                        bot,
+                        credentials.admin_tg_id,
+                        "Ошибка обработки личного напоминания. "
+                        "Подробности записаны в журнал.",
+                        debug_logger,
+                    )
+                finally:
+                    if task is not None:
+                        active_jobs.discard(task)
+
+            async def refresh_user_reminder_jobs(
+                actor_id: int | None = None,
+            ) -> None:
+                if service_registry is None or scheduler is None:
+                    return
+                await refresh_user_reminder_schedule_jobs(
+                    scheduler,
+                    service_registry,
+                    scheduled_user_reminder,
+                    tz,
+                    debug_logger,
+                    actor_id=actor_id,
+                )
+
+            context.refresh_user_reminder_jobs = refresh_user_reminder_jobs
+
+            previous_registry_callback = service_registry.on_change
+
+            def schedule_user_job_refresh() -> None:
+                if previous_registry_callback is not None:
+                    previous_registry_callback()
+                if scheduler is None or not scheduler.running:
+                    return
+                refresh_task = asyncio.create_task(
+                    refresh_user_reminder_jobs(),
+                    name="reminder-bot-refresh-user-reminder-jobs",
+                )
+                active_jobs.add(refresh_task)
+                refresh_task.add_done_callback(active_jobs.discard)
+
+            service_registry.on_change = schedule_user_job_refresh
+
         try:
             _write_pid(pid_file)
             pid_created = True
@@ -1396,6 +1511,7 @@ async def _run_locked(args: CliArgs) -> None:
 
         if service_registry is not None:
             await refresh_service_reminders()
+            await refresh_user_reminder_jobs()
         scheduler.start()
         await _configure_webapp_menu(bot, PROJECT_DIR, debug_logger)
         if backup_manager is not None:

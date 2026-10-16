@@ -266,6 +266,68 @@ class PartialNotificationTest(unittest.TestCase):
 
         asyncio.run(send())
 
+    def test_user_preference_gates_personal_messages_not_group_messages(self):
+        async def send(enabled):
+            bot = SimpleNamespace(
+                send_message=AsyncMock(
+                    side_effect=[
+                        SimpleNamespace(message_id=10),
+                        SimpleNamespace(
+                            message_id=11, chat=SimpleNamespace(id=12345)
+                        ),
+                    ]
+                ),
+                edit_message_text=AsyncMock(),
+            )
+            assignment = {
+                "Ответственный": {
+                    "name": "Алексей",
+                    "username": "alex",
+                    "tg_id": 12345,
+                }
+            }
+            state = {
+                "general_sent": False,
+                "participants": {
+                    "Ответственный": {"delivered": False},
+                },
+            }
+            await send_assignments(
+                bot=bot,
+                group_chat_id=-100,
+                admin_id=67890,
+                assignments=assignment,
+                state=state,
+                templates={
+                    "general": "Ответственный: @{tg_responsible}",
+                    "roles": {"Ответственный": "{name}"},
+                },
+                sunday_str="11.10.2026",
+                sunday_iso="2026-10-11",
+                interaction_logger=MagicMock(),
+                debug_logger=MagicMock(),
+                user_notifications_enabled=lambda _telegram_id: enabled,
+            )
+            return bot, state
+
+        async def verify():
+            opted_in_bot, opted_in_state = await send(True)
+            self.assertEqual(opted_in_bot.send_message.await_count, 2)
+            self.assertTrue(
+                opted_in_state["participants"]["Ответственный"]["delivered"]
+            )
+
+            opted_out_bot, opted_out_state = await send(False)
+            self.assertEqual(opted_out_bot.send_message.await_count, 1)
+            self.assertEqual(
+                opted_out_bot.send_message.await_args.args[0], -100
+            )
+            self.assertFalse(
+                opted_out_state["participants"]["Ответственный"]["delivered"]
+            )
+
+        asyncio.run(verify())
+
     def test_failed_personal_delivery_retries_without_resending_successes(self):
         from aiogram.exceptions import TelegramAPIError
 

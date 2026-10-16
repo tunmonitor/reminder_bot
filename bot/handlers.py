@@ -107,6 +107,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     pending_contact_navigation: dict[str, tuple[int, str, str]] = {}
     pending_notify_task_choices: dict[str, tuple[int, str, str | None]] = {}
     pending_dialog_pages: dict[str, tuple[int, str, InlineKeyboardMarkup, int]] = {}
+    pending_personal_actions: dict[
+        str, tuple[int, str, str, str, dict[str, Any]]
+    ] = {}
 
     async def _send_dialog(
         target: Message,
@@ -114,7 +117,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         *,
         _dialog_page: int = 0,
         **kwargs,
-    ) -> None:
+    ) -> Message | None:
         kwargs.pop("parse_mode", None)
         markup = kwargs.pop("reply_markup", None)
         if isinstance(markup, InlineKeyboardMarkup):
@@ -135,7 +138,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "⚙️", "🔗", "👥", "👤", "📡", "🔔", "📝", "📊",
                         "📋", "📅", "🕒", "🎤", "📖", "🍞", "🧪", "👁",
                         "⏰", "📷", "🎛️", "💻", "🎬", "🎚️", "🖥️",
-                        "🍽️", "☕", "📌",
+                        "🍽️", "☕", "📌", "🔕",
                         "🔧", "🧹", "🔄", "⬅️", "➡️", "🏠", "✖️", "➕",
                         "➖", "🗑", "✏️", "1️⃣", "2️⃣", "3️⃣", "4️⃣",
                     )
@@ -194,8 +197,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 validate_inline_keyboard(rows)
 
         chunks = render_screen_chunks(text)
+        sent_message = None
         for index, chunk in enumerate(chunks):
-            await target.answer(
+            sent_message = await target.answer(
                 chunk,
                 parse_mode="HTML",
                 reply_markup=(
@@ -203,6 +207,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 ),
                 **kwargs,
             )
+        return sent_message
 
     @admin_router.callback_query(F.data.startswith("ui_page:"))
     async def on_dialog_page(callback: CallbackQuery) -> None:
@@ -235,6 +240,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     def clear_pending_actor(actor_id: int) -> None:
         pending_inputs.pop(actor_id, None)
+        for token, action in list(pending_personal_actions.items()):
+            if action[0] == actor_id:
+                pending_personal_actions.pop(token, None)
         for token, page in list(pending_dialog_pages.items()):
             if page[0] == actor_id:
                 pending_dialog_pages.pop(token, None)
@@ -1993,7 +2001,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def on_service_notify(message: Message) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
-        clear_pending_actor(message.from_user.id)
+        await invalidate_personal_session(message.from_user.id)
         payload = (message.text or "").partition(" ")[2]
         fields = [field.strip() for field in payload.split("|", 2)]
         if not payload.strip():
@@ -2025,6 +2033,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or message.chat.type != ChatType.PRIVATE
         ):
             return
+        previous = pending_inputs.get(message.from_user.id)
+        if previous and previous.get("operation", "").startswith(
+            "my_notifications"
+        ):
+            await clean_previous_personal_menu(previous)
         had_request = pending_inputs.pop(message.from_user.id, None) is not None
         for request_id, pending in list(pending_shares.items()):
             if pending[0] == message.from_user.id:
@@ -3210,6 +3223,572 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             parse_mode=None,
         )
 
+    def personal_action_button(
+        actor_id: int,
+        state: dict[str, Any],
+        label: str,
+        action: str,
+        **payload: Any,
+    ) -> InlineKeyboardButton:
+        token = secrets.token_urlsafe(6)
+        pending_personal_actions[token] = (
+            actor_id,
+            state["session_id"],
+            state["screen_id"],
+            action,
+            payload,
+        )
+        return InlineKeyboardButton(
+            text=label, callback_data=f"pmn:{state['session_id']}:{token}"
+        )
+
+    def push_personal_level(
+        state: dict[str, Any], level: dict[str, Any]
+    ) -> None:
+        state["levels"].append({**level, "page": 0})
+
+    def pop_personal_level(state: dict[str, Any]) -> None:
+        if len(state["levels"]) > 1:
+            state["levels"].pop()
+
+    async def clean_previous_personal_menu(
+        state: dict[str, Any]
+    ) -> None:
+        for token, action in list(pending_personal_actions.items()):
+            if action[1] == state.get("session_id"):
+                pending_personal_actions.pop(token, None)
+        message_id = state.pop("menu_message_id", None)
+        chat_id = state.get("menu_chat_id")
+        if message_id is None or chat_id is None:
+            return
+        try:
+            await context.bot.delete_message(
+                chat_id=chat_id, message_id=message_id
+            )
+        except TelegramAPIError:
+            debug.debug(
+                "Could not delete previous personal notification menu"
+            )
+
+    async def finish_personal_session(actor_id: int) -> None:
+        state = pending_inputs.get(actor_id)
+        if state and state.get("operation", "").startswith("my_notifications"):
+            await clean_previous_personal_menu(state)
+        clear_pending_actor(actor_id)
+
+    async def invalidate_personal_session(actor_id: int) -> None:
+        state = pending_inputs.get(actor_id)
+        if state and state.get("operation", "").startswith("my_notifications"):
+            await clean_previous_personal_menu(state)
+        clear_pending_actor(actor_id)
+
+    async def current_personal_tasks(
+        registry: Any, actor_id: int, service_id: str, state: dict[str, Any]
+    ) -> list[str]:
+        task_cache = state.setdefault("task_cache", {})
+        if service_id not in task_cache:
+            assigned = set(registry.list_user_tasks(actor_id, service_id))
+            loader = getattr(context, "load_service_task_assignments", None)
+            if loader is None:
+                raise ValueError("Не удалось проверить актуальный график служения.")
+            current_assignments = await loader(service_id)
+            task_cache[service_id] = [
+                task for task in current_assignments if task in assigned
+            ]
+        assigned_now = set(registry.list_user_tasks(actor_id, service_id))
+        return [task for task in task_cache[service_id] if task in assigned_now]
+
+    async def render_current_personal_level(
+        target: Message,
+        actor_id: int,
+        state: dict[str, Any],
+        *,
+        clean_previous: bool = True,
+    ) -> None:
+        registry = service_registry()
+        if registry is None:
+            await _send_dialog(
+                target,
+                "Реестр настроек служений недоступен. Попробуйте позже.",
+                parse_mode=None,
+            )
+            return
+        if clean_previous:
+            await clean_previous_personal_menu(state)
+        state["screen_id"] = secrets.token_urlsafe(8)
+
+        level = state["levels"][-1]
+        name = level["name"]
+        buttons: list[InlineKeyboardButton] = []
+        if name == "summary":
+            summary = registry.get_user_notifications_state(actor_id)
+            services = summary["per_service"]
+            lines = [
+                "🔔 Мои личные уведомления",
+                f"Включено: {summary['enabled_count']} · "
+                f"выключено: {summary['disabled_count']}",
+                "",
+                "Выберите служение или измените все настройки:",
+            ]
+            for item in services:
+                service = service_by_id(registry, item["service_id"])
+                label = service_label(service) if service else item["service_id"]
+                buttons.append(
+                    personal_action_button(
+                        actor_id,
+                        state,
+                        f"{'🟢' if item['enabled'] else '⚪'} {label} · "
+                        f"правил {item['schedules_count']}",
+                        "open_service",
+                        service_id=item["service_id"],
+                    )
+                )
+            text = "\n".join(lines)
+            if not services:
+                text = (
+                    "ℹ️ Вы пока не привязаны ни к одной задаче. "
+                    "Обратитесь к администратору служения."
+                )
+            if services:
+                buttons.extend(
+                    [
+                        personal_action_button(
+                            actor_id, state, "✅ Включить все", "bulk",
+                            enabled=True,
+                        ),
+                        personal_action_button(
+                            actor_id, state, "🔕 Выключить все", "bulk",
+                            enabled=False,
+                        ),
+                    ]
+                )
+                buttons.append(
+                    personal_action_button(
+                        actor_id, state, "✖️ Закрыть", "finish"
+                    )
+                )
+        elif name == "service":
+            service_id = level["service_id"]
+            if service_id not in registry.list_user_services(actor_id):
+                raise ValueError("Вы больше не привязаны к этому служению.")
+            service = service_by_id(registry, service_id)
+            if service is None:
+                raise ValueError("Служение не найдено.")
+            enabled = registry.get_user_notifications_enabled(
+                actor_id, service_id
+            )
+            tasks = await current_personal_tasks(
+                registry, actor_id, service_id, state
+            )
+            text = (
+                f"🔔 {service_label(service)}\n\n"
+                f"Личные уведомления: {'🟢 включены' if enabled else '⚪ выключены'}\n"
+                f"Доступно задач: {len(tasks)}"
+            )
+            buttons = [
+                personal_action_button(
+                    actor_id, state,
+                    "🔕 Выключить" if enabled else "✅ Включить",
+                    "toggle_service", service_id=service_id,
+                ),
+                personal_action_button(
+                    actor_id, state, "📝 Мои тексты", "open_texts",
+                    service_id=service_id,
+                ),
+                personal_action_button(
+                    actor_id, state, "⬅️ К служениям", "back"
+                ),
+            ]
+        elif name == "texts":
+            service_id = level["service_id"]
+            tasks = await current_personal_tasks(
+                registry, actor_id, service_id, state
+            )
+            texts = {
+                item["task"]: item
+                for item in registry.list_user_texts(actor_id, service_id)
+            }
+            text = "📝 Личные тексты\nВыберите задачу для настройки:"
+            for task in tasks:
+                item = texts.get(task)
+                schedules = (
+                    registry.list_schedules(item["id"]) if item else []
+                )
+                status = "свой текст" if item and item["body"] else "по умолчанию"
+                buttons.append(
+                    personal_action_button(
+                        actor_id,
+                        state,
+                        f"{task[:36]} · {status} · правил {len(schedules)}",
+                        "open_task",
+                        service_id=service_id,
+                        task=task,
+                    )
+                )
+            buttons.append(
+                personal_action_button(actor_id, state, "⬅️ Назад", "back")
+            )
+        elif name in {"task", "delete_text"}:
+            service_id, task = level["service_id"], level["task"]
+            if task not in await current_personal_tasks(
+                registry, actor_id, service_id, state
+            ):
+                raise ValueError("Привязка задачи изменилась. Откройте меню заново.")
+            text_entry = registry.get_user_text(actor_id, service_id, task)
+            body = text_entry["body"] if text_entry else None
+            if name == "delete_text":
+                text = f"Удалить личный текст и его правила для задачи «{task}»?"
+                buttons = [
+                    personal_action_button(
+                        actor_id, state, "🗑 Да, удалить", "confirm_delete_text",
+                        service_id=service_id, task=task,
+                    ),
+                    personal_action_button(
+                        actor_id, state, "⬅️ Отмена", "back"
+                    ),
+                ]
+            else:
+                schedule_count = (
+                    len(registry.list_schedules(text_entry["id"]))
+                    if text_entry else 0
+                )
+                shown_body = body or "Используется стандартный текст."
+                text = (
+                    f"📝 {task}\n\n{shown_body}\n\n"
+                    f"Правил личного расписания: {schedule_count}"
+                )
+                buttons = [
+                    personal_action_button(
+                        actor_id, state, "✏️ Задать / изменить текст",
+                        "edit_text", service_id=service_id, task=task,
+                    ),
+                    personal_action_button(
+                        actor_id, state, "⏰ Расписание", "open_schedules",
+                        service_id=service_id, task=task,
+                    ),
+                ]
+                if body:
+                    buttons.extend(
+                        [
+                            personal_action_button(
+                                actor_id, state, "🔄 Вернуть стандартный",
+                                "reset_text", service_id=service_id, task=task,
+                            ),
+                            personal_action_button(
+                                actor_id, state, "🗑 Удалить текст",
+                                "delete_text", service_id=service_id, task=task,
+                            ),
+                        ]
+                    )
+                buttons.append(
+                    personal_action_button(actor_id, state, "⬅️ Назад", "back")
+                )
+        elif name == "schedules":
+            service_id, task = level["service_id"], level["task"]
+            text_entry = registry.get_user_text(actor_id, service_id, task)
+            schedules = (
+                registry.list_schedules(text_entry["id"]) if text_entry else []
+            )
+            text = f"⏰ Расписание · {task}\nВыберите правило или добавьте новое:"
+            for schedule in schedules:
+                buttons.append(
+                    personal_action_button(
+                        actor_id,
+                        state,
+                        f"{'🟢' if schedule['enabled'] else '⚪'} "
+                        f"за {schedule['reminder_days']} дн. · "
+                        f"{schedule['reminder_time']}",
+                        "toggle_schedule",
+                        service_id=service_id,
+                        task=task,
+                        schedule_id=schedule["id"],
+                    )
+                )
+                buttons.append(
+                    personal_action_button(
+                        actor_id, state, f"✏️ Изменить · {schedule['id']}",
+                        "edit_schedule", service_id=service_id, task=task,
+                        schedule_id=schedule["id"],
+                    )
+                )
+                buttons.append(
+                    personal_action_button(
+                        actor_id, state, f"🗑 Удалить · {schedule['id']}",
+                        "delete_schedule", service_id=service_id, task=task,
+                        schedule_id=schedule["id"],
+                    )
+                )
+            buttons.extend(
+                [
+                    personal_action_button(
+                        actor_id, state, "➕ Добавить правило", "add_schedule",
+                        service_id=service_id, task=task,
+                    ),
+                    personal_action_button(
+                        actor_id, state, "⬅️ Назад", "back"
+                    ),
+                ]
+            )
+        else:
+            raise ValueError("Экран личных уведомлений устарел.")
+
+        page_size = 4
+        page_count = max(1, (len(buttons) + page_size - 1) // page_size)
+        page = min(max(level.get("page", 0), 0), page_count - 1)
+        visible = buttons[page * page_size:(page + 1) * page_size]
+        rows = [[button] for button in visible]
+        navigation = []
+        for next_page, label in (
+            (page - 1, "⬅️ Предыдущая"),
+            (page + 1, "Следующая ➡️"),
+        ):
+            if 0 <= next_page < page_count:
+                navigation.append(
+                    personal_action_button(
+                        actor_id, state, label, "page", page=next_page
+                    )
+                )
+        if navigation:
+            rows.append(navigation)
+        if page_count > 1:
+            text = f"{text}\nСтраница {page + 1}/{page_count}"
+        sent = await _send_dialog(
+            target, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+        )
+        if sent is not None:
+            state["menu_message_id"] = sent.message_id
+            state["menu_chat_id"] = target.chat.id
+
+    @admin_router.message(Command("my_notifications"))
+    async def on_my_notifications(message: Message) -> None:
+        if not message.from_user or message.chat.type != ChatType.PRIVATE:
+            return
+        await invalidate_personal_session(message.from_user.id)
+        registry = service_registry()
+        if registry is None:
+            await _send_dialog(
+                message,
+                "Реестр настроек служений недоступен. Попробуйте позже.",
+                parse_mode=None,
+            )
+            return
+        try:
+            if not registry.list_user_services(message.from_user.id):
+                await _send_dialog(
+                    message,
+                    "ℹ️ Вы пока не привязаны ни к одной задаче. "
+                    "Обратитесь к администратору служения.",
+                    parse_mode=None,
+                )
+                return
+            state = {
+                "operation": "my_notifications",
+                "session_id": secrets.token_urlsafe(8),
+                "levels": [{"name": "summary", "page": 0}],
+            }
+            pending_inputs[message.from_user.id] = state
+            await render_current_personal_level(
+                message, message.from_user.id, state, clean_previous=False
+            )
+        except (sqlite3.Error, ValueError):
+            debug.exception("Не удалось открыть личные уведомления")
+            await _send_dialog(
+                message, "Не удалось открыть настройки личных уведомлений.",
+                parse_mode=None,
+            )
+
+    @admin_router.callback_query(F.data.startswith("pmn:"))
+    async def on_personal_notifications_callback(
+        callback: CallbackQuery,
+    ) -> None:
+        if (
+            not callback.from_user
+            or not callback.message
+            or callback.message.chat.type != ChatType.PRIVATE
+        ):
+            await _answer_callback(callback)
+            return
+        parts = callback.data.split(":")
+        if len(parts) != 3:
+            await _answer_callback(callback, "⚠️ Действие устарело.")
+            return
+        _, session_id, token = parts
+        action = pending_personal_actions.pop(token, None)
+        actor_id = callback.from_user.id
+        state = pending_inputs.get(actor_id)
+        if (
+            action is None
+            or action[0] != actor_id
+            or action[1] != session_id
+            or state is None
+            or action[2] != state.get("screen_id")
+            or state.get("operation") not in {
+                "my_notifications", "my_notifications_input"
+            }
+            or state.get("session_id") != session_id
+        ):
+            await _answer_callback(callback, "⚠️ Меню устарело. Откройте /my_notifications.")
+            return
+        _, _, _, action_name, payload = action
+        registry = service_registry()
+        if registry is None:
+            await _answer_callback(callback, "❌ Реестр настроек недоступен.")
+            return
+        try:
+            if action_name == "finish":
+                await finish_personal_session(actor_id)
+                await _answer_callback(callback, "Меню закрыто")
+                return
+            if state.get("operation") == "my_notifications_input":
+                state["operation"] = "my_notifications"
+                state.pop("input", None)
+            current = state["levels"][-1]
+            if action_name == "page":
+                current["page"] = payload["page"]
+            elif action_name == "back":
+                pop_personal_level(state)
+            elif action_name == "open_service":
+                service_id = payload["service_id"]
+                if service_id not in registry.list_user_services(actor_id):
+                    raise ValueError("Вы не привязаны к этому служению.")
+                push_personal_level(state, {"name": "service", "service_id": service_id})
+            elif action_name == "toggle_service":
+                service_id = payload["service_id"]
+                if service_id not in registry.list_user_services(actor_id):
+                    raise ValueError("Вы не привязаны к этому служению.")
+                enabled = registry.get_user_notifications_enabled(actor_id, service_id)
+                registry.set_user_notifications_enabled(
+                    actor_id, service_id, not enabled
+                )
+            elif action_name == "bulk":
+                registry.set_user_notifications_all(actor_id, payload["enabled"])
+            elif action_name == "open_texts":
+                service_id = payload["service_id"]
+                if service_id not in registry.list_user_services(actor_id):
+                    raise ValueError("Вы не привязаны к этому служению.")
+                push_personal_level(
+                    state, {"name": "texts", "service_id": service_id}
+                )
+            elif action_name == "open_task":
+                service_id, task = payload["service_id"], payload["task"]
+                if task not in await current_personal_tasks(
+                    registry, actor_id, service_id, state
+                ):
+                    raise ValueError("Вы больше не привязаны к этой задаче.")
+                push_personal_level(
+                    state, {"name": "task", "service_id": service_id, "task": task}
+                )
+            elif action_name == "edit_text":
+                state["operation"] = "my_notifications_input"
+                state["screen_id"] = secrets.token_urlsafe(8)
+                state["input"] = {
+                    "type": "text", "service_id": payload["service_id"],
+                    "task": payload["task"],
+                }
+                await clean_previous_personal_menu(state)
+                sent = await _send_dialog(
+                    callback.message,
+                    "Отправьте личный текст. Можно использовать поля "
+                    "{name}, {task}, {service_name}, {sunday_date}, "
+                    "{telegram_id}, {username}.",
+                    parse_mode=None,
+                )
+                if sent is not None:
+                    state["menu_message_id"] = sent.message_id
+                    state["menu_chat_id"] = callback.message.chat.id
+                await _answer_callback(callback)
+                return
+            elif action_name == "reset_text":
+                registry.upsert_user_text(
+                    actor_id, payload["service_id"], payload["task"], None
+                )
+            elif action_name == "delete_text":
+                push_personal_level(
+                    state,
+                    {
+                        "name": "delete_text",
+                        "service_id": payload["service_id"],
+                        "task": payload["task"],
+                    },
+                )
+            elif action_name == "confirm_delete_text":
+                registry.delete_user_text(
+                    actor_id, payload["service_id"], payload["task"]
+                )
+                pop_personal_level(state)
+            elif action_name == "open_schedules":
+                service_id, task = payload["service_id"], payload["task"]
+                if task not in await current_personal_tasks(
+                    registry, actor_id, service_id, state
+                ):
+                    raise ValueError("Вы больше не привязаны к этой задаче.")
+                registry.upsert_user_text(actor_id, service_id, task, None)
+                push_personal_level(
+                    state,
+                    {"name": "schedules", "service_id": service_id, "task": task},
+                )
+            elif action_name in {"add_schedule", "edit_schedule"}:
+                state["operation"] = "my_notifications_input"
+                state["screen_id"] = secrets.token_urlsafe(8)
+                state["input"] = {
+                    "type": action_name,
+                    "service_id": payload["service_id"],
+                    "task": payload["task"],
+                    "schedule_id": payload.get("schedule_id"),
+                }
+                await clean_previous_personal_menu(state)
+                prompt = (
+                    "Введите количество дней до события и время HH:MM, "
+                    "например: 2 18:30."
+                )
+                sent = await _send_dialog(callback.message, prompt, parse_mode=None)
+                if sent is not None:
+                    state["menu_message_id"] = sent.message_id
+                    state["menu_chat_id"] = callback.message.chat.id
+                await _answer_callback(callback)
+                return
+            elif action_name in {"toggle_schedule", "delete_schedule"}:
+                service_id, task = payload["service_id"], payload["task"]
+                text_entry = registry.get_user_text(actor_id, service_id, task)
+                schedules = (
+                    registry.list_schedules(text_entry["id"]) if text_entry else []
+                )
+                schedule_id = payload["schedule_id"]
+                schedule = next(
+                    (item for item in schedules if item["id"] == schedule_id), None
+                )
+                if schedule is None:
+                    raise ValueError("Правило расписания больше не существует.")
+                if action_name == "toggle_schedule":
+                    registry.update_schedule(
+                        schedule_id, enabled=not bool(schedule["enabled"])
+                    )
+                else:
+                    registry.delete_schedule(schedule_id)
+            else:
+                raise ValueError("Неизвестное действие личных уведомлений.")
+            await render_current_personal_level(
+                callback.message, actor_id, state
+            )
+        except PermissionError:
+            await _answer_callback(callback, "❌ Недостаточно прав.")
+            return
+        except ValueError as exc:
+            await _answer_callback(callback, f"⚠️ {exc}")
+            return
+        except sqlite3.Error:
+            debug.exception("Ошибка базы данных в личных уведомлениях")
+            await _answer_callback(callback, "❌ Не удалось сохранить изменение.")
+            return
+        except (OSError, RuntimeError):
+            debug.exception("Не удалось сверить задачи с актуальным графиком")
+            await _answer_callback(
+                callback,
+                "❌ Не удалось загрузить актуальный график. Попробуйте позже.",
+            )
+            return
+        await _answer_callback(callback)
+
     @admin_router.message(F.text & ~F.text.startswith("/"))
     async def on_service_parameter(message: Message) -> None:
         if (
@@ -3220,6 +3799,76 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         pending = pending_inputs.get(message.from_user.id)
         if pending is None:
+            return
+        if pending.get("operation") == "my_notifications_input":
+            registry = service_registry()
+            if registry is None:
+                await _send_dialog(
+                    message, "Реестр настроек служений недоступен.",
+                    parse_mode=None,
+                )
+                return
+            input_state = pending.get("input", {})
+            try:
+                if input_state.get("type") == "text":
+                    registry.upsert_user_text(
+                        message.from_user.id,
+                        input_state["service_id"],
+                        input_state["task"],
+                        message.text.strip(),
+                    )
+                else:
+                    fields = message.text.strip().split()
+                    if (
+                        len(fields) != 2
+                        or not fields[0].isdigit()
+                        or not re.fullmatch(
+                            r"(?:[01]\d|2[0-3]):[0-5]\d", fields[1]
+                        )
+                    ):
+                        raise ValueError(
+                            "Введите количество дней и время HH:MM, например: 2 18:30."
+                        )
+                    days, time = int(fields[0]), fields[1]
+                    service_id, task = (
+                        input_state["service_id"], input_state["task"]
+                    )
+                    if task not in await current_personal_tasks(
+                        registry, message.from_user.id, service_id, pending
+                    ):
+                        raise ValueError("Вы больше не привязаны к этой задаче.")
+                    text_entry_id = registry.upsert_user_text(
+                        message.from_user.id, service_id, task, None
+                    )
+                    if input_state["type"] == "add_schedule":
+                        registry.add_schedule(text_entry_id, days, time)
+                    else:
+                        text_entry = registry.get_user_text(
+                            message.from_user.id, service_id, task
+                        )
+                        schedules = (
+                            registry.list_schedules(text_entry["id"])
+                            if text_entry else []
+                        )
+                        schedule_id = input_state.get("schedule_id")
+                        if not any(
+                            item["id"] == schedule_id for item in schedules
+                        ):
+                            raise ValueError("Правило расписания больше не существует.")
+                        registry.update_schedule(schedule_id, days, time)
+                pending["operation"] = "my_notifications"
+                pending.pop("input", None)
+                await render_current_personal_level(
+                    message, message.from_user.id, pending
+                )
+            except ValueError as exc:
+                await _send_dialog(message, f"⚠️ {exc}", parse_mode=None)
+            except sqlite3.Error:
+                debug.exception("Не удалось сохранить настройки личного уведомления")
+                await _send_dialog(
+                    message, "❌ Не удалось сохранить настройки. Попробуйте позже.",
+                    parse_mode=None,
+                )
             return
         operation = pending["operation"]
         service_id = pending["service_id"]

@@ -111,6 +111,44 @@ class ServiceRegistry:
                     PRIMARY KEY (service_id, task, telegram_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS user_notification_prefs (
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    actor_id INTEGER NOT NULL CHECK (actor_id > 0),
+                    enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+                    PRIMARY KEY (actor_id, service_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS user_reminder_texts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    actor_id INTEGER NOT NULL CHECK (actor_id > 0),
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    task TEXT NOT NULL,
+                    body TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (actor_id, service_id, task)
+                );
+
+                CREATE TABLE IF NOT EXISTS user_reminder_schedules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    text_id INTEGER NOT NULL REFERENCES user_reminder_texts(id)
+                        ON DELETE CASCADE,
+                    reminder_days INTEGER NOT NULL
+                        CHECK (reminder_days BETWEEN 0 AND 6),
+                    reminder_time TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1
+                        CHECK (enabled IN (0, 1))
+                );
+
+                CREATE TABLE IF NOT EXISTS user_reminder_deliveries (
+                    schedule_id INTEGER NOT NULL
+                        REFERENCES user_reminder_schedules(id) ON DELETE CASCADE,
+                    event_date TEXT NOT NULL,
+                    delivered_at TEXT NOT NULL,
+                    PRIMARY KEY (schedule_id, event_date)
+                );
+
                 CREATE TABLE IF NOT EXISTS configuration_audit (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     actor_id INTEGER NOT NULL CHECK (actor_id > 0),
@@ -185,6 +223,55 @@ class ServiceRegistry:
                     "ALTER TABLE service_admins "
                     "ADD COLUMN username TEXT NOT NULL DEFAULT ''"
                 )
+            preference_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(user_notification_prefs)"
+                )
+            }
+            if "actor_id" not in preference_columns:
+                enabled_column = (
+                    "enabled"
+                    if "enabled" in preference_columns
+                    else (
+                        "user_notifications_enabled"
+                        if "user_notifications_enabled" in preference_columns
+                        else "0"
+                    )
+                )
+                connection.executescript(
+                    f"""
+                    BEGIN IMMEDIATE;
+                    CREATE TABLE user_notification_prefs_v2 (
+                        actor_id INTEGER NOT NULL CHECK (actor_id > 0),
+                        service_id TEXT NOT NULL REFERENCES services(id)
+                            ON DELETE CASCADE,
+                        enabled INTEGER NOT NULL DEFAULT 0
+                            CHECK (enabled IN (0, 1)),
+                        PRIMARY KEY (actor_id, service_id)
+                    );
+                    INSERT OR IGNORE INTO user_notification_prefs_v2 (
+                        actor_id, service_id, enabled
+                    )
+                    SELECT telegram_id, service_id, {enabled_column}
+                    FROM user_notification_prefs;
+                    DROP TABLE user_notification_prefs;
+                    ALTER TABLE user_notification_prefs_v2
+                    RENAME TO user_notification_prefs;
+                    """
+                )
+                preference_columns = {"actor_id", "service_id", "enabled"}
+            if "enabled" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE user_notification_prefs "
+                    "ADD COLUMN enabled INTEGER NOT NULL DEFAULT 0 "
+                    "CHECK (enabled IN (0, 1))"
+                )
+                if "user_notifications_enabled" in preference_columns:
+                    connection.execute(
+                        "UPDATE user_notification_prefs "
+                        "SET enabled = user_notifications_enabled"
+                    )
             contact_primary_key = [
                 row["name"]
                 for row in connection.execute(
@@ -245,6 +332,35 @@ class ServiceRegistry:
                 "CREATE UNIQUE INDEX IF NOT EXISTS "
                 "idx_responsible_contacts_name "
                 "ON responsible_contacts(service_id, task, name)"
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO user_notification_prefs (
+                    actor_id, service_id, enabled
+                )
+                SELECT DISTINCT telegram_id, service_id, 0
+                FROM responsible_contacts
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_urtexts_actor "
+                "ON user_reminder_texts(actor_id, service_id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_urschedules_text "
+                "ON user_reminder_schedules(text_id)"
+            )
+            connection.execute(
+                """
+                DELETE FROM user_notification_prefs
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM responsible_contacts
+                    WHERE responsible_contacts.service_id =
+                              user_notification_prefs.service_id
+                      AND responsible_contacts.telegram_id =
+                              user_notification_prefs.actor_id
+                )
+                """
             )
             connection.execute(
                 "INSERT OR IGNORE INTO runtime_counters (name, next_value) "
@@ -952,10 +1068,515 @@ class ServiceRegistry:
                     username.strip().lstrip("@"), actor_id, _utc_now(),
                 ),
             )
+            connection.execute(
+                """
+                DELETE FROM user_notification_prefs
+                WHERE service_id = ? AND NOT EXISTS (
+                    SELECT 1 FROM responsible_contacts
+                    WHERE responsible_contacts.service_id = ?
+                      AND responsible_contacts.telegram_id =
+                              user_notification_prefs.actor_id
+                )
+                """,
+                (service_id, service_id),
+            )
+            connection.execute(
+                """
+                DELETE FROM user_reminder_texts
+                WHERE service_id = ? AND NOT EXISTS (
+                    SELECT 1 FROM responsible_contacts
+                    WHERE responsible_contacts.service_id =
+                              user_reminder_texts.service_id
+                      AND responsible_contacts.task = user_reminder_texts.task
+                      AND responsible_contacts.telegram_id =
+                              user_reminder_texts.actor_id
+                )
+                """,
+                (service_id,),
+            )
             self._audit(
                 connection, actor_id, "responsible_contact_updated", service_id,
                 {"task": task, "name": name, "telegram_id": telegram_id},
             )
+
+    def get_user_notifications_enabled(
+        self, actor_id: int, service_id: str
+    ) -> bool:
+        return self.is_user_notifications_enabled(actor_id, service_id)
+
+    def is_user_notifications_enabled(
+        self, actor_id: int, service_id: str
+    ) -> bool:
+        _validate_positive_id(actor_id, "actor_id")
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            row = connection.execute(
+                "SELECT enabled "
+                "FROM user_notification_prefs "
+                "WHERE service_id = ? AND actor_id = ?",
+                (service_id, actor_id),
+            ).fetchone()
+        return bool(row["enabled"]) if row else False
+
+    def set_user_notifications_enabled(
+        self, actor_id: int, service_id: str, enabled: bool
+    ) -> None:
+        _validate_positive_id(actor_id, "actor_id")
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled должен быть bool")
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            registered = connection.execute(
+                "SELECT 1 FROM responsible_contacts "
+                "WHERE service_id = ? AND telegram_id = ? LIMIT 1",
+                (service_id, actor_id),
+            ).fetchone()
+            if registered is None:
+                raise ValueError(
+                    "Пользователь не привязан к задачам этого служения"
+                )
+            current = connection.execute(
+                "SELECT enabled "
+                "FROM user_notification_prefs "
+                "WHERE service_id = ? AND actor_id = ?",
+                (service_id, actor_id),
+            ).fetchone()
+            if current is not None and bool(
+                current["enabled"]
+            ) == enabled:
+                return
+            if current is None and not enabled:
+                return
+            connection.execute(
+                """
+                INSERT INTO user_notification_prefs (
+                    service_id, actor_id, enabled
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(actor_id, service_id) DO UPDATE SET
+                    enabled = excluded.enabled
+                """,
+                (service_id, actor_id, int(enabled)),
+            )
+            self._audit(
+                connection,
+                actor_id,
+                "user_notification_preference_updated",
+                service_id,
+                {"enabled": enabled},
+            )
+
+    def set_user_notifications_all(
+        self, actor_id: int, enabled: bool
+    ) -> None:
+        _validate_positive_id(actor_id, "actor_id")
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled должен быть bool")
+        with self._connection() as connection:
+            services = connection.execute(
+                "SELECT DISTINCT service_id FROM responsible_contacts "
+                "WHERE telegram_id = ? ORDER BY service_id",
+                (actor_id,),
+            ).fetchall()
+            for row in services:
+                current = connection.execute(
+                    "SELECT enabled FROM user_notification_prefs "
+                    "WHERE service_id = ? AND actor_id = ?",
+                    (row["service_id"], actor_id),
+                ).fetchone()
+                if current is not None and bool(current["enabled"]) == enabled:
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO user_notification_prefs (
+                        service_id, actor_id, enabled
+                    ) VALUES (?, ?, ?)
+                    ON CONFLICT(actor_id, service_id) DO UPDATE SET
+                        enabled = excluded.enabled
+                    WHERE enabled != excluded.enabled
+                    """,
+                    (row["service_id"], actor_id, int(enabled)),
+                )
+                self._audit(
+                    connection,
+                    actor_id,
+                    "user_notification_preference_updated",
+                    row["service_id"],
+                    {"enabled": enabled, "bulk": True},
+                )
+
+    def list_users_with_notifications_enabled(
+        self, service_id: str
+    ) -> list[int]:
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            rows = connection.execute(
+                """
+                SELECT DISTINCT preferences.actor_id
+                FROM user_notification_prefs AS preferences
+                JOIN responsible_contacts AS contacts
+                  ON contacts.service_id = preferences.service_id
+                 AND contacts.telegram_id = preferences.actor_id
+                WHERE preferences.service_id = ?
+                  AND preferences.enabled = 1
+                ORDER BY preferences.actor_id
+                """,
+                (service_id,),
+            ).fetchall()
+        return [row["actor_id"] for row in rows]
+
+    def list_user_services(self, actor_id: int) -> list[str]:
+        _validate_positive_id(actor_id, "actor_id")
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT service_id FROM responsible_contacts "
+                "WHERE telegram_id = ? ORDER BY service_id",
+                (actor_id,),
+            ).fetchall()
+        return [row["service_id"] for row in rows]
+
+    def list_user_tasks(self, actor_id: int, service_id: str) -> list[str]:
+        """Return only tasks to which this user is currently assigned."""
+        _validate_positive_id(actor_id, "actor_id")
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            rows = connection.execute(
+                "SELECT DISTINCT task FROM responsible_contacts "
+                "WHERE telegram_id = ? AND service_id = ? ORDER BY task",
+                (actor_id, service_id),
+            ).fetchall()
+        return [row["task"] for row in rows]
+
+    def get_user_notifications_state(self, actor_id: int) -> dict:
+        _validate_positive_id(actor_id, "actor_id")
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT services.id AS service_id,
+                       COALESCE(preferences.enabled, 0) AS enabled,
+                       COUNT(DISTINCT texts.id) AS texts_count,
+                       COUNT(DISTINCT schedules.id) AS schedules_count
+                FROM responsible_contacts AS contacts
+                JOIN services ON services.id = contacts.service_id
+                LEFT JOIN user_notification_prefs AS preferences
+                  ON preferences.service_id = contacts.service_id
+                 AND preferences.actor_id = contacts.telegram_id
+                LEFT JOIN user_reminder_texts AS texts
+                  ON texts.actor_id = contacts.telegram_id
+                 AND texts.service_id = contacts.service_id
+                LEFT JOIN user_reminder_schedules AS schedules
+                  ON schedules.text_id = texts.id
+                WHERE contacts.telegram_id = ?
+                GROUP BY services.id, preferences.enabled
+                ORDER BY services.id
+                """,
+                (actor_id,),
+            ).fetchall()
+        per_service = [
+            {
+                "service_id": row["service_id"],
+                "enabled": bool(row["enabled"]),
+                "texts_count": row["texts_count"],
+                "schedules_count": row["schedules_count"],
+            }
+            for row in rows
+        ]
+        enabled_count = sum(item["enabled"] for item in per_service)
+        return {
+            "total_services": len(per_service),
+            "enabled_count": enabled_count,
+            "disabled_count": len(per_service) - enabled_count,
+            "per_service": per_service,
+        }
+
+    def list_user_texts(self, actor_id: int, service_id: str) -> list[dict]:
+        _validate_positive_id(actor_id, "actor_id")
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            rows = connection.execute(
+                "SELECT id, actor_id, service_id, task, body, created_at "
+                "FROM user_reminder_texts "
+                "WHERE actor_id = ? AND service_id = ? ORDER BY task",
+                (actor_id, service_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_user_text(
+        self, actor_id: int, service_id: str, task: str
+    ) -> dict | None:
+        _validate_positive_id(actor_id, "actor_id")
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            row = connection.execute(
+                "SELECT id, actor_id, service_id, task, body, created_at "
+                "FROM user_reminder_texts "
+                "WHERE actor_id = ? AND service_id = ? AND task = ?",
+                (actor_id, service_id, task.strip()),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_user_text(
+        self, actor_id: int, service_id: str, task: str, body: str | None
+    ) -> int:
+        _validate_positive_id(actor_id, "actor_id")
+        task = task.strip()
+        if not task:
+            raise ValueError("Название задачи обязательно")
+        if body is not None:
+            if not isinstance(body, str) or not body.strip():
+                raise ValueError("Текст уведомления не может быть пустым")
+            validate_notification_template(
+                body, PERSONAL_TEMPLATE_FIELDS, "Личный шаблон пользователя"
+            )
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            registered = connection.execute(
+                "SELECT 1 FROM responsible_contacts "
+                "WHERE service_id = ? AND task = ? AND telegram_id = ?",
+                (service_id, task, actor_id),
+            ).fetchone()
+            if registered is None:
+                raise ValueError(
+                    "Пользователь не привязан к этой задаче"
+                )
+            connection.execute(
+                """
+                INSERT INTO user_reminder_texts (
+                    actor_id, service_id, task, body
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(actor_id, service_id, task) DO UPDATE SET
+                    body = excluded.body
+                """,
+                (actor_id, service_id, task, body),
+            )
+            row = connection.execute(
+                "SELECT id FROM user_reminder_texts "
+                "WHERE actor_id = ? AND service_id = ? AND task = ?",
+                (actor_id, service_id, task),
+            ).fetchone()
+            text_id = row["id"]
+            self._audit(
+                connection,
+                actor_id,
+                "user_reminder_text_updated",
+                service_id,
+                {"task": task, "body_overridden": body is not None},
+            )
+        return text_id
+
+    def delete_user_text(
+        self, actor_id: int, service_id: str, task: str
+    ) -> None:
+        _validate_positive_id(actor_id, "actor_id")
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            connection.execute(
+                "DELETE FROM user_reminder_texts "
+                "WHERE actor_id = ? AND service_id = ? AND task = ?",
+                (actor_id, service_id, task.strip()),
+            )
+
+    def list_schedules(self, text_id: int) -> list[dict]:
+        _validate_positive_id(text_id, "text_id")
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT id, text_id, reminder_days, reminder_time, enabled "
+                "FROM user_reminder_schedules WHERE text_id = ? ORDER BY id",
+                (text_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def add_schedule(self, text_id: int, days: int, time: str) -> dict:
+        _validate_positive_id(text_id, "text_id")
+        self._validate_user_schedule(days, time)
+        with self._connection() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM user_reminder_texts WHERE id = ?",
+                (text_id,),
+            ).fetchone()
+            if exists is None:
+                raise ValueError("Текст личного уведомления не найден")
+            cursor = connection.execute(
+                "INSERT INTO user_reminder_schedules "
+                "(text_id, reminder_days, reminder_time) VALUES (?, ?, ?)",
+                (text_id, days, time),
+            )
+            schedule_id = cursor.lastrowid
+            row = connection.execute(
+                "SELECT id, text_id, reminder_days, reminder_time, enabled "
+                "FROM user_reminder_schedules WHERE id = ?",
+                (schedule_id,),
+            ).fetchone()
+        return dict(row)
+
+    def update_schedule(
+        self,
+        schedule_id: int,
+        days: int | None = None,
+        time: str | None = None,
+        enabled: bool | None = None,
+    ) -> None:
+        _validate_positive_id(schedule_id, "schedule_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT reminder_days, reminder_time, enabled "
+                "FROM user_reminder_schedules WHERE id = ?",
+                (schedule_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("Правило личного расписания не найдено")
+            new_days = row["reminder_days"] if days is None else days
+            new_time = row["reminder_time"] if time is None else time
+            if enabled is not None and not isinstance(enabled, bool):
+                raise ValueError("enabled должен быть bool")
+            new_enabled = (
+                bool(row["enabled"]) if enabled is None else enabled
+            )
+            self._validate_user_schedule(new_days, new_time)
+            connection.execute(
+                "UPDATE user_reminder_schedules "
+                "SET reminder_days = ?, reminder_time = ?, enabled = ? "
+                "WHERE id = ?",
+                (new_days, new_time, int(new_enabled), schedule_id),
+            )
+
+    def delete_schedule(self, schedule_id: int) -> None:
+        _validate_positive_id(schedule_id, "schedule_id")
+        with self._connection() as connection:
+            connection.execute(
+                "DELETE FROM user_reminder_schedules WHERE id = ?",
+                (schedule_id,),
+            )
+
+    @staticmethod
+    def _validate_user_schedule(days: int, time: str) -> None:
+        if isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 6:
+            raise ValueError("Дни до события должны быть от 0 до 6")
+        if not isinstance(time, str) or not re.fullmatch(
+            r"(?:[01]\d|2[0-3]):[0-5]\d", time
+        ):
+            raise ValueError("Время должно быть в формате HH:MM")
+
+    def list_enabled_user_reminder_schedules(
+        self, actor_id: int | None = None
+    ) -> list[dict]:
+        if actor_id is not None:
+            _validate_positive_id(actor_id, "actor_id")
+        query = """
+            SELECT schedules.id AS schedule_id, schedules.text_id,
+                   schedules.reminder_days, schedules.reminder_time,
+                   texts.actor_id, texts.service_id, texts.task, texts.body,
+                   services.name AS service_name,
+                   services.enabled AS service_enabled,
+                   preferences.enabled AS notifications_enabled
+            FROM user_reminder_schedules AS schedules
+            JOIN user_reminder_texts AS texts ON texts.id = schedules.text_id
+            JOIN services ON services.id = texts.service_id
+            JOIN user_notification_prefs AS preferences
+              ON preferences.service_id = texts.service_id
+             AND preferences.actor_id = texts.actor_id
+            WHERE schedules.enabled = 1
+              AND preferences.enabled = 1
+              AND services.enabled = 1
+        """
+        parameters: tuple = ()
+        if actor_id is not None:
+            query += " AND texts.actor_id = ?"
+            parameters = (actor_id,)
+        query += " ORDER BY schedules.id"
+        with self._connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+            result = []
+            for row in rows:
+                contact = connection.execute(
+                    "SELECT name, username FROM responsible_contacts "
+                    "WHERE service_id = ? AND task = ? AND telegram_id = ? "
+                    "ORDER BY name LIMIT 1",
+                    (row["service_id"], row["task"], row["actor_id"]),
+                ).fetchone()
+                if contact is None:
+                    continue
+                result.append({
+                    **dict(row),
+                    "name": contact["name"],
+                    "username": contact["username"],
+                })
+        return result
+
+    def get_user_reminder_schedule(self, schedule_id: int) -> dict | None:
+        _validate_positive_id(schedule_id, "schedule_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT schedules.id AS schedule_id, schedules.text_id,
+                       schedules.reminder_days, schedules.reminder_time,
+                       texts.actor_id, texts.service_id, texts.task, texts.body,
+                       services.name AS service_name,
+                       services.enabled AS service_enabled,
+                       preferences.enabled AS notifications_enabled,
+                       schedules.enabled AS schedule_enabled
+                FROM user_reminder_schedules AS schedules
+                JOIN user_reminder_texts AS texts ON texts.id = schedules.text_id
+                JOIN services ON services.id = texts.service_id
+                LEFT JOIN user_notification_prefs AS preferences
+                  ON preferences.service_id = texts.service_id
+                 AND preferences.actor_id = texts.actor_id
+                WHERE schedules.id = ?
+                """,
+                (schedule_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            contact = connection.execute(
+                "SELECT name, username FROM responsible_contacts "
+                "WHERE service_id = ? AND task = ? AND telegram_id = ? "
+                "ORDER BY name LIMIT 1",
+                (row["service_id"], row["task"], row["actor_id"]),
+            ).fetchone()
+        return {
+            **dict(row),
+            "notifications_enabled": bool(row["notifications_enabled"]),
+            "name": contact["name"] if contact else None,
+            "username": contact["username"] if contact else "",
+        }
+
+    def is_user_reminder_delivered(
+        self, schedule_id: int, event_date: str
+    ) -> bool:
+        _validate_positive_id(schedule_id, "schedule_id")
+        with self._connection() as connection:
+            return connection.execute(
+                "SELECT 1 FROM user_reminder_deliveries "
+                "WHERE schedule_id = ? AND event_date = ?",
+                (schedule_id, event_date),
+            ).fetchone() is not None
+
+    def mark_user_reminder_delivered(
+        self, schedule_id: int, event_date: str
+    ) -> None:
+        _validate_positive_id(schedule_id, "schedule_id")
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO user_reminder_deliveries "
+                "(schedule_id, event_date, delivered_at) VALUES (?, ?, ?)",
+                (schedule_id, event_date, _utc_now()),
+            )
+
+    def resolve_text_for_user(
+        self,
+        actor_id: int,
+        service_id: str,
+        task: str,
+        personal_templates: dict[str, str] | None = None,
+    ) -> str:
+        user_text = self.get_user_text(actor_id, service_id, task)
+        if user_text is not None and user_text["body"] is not None:
+            return user_text["body"]
+        if personal_templates and personal_templates.get(task):
+            return personal_templates[task]
+        return (
+            "{name}, напоминаем о задаче «{task}» службы "
+            "«{service_name}» на {sunday_date}."
+        )
 
     def get_responsible_contact(
         self, service_id: str, task: str, name: str
