@@ -1,6 +1,9 @@
 """Formatting helpers for user-facing assignment summaries."""
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
+
 
 _TASK_EMOJIS = (
     ("камер", "📷"),
@@ -28,8 +31,23 @@ def task_emoji(task: str) -> str:
     )
 
 
+def task_assignment_names(task_info: Mapping | list[str]) -> list[str]:
+    if isinstance(task_info, Mapping):
+        names = task_info.get("names", [])
+        return list(names) if isinstance(names, (list, tuple, set)) else []
+    return list(task_info)
+
+
+def task_is_informational(task_info: Mapping | list[str]) -> bool:
+    return (
+        bool(task_info.get("is_informational", False))
+        if isinstance(task_info, Mapping)
+        else False
+    )
+
+
 def format_task_assignments(
-    assignments: dict[str, list[str]],
+    assignments: dict[str, dict[str, Any] | list[str]],
     contacts: dict[tuple[str, str], dict] | None = None,
     *,
     mark_unlinked: bool = False,
@@ -38,7 +56,10 @@ def format_task_assignments(
         return "⚪ Ответственные не указаны"
 
     groups = []
-    for task, names in assignments.items():
+    for task, task_info in assignments.items():
+        if task_is_informational(task_info):
+            continue
+        names = task_assignment_names(task_info)
         lines = [f"{task_emoji(task)} {task}"]
         if not names:
             lines.append("• Ответственные не указаны")
@@ -52,4 +73,4 @@ def format_task_assignments(
             )
             lines.append(f"• {name}{suffix}")
         groups.append("\n".join(lines))
-    return "\n\n".join(groups)
+    return "\n\n".join(groups) or "⚪ Ответственные не указаны"

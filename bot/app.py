@@ -47,7 +47,11 @@ if __package__:
         build_service_confirm_kb,
         send_assignments,
     )
-    from .presentation import format_task_assignments
+    from .presentation import (
+        format_task_assignments,
+        task_assignment_names,
+        task_is_informational,
+    )
     from .ui import send_telegram_screen
     from .secure_fs import open_private_directory
     from .scheduler import (
@@ -93,7 +97,11 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         build_service_confirm_kb,
         send_assignments,
     )
-    from bot.presentation import format_task_assignments
+    from bot.presentation import (
+        format_task_assignments,
+        task_assignment_names,
+        task_is_informational,
+    )
     from bot.ui import send_telegram_screen
     from bot.secure_fs import open_private_directory
     from bot.scheduler import (
@@ -290,6 +298,9 @@ def _build_state(
                 "name": info["name"],
                 "username": info["username"],
                 "tg_id": info["tg_id"],
+                "is_informational": bool(
+                    info.get("is_informational", False)
+                ),
                 "delivered": False,
                 "notification_skipped": False,
                 "confirmed": False,
@@ -420,7 +431,7 @@ async def _load_service_task_assignments(
     only_date: date | None = None,
     *,
     return_event_found: bool = False,
-) -> dict[str, list[str]] | tuple[dict[str, list[str]], bool]:
+) -> dict[str, dict[str, object]] | tuple[dict[str, dict[str, object]], bool]:
     sunday_date = only_date or _next_sunday_in_tz(tz)
     debug_dir = shm_dir / "debug"
     directory_fd = open_private_directory(debug_dir, create=True)
@@ -448,17 +459,28 @@ async def _load_service_task_assignments(
         event_found = any(
             event.event_date == sunday_date for event in service_events
         )
-        assignments: dict[str, set[str]] = {}
+        assignments: dict[str, dict[str, object]] = {}
         for event in service_events:
             if only_date is not None and event.event_date != only_date:
                 continue
             for assignment in event.assignments:
-                assignments.setdefault(assignment.task, set()).add(
-                    assignment.name
+                task_info = assignments.setdefault(
+                    assignment.task,
+                    {"names": set(), "is_informational": False},
+                )
+                names = task_info["names"]
+                if assignment.name:
+                    names.add(assignment.name)
+                task_info["is_informational"] = (
+                    task_info["is_informational"]
+                    or getattr(assignment, "is_informational", False)
                 )
         result = {
-            task: sorted(names)
-            for task, names in sorted(assignments.items())
+            task: {
+                "names": sorted(task_info["names"]),
+                "is_informational": task_info["is_informational"],
+            }
+            for task, task_info in sorted(assignments.items())
         }
         if return_event_found:
             return result, event_found
@@ -550,6 +572,22 @@ async def _process_service_reminder(
     contacts_by_name = {
         (contact["task"], contact["name"]): contact for contact in contacts
     }
+    for task, task_info in assignments.items():
+        if not task_is_informational(task_info):
+            continue
+        stale_contacts = [
+            contact
+            for contact in contacts
+            if contact["task"] == task
+        ]
+        if stale_contacts:
+            debug_logger.debug(
+                "Информационная задача исключена из привязок служения %s: "
+                "%s (в БД сохранено привязок: %s)",
+                service_id,
+                task,
+                len(stale_contacts),
+            )
     date_text = event_date.strftime("%d.%m.%Y")
     assignment_text = format_task_assignments(
         assignments, contacts_by_name, mark_unlinked=True
@@ -576,7 +614,10 @@ async def _process_service_reminder(
         )
         return
 
-    if not assignments:
+    if not any(
+        not task_is_informational(task_info)
+        for task_info in assignments.values()
+    ):
         await _notify_admin(
             bot,
             credentials.admin_tg_id,
@@ -701,8 +742,17 @@ async def _process_user_reminder_schedule(
             debug_logger,
         )
         return
-    if not event_found or schedule["name"] not in assignments.get(
-        schedule["task"], ()
+    task_info = assignments.get(schedule["task"])
+    if task_is_informational(task_info or []):
+        debug_logger.debug(
+            "Личное расписание %s пропущено: задача «%s» стала "
+            "информационной в графике",
+            schedule_id,
+            schedule["task"],
+        )
+        return
+    if not event_found or schedule["name"] not in task_assignment_names(
+        task_info or []
     ):
         return
 
@@ -891,7 +941,16 @@ async def _prepare_service_test_previews(
         if personal_templates is None
         else personal_templates
     )
-    for task, names in assignments.items():
+    for task, task_info in assignments.items():
+        if task_is_informational(task_info):
+            if any(contact["task"] == task for contact in contacts):
+                debug_logger.debug(
+                    "Информационная задача исключена из предпросмотра "
+                    "привязок: %s",
+                    task,
+                )
+            continue
+        names = task_assignment_names(task_info)
         for name in names:
             contact = contacts_by_name.get((task, name))
             if contact is None:
@@ -934,7 +993,7 @@ async def _prepare_service_test_previews(
                     "text": personal_text,
                 }
             )
-    if not assignments:
+    if not rendered_assignment_names:
         issues.append("В актуальном графике для службы нет назначенных задач.")
     assignment_text = format_task_assignments(
         rendered_assignment_names,
@@ -1115,10 +1174,12 @@ async def _process_upcoming_sunday(
                 or participant.get("notification_skipped") is True
                 for participant in state["participants"].values()
                 if participant.get("tg_id")
+                and not participant.get("is_informational", False)
             )
             and all(
                 participant.get("tg_id")
                 for participant in state["participants"].values()
+                if not participant.get("is_informational", False)
             )
         )
         state_cache.save()
@@ -1263,7 +1324,7 @@ async def _run_locked(args: CliArgs) -> None:
 
         async def load_service_task_assignments(
             service_id: str,
-        ) -> dict[str, list[str]]:
+        ) -> dict[str, dict[str, object]]:
             return await _load_service_task_assignments(
                 credentials, shm_dir, tz, service_id, debug_logger
             )

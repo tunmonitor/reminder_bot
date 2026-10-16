@@ -201,6 +201,13 @@ async def send_assignments(
     # --- 2) Персональные ЛС ---
     for role, info in assignments.items():
         participant_state = state["participants"][role]
+        if info.get("is_informational", False):
+            debug_logger.debug(
+                "Личное уведомление пропущено для информационной задачи: %s",
+                role,
+            )
+            participant_state["notification_skipped"] = True
+            continue
         if not info.get("tg_id") or participant_state.get("delivered"):
             continue
         if not send_personal_notifications:

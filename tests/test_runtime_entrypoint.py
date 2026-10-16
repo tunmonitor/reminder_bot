@@ -322,6 +322,63 @@ class ReminderBotEntrypointTest(unittest.TestCase):
 
         asyncio.run(process())
 
+    def test_user_reminder_is_skipped_when_task_becomes_informational(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                registry.set_group_chat(1001, "sound", -10055, enabled=True)
+                registry.set_responsible_contact(
+                    1001, "sound", "Праздник", "Дежурный", 2002
+                )
+                registry.set_user_notifications_enabled(2002, "sound", True)
+                text_id = registry.upsert_user_text(
+                    2002, "sound", "Праздник", "Не отправлять {name}"
+                )
+                schedule = registry.add_schedule(text_id, 1, "18:00")
+                bot = SimpleNamespace(send_message=AsyncMock())
+                logger = MagicMock()
+                info_assignments = {
+                    "Праздник": {
+                        "names": ["Дежурный"],
+                        "is_informational": True,
+                    }
+                }
+                with patch.object(
+                    app,
+                    "_load_service_task_assignments",
+                    new=AsyncMock(return_value=(info_assignments, True)),
+                ):
+                    await app._process_user_reminder_schedule(
+                        bot,
+                        SimpleNamespace(admin_tg_id=1001),
+                        Path(tmp_dir),
+                        ZoneInfo("UTC"),
+                        registry,
+                        schedule["id"],
+                        logger,
+                        logger,
+                        run_date=date(2026, 10, 17),
+                    )
+
+                bot.send_message.assert_not_awaited()
+                self.assertFalse(
+                    registry.is_user_reminder_delivered(
+                        schedule["id"], "2026-10-18"
+                    )
+                )
+                logger.debug.assert_any_call(
+                    "Личное расписание %s пропущено: задача «%s» стала "
+                    "информационной в графике",
+                    schedule["id"],
+                    "Праздник",
+                )
+
+        asyncio.run(process())
+
     def test_scheduler_initialization_failure_closes_bot_without_pid(self):
         from bot import app
 

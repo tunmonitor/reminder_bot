@@ -11,7 +11,12 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .config import load_credentials, load_templates
-from .excel_parser import parse_people, parse_schedule, resolve_assignments
+from .excel_parser import (
+    parse_people,
+    parse_schedule,
+    parse_service_events,
+    resolve_assignments,
+)
 from .logger import setup_loggers
 from .notifier import build_general_message, build_personal_message
 from .secure_fs import open_private_directory
@@ -60,6 +65,25 @@ async def run_check(target: date | None, output_dir: Path) -> Path:
         if role not in schedule
     ]
     assignments = resolve_assignments(schedule, people, debug_logger, issues)
+    service_events = parse_service_events(
+        path, selected_date, debug_logger
+    )
+    task_kinds = sorted(
+        {
+            (
+                service_id,
+                assignment.task,
+                assignment.is_informational,
+            )
+            for service_id, events in service_events.items()
+            for event in events
+            for assignment in event.assignments
+        }
+    )
+    print("Задачи служений в файле:")
+    for service_id, task, is_informational in task_kinds:
+        label = "информационная" if is_informational else "обычная"
+        print(f"  {service_id}: {task} — {label}")
     templates = load_templates()
     sunday_str = selected_date.strftime("%d.%m.%Y")
 

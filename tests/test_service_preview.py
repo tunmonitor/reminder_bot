@@ -83,6 +83,50 @@ class ServicePreviewTest(unittest.TestCase):
                 any("Презентация — Иван" in issue for issue in preview["issues"])
             )
 
+    def test_preview_excludes_informational_tasks_from_group_and_personal_texts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ServiceRegistry(Path(temp_dir) / "registry.sqlite3")
+            registry.initialize(67890, -100)
+            registry.set_responsible_contact(
+                67890, "sound", "Праздник", "Дежурный", 12345
+            )
+            assignments = {
+                "Микшер": {
+                    "names": ["Алексей"],
+                    "is_informational": False,
+                },
+                "Праздник": {
+                    "names": ["Дежурный"],
+                    "is_informational": True,
+                },
+            }
+
+            async def run():
+                with patch(
+                    "bot.app._next_sunday_in_tz",
+                    return_value=date(2026, 10, 25),
+                ), patch(
+                    "bot.app._load_service_task_assignments",
+                    new=AsyncMock(return_value=assignments),
+                ):
+                    return await _prepare_service_test_previews(
+                        "sound",
+                        SimpleNamespace(admin_tg_id=67890),
+                        Path(temp_dir),
+                        ZoneInfo("UTC"),
+                        registry,
+                        logging.getLogger("test-info-preview"),
+                    )
+
+            preview = asyncio.run(run())
+
+            self.assertIn("Микшер", preview["group_text"])
+            self.assertNotIn("Праздник", preview["group_text"])
+            self.assertEqual(
+                [item["task"] for item in preview["personal_messages"]],
+                ["Микшер"],
+            )
+
     def test_task_loader_can_filter_assignments_to_one_sunday(self):
         from bot.app import _load_service_task_assignments
 
@@ -93,14 +137,29 @@ class ServicePreviewTest(unittest.TestCase):
                 SimpleNamespace(
                     event_date=target_sunday,
                     assignments=[
-                        SimpleNamespace(task="Звук", name="Алексей")
+                        SimpleNamespace(
+                            task="Звук",
+                            name="Алексей",
+                            is_informational=False,
+                        ),
+                        SimpleNamespace(
+                            task="Праздник",
+                            name="",
+                            is_informational=True,
+                        ),
                     ],
                 ),
                 SimpleNamespace(
                     event_date=next_sunday,
                     assignments=[
-                        SimpleNamespace(task="Звук", name="Мария"),
-                        SimpleNamespace(task="Слайды", name="Иван"),
+                        SimpleNamespace(
+                            task="Звук", name="Мария",
+                            is_informational=False,
+                        ),
+                        SimpleNamespace(
+                            task="Слайды", name="Иван",
+                            is_informational=False,
+                        ),
                     ],
                 ),
             ]
@@ -147,9 +206,25 @@ class ServicePreviewTest(unittest.TestCase):
 
         self.assertEqual(
             month_assignments,
-            {"Звук": ["Алексей", "Мария"], "Слайды": ["Иван"]},
+            {
+                "Звук": {
+                    "names": ["Алексей", "Мария"],
+                    "is_informational": False,
+                },
+                "Праздник": {"names": [], "is_informational": True},
+                "Слайды": {"names": ["Иван"], "is_informational": False},
+            },
         )
-        self.assertEqual(sunday_assignments, {"Звук": ["Алексей"]})
+        self.assertEqual(
+            sunday_assignments,
+            {
+                "Звук": {
+                    "names": ["Алексей"],
+                    "is_informational": False,
+                },
+                "Праздник": {"names": [], "is_informational": True},
+            },
+        )
 
     def test_malformed_template_is_reported_as_clear_value_error(self):
         with tempfile.TemporaryDirectory() as temp_dir:

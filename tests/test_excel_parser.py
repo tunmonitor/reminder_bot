@@ -12,6 +12,7 @@ from openpyxl.cell.read_only import ReadOnlyCell
 from openpyxl.styles import Border, Font, Side
 
 from bot.excel_parser import (
+    is_informational_name,
     parse_people,
     parse_schedule,
     parse_service_events,
@@ -54,6 +55,68 @@ class ExcelParserTest(unittest.TestCase):
         people.append(["Аркадий"])
         people.append(["Алексей", "alebzor", 181601986])
         workbook.save(self.path)
+
+    def test_is_informational_name_recognizes_markers_and_empty_names(self):
+        cases = (
+            ("* Задача", (True, "Задача")),
+            ("[*] Задача", (True, "Задача")),
+            ("[Задача]", (True, "Задача")),
+            ("*Задача", (True, "Задача")),
+            ("Задача*", (False, "Задача*")),
+            ("[]", (True, "")),
+            ("*", (True, "")),
+            ("Обычная задача", (False, "Обычная задача")),
+        )
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(is_informational_name(raw), expected)
+
+    def test_parse_service_events_keeps_marked_tasks_without_assignees(self):
+        workbook = Workbook()
+        schedule = workbook.active
+        schedule.title = "ОКТЯБРЬ26"
+        schedule.append(["СОБРАНИЕ", None, "ЗВУК", None])
+        schedule.append([date(2026, 10, 11), None, date(2026, 10, 11), None])
+        schedule.append(
+            ["* Причастие (В.П.)", "В.П.", "[*] Событие", "Дежурный"]
+        )
+        schedule.append(["[Праздник]", None, "*Звук"])
+        schedule.append(["Ведущий", "Аркадий", None, None])
+        workbook.save(self.path)
+        logger = MagicMock()
+
+        parsed = parse_service_events(
+            self.path, date(2026, 10, 1), logger
+        )
+
+        assembly = parsed["assembly"][0].assignments
+        self.assertEqual(
+            [
+                (item.task, item.name, item.is_informational)
+                for item in assembly
+            ],
+            [
+                ("Причастие (В.П.)", "В.П.", True),
+                ("Праздник", "", True),
+                ("Ведущий", "Аркадий", False),
+            ],
+        )
+        sound = parsed["sound"][0].assignments
+        self.assertEqual(
+            [
+                (item.task, item.name, item.is_informational)
+                for item in sound
+            ],
+            [
+                ("Событие", "Дежурный", True),
+                ("Звук", "", True),
+            ],
+        )
+        logger.debug.assert_any_call(
+            "Найдено информационных задач: %s; названия: %s",
+            4,
+            ["Звук", "Праздник", "Причастие (В.П.)", "Событие"],
+        )
 
     def test_parses_service_events_from_horizontal_monthly_blocks(self):
         workbook = Workbook()

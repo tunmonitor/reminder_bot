@@ -126,6 +126,55 @@ class PartialNotificationTest(unittest.TestCase):
 
         asyncio.run(send())
 
+    def test_informational_participant_is_not_sent_a_personal_message(self):
+        async def send():
+            bot = SimpleNamespace(
+                send_message=AsyncMock(
+                    return_value=SimpleNamespace(message_id=10)
+                )
+            )
+            assignments = {
+                "Ответственный": {
+                    "name": "Причастие",
+                    "username": "",
+                    "tg_id": 12345,
+                    "is_informational": True,
+                }
+            }
+            state = {
+                "participants": {
+                    "Ответственный": {
+                        "message_id": None,
+                        "chat_id": None,
+                    }
+                }
+            }
+            templates = {
+                "general": "Ответственный: @{tg_responsible}",
+                "roles": {"Ответственный": "{name}"},
+            }
+
+            await send_assignments(
+                bot=bot,
+                group_chat_id=-100,
+                admin_id=67890,
+                assignments=assignments,
+                state=state,
+                templates=templates,
+                sunday_str="11.10.2026",
+                sunday_iso="2026-10-11",
+                interaction_logger=MagicMock(),
+                debug_logger=MagicMock(),
+            )
+
+            bot.send_message.assert_awaited_once()
+            self.assertEqual(bot.send_message.await_args.args[0], -100)
+            self.assertTrue(
+                state["participants"]["Ответственный"]["notification_skipped"]
+            )
+
+        asyncio.run(send())
+
     def test_long_personal_message_is_rejected_with_admin_warning(self):
         async def send():
             bot = SimpleNamespace(

@@ -22,6 +22,7 @@ ROLES = ("Ответственный", "Ведущий", "Проповедник
 class ServiceAssignment:
     task: str
     name: str
+    is_informational: bool = False
 
 
 @dataclass(frozen=True)
@@ -129,6 +130,23 @@ def _clean(value) -> str:
     return str(value).strip()
 
 
+def is_informational_name(raw: str) -> tuple[bool, str]:
+    """Return whether a task label is informational and its unmarked name."""
+    text = _clean(raw)
+    if text.startswith("*"):
+        return True, text[1:].strip()
+    if text.startswith("["):
+        closing = text.find("]")
+        if closing >= 0:
+            wrapped_name = text[1:closing].strip()
+            suffix = text[closing + 1:].strip()
+            if wrapped_name == "*" and suffix:
+                return True, suffix
+            if not suffix:
+                return True, wrapped_name
+    return False, text
+
+
 def _normalized(value: str) -> str:
     return " ".join(value.casefold().replace("ё", "е").split())
 
@@ -222,6 +240,27 @@ def _parse_legacy_task_row(row) -> list[tuple[str, str]]:
     return assignments
 
 
+def _parse_legacy_event_row(row) -> list[ServiceAssignment]:
+    assignments = [
+        ServiceAssignment(task=role, name=name)
+        for role, name in _parse_legacy_task_row(row)
+    ]
+    if assignments:
+        return assignments
+    raw_task = _clean(row[1]) if len(row) > 1 else ""
+    is_informational, task = is_informational_name(raw_task)
+    if is_informational and task:
+        name = _clean(row[2]) if len(row) > 2 else ""
+        assignments.append(
+            ServiceAssignment(
+                task=task,
+                name=name,
+                is_informational=True,
+            )
+        )
+    return assignments
+
+
 def parse_schedule(path: Path, target: date,
                    debug_logger: logging.Logger) -> dict[str, str]:
     """Возвращает назначения трёх ролей для даты target."""
@@ -302,6 +341,7 @@ def parse_service_events(
         rows = list(worksheet.iter_rows(values_only=True))
         if not rows:
             raise RuntimeError(f"Лист расписания '{sheet_name}' пуст")
+        sheet_width = max(len(row) for row in rows)
 
         result: dict[str, list[ServiceEvent]] = {
             service.id: [] for service in SERVICES
@@ -321,9 +361,9 @@ def parse_service_events(
                     else len(rows)
                 )
                 assignments = tuple(
-                    ServiceAssignment(task=role, name=name)
+                    assignment
                     for row in rows[row_index + 1:next_row]
-                    for role, name in _parse_legacy_task_row(row)
+                    for assignment in _parse_legacy_event_row(row)
                 )
                 result["assembly"].append(
                     ServiceEvent(
@@ -337,6 +377,7 @@ def parse_service_events(
                 sheet_name,
                 len(result["assembly"]),
             )
+            _log_informational_tasks(result, debug_logger)
             return result
 
         aliases = {
@@ -370,7 +411,9 @@ def parse_service_events(
                 )
                 continue
             next_headers = [column for column in headers if column > start_column]
-            end_column = min(next_headers) - 1 if next_headers else len(rows[0]) - 1
+            end_column = (
+                min(next_headers) - 1 if next_headers else sheet_width - 1
+            )
             if service.assignment_layout == "pairs" and end_column < start_column + 1:
                 raise RuntimeError(
                     f"Для служения «{service.name}» на листе '{sheet_name}' "
@@ -396,16 +439,28 @@ def parse_service_events(
                 for row in rows[row_index + 1:next_row]:
                     if service.assignment_layout == "single":
                         name = _clean(row[start_column]) if len(row) > start_column else ""
-                        if name and _cell_date(name, month.year) is None:
+                        is_informational, task = is_informational_name(name)
+                        if is_informational and task:
+                            assignments.append(
+                                ServiceAssignment(
+                                    task=task,
+                                    name="",
+                                    is_informational=True,
+                                )
+                            )
+                        elif name and _cell_date(name, month.year) is None:
                             assignments.append(
                                 ServiceAssignment(task=service.name, name=name)
                             )
                         continue
 
-                    task_text = (
+                    raw_task_text = (
                         _clean(row[start_column])
                         if len(row) > start_column
                         else ""
+                    )
+                    is_informational, task_text = is_informational_name(
+                        raw_task_text
                     )
                     name = (
                         _clean(row[start_column + 1])
@@ -415,14 +470,22 @@ def parse_service_events(
                     task_label, separator, inline_name = task_text.partition(";")
                     if not name and separator:
                         name = inline_name.strip()
-                    if not name:
-                        continue
                     task = (
                         _canonical_role(task_label.strip())
                         or task_label.strip()
                         or service.name
                     )
-                    assignments.append(ServiceAssignment(task=task, name=name))
+                    if not name and not is_informational:
+                        continue
+                    if not task:
+                        continue
+                    assignments.append(
+                        ServiceAssignment(
+                            task=task,
+                            name=name,
+                            is_informational=is_informational,
+                        )
+                    )
 
                 result[service.id].append(
                     ServiceEvent(
@@ -436,9 +499,30 @@ def parse_service_events(
                     service.name, event_date, len(assignments),
                 )
 
+        _log_informational_tasks(result, debug_logger)
         return result
     finally:
         workbook.close()
+
+
+def _log_informational_tasks(
+    events_by_service: dict[str, list[ServiceEvent]],
+    debug_logger: logging.Logger,
+) -> None:
+    task_names = sorted(
+        {
+            assignment.task
+            for events in events_by_service.values()
+            for event in events
+            for assignment in event.assignments
+            if assignment.is_informational
+        }
+    )
+    debug_logger.debug(
+        "Найдено информационных задач: %s; названия: %s",
+        len(task_names),
+        task_names,
+    )
 
 
 def _telegram_id(value, allow_decorated: bool = False) -> int | None:

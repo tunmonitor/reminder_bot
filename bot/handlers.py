@@ -25,7 +25,12 @@ from aiogram.types import (
 )
 
 from .notifier import CONFIRM_PREFIX, _notify_admin
-from .presentation import format_task_assignments, task_emoji
+from .presentation import (
+    format_task_assignments,
+    task_assignment_names,
+    task_emoji,
+    task_is_informational,
+)
 from .ui import code as ui_code
 from .service_registry import (
     GROUP_TEMPLATE_FIELDS,
@@ -747,6 +752,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
 
         tasks = pending.get("schedule_tasks", [])
+        if operation == "service_contact":
+            tasks = [
+                task for task in tasks
+                if not task_is_informational(
+                    pending.get("schedule_assignments", {}).get(task, [])
+                )
+            ]
         page_size = 3
         page_count = max(1, (len(tasks) + page_size - 1) // page_size)
         page = min(max(page, 0), page_count - 1)
@@ -784,9 +796,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     actor_id, service_id, task
                 )
                 label = task if len(task) <= 48 else task[:45] + "..."
+                if task_is_informational(
+                    pending.get("schedule_assignments", {}).get(task, [])
+                ):
+                    label = f"ℹ️ {label} · инфо"
                 rows.append([
                     InlineKeyboardButton(
-                        text=f"{task_emoji(task)} {label}",
+                        text=(
+                            label
+                            if label.startswith("ℹ️ ")
+                            else f"{task_emoji(task)} {label}"
+                        ),
                         callback_data=f"notify_task:{token}",
                     )
                 ])
@@ -868,6 +888,19 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             return
 
+        if task_is_informational(
+            pending["schedule_assignments"].get(task, [])
+        ):
+            debug.debug(
+                "Отклонён выбор информационной записи для привязки: %s",
+                task,
+            )
+            await _send_dialog(
+                message,
+                "Эта запись — не задача, а пометка о дне служения.",
+                parse_mode=None,
+            )
+            return
         pending["step"] = "choose_contact_person"
         pending["active_task"] = task
         for token, choice in list(pending_contact_person_choices.items()):
@@ -882,7 +915,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         }
         rows = []
         bound_count = 0
-        names = pending["schedule_assignments"][task]
+        names = task_assignment_names(
+            pending["schedule_assignments"][task]
+        )
         for person_name in names:
             contact = contacts_by_name.get(person_name)
             if contact:
@@ -986,7 +1021,22 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             return False
         pending["schedule_assignments"] = assignments
-        pending["schedule_tasks"] = sorted(assignments)
+        pending["schedule_tasks"] = sorted(
+            task
+            for task, task_info in assignments.items()
+            if not task_is_informational(task_info)
+        )
+        informational_tasks = sorted(
+            task
+            for task, task_info in assignments.items()
+            if task_is_informational(task_info)
+        )
+        if informational_tasks:
+            debug.debug(
+                "Информационные записи исключены из привязок для %s: %s",
+                service_id,
+                informational_tasks,
+            )
         pending["registered_contacts"] = {}
         for contact in contacts:
             pending["registered_contacts"].setdefault(
@@ -1440,9 +1490,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         pending["active_task"] = task
         pending["step"] = "notify_template"
+        is_informational = task_is_informational(
+            pending.get("schedule_assignments", {}).get(task, [])
+        )
+        display_task = (
+            f"ℹ️ {task} · инфо" if is_informational else task
+        )
         text = (
             f"Введите индивидуальный текст напоминания для задачи "
-            f"«{task}». Шаблоны: {{name}}, {{task}}, {{service_name}}, "
+            f"«{display_task}». Шаблоны: {{name}}, {{task}}, {{service_name}}, "
             f"{{sunday_date}}, {{telegram_id}}, {{username}}.\n\n"
             + await notification_template_preview(
                 actor_id, service_id, task
@@ -3108,8 +3164,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("step") != "choose_contact_person"
             or pending.get("active_task") != selection[2]
             or selection[3]
-            not in pending.get("schedule_assignments", {}).get(
-                selection[2], []
+            not in task_assignment_names(
+                pending.get("schedule_assignments", {}).get(selection[2], [])
             )
         ):
             await _answer_callback(callback,"⚠️ Выбор устарел. Начните команду заново.")
@@ -3374,18 +3430,37 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         clear_pending_actor(actor_id)
 
     async def current_personal_tasks(
-        registry: Any, actor_id: int, service_id: str, state: dict[str, Any]
+        registry: Any,
+        actor_id: int,
+        service_id: str,
+        state: dict[str, Any],
+        *,
+        force_refresh: bool = False,
     ) -> list[str]:
         task_cache = state.setdefault("task_cache", {})
-        if service_id not in task_cache:
+        if force_refresh or service_id not in task_cache:
             assigned = set(registry.list_user_tasks(actor_id, service_id))
             loader = getattr(context, "load_service_task_assignments", None)
             if loader is None:
                 raise ValueError("Не удалось проверить актуальный график служения.")
             current_assignments = await loader(service_id)
             task_cache[service_id] = [
-                task for task in current_assignments if task in assigned
+                task
+                for task, task_info in current_assignments.items()
+                if task in assigned and not task_is_informational(task_info)
             ]
+            informational_tasks = sorted(
+                task
+                for task, task_info in current_assignments.items()
+                if task_is_informational(task_info)
+            )
+            if informational_tasks:
+                debug.debug(
+                    "Информационные задачи исключены из личных уведомлений "
+                    "для пользователя %s: %s",
+                    actor_id,
+                    informational_tasks,
+                )
         assigned_now = set(registry.list_user_tasks(actor_id, service_id))
         return [task for task in task_cache[service_id] if task in assigned_now]
 
@@ -3766,13 +3841,23 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             elif action_name == "open_task":
                 service_id, task = payload["service_id"], payload["task"]
                 if task not in await current_personal_tasks(
-                    registry, actor_id, service_id, state
+                    registry, actor_id, service_id, state, force_refresh=True
                 ):
                     raise ValueError("Вы больше не привязаны к этой задаче.")
                 push_personal_level(
                     state, {"name": "task", "service_id": service_id, "task": task}
                 )
             elif action_name == "edit_text":
+                if payload["task"] not in await current_personal_tasks(
+                    registry,
+                    actor_id,
+                    payload["service_id"],
+                    state,
+                    force_refresh=True,
+                ):
+                    raise ValueError(
+                        "Для информационной записи нельзя задать личный текст."
+                    )
                 state["operation"] = "my_notifications_input"
                 state["screen_id"] = secrets.token_urlsafe(8)
                 state["input"] = {
@@ -3794,10 +3879,20 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await _answer_callback(callback)
                 return
             elif action_name == "reset_text":
+                if payload["task"] not in await current_personal_tasks(
+                    registry, actor_id, payload["service_id"], state,
+                    force_refresh=True,
+                ):
+                    raise ValueError("Эта задача недоступна для личных уведомлений.")
                 registry.upsert_user_text(
                     actor_id, payload["service_id"], payload["task"], None
                 )
             elif action_name == "delete_text":
+                if payload["task"] not in await current_personal_tasks(
+                    registry, actor_id, payload["service_id"], state,
+                    force_refresh=True,
+                ):
+                    raise ValueError("Эта задача недоступна для личных уведомлений.")
                 push_personal_level(
                     state,
                     {
@@ -3807,6 +3902,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     },
                 )
             elif action_name == "confirm_delete_text":
+                if payload["task"] not in await current_personal_tasks(
+                    registry, actor_id, payload["service_id"], state,
+                    force_refresh=True,
+                ):
+                    raise ValueError("Эта задача недоступна для личных уведомлений.")
                 registry.delete_user_text(
                     actor_id, payload["service_id"], payload["task"]
                 )
@@ -3814,7 +3914,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             elif action_name == "open_schedules":
                 service_id, task = payload["service_id"], payload["task"]
                 if task not in await current_personal_tasks(
-                    registry, actor_id, service_id, state
+                    registry,
+                    actor_id,
+                    service_id,
+                    state,
+                    force_refresh=True,
                 ):
                     raise ValueError("Вы больше не привязаны к этой задаче.")
                 registry.ensure_user_text(actor_id, service_id, task)
@@ -3911,6 +4015,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             input_state = pending.get("input", {})
             try:
                 if input_state.get("type") == "text":
+                    if input_state["task"] not in await current_personal_tasks(
+                        registry,
+                        message.from_user.id,
+                        input_state["service_id"],
+                        pending,
+                        force_refresh=True,
+                    ):
+                        raise ValueError(
+                            "Для информационной или отсутствующей в актуальном "
+                            "графике записи нельзя задать личный текст."
+                        )
                     registry.upsert_user_text(
                         message.from_user.id,
                         input_state["service_id"],
@@ -3934,7 +4049,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         input_state["service_id"], input_state["task"]
                     )
                     if task not in await current_personal_tasks(
-                        registry, message.from_user.id, service_id, pending
+                        registry,
+                        message.from_user.id,
+                        service_id,
+                        pending,
+                        force_refresh=True,
                     ):
                         raise ValueError("Вы больше не привязаны к этой задаче.")
                     text_entry_id = registry.ensure_user_text(

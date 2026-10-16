@@ -911,6 +911,97 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_personal_notification_screens_exclude_informational_tasks(self):
+        async def run():
+            actor_id = 4404
+            self.registry.set_responsible_contact(
+                67890, "sound", "Микшер", "Алексей", actor_id
+            )
+            self.registry.set_responsible_contact(
+                67890, "sound", "Праздник", "Дежурный", actor_id
+            )
+            self.context.load_service_task_assignments = AsyncMock(
+                return_value={
+                    "Микшер": {
+                        "names": ["Алексей"],
+                        "is_informational": False,
+                    },
+                    "Праздник": {
+                        "names": ["Дежурный"],
+                        "is_informational": True,
+                    },
+                }
+            )
+            message_id = 200
+
+            def message(text=""):
+                nonlocal message_id
+                message_id += 1
+                return SimpleNamespace(
+                    from_user=SimpleNamespace(id=actor_id),
+                    chat=SimpleNamespace(type="private", id=actor_id),
+                    text=text,
+                    answer=AsyncMock(
+                        return_value=SimpleNamespace(message_id=message_id)
+                    ),
+                )
+
+            def callback(data):
+                return SimpleNamespace(
+                    data=data,
+                    from_user=SimpleNamespace(id=actor_id),
+                    message=message(),
+                    answer=AsyncMock(),
+                )
+
+            handler = self.callback_handler(
+                "on_personal_notifications_callback"
+            )
+            command = message("/my_notifications")
+            await next(
+                item.callback
+                for item in self.admin_router.message.handlers
+                if item.callback.__name__ == "on_my_notifications"
+            )(command)
+            service_button = next(
+                button
+                for row in command.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if "ЗВУК" in button.text
+            )
+            service_callback = callback(service_button.callback_data)
+            await handler(service_callback)
+            service_text = service_callback.message.answer.await_args.args[0]
+            self.assertIn("Доступно задач: 1", service_text)
+
+            texts_button = next(
+                button
+                for row in service_callback.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.text == "📝 Мои тексты"
+            )
+            texts_callback = callback(texts_button.callback_data)
+            await handler(texts_callback)
+            texts_markup = texts_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            task_labels = [
+                button.text
+                for row in texts_markup.inline_keyboard
+                for button in row
+            ]
+            self.assertTrue(any("Микшер" in label for label in task_labels))
+            self.assertFalse(any("Праздник" in label for label in task_labels))
+            self.assertIsNone(
+                self.registry.get_user_text(actor_id, "sound", "Праздник")
+            )
+
+        asyncio.run(run())
+
     def test_personal_notifications_bulk_toggle_preserves_rules_and_conflicts(self):
         async def run():
             actor_id = 4004
@@ -1825,7 +1916,16 @@ class ServiceManagementHandlerTest(unittest.TestCase):
     def test_personal_template_prompt_displays_single_braced_names(self):
         async def run():
             self.context.load_service_task_assignments = AsyncMock(
-                return_value={"Микшер": ["Алексей"]}
+                return_value={
+                    "Микшер": {
+                        "names": ["Алексей"],
+                        "is_informational": False,
+                    },
+                    "Причастие": {
+                        "names": [],
+                        "is_informational": True,
+                    },
+                }
             )
             command = self.message(67890, "/service_notify")
             await self.admin_router.message.handlers[6].callback(command)
@@ -1867,7 +1967,14 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 button
                 for row in task_keyboard.inline_keyboard
                 for button in row
-                if button.text.endswith("Микшер")
+                if button.text == "ℹ️ Причастие · инфо"
+            )
+            self.assertTrue(
+                any(
+                    button.text.endswith("Микшер")
+                    for row in task_keyboard.inline_keyboard
+                    for button in row
+                )
             )
             task_callback = SimpleNamespace(
                 data=task_button.callback_data,
@@ -1882,6 +1989,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 task_callback
             )
             prompt = task_callback.message.answer.await_args.args[0]
+            self.assertIn("ℹ️ Причастие · инфо", prompt)
             for placeholder in (
                 "{name}",
                 "{task}",
@@ -2179,6 +2287,18 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
     def test_service_sync_refreshes_schedule_and_shows_existing_links(self):
         async def run():
+            self.context.load_service_task_assignments = AsyncMock(
+                return_value={
+                    "Микшер": {
+                        "names": ["Имя из расписания"],
+                        "is_informational": False,
+                    },
+                    "Праздник": {
+                        "names": ["Пометка"],
+                        "is_informational": True,
+                    },
+                }
+            )
             self.registry.set_responsible_contact(
                 67890, "sound", "Микшер", "Имя из расписания", 11111
             )
@@ -2236,6 +2356,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             await self.callback_handler("on_task_choice")(task_callback)
             contact_screen = task_callback.message.answer.await_args
             self.assertIn("Привязано 1 из 1", contact_screen.args[0])
+            self.assertNotIn("Праздник", output)
+            self.assertNotIn("Праздник", contact_screen.args[0])
             self.assertTrue(
                 contact_screen.kwargs["reply_markup"]
                 .inline_keyboard[0][0].text.startswith("✅ ")
