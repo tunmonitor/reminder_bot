@@ -32,7 +32,13 @@ from .service_registry import (
     PERSONAL_TEMPLATE_FIELDS,
     validate_notification_template,
 )
-from .ui import callback_text, render_screen_chunks, validate_inline_keyboard
+from .ui import (
+    callback_text,
+    layout_buttons,
+    nav_row,
+    render_screen_chunks,
+    validate_inline_keyboard,
+)
 
 router = Router()
 
@@ -145,9 +151,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 ):
                     button.text = f"📋 {label}"
 
-            rows = [list(row) for row in markup.inline_keyboard]
-            if any(len(row) > 3 for row in rows):
-                rows = [[button] for button in buttons]
             if len(buttons) > 6:
                 page_size = 4
                 pinned_buttons = [
@@ -168,7 +171,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 page_buttons = pageable_buttons[
                     _dialog_page * page_size:(_dialog_page + 1) * page_size
                 ]
-                rows = [[button] for button in page_buttons]
                 navigation = []
                 for action, next_page, label in (
                     ("prev", _dialog_page - 1, "⬅️ Назад"),
@@ -186,15 +188,32 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                                 callback_data=f"ui_page:{token}",
                             )
                         )
-                if navigation:
-                    rows.append(navigation)
-                if pinned_buttons:
-                    rows.extend([[button] for button in pinned_buttons])
+                navigation = nav_row(
+                    back=next(
+                        (
+                            button for button in navigation
+                            if button.text.startswith("⬅️")
+                        ),
+                        None,
+                    ),
+                    save=next(
+                        (
+                            button for button in navigation
+                            if button.text.endswith("➡️")
+                        ),
+                        None,
+                    ),
+                )
+                rows = layout_buttons(
+                    [*page_buttons, *navigation, *pinned_buttons]
+                )
                 validate_inline_keyboard(rows)
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
                 text = f"{text}\n📊 Страница {_dialog_page + 1}/{page_count}"
             else:
+                rows = layout_buttons(buttons)
                 validate_inline_keyboard(rows)
+                markup = InlineKeyboardMarkup(inline_keyboard=rows)
 
         chunks = render_screen_chunks(text)
         sent_message = None

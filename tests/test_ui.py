@@ -10,6 +10,8 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from bot.ui import (
     callback_text,
     code,
+    layout_buttons,
+    nav_row,
     render_screen_chunks,
     send_telegram_screen,
     validate_inline_keyboard,
@@ -56,6 +58,87 @@ class DialogRenderingTest(unittest.TestCase):
                 [InlineKeyboardButton(text=str(index), callback_data=str(index))]
                 for index in range(7)
             ])
+
+    def test_layout_buttons_keeps_long_buttons_on_separate_rows(self):
+        buttons = [
+            InlineKeyboardButton(
+                text="📝 Текст группового сообщения", callback_data="group"
+            )
+        ]
+
+        self.assertEqual(layout_buttons(buttons), [buttons])
+
+    def test_layout_buttons_pairs_short_buttons(self):
+        buttons = [
+            InlineKeyboardButton(text="✅ Включить", callback_data="on"),
+            InlineKeyboardButton(text="✖️ Выключить", callback_data="off"),
+        ]
+
+        self.assertEqual(layout_buttons(buttons), [buttons])
+
+    def test_layout_buttons_places_three_very_short_buttons_together(self):
+        buttons = [
+            InlineKeyboardButton(text=f"{day} дн.", callback_data=str(day))
+            for day in range(3)
+        ]
+
+        self.assertEqual(layout_buttons(buttons), [buttons])
+
+    def test_layout_buttons_wraps_four_medium_buttons_as_pairs(self):
+        buttons = [
+            InlineKeyboardButton(
+                text=f"Средняя кнопка {index}", callback_data=str(index)
+            )
+            for index in range(4)
+        ]
+
+        self.assertEqual(
+            [[button.text for button in row] for row in layout_buttons(buttons)],
+            [
+                ["Средняя кнопка 0", "Средняя кнопка 1"],
+                ["Средняя кнопка 2", "Средняя кнопка 3"],
+            ],
+        )
+
+    def test_layout_buttons_moves_navigation_to_end_even_if_given_first(self):
+        buttons = [
+            InlineKeyboardButton(text="⬅️ Назад", callback_data="back"),
+            InlineKeyboardButton(text="Задача А", callback_data="a"),
+            InlineKeyboardButton(text="Задача Б", callback_data="b"),
+        ]
+
+        rows = layout_buttons(buttons)
+
+        self.assertEqual(
+            [[button.text for button in row] for row in rows],
+            [["Задача А", "Задача Б"], ["⬅️ Назад"]],
+        )
+
+    def test_layout_buttons_keeps_semantic_action_buttons_separate(self):
+        buttons = [
+            InlineKeyboardButton(
+                text="⏰ Напоминания (3)", callback_data="reminders"
+            ),
+            InlineKeyboardButton(
+                text="📝 Групповой текст", callback_data="group"
+            ),
+            InlineKeyboardButton(text="Задача A", callback_data="task"),
+        ]
+
+        self.assertEqual(
+            [[button.text for button in row] for row in layout_buttons(buttons)],
+            [
+                ["⏰ Напоминания (3)"],
+                ["📝 Групповой текст"],
+                ["Задача A"],
+            ],
+        )
+
+    def test_nav_row_omits_missing_controls_and_keeps_declared_order(self):
+        back = InlineKeyboardButton(text="⬅️ Назад", callback_data="back")
+        cancel = InlineKeyboardButton(text="✖️ Отмена", callback_data="cancel")
+
+        self.assertEqual(nav_row(back=back, cancel=cancel), [back, cancel])
 
     def test_pagination_attaches_markup_only_to_last_screen(self):
         async def send():

@@ -7,12 +7,14 @@ import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from aiogram.types import InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 MAX_SCREEN_UNITS = 500
 MAX_CALLBACK_UNITS = 200
 _CODE_MARKER = re.compile(r"\x00CODE:([A-Za-z0-9_-]+)\x00")
 _STATUS_PREFIX = re.compile(r"^(?:✅|❌|⚠️|ℹ️|⏳)\s*")
+_NAVIGATION_PREFIXES = ("⬅️", "✖️", "✅", "➡️", "↩️", "🏠")
+_SINGLE_ACTION_PREFIXES = ("⏰", "📝", "➕")
 
 
 def code(value: int | str | None) -> str:
@@ -127,6 +129,85 @@ def validate_inline_keyboard(rows: list[list[object]]) -> None:
                 and len(callback_data.encode("utf-8")) > 64
             ):
                 raise ValueError("callback_data не может превышать 64 байта.")
+
+
+def nav_row(
+    back: InlineKeyboardButton | None = None,
+    save: InlineKeyboardButton | None = None,
+    cancel: InlineKeyboardButton | None = None,
+) -> list[InlineKeyboardButton]:
+    """Build a navigation row from whichever navigation buttons are present."""
+    return [button for button in (back, save, cancel) if button is not None]
+
+
+def layout_buttons(
+    buttons: list[InlineKeyboardButton],
+    *,
+    max_row_width: int = 40,
+    max_row_buttons: int = 3,
+    short_button: int = 20,
+    very_short_button: int = 15,
+) -> list[list[InlineKeyboardButton]]:
+    """Arrange flat inline buttons into compact rows, keeping navigation last."""
+    if (
+        max_row_width <= 0
+        or max_row_buttons <= 0
+        or short_button < 0
+        or very_short_button < 0
+    ):
+        raise ValueError("Параметры компоновки кнопок должны быть положительными.")
+
+    def is_navigation(button: InlineKeyboardButton) -> bool:
+        return button.text.startswith(_NAVIGATION_PREFIXES) or button.text.endswith(
+            "➡️"
+        )
+
+    navigation = [button for button in buttons if is_navigation(button)]
+    regular = [button for button in buttons if not is_navigation(button)]
+    rows: list[list[InlineKeyboardButton]] = []
+    current: list[InlineKeyboardButton] = []
+
+    def flush() -> None:
+        if current:
+            rows.append(current.copy())
+            current.clear()
+
+    for button in regular:
+        label = button.text
+        if len(label) > short_button or label.startswith(
+            _SINGLE_ACTION_PREFIXES
+        ):
+            flush()
+            rows.append([button])
+            continue
+
+        proposed = [*current, button]
+        proposed_width = sum(len(item.text) for item in proposed) + (
+            2 * (len(proposed) - 1)
+        )
+        max_buttons = (
+            max_row_buttons
+            if all(len(item.text) <= very_short_button for item in proposed)
+            else min(2, max_row_buttons)
+        )
+        if (
+            len(proposed) > max_buttons
+            or proposed_width > max_row_width
+        ):
+            flush()
+            current.append(button)
+        else:
+            current.append(button)
+    flush()
+
+    if len(navigation) in {2, 3} and max_row_buttons >= len(navigation):
+        if all(len(button.text) <= 24 for button in navigation):
+            rows.append(navigation)
+        else:
+            rows.extend([[button] for button in navigation])
+    else:
+        rows.extend([[button] for button in navigation])
+    return rows
 
 
 async def send_telegram_screen(

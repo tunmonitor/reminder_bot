@@ -1022,6 +1022,48 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_service_list_paginates_seven_or_more_buttons(self):
+        async def run():
+            handler = next(
+                item.callback
+                for item in self.admin_router.message.handlers
+                if item.callback.__name__ == "on_services"
+            )
+            message = self.message(67890, "/services")
+            await handler(message)
+
+            first_markup = message.answer.await_args.kwargs["reply_markup"]
+            first_buttons = [
+                button
+                for row in first_markup.inline_keyboard
+                for button in row
+            ]
+            self.assertLessEqual(len(first_buttons), 6)
+            self.assertTrue(
+                any(button.callback_data.startswith("ui_page:") for button in first_buttons)
+            )
+            self.assertIn("Страница 1/2", message.answer.await_args.args[0])
+
+            next_button = next(
+                button
+                for button in first_buttons
+                if button.callback_data.startswith("ui_page:")
+            )
+            callback = SimpleNamespace(
+                data=next_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=message,
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_dialog_page")(callback)
+            second_markup = message.answer.await_args.kwargs["reply_markup"]
+            self.assertLessEqual(
+                sum(len(row) for row in second_markup.inline_keyboard), 6
+            )
+            self.assertIn("Страница 2/2", message.answer.await_args.args[0])
+
+        asyncio.run(run())
+
     def test_super_admin_can_configure_chat_admin_and_contact(self):
         async def run():
             handlers = self.admin_router.message.handlers
