@@ -125,6 +125,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         **kwargs,
     ) -> Message | None:
         kwargs.pop("parse_mode", None)
+        keyboard_limit = kwargs.pop("_dialog_keyboard_limit", 6)
         markup = kwargs.pop("reply_markup", None)
         if isinstance(markup, InlineKeyboardMarkup):
             actor_id = getattr(getattr(target, "chat", None), "id", None)
@@ -151,7 +152,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 ):
                     button.text = f"📋 {label}"
 
-            if len(buttons) > 6:
+            if len(buttons) > keyboard_limit:
                 page_size = 4
                 pinned_buttons = [
                     button
@@ -207,12 +208,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 rows = layout_buttons(
                     [*page_buttons, *navigation, *pinned_buttons]
                 )
-                validate_inline_keyboard(rows)
+                validate_inline_keyboard(rows, max_buttons=keyboard_limit)
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
                 text = f"{text}\n📊 Страница {_dialog_page + 1}/{page_count}"
             else:
                 rows = layout_buttons(buttons)
-                validate_inline_keyboard(rows)
+                validate_inline_keyboard(rows, max_buttons=keyboard_limit)
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
 
         chunks = render_screen_chunks(text)
@@ -1812,6 +1813,19 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     message.from_user.id, service["id"]
                 )
             ]
+            service_order = (
+                "assembly", "broadcast", "slides", "order",
+                "kitchen", "coffee", "sound", "rehearsal",
+            )
+            service_rank = {
+                service_id: index
+                for index, service_id in enumerate(service_order)
+            }
+            visible.sort(
+                key=lambda service: service_rank.get(
+                    service["id"], len(service_rank)
+                )
+            )
             if not visible:
                 await _send_dialog(message, "ℹ️ Вы не назначены администратором служений.",
                     parse_mode=None,
@@ -1842,6 +1856,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             message,
             "📋 Служения\nℹ️ Выберите служение для просмотра настроек.",
             reply_markup=keyboard,
+            _dialog_keyboard_limit=8,
         )
 
     @admin_router.message(Command("service_settings"))

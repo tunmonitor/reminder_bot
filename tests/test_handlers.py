@@ -1022,7 +1022,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_service_list_paginates_seven_or_more_buttons(self):
+    def test_service_list_shows_all_eight_services_in_requested_order(self):
         async def run():
             handler = next(
                 item.callback
@@ -1032,35 +1032,26 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             message = self.message(67890, "/services")
             await handler(message)
 
-            first_markup = message.answer.await_args.kwargs["reply_markup"]
-            first_buttons = [
-                button
-                for row in first_markup.inline_keyboard
-                for button in row
-            ]
-            self.assertLessEqual(len(first_buttons), 6)
-            self.assertTrue(
-                any(button.callback_data.startswith("ui_page:") for button in first_buttons)
+            markup = message.answer.await_args.kwargs["reply_markup"]
+            self.assertEqual(
+                [
+                    [button.callback_data.rsplit(":", 1)[-1] for button in row]
+                    for row in markup.inline_keyboard
+                ],
+                [
+                    ["assembly", "broadcast", "slides"],
+                    ["order", "kitchen", "coffee"],
+                    ["sound", "rehearsal"],
+                ],
             )
-            self.assertIn("Страница 1/2", message.answer.await_args.args[0])
-
-            next_button = next(
-                button
-                for button in first_buttons
-                if button.callback_data.startswith("ui_page:")
+            self.assertEqual(sum(map(len, markup.inline_keyboard)), 8)
+            self.assertFalse(
+                any(
+                    button.callback_data.startswith("ui_page:")
+                    for row in markup.inline_keyboard
+                    for button in row
+                )
             )
-            callback = SimpleNamespace(
-                data=next_button.callback_data,
-                from_user=SimpleNamespace(id=67890),
-                message=message,
-                answer=AsyncMock(),
-            )
-            await self.callback_handler("on_dialog_page")(callback)
-            second_markup = message.answer.await_args.kwargs["reply_markup"]
-            self.assertLessEqual(
-                sum(len(row) for row in second_markup.inline_keyboard), 6
-            )
-            self.assertIn("Страница 2/2", message.answer.await_args.args[0])
 
         asyncio.run(run())
 

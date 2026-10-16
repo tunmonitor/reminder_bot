@@ -115,12 +115,18 @@ def callback_text(text: str | None) -> str | None:
     return "".join(shortened)
 
 
-def validate_inline_keyboard(rows: list[list[object]]) -> None:
+def validate_inline_keyboard(
+    rows: list[list[object]], *, max_buttons: int = 6
+) -> None:
     """Raise when a screen's inline keyboard exceeds Telegram design limits."""
+    if max_buttons <= 0:
+        raise ValueError("Лимит кнопок на экране должен быть положительным.")
     if any(len(row) > 3 for row in rows):
         raise ValueError("В одном ряду допускается не более 3 кнопок.")
-    if sum(map(len, rows)) > 6:
-        raise ValueError("На одном экране допускается не более 6 кнопок.")
+    if sum(map(len, rows)) > max_buttons:
+        raise ValueError(
+            f"На одном экране допускается не более {max_buttons} кнопок."
+        )
     for row in rows:
         for button in row:
             callback_data = getattr(button, "callback_data", None)
