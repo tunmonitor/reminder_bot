@@ -6,6 +6,7 @@ import logging
 import re
 import secrets
 import sqlite3
+import time
 from typing import Any
 
 from aiogram import F, Dispatcher, Router
@@ -48,6 +49,7 @@ from .ui import (
 )
 
 router = Router()
+PERSONAL_TASK_CACHE_TTL_SECONDS = 300
 
 
 async def _answer_callback(
@@ -3434,11 +3436,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         actor_id: int,
         service_id: str,
         state: dict[str, Any],
-        *,
-        force_refresh: bool = False,
     ) -> list[str]:
         task_cache = state.setdefault("task_cache", {})
-        if force_refresh or service_id not in task_cache:
+        task_cache_updated = state.setdefault("task_cache_updated", {})
+        now = time.monotonic()
+        if (
+            service_id not in task_cache
+            or now - task_cache_updated.get(service_id, 0)
+            >= PERSONAL_TASK_CACHE_TTL_SECONDS
+        ):
             assigned = set(registry.list_user_tasks(actor_id, service_id))
             loader = getattr(context, "load_service_task_assignments", None)
             if loader is None:
@@ -3461,6 +3467,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     actor_id,
                     informational_tasks,
                 )
+            task_cache_updated[service_id] = time.monotonic()
         assigned_now = set(registry.list_user_tasks(actor_id, service_id))
         return [task for task in task_cache[service_id] if task in assigned_now]
 
@@ -3570,10 +3577,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             tasks = await current_personal_tasks(
                 registry, actor_id, service_id, state
             )
+            available_tasks = set(tasks)
             texts = {
                 item["task"]: item
                 for item in registry.list_user_texts(actor_id, service_id)
             }
+            tasks.extend(task for task in texts if task not in tasks)
             text = "📝 Личные тексты\nВыберите задачу для настройки:"
             for task in tasks:
                 item = texts.get(task)
@@ -3581,11 +3590,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     registry.list_schedules(item["id"]) if item else []
                 )
                 status = "свой текст" if item and item["body"] else "по умолчанию"
+                unavailable = (
+                    " · задача недоступна"
+                    if task not in available_tasks
+                    else ""
+                )
                 buttons.append(
                     personal_action_button(
                         actor_id,
                         state,
-                        f"{task[:36]} · {status} · правил {len(schedules)}",
+                        f"{task[:36]}{unavailable} · {status} · "
+                        f"правил {len(schedules)}",
                         "open_task",
                         service_id=service_id,
                         task=task,
@@ -3596,11 +3611,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
         elif name in {"task", "delete_text"}:
             service_id, task = level["service_id"], level["task"]
-            if task not in await current_personal_tasks(
-                registry, actor_id, service_id, state
-            ):
-                raise ValueError("Привязка задачи изменилась. Откройте меню заново.")
             text_entry = registry.get_user_text(actor_id, service_id, task)
+            if name == "delete_text" and text_entry is None:
+                raise ValueError("Личный текст больше не существует.")
             body = text_entry["body"] if text_entry else None
             if name == "delete_text":
                 text = f"Удалить личный текст и его правила для задачи «{task}»?"
@@ -3634,17 +3647,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     ),
                 ]
                 if body:
-                    buttons.extend(
-                        [
-                            personal_action_button(
-                                actor_id, state, "🔄 Вернуть стандартный",
-                                "reset_text", service_id=service_id, task=task,
-                            ),
-                            personal_action_button(
-                                actor_id, state, "🗑 Удалить текст",
-                                "delete_text", service_id=service_id, task=task,
-                            ),
-                        ]
+                    buttons.append(
+                        personal_action_button(
+                            actor_id, state, "🔄 Вернуть стандартный",
+                            "reset_text", service_id=service_id, task=task,
+                        )
+                    )
+                if text_entry is not None:
+                    buttons.append(
+                        personal_action_button(
+                            actor_id, state, "🗑 Удалить текст",
+                            "delete_text", service_id=service_id, task=task,
+                        )
                     )
                 buttons.append(
                     personal_action_button(actor_id, state, "⬅️ Назад", "back")
@@ -3840,8 +3854,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
             elif action_name == "open_task":
                 service_id, task = payload["service_id"], payload["task"]
-                if task not in await current_personal_tasks(
-                    registry, actor_id, service_id, state, force_refresh=True
+                text_entry = registry.get_user_text(actor_id, service_id, task)
+                if text_entry is None and task not in await current_personal_tasks(
+                    registry, actor_id, service_id, state
                 ):
                     raise ValueError("Вы больше не привязаны к этой задаче.")
                 push_personal_level(
@@ -3853,10 +3868,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     actor_id,
                     payload["service_id"],
                     state,
-                    force_refresh=True,
                 ):
                     raise ValueError(
-                        "Для информационной записи нельзя задать личный текст."
+                        "Эта задача недоступна для личных уведомлений."
                     )
                 state["operation"] = "my_notifications_input"
                 state["screen_id"] = secrets.token_urlsafe(8)
@@ -3879,19 +3893,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await _answer_callback(callback)
                 return
             elif action_name == "reset_text":
-                if payload["task"] not in await current_personal_tasks(
-                    registry, actor_id, payload["service_id"], state,
-                    force_refresh=True,
-                ):
+                if registry.get_user_text(
+                    actor_id, payload["service_id"], payload["task"]
+                ) is None:
                     raise ValueError("Эта задача недоступна для личных уведомлений.")
-                registry.upsert_user_text(
-                    actor_id, payload["service_id"], payload["task"], None
+                registry.reset_user_text(
+                    actor_id, payload["service_id"], payload["task"]
                 )
             elif action_name == "delete_text":
-                if payload["task"] not in await current_personal_tasks(
-                    registry, actor_id, payload["service_id"], state,
-                    force_refresh=True,
-                ):
+                if registry.get_user_text(
+                    actor_id, payload["service_id"], payload["task"]
+                ) is None:
                     raise ValueError("Эта задача недоступна для личных уведомлений.")
                 push_personal_level(
                     state,
@@ -3902,10 +3914,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     },
                 )
             elif action_name == "confirm_delete_text":
-                if payload["task"] not in await current_personal_tasks(
-                    registry, actor_id, payload["service_id"], state,
-                    force_refresh=True,
-                ):
+                if registry.get_user_text(
+                    actor_id, payload["service_id"], payload["task"]
+                ) is None:
                     raise ValueError("Эта задача недоступна для личных уведомлений.")
                 registry.delete_user_text(
                     actor_id, payload["service_id"], payload["task"]
@@ -3918,7 +3929,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     actor_id,
                     service_id,
                     state,
-                    force_refresh=True,
                 ):
                     raise ValueError("Вы больше не привязаны к этой задаче.")
                 registry.ensure_user_text(actor_id, service_id, task)
@@ -4020,11 +4030,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         message.from_user.id,
                         input_state["service_id"],
                         pending,
-                        force_refresh=True,
                     ):
                         raise ValueError(
-                            "Для информационной или отсутствующей в актуальном "
-                            "графике записи нельзя задать личный текст."
+                            "Эта задача недоступна для личных уведомлений."
                         )
                     registry.upsert_user_text(
                         message.from_user.id,
@@ -4053,7 +4061,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         message.from_user.id,
                         service_id,
                         pending,
-                        force_refresh=True,
                     ):
                         raise ValueError("Вы больше не привязаны к этой задаче.")
                     text_entry_id = registry.ensure_user_text(
@@ -4086,6 +4093,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 debug.exception("Не удалось сохранить настройки личного уведомления")
                 await _send_dialog(
                     message, "❌ Не удалось сохранить настройки. Попробуйте позже.",
+                    parse_mode=None,
+                )
+            except (OSError, RuntimeError):
+                debug.exception(
+                    "Не удалось сверить задачи с актуальным графиком"
+                )
+                await _send_dialog(
+                    message,
+                    "Не удалось сверить задачи с актуальным графиком. "
+                    "Попробуйте позже.",
                     parse_mode=None,
                 )
             return

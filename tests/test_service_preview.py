@@ -157,6 +157,10 @@ class ServicePreviewTest(unittest.TestCase):
                             is_informational=False,
                         ),
                         SimpleNamespace(
+                            task="Звук", name="",
+                            is_informational=True,
+                        ),
+                        SimpleNamespace(
                             task="Слайды", name="Иван",
                             is_informational=False,
                         ),

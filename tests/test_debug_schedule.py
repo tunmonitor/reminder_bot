@@ -5,7 +5,7 @@ import unittest
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from bot import debug_schedule
 
@@ -54,6 +54,58 @@ class DebugScheduleTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 stat.S_IMODE(output_dir.stat().st_mode) & 0o077,
                 0,
+            )
+
+    async def test_service_sheet_parse_failure_is_reported_without_aborting(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "debug"
+            debug_logger = MagicMock()
+
+            async def fake_download(_url, path, _logger, **_kwargs):
+                path.write_bytes(b"debug workbook")
+                return path
+
+            with (
+                patch.object(
+                    debug_schedule,
+                    "load_credentials",
+                    return_value=SimpleNamespace(
+                        yandex_public_url="https://example.invalid/public",
+                        timezone="UTC",
+                    ),
+                ),
+                patch.object(
+                    debug_schedule,
+                    "setup_loggers",
+                    return_value=(MagicMock(), debug_logger),
+                ),
+                patch.object(
+                    debug_schedule, "download_public", side_effect=fake_download
+                ),
+                patch.object(debug_schedule, "parse_schedule", return_value={}),
+                patch.object(debug_schedule, "parse_people", return_value={}),
+                patch.object(
+                    debug_schedule, "resolve_assignments", return_value={}
+                ),
+                patch.object(
+                    debug_schedule,
+                    "parse_service_events",
+                    side_effect=RuntimeError("missing month sheet"),
+                ),
+                patch.object(debug_schedule, "load_templates", return_value={}),
+                patch.object(
+                    debug_schedule, "build_general_message", return_value="preview"
+                ) as build_message,
+            ):
+                result = await debug_schedule.run_check(
+                    date(2026, 10, 11), output_dir
+                )
+
+            self.assertTrue(result.exists())
+            build_message.assert_called_once()
+            debug_logger.warning.assert_any_call(
+                "Предупреждение, которое получит администратор: %s",
+                "Не удалось прочитать задачи служений: missing month sheet",
             )
 
     async def test_rejects_output_directory_accessible_to_others(self):

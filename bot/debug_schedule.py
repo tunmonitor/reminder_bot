@@ -65,9 +65,13 @@ async def run_check(target: date | None, output_dir: Path) -> Path:
         if role not in schedule
     ]
     assignments = resolve_assignments(schedule, people, debug_logger, issues)
-    service_events = parse_service_events(
-        path, selected_date, debug_logger
-    )
+    try:
+        service_events = parse_service_events(
+            path, selected_date, debug_logger
+        )
+    except RuntimeError as exc:
+        service_events = {}
+        issues.append(f"Не удалось прочитать задачи служений: {exc}")
     task_kinds = sorted(
         {
             (

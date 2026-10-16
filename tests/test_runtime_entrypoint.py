@@ -177,6 +177,60 @@ class ReminderBotEntrypointTest(unittest.TestCase):
 
         asyncio.run(send_reminder())
 
+    def test_informational_only_service_reminder_is_not_sent_or_recorded(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                reminder = registry.get_service("assembly")["reminders"][0]
+                bot = SimpleNamespace(send_message=AsyncMock())
+                logger = MagicMock()
+                event_date = date(2026, 10, 11)
+                assignments = {
+                    "Праздник": {
+                        "names": [],
+                        "is_informational": True,
+                    }
+                }
+                with patch.object(
+                    app,
+                    "_load_service_task_assignments",
+                    new=AsyncMock(return_value=(assignments, True)),
+                ), patch.object(
+                    app, "_notify_admin", new=AsyncMock()
+                ) as notify_admin:
+                    await app._process_service_reminder(
+                        bot,
+                        SimpleNamespace(admin_tg_id=1001),
+                        Path(tmp_dir),
+                        ZoneInfo("UTC"),
+                        registry,
+                        "assembly",
+                        reminder,
+                        logger,
+                        logger,
+                        run_date=(
+                            event_date
+                            - timedelta(days=reminder["reminder_days"])
+                        ),
+                    )
+
+                bot.send_message.assert_not_awaited()
+                notify_admin.assert_awaited_once()
+                self.assertFalse(
+                    registry.is_service_reminder_delivered(
+                        "assembly",
+                        reminder["id"],
+                        event_date.isoformat(),
+                        "group:-10001",
+                    )
+                )
+
+        asyncio.run(process())
+
     def test_opted_out_user_is_skipped_but_group_reminder_is_sent(self):
         from bot import app
         from bot.service_registry import ServiceRegistry

@@ -466,14 +466,14 @@ async def _load_service_task_assignments(
             for assignment in event.assignments:
                 task_info = assignments.setdefault(
                     assignment.task,
-                    {"names": set(), "is_informational": False},
+                    {"names": set(), "is_informational": True},
                 )
                 names = task_info["names"]
                 if assignment.name:
                     names.add(assignment.name)
                 task_info["is_informational"] = (
                     task_info["is_informational"]
-                    or getattr(assignment, "is_informational", False)
+                    and getattr(assignment, "is_informational", False)
                 )
         result = {
             task: {
@@ -625,6 +625,7 @@ async def _process_service_reminder(
             f"{date_text}, но задачи не назначены.",
             debug_logger,
         )
+        return
 
     group_chat_id = service["group_chat_id"]
     group_recipient = f"group:{group_chat_id}"

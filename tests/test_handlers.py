@@ -908,6 +908,138 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 self.registry.get_service("sound")["group_chat_id"], None
             )
             self.context.bot.delete_message.assert_awaited()
+            self.context.load_service_task_assignments.assert_awaited_once_with(
+                "sound"
+            )
+
+        asyncio.run(run())
+
+    def test_personal_input_refresh_failures_are_retryable(self):
+        async def run():
+            actor_id = 4405
+            assignments = {"Микшер": ["Алексей"]}
+            self.registry.set_responsible_contact(
+                67890, "sound", "Микшер", "Алексей", actor_id
+            )
+            self.context.load_service_task_assignments = AsyncMock(
+                side_effect=[
+                    assignments,
+                    RuntimeError("temporary workbook failure"),
+                    assignments,
+                    OSError("temporary filesystem failure"),
+                    assignments,
+                ]
+            )
+
+            def callback(button):
+                return SimpleNamespace(
+                    data=button.callback_data,
+                    from_user=SimpleNamespace(id=actor_id),
+                    message=self.message(actor_id, ""),
+                    answer=AsyncMock(),
+                )
+
+            async def press(source, predicate):
+                button = next(
+                    button
+                    for row in source.answer.await_args.kwargs[
+                        "reply_markup"
+                    ].inline_keyboard
+                    for button in row
+                    if predicate(button)
+                )
+                result = callback(button)
+                await personal_handler(result)
+                return result
+
+            personal_handler = self.callback_handler(
+                "on_personal_notifications_callback"
+            )
+            command = self.message(actor_id, "/my_notifications")
+            command_handler = next(
+                item.callback
+                for item in self.admin_router.message.handlers
+                if item.callback.__name__ == "on_my_notifications"
+            )
+            await command_handler(command)
+            service = await press(
+                command, lambda button: "ЗВУК" in button.text
+            )
+            texts = await press(
+                service.message,
+                lambda button: button.text == "📝 Мои тексты",
+            )
+            task = await press(
+                texts.message, lambda button: "Микшер" in button.text
+            )
+            await press(
+                task.message,
+                lambda button: button.text == "✏️ Задать / изменить текст",
+            )
+            text_handler = next(
+                item.callback
+                for item in self.admin_router.message.handlers
+                if item.callback.__name__ == "on_service_parameter"
+            )
+            failed_text = self.message(actor_id, "Моё сообщение для {name}")
+            with patch(
+                "bot.handlers.PERSONAL_TASK_CACHE_TTL_SECONDS", -1
+            ):
+                await text_handler(failed_text)
+            self.assertIn(
+                "Не удалось сверить задачи с актуальным графиком",
+                failed_text.answer.await_args.args[0],
+            )
+            retry_text = self.message(actor_id, "Моё сообщение для {name}")
+            with patch(
+                "bot.handlers.PERSONAL_TASK_CACHE_TTL_SECONDS", -1
+            ):
+                await text_handler(retry_text)
+            self.assertEqual(
+                self.registry.get_user_text(actor_id, "sound", "Микшер")[
+                    "body"
+                ],
+                "Моё сообщение для {name}",
+            )
+
+            schedules = await press(
+                retry_text, lambda button: button.text == "⏰ Расписание"
+            )
+            await press(
+                schedules.message,
+                lambda button: button.text == "➕ Добавить правило",
+            )
+            failed_schedule = self.message(actor_id, "2 18:30")
+            with patch(
+                "bot.handlers.PERSONAL_TASK_CACHE_TTL_SECONDS", -1
+            ):
+                await text_handler(failed_schedule)
+            self.assertIn(
+                "Не удалось сверить задачи с актуальным графиком",
+                failed_schedule.answer.await_args.args[0],
+            )
+            retry_schedule = self.message(actor_id, "2 18:30")
+            with patch(
+                "bot.handlers.PERSONAL_TASK_CACHE_TTL_SECONDS", -1
+            ):
+                await text_handler(retry_schedule)
+
+            text_entry = self.registry.get_user_text(
+                actor_id, "sound", "Микшер"
+            )
+            self.assertEqual(
+                [
+                    (item["reminder_days"], item["reminder_time"])
+                    for item in self.registry.list_schedules(text_entry["id"])
+                ],
+                [(2, "18:30")],
+            )
+            self.assertEqual(
+                self.context.load_service_task_assignments.await_count, 5
+            )
+            self.context.debug_logger.exception.assert_any_call(
+                "Не удалось сверить задачи с актуальным графиком"
+            )
 
         asyncio.run(run())
 
@@ -998,6 +1130,95 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertFalse(any("Праздник" in label for label in task_labels))
             self.assertIsNone(
                 self.registry.get_user_text(actor_id, "sound", "Праздник")
+            )
+
+        asyncio.run(run())
+
+    def test_informational_task_text_can_be_reset_and_deleted_without_refresh(self):
+        async def run():
+            actor_id = 4406
+            self.registry.set_responsible_contact(
+                67890, "sound", "Праздник", "Дежурный", actor_id
+            )
+            self.registry.upsert_user_text(
+                actor_id, "sound", "Праздник", "Личное {name}: {task}"
+            )
+            self.context.load_service_task_assignments = AsyncMock(
+                return_value={
+                    "Праздник": {
+                        "names": [],
+                        "is_informational": True,
+                    }
+                }
+            )
+
+            def callback(button):
+                return SimpleNamespace(
+                    data=button.callback_data,
+                    from_user=SimpleNamespace(id=actor_id),
+                    message=self.message(actor_id, ""),
+                    answer=AsyncMock(),
+                )
+
+            async def press(source, predicate):
+                button = next(
+                    button
+                    for row in source.answer.await_args.kwargs[
+                        "reply_markup"
+                    ].inline_keyboard
+                    for button in row
+                    if predicate(button)
+                )
+                result = callback(button)
+                await handler(result)
+                return result
+
+            handler = self.callback_handler(
+                "on_personal_notifications_callback"
+            )
+            command = self.message(actor_id, "/my_notifications")
+            command_handler = next(
+                item.callback
+                for item in self.admin_router.message.handlers
+                if item.callback.__name__ == "on_my_notifications"
+            )
+            await command_handler(command)
+            service = await press(
+                command, lambda button: "ЗВУК" in button.text
+            )
+            texts = await press(
+                service.message,
+                lambda button: button.text == "📝 Мои тексты",
+            )
+            stale_task = await press(
+                texts.message,
+                lambda button: "Праздник" in button.text,
+            )
+            task = await press(
+                stale_task.message,
+                lambda button: button.text == "🔄 Вернуть стандартный",
+            )
+            self.assertIsNone(
+                self.registry.get_user_text(
+                    actor_id, "sound", "Праздник"
+                )["body"]
+            )
+            delete = await press(
+                task.message,
+                lambda button: button.text == "🗑 Удалить текст",
+            )
+            await press(
+                delete.message,
+                lambda button: button.text == "🗑 Да, удалить",
+            )
+
+            self.assertIsNone(
+                self.registry.get_user_text(
+                    actor_id, "sound", "Праздник"
+                )
+            )
+            self.context.load_service_task_assignments.assert_awaited_once_with(
+                "sound"
             )
 
         asyncio.run(run())

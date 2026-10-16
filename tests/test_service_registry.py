@@ -453,6 +453,20 @@ class ServiceRegistryTest(unittest.TestCase):
             custom,
         )
 
+    def test_reset_user_text_restores_default_body(self):
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Алексей", 4004
+        )
+        self.registry.upsert_user_text(
+            4004, "sound", "Микшер", "Personal {name}: {task}"
+        )
+
+        self.registry.reset_user_text(4004, "sound", "Микшер")
+
+        self.assertIsNone(
+            self.registry.get_user_text(4004, "sound", "Микшер")["body"]
+        )
+
     def test_changing_user_schedule_time_clears_only_its_delivery_history(self):
         self.registry.set_responsible_contact(
             1001, "sound", "Микшер", "Алексей", 4004

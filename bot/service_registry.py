@@ -1363,6 +1363,30 @@ class ServiceRegistry:
             )
         return text_id
 
+    def reset_user_text(
+        self, actor_id: int, service_id: str, task: str
+    ) -> None:
+        _validate_positive_id(actor_id, "actor_id")
+        task = task.strip()
+        if not task:
+            raise ValueError("Название задачи обязательно")
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            cursor = connection.execute(
+                "UPDATE user_reminder_texts SET body = NULL "
+                "WHERE actor_id = ? AND service_id = ? AND task = ?",
+                (actor_id, service_id, task),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("Личный текст не найден")
+            self._audit(
+                connection,
+                actor_id,
+                "user_reminder_text_updated",
+                service_id,
+                {"task": task, "body_overridden": False},
+            )
+
     def ensure_user_text(
         self, actor_id: int, service_id: str, task: str
     ) -> int:
