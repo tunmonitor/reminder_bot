@@ -178,6 +178,81 @@ class BackupManagerTest(unittest.TestCase):
         self.assertFalse(valid_snapshots[1].exists())
         self.assertFalse(valid_snapshots[2].exists())
 
+    def test_same_size_corruption_does_not_displace_usable_snapshot(self):
+        committed = asyncio.run(self.manager.create_snapshot("retention test"))
+        backup_dir = committed.parent
+        valid_snapshots = [committed]
+        origin = datetime(2020, 1, 1, tzinfo=ZoneInfo("UTC"))
+
+        for index in range(1, MAX_SNAPSHOTS_PER_ENVIRONMENT):
+            candidate = backup_dir / f"snapshot-valid-{index:02}"
+            shutil.copytree(committed, candidate)
+            manifest_path = candidate / "manifest.json"
+            manifest = json.loads(manifest_path.read_text("utf-8"))
+            manifest["created_at"] = (
+                origin + timedelta(days=index)
+            ).isoformat()
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            manifest_path.chmod(0o600)
+            valid_snapshots.append(candidate)
+
+        corrupted = backup_dir / "snapshot-corrupted"
+        shutil.copytree(committed, corrupted)
+        manifest_path = corrupted / "manifest.json"
+        manifest = json.loads(manifest_path.read_text("utf-8"))
+        manifest["created_at"] = (
+            origin + timedelta(days=MAX_SNAPSHOTS_PER_ENVIRONMENT)
+        ).isoformat()
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        manifest_path.chmod(0o600)
+        target = corrupted / "database.sql"
+        original = target.read_bytes()
+        target.write_bytes(
+            bytes([original[0] ^ 1]) + original[1:]
+        )
+        self.assertEqual(target.stat().st_size, len(original))
+
+        with self.assertLogs("test.backup", level="WARNING"):
+            self.manager._prune_old_snapshots(backup_dir, committed)
+
+        self.assertTrue(all(path.exists() for path in valid_snapshots))
+        self.assertTrue(corrupted.exists())
+
+    def test_pruning_reuses_validation_for_unchanged_snapshots(self):
+        from unittest.mock import patch
+
+        committed = asyncio.run(self.manager.create_snapshot("retention test"))
+        backup_dir = committed.parent
+        for index in range(MAX_SNAPSHOTS_PER_ENVIRONMENT):
+            shutil.copytree(
+                committed, backup_dir / f"snapshot-copy-{index:02}"
+            )
+        self.manager._prune_old_snapshots(backup_dir, committed)
+
+        next_snapshot = backup_dir / "snapshot-next"
+        shutil.copytree(committed, next_snapshot)
+        manifest_path = next_snapshot / "manifest.json"
+        manifest = json.loads(manifest_path.read_text("utf-8"))
+        manifest["created_at"] = (
+            datetime.now(ZoneInfo("UTC")) + timedelta(seconds=1)
+        ).isoformat()
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        manifest_path.chmod(0o600)
+        next_manifest = self.manager._validate_snapshot(
+            next_snapshot, self.manager.environment
+        )
+
+        with patch.object(
+            self.manager,
+            "_validate_snapshot",
+            wraps=self.manager._validate_snapshot,
+        ) as validate:
+            self.manager._prune_old_snapshots(
+                backup_dir, next_snapshot, next_manifest
+            )
+
+        validate.assert_not_called()
+
     def test_prunes_only_abandoned_staging_directories_older_than_cutoff(self):
         backup_dir = self.backup_base / "test"
         backup_dir.mkdir(parents=True, mode=0o700)

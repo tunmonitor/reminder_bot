@@ -435,6 +435,49 @@ class ServiceRegistryTest(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(count, 0)
 
+    def test_ensure_user_text_preserves_custom_body(self):
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Алексей", 4004
+        )
+        custom = "Personal {name}: {task}"
+        text_id = self.registry.upsert_user_text(
+            4004, "sound", "Микшер", custom
+        )
+
+        self.assertEqual(
+            self.registry.ensure_user_text(4004, "sound", "Микшер"),
+            text_id,
+        )
+        self.assertEqual(
+            self.registry.get_user_text(4004, "sound", "Микшер")["body"],
+            custom,
+        )
+
+    def test_changing_user_schedule_time_clears_only_its_delivery_history(self):
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Алексей", 4004
+        )
+        text_id = self.registry.ensure_user_text(4004, "sound", "Микшер")
+        first = self.registry.add_schedule(text_id, 3, "09:00")
+        second = self.registry.add_schedule(text_id, 1, "18:00")
+        event_date = "2026-10-18"
+        self.registry.mark_user_reminder_delivered(first["id"], event_date)
+        self.registry.mark_user_reminder_delivered(second["id"], event_date)
+
+        self.registry.update_schedule(first["id"], days=2)
+
+        self.assertFalse(
+            self.registry.is_user_reminder_delivered(first["id"], event_date)
+        )
+        self.assertTrue(
+            self.registry.is_user_reminder_delivered(second["id"], event_date)
+        )
+        self.registry.mark_user_reminder_delivered(first["id"], event_date)
+        self.registry.update_schedule(first["id"], enabled=False)
+        self.assertTrue(
+            self.registry.is_user_reminder_delivered(first["id"], event_date)
+        )
+
     def test_multiple_reminders_keep_ids_and_update_independently(self):
         current = self.registry.get_service("sound")["reminders"][0]
         self.registry.set_notification_settings(

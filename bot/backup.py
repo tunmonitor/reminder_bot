@@ -257,6 +257,7 @@ class BackupManager:
         self._backup_lock = asyncio.Lock()
         self._tasks: set[asyncio.Task] = set()
         self._failure_callback: Callable[[str], Awaitable[None]] | None = None
+        self._snapshot_validation_cache: dict[Path, tuple[tuple, bool]] = {}
 
     def set_failure_callback(
         self, callback: Callable[[str], Awaitable[None]]
@@ -522,16 +523,64 @@ class BackupManager:
             (committed_at, committed_snapshot.name, committed_snapshot)
         )
         snapshots.sort(key=lambda item: (item[0], item[1]))
-        excess_count = min(
-            max(0, len(snapshots) - MAX_SNAPSHOTS_PER_ENVIRONMENT),
-            max(0, len(snapshots) - MIN_RETAINED_SNAPSHOTS),
+
+        if len(snapshots) <= MAX_SNAPSHOTS_PER_ENVIRONMENT:
+            return
+
+        validated_snapshots = []
+        for item in snapshots:
+            _, _, candidate = item
+            try:
+                fingerprint = self._snapshot_fingerprint(candidate)
+            except OSError:
+                self.logger.exception(
+                    "Не удалось проверить состояние снимка для retention: %s",
+                    candidate,
+                )
+                continue
+            cached = self._snapshot_validation_cache.get(candidate)
+            if cached is not None and cached[0] == fingerprint:
+                if cached[1]:
+                    validated_snapshots.append(item)
+                continue
+            if candidate == committed_snapshot and committed_manifest is not None:
+                self._snapshot_validation_cache[candidate] = (
+                    fingerprint,
+                    True,
+                )
+                validated_snapshots.append(item)
+                continue
+            try:
+                self._validate_snapshot(candidate, self.environment)
+            except Exception:
+                self._snapshot_validation_cache[candidate] = (
+                    fingerprint,
+                    False,
+                )
+                self.logger.warning(
+                    "Снимок не прошёл полную проверку; оставляю его "
+                    "без изменений и не учитываю в retention: %s",
+                    candidate,
+                    exc_info=True,
+                )
+                continue
+            self._snapshot_validation_cache[candidate] = (
+                fingerprint,
+                True,
+            )
+            validated_snapshots.append(item)
+
+        excess_count = max(
+            0,
+            len(validated_snapshots) - MAX_SNAPSHOTS_PER_ENVIRONMENT,
         )
         removable = [
-            item for item in snapshots
+            item for item in validated_snapshots
             if item[2] != committed_snapshot
         ][:excess_count]
-        if removable and (
-            len(snapshots) - len(removable) < MIN_RETAINED_SNAPSHOTS
+        if (
+            len(validated_snapshots) - len(removable)
+            < MIN_RETAINED_SNAPSHOTS
         ):
             self.logger.error(
                 "Очистка снимков отменена: не удалось сохранить минимум %d "
@@ -550,8 +599,10 @@ class BackupManager:
                     old_snapshot,
                 )
                 continue
-            self.logger.info(            "Удалён старый снимок с корректными метаданными: %s",
-            old_snapshot,)
+            self._snapshot_validation_cache.pop(old_snapshot, None)
+            self.logger.info(
+                "Удалён старый проверенный снимок: %s", old_snapshot
+            )
             removed_any = True
 
         if removed_any:
@@ -567,6 +618,29 @@ class BackupManager:
                 self.logger.exception(
                     "Не удалось синхронизировать каталог после очистки снимков"
                 )
+
+    @staticmethod
+    def _snapshot_fingerprint(snapshot: Path) -> tuple:
+        def file_fingerprint(path: Path) -> tuple:
+            info = path.stat(follow_symlinks=False)
+            return (
+                path.name,
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+                info.st_mode,
+                info.st_uid,
+            )
+
+        return (
+            file_fingerprint(snapshot),
+            *(
+                file_fingerprint(path)
+                for path in sorted(snapshot.iterdir(), key=lambda item: item.name)
+            ),
+        )
 
     def _prune_abandoned_stages(self, backup_dir: Path) -> None:
         cutoff = datetime.now().timestamp() - STALE_SNAPSHOT_STAGE_AGE.total_seconds()

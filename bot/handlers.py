@@ -3722,7 +3722,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     registry, actor_id, service_id, state
                 ):
                     raise ValueError("Вы больше не привязаны к этой задаче.")
-                registry.upsert_user_text(actor_id, service_id, task, None)
+                registry.ensure_user_text(actor_id, service_id, task)
                 push_personal_level(
                     state,
                     {"name": "schedules", "service_id": service_id, "task": task},
@@ -3837,8 +3837,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         registry, message.from_user.id, service_id, pending
                     ):
                         raise ValueError("Вы больше не привязаны к этой задаче.")
-                    text_entry_id = registry.upsert_user_text(
-                        message.from_user.id, service_id, task, None
+                    text_entry_id = registry.ensure_user_text(
+                        message.from_user.id, service_id, task
                     )
                     if input_state["type"] == "add_schedule":
                         registry.add_schedule(text_entry_id, days, time)

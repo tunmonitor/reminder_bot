@@ -816,6 +816,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             task_callback = callback(task_button.callback_data)
             await personal_handler(task_callback)
+            custom_body = "Особое напоминание для {name}: {task}"
+            self.registry.upsert_user_text(
+                actor_id, "sound", "Микшер", custom_body
+            )
             schedules_button = next(
                 button
                 for row in task_callback.message.answer.await_args.kwargs[
@@ -849,6 +853,12 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertEqual(len(schedules), 1)
             self.assertEqual(schedules[0]["reminder_days"], 2)
             self.assertEqual(schedules[0]["reminder_time"], "18:30")
+            self.assertEqual(
+                self.registry.get_user_text(actor_id, "sound", "Микшер")[
+                    "body"
+                ],
+                custom_body,
+            )
             disabled_schedule = await press(
                 input_message,
                 lambda button: button.text.startswith("🟢 за 2 дн."),

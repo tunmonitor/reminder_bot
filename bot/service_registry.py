@@ -1363,6 +1363,38 @@ class ServiceRegistry:
             )
         return text_id
 
+    def ensure_user_text(
+        self, actor_id: int, service_id: str, task: str
+    ) -> int:
+        _validate_positive_id(actor_id, "actor_id")
+        task = task.strip()
+        if not task:
+            raise ValueError("Название задачи обязательно")
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            registered = connection.execute(
+                "SELECT 1 FROM responsible_contacts "
+                "WHERE service_id = ? AND task = ? AND telegram_id = ?",
+                (service_id, task, actor_id),
+            ).fetchone()
+            if registered is None:
+                raise ValueError("Пользователь не привязан к этой задаче")
+            connection.execute(
+                """
+                INSERT INTO user_reminder_texts (
+                    actor_id, service_id, task, body
+                ) VALUES (?, ?, ?, NULL)
+                ON CONFLICT(actor_id, service_id, task) DO NOTHING
+                """,
+                (actor_id, service_id, task),
+            )
+            row = connection.execute(
+                "SELECT id FROM user_reminder_texts "
+                "WHERE actor_id = ? AND service_id = ? AND task = ?",
+                (actor_id, service_id, task),
+            ).fetchone()
+        return row["id"]
+
     def delete_user_text(
         self, actor_id: int, service_id: str, task: str
     ) -> None:
@@ -1432,6 +1464,15 @@ class ServiceRegistry:
                 bool(row["enabled"]) if enabled is None else enabled
             )
             self._validate_user_schedule(new_days, new_time)
+            if (
+                new_days != row["reminder_days"]
+                or new_time != row["reminder_time"]
+            ):
+                connection.execute(
+                    "DELETE FROM user_reminder_deliveries "
+                    "WHERE schedule_id = ?",
+                    (schedule_id,),
+                )
             connection.execute(
                 "UPDATE user_reminder_schedules "
                 "SET reminder_days = ?, reminder_time = ?, enabled = ? "

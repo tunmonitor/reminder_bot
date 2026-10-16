@@ -676,6 +676,16 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 self.assertIn("11.10.2026", args[2])
                 self.assertIn("отсутствует Telegram_ID", args[2])
                 app.send_assignments.assert_awaited_once()
+                self.assertTrue(
+                    app.send_assignments.await_args.kwargs[
+                        "send_personal_notifications"
+                    ]
+                )
+                self.assertIsNone(
+                    app.send_assignments.await_args.kwargs[
+                        "user_notifications_enabled"
+                    ]
+                )
                 sent_assignments = app.send_assignments.await_args.kwargs["assignments"]
                 self.assertEqual(
                     list(sent_assignments), ["Ответственный", "Ведущий"]

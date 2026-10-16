@@ -1094,14 +1094,17 @@ async def _process_upcoming_sunday(
             debug_logger=debug_logger,
             save_state=state_cache.save,
             user_notifications_enabled=(
-                lambda telegram_id: (
-                    service_registry is not None
-                    and service_registry.get_user_notifications_enabled(
-                        telegram_id, "assembly"
+                (
+                    lambda telegram_id: (
+                        service_registry.get_user_notifications_enabled(
+                            telegram_id, "assembly"
+                        )
                     )
                 )
+                if service_registry is not None
+                else None
             ),
-            send_personal_notifications=False,
+            send_personal_notifications=service_registry is None,
         )
         state["complete"] = (
             not assignment_issues
