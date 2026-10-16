@@ -34,6 +34,8 @@ from .service_registry import (
 )
 from .ui import (
     callback_text,
+    clean_previous_menu,
+    clean_previous_menu_by_id,
     layout_buttons,
     nav_row,
     render_screen_chunks,
@@ -122,16 +124,35 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         text: str,
         *,
         _dialog_page: int = 0,
+        clean_previous: bool = True,
         **kwargs,
     ) -> Message | None:
         kwargs.pop("parse_mode", None)
         keyboard_limit = kwargs.pop("_dialog_keyboard_limit", 6)
         markup = kwargs.pop("reply_markup", None)
+        actor_id = getattr(getattr(target, "chat", None), "id", None)
+        pending = (
+            pending_inputs.get(actor_id)
+            if getattr(getattr(target, "chat", None), "type", None)
+            == ChatType.PRIVATE
+            else None
+        )
+        for token, page_state in list(pending_dialog_pages.items()):
+            if page_state[0] == actor_id:
+                pending_dialog_pages.pop(token, None)
+        if (
+            clean_previous
+            and pending is not None
+            and pending.get("menu_message_id") is not None
+            and pending.get("menu_chat_id") is not None
+        ):
+            await clean_previous_menu_by_id(
+                context.bot,
+                pending.get("menu_chat_id"),
+                pending.get("menu_message_id"),
+                debug,
+            )
         if isinstance(markup, InlineKeyboardMarkup):
-            actor_id = getattr(getattr(target, "chat", None), "id", None)
-            for token, page_state in list(pending_dialog_pages.items()):
-                if page_state[0] == actor_id:
-                    pending_dialog_pages.pop(token, None)
             buttons = [
                 button
                 for row in markup.inline_keyboard
@@ -227,6 +248,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 ),
                 **kwargs,
             )
+        if sent_message is not None and pending is not None:
+            pending["menu_message_id"] = sent_message.message_id
+            pending["menu_chat_id"] = target.chat.id
         return sent_message
 
     @admin_router.callback_query(F.data.startswith("ui_page:"))
@@ -244,11 +268,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await _answer_callback(callback, "Выбор устарел")
             return
         _, text, markup, page = page_state
+        await clean_previous_menu(callback.message, debug)
         await _send_dialog(
             callback.message,
             text,
             reply_markup=markup,
             _dialog_page=page,
+            clean_previous=False,
         )
         await _answer_callback(callback)
 
@@ -287,6 +313,20 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         for key in list(pending_notify_task_choices):
             if pending_notify_task_choices[key][0] == actor_id:
                 pending_notify_task_choices.pop(key, None)
+
+    async def clean_and_clear_pending_actor(actor_id: int) -> None:
+        pending = pending_inputs.get(actor_id)
+        if pending is not None:
+            if pending.get("operation", "").startswith("my_notifications"):
+                await clean_previous_personal_menu(pending)
+            else:
+                await clean_previous_menu_by_id(
+                    context.bot,
+                    pending.get("menu_chat_id"),
+                    pending.get("menu_message_id"),
+                    debug,
+                )
+        clear_pending_actor(actor_id)
 
     def service_registry():
         registry = getattr(context, "service_registry", None)
@@ -491,6 +531,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         label: str,
     ) -> None:
         if operation == "service_chat":
+            pending_inputs[actor_id] = {
+                "operation": "service_chat",
+                "service_id": service_id,
+                "step": "await_chat",
+            }
             request_id = new_share_request_id()
             pending_shares[request_id] = (
                 actor_id, "service_chat", service_id, None, None
@@ -601,7 +646,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or message.chat.type != ChatType.PRIVATE
         ):
             return
-        clear_pending_actor(message.from_user.id)
+        await clean_and_clear_pending_actor(message.from_user.id)
         if service_registry() is None:
             await _send_dialog(message, "Реестр настроек служений недоступен. "
                 "Попробуйте позже или сообщите супер-администратору.",
@@ -1514,6 +1559,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             return
         pending_inputs.pop(actor_id, None)
+        await clean_previous_menu_by_id(
+            context.bot,
+            pending.get("menu_chat_id"),
+            pending.get("menu_message_id"),
+            debug,
+        )
         await _send_dialog(
             message,
             f"✅ Настройки уведомлений служения "
@@ -1609,11 +1660,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def offer_user_selection(
         message: Message, actor_id: int, service_id: str
     ) -> None:
-        pending_inputs[actor_id] = {
-            "operation": "service_admin_add",
-            "service_id": service_id,
-            "step": "await_user",
-        }
+        pending = pending_inputs.setdefault(actor_id, {})
+        pending.update(
+            {
+                "operation": "service_admin_add",
+                "service_id": service_id,
+                "step": "await_user",
+            }
+        )
         request_id = new_share_request_id()
         pending_shares[request_id] = (
             actor_id, "service_admin_add", service_id, None, None
@@ -1733,6 +1787,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         contact_name: str | None = None,
         display_name: str | None = None,
     ) -> None:
+        if operation == "service_admin_add":
+            pending = pending_inputs.setdefault(actor_id, {})
+            pending.update(
+                {
+                    "operation": operation,
+                    "service_id": service_id,
+                    "step": "confirm",
+                }
+            )
         key = (actor_id, service_id, user_id)
         confirmation_id = secrets.token_urlsafe(8)
         pending_admin_confirmations[key] = (
@@ -1863,7 +1926,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def on_service_settings(message: Message) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
-        clear_pending_actor(message.from_user.id)
+        await clean_and_clear_pending_actor(message.from_user.id)
         parts = (message.text or "").split()
         if len(parts) == 1:
             await request_service_input(message, "service_settings")
@@ -1876,7 +1939,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def on_service_admin_add(message: Message) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
-        clear_pending_actor(message.from_user.id)
+        await clean_and_clear_pending_actor(message.from_user.id)
         parts = (message.text or "").split()
         if len(parts) == 1:
             await request_service_input(message, "service_admin_add")
@@ -1926,7 +1989,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def on_service_admin_remove(message: Message) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
-        clear_pending_actor(message.from_user.id)
+        await clean_and_clear_pending_actor(message.from_user.id)
         parts = (message.text or "").split()
         if len(parts) == 1:
             await request_service_input(message, "service_admin_remove")
@@ -1953,7 +2016,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def on_service_chat(message: Message) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
-        clear_pending_actor(message.from_user.id)
+        await clean_and_clear_pending_actor(message.from_user.id)
         parts = (message.text or "").split()
         if len(parts) == 1:
             await request_service_input(message, "service_chat")
@@ -2010,7 +2073,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def on_service_contact(message: Message) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
-        clear_pending_actor(message.from_user.id)
+        await clean_and_clear_pending_actor(message.from_user.id)
         payload = (message.text or "").partition(" ")[2].strip()
         parts = payload.split("|")
         prefix_parts = parts[0].strip().split(maxsplit=1) if parts else []
@@ -2068,11 +2131,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         ):
             return
         previous = pending_inputs.get(message.from_user.id)
-        if previous and previous.get("operation", "").startswith(
-            "my_notifications"
-        ):
-            await clean_previous_personal_menu(previous)
-        had_request = pending_inputs.pop(message.from_user.id, None) is not None
+        had_request = previous is not None
+        if previous is not None:
+            await clean_and_clear_pending_actor(message.from_user.id)
         for request_id, pending in list(pending_shares.items()):
             if pending[0] == message.from_user.id:
                 pending_shares.pop(request_id, None)
@@ -2114,7 +2175,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def on_start(message: Message) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
-        clear_pending_actor(message.from_user.id)
+        await clean_and_clear_pending_actor(message.from_user.id)
         await _send_dialog(message, "👋 Здравствуйте! Для управления служениями используйте команды "
             "из меню бота.",
             parse_mode=None,
@@ -2134,9 +2195,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await _answer_callback(callback,"❌ Некорректный выбор служения.")
             return
         _, operation, service_id = callback_parts
-        clear_pending_actor(callback.from_user.id)
+        if callback.from_user.id in pending_inputs:
+            await clean_and_clear_pending_actor(callback.from_user.id)
+        else:
+            await clean_previous_menu(callback.message, debug)
         if operation == "back_to_services":
-            clear_pending_actor(callback.from_user.id)
             registry = service_registry()
             if registry is None:
                 await _send_dialog(callback.message, "Реестр настроек служений недоступен.",
@@ -2797,7 +2860,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         ):
             await _answer_callback(callback,"⚠️ Настройка устарела.")
             return
-        clear_pending_actor(callback.from_user.id)
+        await clean_and_clear_pending_actor(callback.from_user.id)
         await _send_dialog(
             callback.message,
             "✖️ Изменения отменены, сохранённые настройки не изменены.",
@@ -2941,7 +3004,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     + f" для задачи «{task}»."
                 )
         if operation == "service_admin_add":
-            pending_inputs.pop(callback.from_user.id, None)
+            await clean_and_clear_pending_actor(callback.from_user.id)
             await _send_dialog(callback.message, _status_text(
                     response, "✅" if assignment_saved else "❌"
                 ),
@@ -3110,7 +3173,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "service_contact",
             )
         elif action == "services":
-            clear_pending_actor(callback.from_user.id)
+            await clean_and_clear_pending_actor(callback.from_user.id)
             await request_service_input(
                 callback.message,
                 "service_contact",
@@ -3241,6 +3304,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         if pending[2] == "assembly":
             context.group_chat_id = shared_chat.chat_id
+        await clean_and_clear_pending_actor(message.from_user.id)
         title = shared_chat.title or "Групповой чат"
         await _send_dialog(
             message,
@@ -3291,18 +3355,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         for token, action in list(pending_personal_actions.items()):
             if action[1] == state.get("session_id"):
                 pending_personal_actions.pop(token, None)
-        message_id = state.pop("menu_message_id", None)
+        message_id = state.get("menu_message_id")
         chat_id = state.get("menu_chat_id")
-        if message_id is None or chat_id is None:
-            return
-        try:
-            await context.bot.delete_message(
-                chat_id=chat_id, message_id=message_id
-            )
-        except TelegramAPIError:
-            debug.debug(
-                "Could not delete previous personal notification menu"
-            )
+        await clean_previous_menu_by_id(
+            context.bot, chat_id, message_id, debug
+        )
 
     async def finish_personal_session(actor_id: int) -> None:
         state = pending_inputs.get(actor_id)
@@ -3587,7 +3644,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if page_count > 1:
             text = f"{text}\nСтраница {page + 1}/{page_count}"
         sent = await _send_dialog(
-            target, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+            target,
+            text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            clean_previous=False,
         )
         if sent is not None:
             state["menu_message_id"] = sent.message_id
@@ -3726,6 +3786,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     "{name}, {task}, {service_name}, {sunday_date}, "
                     "{telegram_id}, {username}.",
                     parse_mode=None,
+                    clean_previous=False,
                 )
                 if sent is not None:
                     state["menu_message_id"] = sent.message_id
@@ -3775,7 +3836,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     "Введите количество дней до события и время HH:MM, "
                     "например: 2 18:30."
                 )
-                sent = await _send_dialog(callback.message, prompt, parse_mode=None)
+                sent = await _send_dialog(
+                    callback.message,
+                    prompt,
+                    parse_mode=None,
+                    clean_previous=False,
+                )
                 if sent is not None:
                     state["menu_message_id"] = sent.message_id
                     state["menu_chat_id"] = callback.message.chat.id
@@ -3908,6 +3974,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         service_id = pending["service_id"]
         registry = service_registry()
         if registry is None:
+            await clean_previous_menu_by_id(
+                context.bot,
+                pending.get("menu_chat_id"),
+                pending.get("menu_message_id"),
+                debug,
+            )
             pending_inputs.pop(message.from_user.id, None)
             await _send_dialog(message, "Реестр настроек служений недоступен. Попробуйте позже.",
                 parse_mode=None,
@@ -4127,6 +4199,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     return
                 raise ValueError("Шаг настройки устарел. Запустите команду заново.")
             else:
+                await clean_previous_menu_by_id(
+                    context.bot,
+                    pending.get("menu_chat_id"),
+                    pending.get("menu_message_id"),
+                    debug,
+                )
                 pending_inputs.pop(message.from_user.id, None)
                 return
         except (PermissionError, ValueError) as exc:
@@ -4139,6 +4217,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             return
 
+        await clean_previous_menu_by_id(
+            context.bot,
+            pending.get("menu_chat_id"),
+            pending.get("menu_message_id"),
+            debug,
+        )
         pending_inputs.pop(message.from_user.id, None)
         await _send_dialog(
             message,
@@ -4151,7 +4235,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def on_service_sync(message: Message) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
-        clear_pending_actor(message.from_user.id)
+        await clean_and_clear_pending_actor(message.from_user.id)
         payload = (message.text or "").partition(" ")[2].strip()
         if payload:
             await _send_dialog(message, "Служение нужно выбрать кнопкой. Используйте /service_sync "
@@ -4265,7 +4349,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         if message.chat.type != ChatType.PRIVATE:
             return
-        clear_pending_actor(message.from_user.id)
+        await clean_and_clear_pending_actor(message.from_user.id)
         registry = service_registry()
         if registry is None:
             await _send_dialog(message, "Реестр служений недоступен; нельзя выбрать чат проверки.",
@@ -4306,6 +4390,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await _answer_callback(callback,)
             return
         _, action, service_id = callback.data.split(":", 2)
+        await clean_previous_menu(callback.message, debug)
         registry = service_registry()
         if registry is None:
             await _answer_callback(callback,"❌ Реестр служений недоступен.")

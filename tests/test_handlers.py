@@ -1148,6 +1148,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 message=self.message(12345, ""),
                 answer=AsyncMock(),
             )
+            service_callback.message.answer.return_value = SimpleNamespace(
+                message_id=501
+            )
             await self.callback_handler("on_service_selected")(service_callback)
             root_markup = service_callback.message.answer.await_args.kwargs[
                 "reply_markup"
@@ -1163,6 +1166,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 from_user=SimpleNamespace(id=12345),
                 message=self.message(12345, ""),
                 answer=AsyncMock(),
+            )
+            edit_callback.message.answer.return_value = SimpleNamespace(
+                message_id=502
             )
             await self.callback_handler("on_notification_setting_edit")(
                 edit_callback
@@ -1182,8 +1188,18 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 message=self.message(12345, ""),
                 answer=AsyncMock(),
             )
+            back_callback.message.answer.return_value = SimpleNamespace(
+                message_id=503
+            )
             await self.callback_handler("on_notification_edit_back")(
                 back_callback
+            )
+            self.assertEqual(
+                [
+                    call.kwargs["message_id"]
+                    for call in self.context.bot.delete_message.await_args_list
+                ],
+                [501, 502],
             )
             returned_markup = back_callback.message.answer.await_args.kwargs[
                 "reply_markup"
@@ -1211,6 +1227,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 message=self.message(12345, ""),
                 answer=AsyncMock(),
             )
+            close_callback.message.answer.return_value = SimpleNamespace(
+                message_id=504
+            )
             await self.callback_handler("on_notification_setting_cancel")(
                 close_callback
             )
@@ -1220,6 +1239,74 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertEqual(
                 len(result_markup.inline_keyboard),
                 2,
+            )
+            self.assertEqual(
+                [
+                    call.kwargs["message_id"]
+                    for call in self.context.bot.delete_message.await_args_list
+                ],
+                [501, 502, 503],
+            )
+
+        asyncio.run(run())
+
+    def test_chat_picker_prompt_is_deleted_after_shared_chat_arrives(self):
+        async def run():
+            command = self.message(67890, "/service_chat")
+            command_handler = next(
+                item.callback
+                for item in self.admin_router.message.handlers
+                if item.callback.__name__ == "on_service_chat"
+            )
+            await command_handler(command)
+            service_button = next(
+                button
+                for row in command.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith("service:service_chat:")
+            )
+            selection = SimpleNamespace(
+                data=service_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_selected")(selection)
+            action_selection = SimpleNamespace(
+                data=f"service:service_chat_set:{service_button.callback_data.rsplit(':', 1)[1]}",
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            action_selection.message.answer.return_value = SimpleNamespace(
+                message_id=601
+            )
+            await self.callback_handler("on_service_selected")(action_selection)
+            keyboard = action_selection.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            request_id = keyboard.keyboard[0][0].request_chat.request_id
+            shared_message = SimpleNamespace(
+                from_user=SimpleNamespace(id=67890),
+                chat=SimpleNamespace(type="private", id=67890),
+                chat_shared=SimpleNamespace(
+                    request_id=request_id,
+                    chat_id=-100601,
+                    title="Test chat",
+                ),
+                answer=AsyncMock(),
+            )
+            chat_shared_handler = next(
+                item.callback
+                for item in self.admin_router.message.handlers
+                if item.callback.__name__ == "on_chat_shared"
+            )
+            await chat_shared_handler(shared_message)
+
+            self.context.bot.delete_message.assert_awaited_once_with(
+                chat_id=67890, message_id=601
             )
 
         asyncio.run(run())

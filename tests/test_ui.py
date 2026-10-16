@@ -1,14 +1,19 @@
 import asyncio
 import html
+import logging
 import re
 import unittest
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from aiogram.exceptions import TelegramAPIError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.ui import (
     callback_text,
+    clean_previous_menu,
+    clean_previous_menu_by_id,
     code,
     layout_buttons,
     nav_row,
@@ -192,6 +197,83 @@ class DialogRenderingTest(unittest.TestCase):
             )
 
         asyncio.run(send())
+
+
+class CleanPreviousMenuTest(unittest.TestCase):
+    @staticmethod
+    def api_error():
+        return TelegramAPIError(
+            method=SimpleNamespace(), message="Telegram API error"
+        )
+
+    def test_deletes_menu_when_delete_succeeds(self):
+        async def run():
+            message = SimpleNamespace(
+                date=datetime.now(timezone.utc),
+                message_id=10,
+                delete=AsyncMock(),
+                edit_text=AsyncMock(),
+            )
+
+            await clean_previous_menu(message, logging.getLogger(__name__))
+
+            message.delete.assert_awaited_once()
+            message.edit_text.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_old_menu_uses_edit_fallback_without_delete_attempt(self):
+        async def run():
+            message = SimpleNamespace(
+                date=datetime.now(timezone.utc) - timedelta(hours=49),
+                message_id=11,
+                delete=AsyncMock(),
+                edit_text=AsyncMock(),
+            )
+
+            await clean_previous_menu(message, logging.getLogger(__name__))
+
+            message.delete.assert_not_awaited()
+            message.edit_text.assert_awaited_once()
+            self.assertIsNone(
+                message.edit_text.await_args.kwargs["reply_markup"]
+            )
+
+        asyncio.run(run())
+
+    def test_failed_delete_falls_back_to_edit(self):
+        async def run():
+            message = SimpleNamespace(
+                date=datetime.now(timezone.utc),
+                message_id=12,
+                delete=AsyncMock(side_effect=self.api_error()),
+                edit_text=AsyncMock(),
+            )
+
+            await clean_previous_menu(message, logging.getLogger(__name__))
+
+            message.delete.assert_awaited_once()
+            message.edit_text.assert_awaited_once()
+
+        asyncio.run(run())
+
+    def test_delete_and_edit_failures_are_nonfatal(self):
+        async def run():
+            bot = SimpleNamespace(
+                delete_message=AsyncMock(side_effect=self.api_error()),
+                edit_message_text=AsyncMock(side_effect=self.api_error()),
+            )
+
+            await clean_previous_menu_by_id(
+                bot, 42, 13, logging.getLogger(__name__)
+            )
+
+            bot.delete_message.assert_awaited_once_with(
+                chat_id=42, message_id=13
+            )
+            bot.edit_message_text.assert_awaited_once()
+
+        asyncio.run(run())
 
 
 if __name__ == "__main__":

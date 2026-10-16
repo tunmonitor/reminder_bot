@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import base64
 import html
+import logging
 import re
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from typing import Any
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 MAX_SCREEN_UNITS = 500
 MAX_CALLBACK_UNITS = 200
@@ -15,6 +19,8 @@ _CODE_MARKER = re.compile(r"\x00CODE:([A-Za-z0-9_-]+)\x00")
 _STATUS_PREFIX = re.compile(r"^(?:✅|❌|⚠️|ℹ️|⏳)\s*")
 _NAVIGATION_PREFIXES = ("⬅️", "✖️", "✅", "➡️", "↩️", "🏠")
 _SINGLE_ACTION_PREFIXES = ("⏰", "📝", "➕")
+_MENU_CLOSED_TEXT = "📋 Предыдущее меню закрыто."
+_MESSAGE_DELETE_AGE_SECONDS = 48 * 60 * 60
 
 
 def code(value: int | str | None) -> str:
@@ -144,6 +150,110 @@ def nav_row(
 ) -> list[InlineKeyboardButton]:
     """Build a navigation row from whichever navigation buttons are present."""
     return [button for button in (back, save, cancel) if button is not None]
+
+
+async def clean_previous_menu(
+    message: Message | None,
+    debug: logging.Logger,
+    *,
+    fallback_text: str = _MENU_CLOSED_TEXT,
+) -> None:
+    """Delete an old wizard menu, or neutralize it when deletion is unavailable."""
+    if message is None:
+        return
+    message_date = getattr(message, "date", None)
+    is_too_old = False
+    if isinstance(message_date, datetime):
+        if message_date.tzinfo is None:
+            message_date = message_date.replace(tzinfo=timezone.utc)
+        is_too_old = (
+            datetime.now(timezone.utc) - message_date
+        ).total_seconds() >= _MESSAGE_DELETE_AGE_SECONDS
+    if not is_too_old:
+        delete = getattr(message, "delete", None)
+        if callable(delete):
+            try:
+                await delete()
+            except TelegramAPIError:
+                debug.debug(
+                    "Не удалось удалить предыдущее меню %s; пробую очистить его",
+                    getattr(message, "message_id", None),
+                    exc_info=True,
+                )
+            else:
+                debug.debug(
+                    "Удалено предыдущее меню: %s",
+                    getattr(message, "message_id", None),
+                )
+                return
+        else:
+            debug.warning("У сообщения отсутствует метод удаления меню")
+    edit_text = getattr(message, "edit_text", None)
+    if not callable(edit_text):
+        debug.warning("У сообщения отсутствует метод очистки меню")
+        return
+    try:
+        await edit_text(fallback_text, reply_markup=None)
+    except TelegramAPIError:
+        debug.debug(
+            "Не удалось удалить или заменить предыдущее меню %s",
+            getattr(message, "message_id", None),
+            exc_info=True,
+        )
+    else:
+        debug.debug(
+            "Предыдущее меню %s заменено нейтральным текстом",
+            getattr(message, "message_id", None),
+        )
+
+
+async def clean_previous_menu_by_id(
+    bot: Bot,
+    chat_id: int | None,
+    message_id: int | None,
+    debug: logging.Logger,
+    *,
+    fallback_text: str = _MENU_CLOSED_TEXT,
+) -> None:
+    """Delete a saved wizard menu by its identifiers, with an edit fallback."""
+    if chat_id is None or message_id is None:
+        return
+    delete = getattr(bot, "delete_message", None)
+    if callable(delete):
+        try:
+            await delete(chat_id=chat_id, message_id=message_id)
+        except TelegramAPIError:
+            debug.debug(
+                "Не удалось удалить предыдущее меню %s; пробую очистить его",
+                message_id,
+                exc_info=True,
+            )
+        else:
+            debug.debug("Удалено предыдущее меню: %s", message_id)
+            return
+    else:
+        debug.warning("У бота отсутствует метод удаления меню %s", message_id)
+    edit = getattr(bot, "edit_message_text", None)
+    if not callable(edit):
+        debug.warning("У бота отсутствует метод очистки меню %s", message_id)
+        return
+    try:
+        await edit(
+            fallback_text,
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=None,
+        )
+    except TelegramAPIError:
+        debug.debug(
+            "Не удалось удалить или заменить предыдущее меню %s",
+            message_id,
+            exc_info=True,
+        )
+    else:
+        debug.debug(
+            "Предыдущее меню %s заменено нейтральным текстом", message_id
+        )
 
 
 def layout_buttons(
