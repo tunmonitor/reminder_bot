@@ -10,11 +10,262 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
-from bot.app import _prepare_service_test_previews
+from bot.app import _prepare_service_test_previews, get_group_reminder_preview
 from bot.service_registry import ServiceRegistry
 
 
 class ServicePreviewTest(unittest.TestCase):
+    def _group_reminder_preview(self, registry, temp_dir, assignments):
+        reminder = registry.list_group_reminders("sound")[0]
+        credentials = SimpleNamespace(
+            admin_tg_id=67890,
+            yandex_public_url="https://example.invalid/schedule",
+        )
+
+        async def run():
+            with patch(
+                "bot.app._next_sunday_in_tz",
+                return_value=date(2026, 10, 25),
+            ), patch(
+                "bot.app._load_service_task_assignments",
+                new=AsyncMock(return_value=(assignments, True)),
+            ):
+                return await get_group_reminder_preview(
+                    reminder["id"],
+                    credentials,
+                    Path(temp_dir),
+                    ZoneInfo("UTC"),
+                    registry,
+                    logging.getLogger("test-group-reminder-preview"),
+                )
+
+        return asyncio.run(run()), reminder
+
+    def test_group_reminder_preview_uses_default_template_and_informational_notes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ServiceRegistry(Path(temp_dir) / "registry.sqlite3")
+            registry.initialize(67890, -100)
+            registry.set_service_default_template(
+                67890,
+                "sound",
+                "{service_name} · {sunday_date}\n{task_assignments}\n"
+                "{informational_notes}",
+            )
+            registry.set_responsible_contact(
+                67890, "sound", "Микшер", "Алексей", 12345, "alex"
+            )
+            result, reminder = self._group_reminder_preview(
+                registry,
+                temp_dir,
+                {
+                    "Микшер": {
+                        "names": ["Алексей"],
+                        "is_informational": False,
+                    },
+                    "2-я часть": {
+                        "names": ["нет"],
+                        "is_informational": True,
+                    },
+                },
+            )
+
+            self.assertTrue(result["has_data"])
+            self.assertIsNone(result["error"])
+            self.assertEqual(result["date"], "25.10.2026")
+            self.assertEqual(result["time"], reminder["reminder_time"])
+            self.assertIn("Звук · 25.10.2026", result["text"])
+            self.assertIn("Алексей (@alex)", result["text"])
+            self.assertIn("📌 2-я часть — нет", result["text"])
+
+    def test_group_reminder_preview_falls_back_to_builtin_template(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ServiceRegistry(Path(temp_dir) / "registry.sqlite3")
+            registry.initialize(67890, -100)
+            result, _ = self._group_reminder_preview(
+                registry,
+                temp_dir,
+                {"Микшер": ["Алексей"]},
+            )
+
+            self.assertTrue(result["has_data"])
+            self.assertIn(
+                "Напоминание о служении «Звук» в воскресенье 25.10.2026:",
+                result["text"],
+            )
+            self.assertIn("Микшер", result["text"])
+
+    def test_group_reminder_preview_uses_reminder_body_when_set(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ServiceRegistry(Path(temp_dir) / "registry.sqlite3")
+            registry.initialize(67890, -100)
+            reminder_id = registry.add_group_reminder(
+                67890,
+                "sound",
+                2,
+                "11:00",
+                "Свое сообщение {service_name}: {informational_notes}",
+            )
+            reminder = registry.get_group_reminder(reminder_id)
+            credentials = SimpleNamespace(
+                admin_tg_id=67890,
+                yandex_public_url="https://example.invalid/schedule",
+            )
+
+            async def run():
+                with patch(
+                    "bot.app._next_sunday_in_tz",
+                    return_value=date(2026, 10, 25),
+                ), patch(
+                    "bot.app._load_service_task_assignments",
+                    new=AsyncMock(return_value=({}, True)),
+                ):
+                    return await get_group_reminder_preview(
+                        reminder_id,
+                        credentials,
+                        Path(temp_dir),
+                        ZoneInfo("UTC"),
+                        registry,
+                        logging.getLogger("test-custom-reminder-preview"),
+                    )
+
+            result = asyncio.run(run())
+
+            self.assertTrue(result["has_data"])
+            self.assertEqual(result["time"], "11:00")
+            self.assertEqual(result["text"], "Свое сообщение Звук: ")
+
+    def test_group_reminder_preview_leaves_informational_notes_empty_when_absent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ServiceRegistry(Path(temp_dir) / "registry.sqlite3")
+            registry.initialize(67890, -100)
+            registry.set_service_default_template(
+                67890, "sound", "Текст {informational_notes}"
+            )
+
+            result, _ = self._group_reminder_preview(
+                registry,
+                temp_dir,
+                {
+                    "Микшер": {
+                        "names": ["Алексей"],
+                        "is_informational": False,
+                    }
+                },
+            )
+
+            self.assertTrue(result["has_data"])
+            self.assertEqual(result["text"], "Текст ")
+            self.assertNotIn("📌", result["text"])
+
+    def test_group_reminder_preview_reports_missing_event_data(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ServiceRegistry(Path(temp_dir) / "registry.sqlite3")
+            registry.initialize(67890, -100)
+            reminder = registry.list_group_reminders("sound")[0]
+            credentials = SimpleNamespace(
+                admin_tg_id=67890,
+                yandex_public_url="https://example.invalid/schedule",
+            )
+
+            async def run():
+                with patch(
+                    "bot.app._next_sunday_in_tz",
+                    return_value=date(2026, 10, 25),
+                ), patch(
+                    "bot.app._load_service_task_assignments",
+                    new=AsyncMock(return_value=({}, False)),
+                ):
+                    return await get_group_reminder_preview(
+                        reminder["id"],
+                        credentials,
+                        Path(temp_dir),
+                        ZoneInfo("UTC"),
+                        registry,
+                        logging.getLogger("test-missing-reminder-data"),
+                    )
+
+            result = asyncio.run(run())
+
+            self.assertFalse(result["has_data"])
+            self.assertEqual(result["error"], "Нет данных из графика на 25.10.2026.")
+            self.assertEqual(result["text"], "")
+
+    def test_group_reminder_preview_reports_schedule_download_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ServiceRegistry(Path(temp_dir) / "registry.sqlite3")
+            registry.initialize(67890, -100)
+            reminder = registry.list_group_reminders("sound")[0]
+            credentials = SimpleNamespace(
+                admin_tg_id=67890,
+                yandex_public_url="https://example.invalid/schedule",
+            )
+
+            async def run():
+                with patch(
+                    "bot.app._next_sunday_in_tz",
+                    return_value=date(2026, 10, 25),
+                ), patch(
+                    "bot.app._load_service_task_assignments",
+                    new=AsyncMock(side_effect=RuntimeError("download failed")),
+                ):
+                    return await get_group_reminder_preview(
+                        reminder["id"],
+                        credentials,
+                        Path(temp_dir),
+                        ZoneInfo("UTC"),
+                        registry,
+                        logging.getLogger("test-download-failure-preview"),
+                    )
+
+            result = asyncio.run(run())
+
+            self.assertFalse(result["has_data"])
+            self.assertEqual(
+                result["error"],
+                "Не удалось загрузить график. Попробуйте позже.",
+            )
+
+    def test_group_reminder_preview_reports_unsupported_template_field(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ServiceRegistry(Path(temp_dir) / "registry.sqlite3")
+            registry.initialize(67890, -100)
+            reminder_id = registry.list_group_reminders("sound")[0]["id"]
+            with closing(sqlite3.connect(registry.path)) as connection:
+                connection.execute(
+                    "UPDATE group_reminders SET body = ? WHERE id = ?",
+                    ("Значение: {foo}", reminder_id),
+                )
+                connection.commit()
+            credentials = SimpleNamespace(
+                admin_tg_id=67890,
+                yandex_public_url="https://example.invalid/schedule",
+            )
+
+            async def run():
+                with patch(
+                    "bot.app._next_sunday_in_tz",
+                    return_value=date(2026, 10, 25),
+                ), patch(
+                    "bot.app._load_service_task_assignments",
+                    new=AsyncMock(return_value=({}, True)),
+                ):
+                    return await get_group_reminder_preview(
+                        reminder_id,
+                        credentials,
+                        Path(temp_dir),
+                        ZoneInfo("UTC"),
+                        registry,
+                        logging.getLogger("test-template-error-preview"),
+                    )
+
+            result = asyncio.run(run())
+
+            self.assertTrue(result["has_data"] is False)
+            self.assertEqual(
+                result["error"],
+                "Ошибка в шаблоне: поле {foo} не поддерживается.",
+            )
+
     def test_preview_uses_selected_service_assignments_and_contacts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             registry = ServiceRegistry(Path(temp_dir) / "registry.sqlite3")

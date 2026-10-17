@@ -134,6 +134,11 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 )
                 registry.set_user_notifications_enabled(2002, "assembly", True)
                 registry.set_user_notifications_enabled(2003, "assembly", True)
+                registry.set_service_default_template(
+                    1001,
+                    "assembly",
+                    "{task_assignments}\n{informational_notes}",
+                )
                 reminder = registry.get_service("assembly")["reminders"][0]
                 bot = SimpleNamespace(send_message=AsyncMock())
                 credentials = SimpleNamespace(admin_tg_id=1001)
@@ -142,7 +147,13 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     state={},
                     save=MagicMock(),
                 )
-                assignments = {"Камеры": ["Анна", "Борис"]}
+                assignments = {
+                    "Камеры": ["Анна", "Борис"],
+                    "2-я часть": {
+                        "names": ["нет"],
+                        "is_informational": True,
+                    },
+                }
                 with patch.object(
                     app,
                     "_load_service_task_assignments",
@@ -170,6 +181,10 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 self.assertEqual(bot.send_message.await_count, 1)
                 self.assertEqual(
                     bot.send_message.await_args_list[0].args[0], -10001
+                )
+                self.assertIn(
+                    "📌 2-я часть — нет",
+                    bot.send_message.await_args_list[0].args[1],
                 )
                 state_cache.save.assert_not_called()
                 notify_admin.assert_not_awaited()

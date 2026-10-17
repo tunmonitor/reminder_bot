@@ -18,7 +18,12 @@ from .services import SERVICES
 
 
 GROUP_TEMPLATE_FIELDS = frozenset(
-    {"service_name", "sunday_date", "task_assignments"}
+    {
+        "service_name",
+        "sunday_date",
+        "task_assignments",
+        "informational_notes",
+    }
 )
 PERSONAL_TEMPLATE_FIELDS = frozenset(
     {"name", "task", "service_name", "sunday_date", "telegram_id", "username"}

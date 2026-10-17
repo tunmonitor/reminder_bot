@@ -74,3 +74,18 @@ def format_task_assignments(
             lines.append(f"• {name}{suffix}")
         groups.append("\n".join(lines))
     return "\n\n".join(groups) or "⚪ Ответственные не указаны"
+
+
+def format_informational_notes(
+    assignments: dict[str, dict[str, Any] | list[str]],
+) -> str:
+    notes = []
+    for task, task_info in assignments.items():
+        if not task_is_informational(task_info):
+            continue
+        values = task_assignment_names(task_info)
+        note = f"📌 {task}"
+        if values:
+            note += f" — {', '.join(values)}"
+        notes.append(note)
+    return "\n".join(notes)

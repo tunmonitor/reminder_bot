@@ -136,6 +136,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     ) -> Message | None:
         kwargs.pop("parse_mode", None)
         keyboard_limit = kwargs.pop("_dialog_keyboard_limit", 6)
+        text_limit = kwargs.pop("_dialog_text_limit", 500)
         markup = kwargs.pop("reply_markup", None)
         actor_id = getattr(getattr(target, "chat", None), "id", None)
         pending = (
@@ -244,7 +245,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 validate_inline_keyboard(rows, max_buttons=keyboard_limit)
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
 
-        chunks = render_screen_chunks(text)
+        chunks = render_screen_chunks(text, limit=text_limit)
         sent_message = None
         for index, chunk in enumerate(chunks):
             sent_message = await target.answer(
@@ -1264,6 +1265,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await _send_dialog(message, "Служение не найдено.", parse_mode=None)
             return
         pending["step"] = "group_reminder_card"
+        pending["reminder_id"] = reminder_id
         body_status = (
             "собственный" if reminder["body"] else
             "используется шаблон по умолчанию"
@@ -1282,36 +1284,36 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         buttons = [
             [
                 InlineKeyboardButton(
-                    text=(
-                        "✏️ Изменить текст"
-                        if reminder["body"]
-                        else "✏️ Задать свой текст"
+                    text="👁 Предпросмотр",
+                    callback_data=(
+                        f"group_reminder:preview:{service_id}:{reminder_id}"
                     ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✏️ Текст",
                     callback_data=(
                         f"group_reminder:edit_text:{service_id}:"
                         f"{reminder_id}:{pending['session_id']}"
                     ),
-                )
-            ],
-            [
+                ),
                 InlineKeyboardButton(
-                    text="📅 Изменить срок",
+                    text="📅 Срок",
                     callback_data=(
                         f"group_reminder:edit_days:{service_id}:"
                         f"{reminder_id}:{pending['session_id']}"
                     ),
-                )
+                ),
             ],
             [
                 InlineKeyboardButton(
-                    text="🕒 Изменить время",
+                    text="🕒 Время",
                     callback_data=(
                         f"group_reminder:edit_time:{service_id}:"
                         f"{reminder_id}:{pending['session_id']}"
                     ),
-                )
-            ],
-            [
+                ),
                 InlineKeyboardButton(
                     text="🔄 Выключить" if reminder["enabled"] else "🔄 Включить",
                     callback_data=(
@@ -1319,6 +1321,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         f"{reminder_id}:{pending['session_id']}"
                     ),
                 ),
+            ],
+            [
                 InlineKeyboardButton(
                     text="🗑 Удалить",
                     callback_data=(
@@ -1329,8 +1333,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ],
         ]
         if reminder["body"]:
-            buttons.insert(
-                1,
+            buttons.append(
                 [
                     InlineKeyboardButton(
                         text="🔄 Вернуть шаблон по умолчанию",
@@ -1356,6 +1359,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             message,
             text,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            _dialog_keyboard_limit=8,
             parse_mode=None,
         )
 
@@ -1445,7 +1449,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         _, action, service_id, *tail = parts
         reminder_id = None
-        if len(tail) == 2:
+        is_preview = action == "preview"
+        if is_preview:
+            if len(tail) != 1:
+                await _answer_callback(callback, "⚠️ Настройка устарела.")
+                return
+            try:
+                reminder_id = int(tail[0])
+            except ValueError:
+                await _answer_callback(callback, "⚠️ Некорректный идентификатор.")
+                return
+            session_id = None
+        elif len(tail) == 2:
             try:
                 reminder_id = int(tail[0])
             except ValueError:
@@ -1461,12 +1476,21 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             pending is None
             or pending.get("operation") != "service_notify"
             or pending.get("service_id") != service_id
-            or pending.get("session_id") != session_id
+            or (
+                not is_preview
+                and pending.get("session_id") != session_id
+            )
             or registry is None
         ):
             await _answer_callback(
                 callback, "⚠️ Настройка устарела. Запустите /service_notify заново."
             )
+            return
+        if is_preview and (
+            pending.get("step") != "group_reminder_card"
+            or pending.get("reminder_id") != reminder_id
+        ):
+            await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
             return
         try:
             if not is_service_admin(actor_id, service_id):
@@ -1505,6 +1529,124 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await show_reminder_rules_menu(
                     callback.message, actor_id, service_id
                 )
+            elif action == "preview":
+                pending["step"] = "group_reminder_preview"
+                reminder = registry.get_group_reminder(reminder_id)
+                if reminder is None or reminder["service_id"] != service_id:
+                    raise ValueError(
+                        "Групповое напоминание больше не существует."
+                    )
+                service = registry.get_service(service_id)
+                if service is None:
+                    raise ValueError("Служение не найдено.")
+                await _answer_callback(callback)
+                await _send_dialog(
+                    callback.message,
+                    "⏳ Загружаю данные графика для предпросмотра...",
+                    parse_mode=None,
+                )
+                preview_loader = getattr(
+                    context, "get_group_reminder_preview", None
+                )
+                if not callable(preview_loader):
+                    debug.error(
+                        "Функция предпросмотра группового напоминания "
+                        "не настроена"
+                    )
+                    result = {
+                        "date": "",
+                        "time": reminder["reminder_time"],
+                        "text": "",
+                        "has_data": False,
+                        "error": "Не удалось загрузить график. Попробуйте позже.",
+                    }
+                else:
+                    try:
+                        result = await preview_loader(reminder_id)
+                    except sqlite3.Error:
+                        debug.exception(
+                            "Не удалось прочитать настройки напоминания "
+                            "для предпросмотра"
+                        )
+                        result = {
+                            "date": "",
+                            "time": reminder["reminder_time"],
+                            "text": "",
+                            "has_data": False,
+                            "error": (
+                                "Не удалось прочитать настройки напоминания."
+                            ),
+                        }
+                    except (OSError, RuntimeError):
+                        debug.exception(
+                            "Не удалось загрузить график для предпросмотра"
+                        )
+                        result = {
+                            "date": "",
+                            "time": reminder["reminder_time"],
+                            "text": "",
+                            "has_data": False,
+                            "error": (
+                                "Не удалось загрузить график. Попробуйте позже."
+                            ),
+                        }
+                preview_date = result.get("date", "")
+                header = (
+                    f"👁 Предпросмотр · {service_label(service)}\n\n"
+                    f"📅 {preview_date} · 🕒 {result['time']}\n\n"
+                    "──────────────────\n\n"
+                )
+                if result.get("error") == (
+                    "Не удалось прочитать настройки напоминания."
+                ):
+                    text = f"❌ {result['error']}"
+                elif result.get("error"):
+                    text = header
+                    if result["error"].startswith(
+                        "Нет данных из графика"
+                    ):
+                        text += (
+                            f"⚠️ {result['error']}\n"
+                            "Предпросмотр временно недоступен."
+                        )
+                    elif result["error"].startswith(
+                        "Не удалось загрузить график"
+                    ):
+                        text += f"⚠️ {result['error']}"
+                    else:
+                        text += f"❌ {result['error']}"
+                elif result.get("has_data"):
+                    preview_text = (
+                        result.get("text") or "⚪ Текст напоминания пуст."
+                    )
+                    preview_chunks = _telegram_text_chunks(
+                        preview_text, limit=3800
+                    )
+                    if len(preview_chunks) > 1:
+                        preview_text = (
+                            preview_chunks[0] + "\n... (текст обрезан)"
+                        )
+                    text = header + preview_text
+                else:
+                    text = header + "⚠️ Предпросмотр временно недоступен."
+                back_button = InlineKeyboardMarkup(
+                    inline_keyboard=[[
+                        InlineKeyboardButton(
+                            text="⬅️ К напоминанию",
+                            callback_data=(
+                                f"group_reminder:back:{service_id}:"
+                                f"{pending['session_id']}"
+                            ),
+                        )
+                    ]]
+                )
+                await _send_dialog(
+                    callback.message,
+                    text,
+                    reply_markup=back_button,
+                    _dialog_text_limit=4096,
+                    parse_mode=None,
+                )
             elif action == "edit_default":
                 if pending.get("step") != "default_template":
                     await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
@@ -1513,7 +1655,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await _send_dialog(
                     callback.message,
                     "Введите шаблон по умолчанию. Доступные поля: "
-                    "{service_name}, {sunday_date}, {task_assignments}.",
+                    "{service_name}, {sunday_date}, {task_assignments}, "
+                    "{informational_notes}.",
                     reply_markup=notification_edit_controls(
                         service_id, session_id
                     ),
@@ -1593,12 +1736,19 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 if pending.get("step") not in {
                     "group_reminder_card",
                     "group_reminder_delete",
+                    "group_reminder_preview",
                 }:
                     await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
                     return
-                if pending["step"] == "group_reminder_delete":
+                if pending["step"] in {
+                    "group_reminder_delete",
+                    "group_reminder_preview",
+                }:
                     await enter_group_reminder_card(
-                        callback.message, actor_id, service_id, reminder_id
+                        callback.message,
+                        actor_id,
+                        service_id,
+                        pending["reminder_id"],
                     )
                 else:
                     await show_reminder_rules_menu(
@@ -1631,7 +1781,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     f"{reminder['reminder_time']}.",
                     "text": "Введите собственный текст напоминания. "
                     "Можно использовать {service_name}, {sunday_date}, "
-                    "{task_assignments}.",
+                    "{task_assignments}, {informational_notes}.",
                 }
                 await _send_dialog(
                     callback.message,
@@ -1741,6 +1891,26 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         except sqlite3.Error:
             debug.exception("Ошибка управления групповым напоминанием")
+            if action == "preview":
+                back_button = InlineKeyboardMarkup(
+                    inline_keyboard=[[
+                        InlineKeyboardButton(
+                            text="⬅️ К напоминанию",
+                            callback_data=(
+                                f"group_reminder:back:{service_id}:"
+                                f"{pending['session_id']}"
+                            ),
+                        )
+                    ]]
+                )
+                await _send_dialog(
+                    callback.message,
+                    "❌ Не удалось прочитать настройки напоминания.",
+                    reply_markup=back_button,
+                    parse_mode=None,
+                )
+                await _answer_callback(callback)
+                return
             await _notify_admin(
                 context.bot,
                 context.admin_id,
@@ -1933,7 +2103,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "Введите новый текст для группы. Доступные поля:\n"
                 "• {service_name} — название служения\n"
                 "• {sunday_date} — дата воскресенья\n"
-                "• {task_assignments} — список задач и ответственных.\n"
+                "• {task_assignments} — список задач и ответственных\n"
+                "• {informational_notes} — информационные заметки графика.\n"
                 "Пустое значение не меняет текущий текст."
             ),
         }
@@ -1957,7 +2128,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     text += (
                         "\n\n⚠️ В сохранённом шаблоне есть неподдерживаемые "
                         "поля (например, {tg_responsible}). Они не подставляются. "
-                        "Замените их на {task_assignments}."
+                        "Замените их на {task_assignments} или "
+                        "{informational_notes}."
                     )
             text += "\n\n" + await notification_template_preview(
                 actor_id, service_id

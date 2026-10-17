@@ -1740,7 +1740,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 button
                 for row in edit_rule_menu.inline_keyboard
                 for button in row
-                if button.text == "📅 Изменить срок"
+                if button.text == "📅 Срок"
             )
             days_callback = SimpleNamespace(
                 data=days_button.callback_data,
@@ -1900,6 +1900,165 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_group_reminder_preview_is_private_and_returns_to_card(self):
+        async def run():
+            self.context.get_group_reminder_preview = AsyncMock(
+                return_value={
+                    "date": "25.10.2026",
+                    "time": "18:00",
+                    "text": "Отрендеренное сообщение группы " + "🙂" * 5000,
+                    "has_data": True,
+                    "error": None,
+                }
+            )
+            command = self.message(67890, "/service_notify")
+            await self.admin_router.message.handlers[6].callback(command)
+            service_callback = SimpleNamespace(
+                data="service:service_notify:sound",
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private", id=67890),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_selected")(service_callback)
+            settings = service_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            reminders_button = next(
+                button
+                for row in settings.inline_keyboard
+                for button in row
+                if button.callback_data.startswith("group_reminder:list:sound:")
+            )
+            reminders_callback = SimpleNamespace(
+                data=reminders_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private", id=67890),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_group_reminder_action")(
+                reminders_callback
+            )
+            reminder_button = next(
+                button
+                for row in reminders_callback.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith(
+                    "group_reminder:open:sound:"
+                )
+            )
+            reminder_callback = SimpleNamespace(
+                data=reminder_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private", id=67890),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_group_reminder_action")(
+                reminder_callback
+            )
+            card_markup = reminder_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            preview_button = next(
+                button
+                for row in card_markup.inline_keyboard
+                for button in row
+                if button.text == "👁 Предпросмотр"
+            )
+            reminder_id = self.registry.list_group_reminders("sound")[0]["id"]
+            self.assertEqual(
+                preview_button.callback_data,
+                f"group_reminder:preview:sound:{reminder_id}",
+            )
+            preview_callback = SimpleNamespace(
+                data=preview_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private", id=67890),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_group_reminder_action")(
+                preview_callback
+            )
+
+            self.context.get_group_reminder_preview.assert_awaited_once_with(
+                reminder_id
+            )
+            preview_text = preview_callback.message.answer.await_args.args[0]
+            self.assertIn("👁 Предпросмотр · ЗВУК", preview_text)
+            self.assertIn("📅 25.10.2026 · 🕒 18:00", preview_text)
+            self.assertIn("Отрендеренное сообщение группы", preview_text)
+            self.assertIn("... (текст обрезан)", preview_text)
+            back_button = preview_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard[0][0]
+            self.assertEqual(back_button.text, "⬅️ К напоминанию")
+            self.assertTrue(
+                back_button.callback_data.startswith(
+                    "group_reminder:back:sound:"
+                )
+            )
+            self.context.bot.send_message.assert_not_awaited()
+
+            back_callback = SimpleNamespace(
+                data=back_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private", id=67890),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_group_reminder_action")(
+                back_callback
+            )
+            card_markup = back_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            preview_button = next(
+                button
+                for row in card_markup.inline_keyboard
+                for button in row
+                if button.text == "👁 Предпросмотр"
+            )
+            self.context.get_group_reminder_preview.side_effect = (
+                sqlite3.OperationalError("database unavailable")
+            )
+            db_error_callback = SimpleNamespace(
+                data=preview_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private", id=67890),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_group_reminder_action")(
+                db_error_callback
+            )
+            self.assertIn(
+                "Не удалось прочитать настройки напоминания.",
+                db_error_callback.message.answer.await_args.args[0],
+            )
+            self.assertEqual(
+                self.context.get_group_reminder_preview.await_count, 2
+            )
+            self.context.bot.send_message.assert_not_awaited()
+
+        asyncio.run(run())
+
     def test_guided_notification_setup_adds_independent_reminder(self):
         async def run():
             self.registry.add_service_admin(67890, "sound", 12345)
@@ -1989,7 +2148,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 button
                 for row in card_markup.inline_keyboard
                 for button in row
-                if button.text == "📅 Изменить срок"
+                if button.text == "📅 Срок"
             )
             edit_days_callback = SimpleNamespace(
                 data=edit_days.callback_data,
@@ -2012,7 +2171,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 button
                 for row in card_markup.inline_keyboard
                 for button in row
-                if button.text == "🕒 Изменить время"
+                if button.text == "🕒 Время"
             )
             edit_time_callback = SimpleNamespace(
                 data=edit_time.callback_data,

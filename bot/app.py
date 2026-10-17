@@ -48,6 +48,7 @@ if __package__:
         send_assignments,
     )
     from .presentation import (
+        format_informational_notes,
         format_task_assignments,
         task_assignment_names,
         task_is_informational,
@@ -60,7 +61,7 @@ if __package__:
         refresh_user_reminder_jobs as refresh_user_reminder_schedule_jobs,
         scheduled_reminder_date,
     )
-    from .service_registry import ServiceRegistry
+    from .service_registry import DEFAULT_GROUP_TEMPLATE, ServiceRegistry
     from .state import StateCache
     from .yandex_disk import download_public
     from .backup import (
@@ -98,6 +99,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         send_assignments,
     )
     from bot.presentation import (
+        format_informational_notes,
         format_task_assignments,
         task_assignment_names,
         task_is_informational,
@@ -110,7 +112,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         refresh_user_reminder_jobs as refresh_user_reminder_schedule_jobs,
         scheduled_reminder_date,
     )
-    from bot.service_registry import ServiceRegistry
+    from bot.service_registry import DEFAULT_GROUP_TEMPLATE, ServiceRegistry
     from bot.state import StateCache
     from bot.yandex_disk import download_public
     from bot.backup import (
@@ -489,6 +491,89 @@ async def _load_service_task_assignments(
         xlsx_path.unlink(missing_ok=True)
 
 
+async def get_group_reminder_preview(
+    reminder_id: int,
+    credentials,
+    shm_dir: Path,
+    tz,
+    registry: ServiceRegistry,
+    debug_logger,
+) -> dict:
+    reminder = registry.get_group_reminder(reminder_id)
+    if reminder is None:
+        raise ValueError("Групповое напоминание больше не существует.")
+    service = registry.get_service(reminder["service_id"])
+    if service is None:
+        raise ValueError("Служение для напоминания не найдено.")
+
+    event_date = _next_sunday_in_tz(tz)
+    date_text = event_date.strftime("%d.%m.%Y")
+    result = {
+        "date": date_text,
+        "time": reminder["reminder_time"],
+        "text": "",
+        "has_data": False,
+        "error": None,
+    }
+    try:
+        assignments, event_found = await _load_service_task_assignments(
+            credentials,
+            shm_dir,
+            tz,
+            service["id"],
+            debug_logger,
+            only_date=event_date,
+            return_event_found=True,
+        )
+    except (OSError, RuntimeError, ValueError):
+        debug_logger.exception(
+            "Не удалось загрузить график для предпросмотра напоминания %s",
+            reminder_id,
+        )
+        result["error"] = "Не удалось загрузить график. Попробуйте позже."
+        return result
+
+    if not event_found:
+        result["error"] = f"Нет данных из графика на {date_text}."
+        return result
+
+    contacts = registry.list_responsible_contacts(
+        credentials.admin_tg_id, service["id"]
+    )
+    contacts_by_name = {
+        (contact["task"], contact["name"]): contact for contact in contacts
+    }
+    assignment_text = format_task_assignments(
+        assignments, contacts_by_name, mark_unlinked=True
+    )
+    informational_notes = format_informational_notes(assignments)
+    template = (
+        reminder.get("body")
+        or service.get("group_template")
+        or DEFAULT_GROUP_TEMPLATE
+    )
+    try:
+        result["text"] = template.format_map(
+            {
+                "service_name": service["name"],
+                "sunday_date": date_text,
+                "task_assignments": assignment_text,
+                "informational_notes": informational_notes,
+            }
+        )
+    except KeyError as exc:
+        field = exc.args[0]
+        result["error"] = (
+            f"Ошибка в шаблоне: поле {{{field}}} не поддерживается."
+        )
+        return result
+    except (AttributeError, IndexError, ValueError):
+        result["error"] = "Ошибка в синтаксисе шаблона."
+        return result
+    result["has_data"] = True
+    return result
+
+
 class _TemplateValues(dict):
     def __missing__(self, key: str) -> str:
         return "{" + key + "}"
@@ -606,6 +691,7 @@ async def _process_service_reminder(
                 service_name=service["name"],
                 sunday_date=date_text,
                 task_assignments=assignment_text,
+                informational_notes=format_informational_notes(assignments),
             )
         )
     except (AttributeError, IndexError, KeyError, ValueError) as exc:
@@ -1017,6 +1103,7 @@ async def _prepare_service_test_previews(
                 service_name=service["name"],
                 sunday_date=sunday_str,
                 task_assignments=assignment_text,
+                informational_notes=format_informational_notes(assignments),
             )
         )
     except (AttributeError, IndexError, KeyError, ValueError) as exc:
@@ -1032,6 +1119,7 @@ async def _prepare_service_test_previews(
             service_name=service["name"],
             sunday_date=sunday_str,
             task_assignments=assignment_text,
+            informational_notes=format_informational_notes(assignments),
         )
     )
     return {
@@ -1351,9 +1439,24 @@ async def _run_locked(args: CliArgs) -> None:
                 personal_templates,
             )
 
+        async def prepare_group_reminder_preview(
+            reminder_id: int,
+        ) -> dict:
+            if service_registry is None:
+                raise ValueError("Реестр настроек служений недоступен")
+            return await get_group_reminder_preview(
+                reminder_id,
+                credentials,
+                shm_dir,
+                tz,
+                service_registry,
+                debug_logger,
+            )
+
         context.prepare_test_previews = prepare_test_previews
         context.load_service_task_assignments = load_service_task_assignments
         context.prepare_service_test_previews = prepare_service_test_previews
+        context.get_group_reminder_preview = prepare_group_reminder_preview
         register(dp, context)
 
         if backup_manager is not None:
