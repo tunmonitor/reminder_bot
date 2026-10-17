@@ -184,18 +184,19 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     button.text = f"📋 {label}"
 
             if len(buttons) > keyboard_limit:
-                page_size = 4
                 pinned_buttons = [
                     button
                     for button in buttons
                     if button.text.startswith(("⬅️ К ", "↩️ К "))
                 ]
-                if pinned_buttons:
-                    page_size = 3
                 pageable_buttons = [
                     button for button in buttons
                     if button not in pinned_buttons
                 ]
+                page_size = max(
+                    1,
+                    min(6, keyboard_limit - len(pinned_buttons) - 2),
+                )
                 page_count = max(
                     1, (len(pageable_buttons) + page_size - 1) // page_size
                 )
@@ -244,7 +245,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 text = f"{text}\n📊 Страница {_dialog_page + 1}/{page_count}"
             else:
                 rows = layout_buttons(buttons)
-                validate_inline_keyboard(rows, max_buttons=keyboard_limit)
+                validate_inline_keyboard(
+                    rows, max_buttons=keyboard_limit
+                )
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
 
         chunks = render_screen_chunks(text, limit=text_limit)
@@ -422,6 +425,39 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         )
         return "\n".join(lines)
 
+    def service_selection_keyboard(
+        services: list[dict],
+        operation: str,
+    ) -> InlineKeyboardMarkup:
+        service_order = (
+            "assembly", "broadcast", "slides", "order",
+            "kitchen", "coffee", "sound", "rehearsal",
+        )
+        service_rank = {
+            service_id: index
+            for index, service_id in enumerate(service_order)
+        }
+        ordered_services = sorted(
+            services,
+            key=lambda service: service_rank.get(
+                service["id"], len(service_rank)
+            ),
+        )
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=(
+                            f"{'🟢' if service['enabled'] else '🔴'} "
+                            f"{service_label(service)}"
+                        ),
+                        callback_data=f"service:{operation}:{service['id']}",
+                    )
+                ]
+                for service in ordered_services
+            ]
+        )
+
     async def request_service_input(
         message: Message,
         operation: str,
@@ -505,20 +541,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             return
 
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text=(
-                            f"{'🟢' if service['enabled'] else '🔴'} "
-                            f"{service_label(service)}"
-                        ),
-                        callback_data=f"service:{operation}:{service['id']}",
-                    )
-                ]
-                for service in services
-            ]
-        )
+        keyboard = service_selection_keyboard(services, operation)
         descriptions = {
             "service_settings": "ℹ️ Выберите служение для просмотра настроек.",
             "service_admin_add": "ℹ️ Выберите служение для назначения администратора.",
@@ -531,6 +554,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         await _send_dialog(message, descriptions[operation],
             reply_markup=keyboard,
             parse_mode=None,
+            _dialog_keyboard_limit=8,
         )
 
     async def ask_for_service_parameters(
@@ -2656,39 +2680,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     message.from_user.id, service["id"]
                 )
             ]
-            service_order = (
-                "assembly", "broadcast", "slides", "order",
-                "kitchen", "coffee", "sound", "rehearsal",
-            )
-            service_rank = {
-                service_id: index
-                for index, service_id in enumerate(service_order)
-            }
-            visible.sort(
-                key=lambda service: service_rank.get(
-                    service["id"], len(service_rank)
-                )
-            )
             if not visible:
                 await _send_dialog(message, "ℹ️ Вы не назначены администратором служений.",
                     parse_mode=None,
                 )
                 return
-            keyboard = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text=(
-                                f"{'🟢' if service['enabled'] else '🔴'} "
-                                f"{service_label(service)}"
-                            ),
-                            callback_data=(
-                                f"service:service_settings:{service['id']}"
-                            ),
-                        )
-                    ]
-                    for service in visible
-                ]
+            keyboard = service_selection_keyboard(
+                visible, "service_settings"
             )
         except sqlite3.Error:
             debug.exception("Не удалось прочитать список служений")
@@ -2998,26 +2996,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             callback.from_user.id, service["id"]
                         )
                     ]
-                    keyboard = InlineKeyboardMarkup(
-                        inline_keyboard=[
-                            [
-                                InlineKeyboardButton(
-                                    text=(
-                                        f"{'🟢' if service['enabled'] else '🔴'} "
-                                        f"{service_label(service)}"
-                                    ),
-                                    callback_data=(
-                                        "service:service_settings:"
-                                        f"{service['id']}"
-                                    ),
-                                )
-                            ]
-                            for service in services
-                        ]
+                    keyboard = service_selection_keyboard(
+                        services, "service_settings"
                     )
                     await _send_dialog(callback.message, "📋 Служения\nℹ️ Выберите служение для просмотра настроек.",
                         reply_markup=keyboard,
                         parse_mode=None,
+                        _dialog_keyboard_limit=8,
                     )
                 except sqlite3.Error:
                     debug.exception(

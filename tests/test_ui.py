@@ -109,6 +109,21 @@ class DialogRenderingTest(unittest.TestCase):
                     expected_sizes,
                 )
 
+    def test_layout_buttons_retries_boundaries_at_same_row_count(self):
+        buttons = [
+            InlineKeyboardButton(text="A" * 20, callback_data="first"),
+            InlineKeyboardButton(text="B" * 20, callback_data="second"),
+            InlineKeyboardButton(text="C" * 6, callback_data="third"),
+            InlineKeyboardButton(text="⬅️ Назад", callback_data="back"),
+        ]
+
+        rows = layout_buttons(buttons)
+
+        self.assertEqual(
+            [[button.callback_data for button in row] for row in rows],
+            [["first"], ["second", "third"], ["back"]],
+        )
+
     def test_layout_buttons_places_pagination_on_its_own_bottom_row(self):
         buttons = [
             InlineKeyboardButton(

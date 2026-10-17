@@ -292,29 +292,46 @@ def layout_buttons(
             else min(2, max_row_buttons)
         )
         row_count = (len(group) + max_buttons - 1) // max_buttons
-        while True:
-            base_size, extra_rows = divmod(len(group), row_count)
-            sizes = [
-                base_size + (1 if index < extra_rows else 0)
-                for index in range(row_count)
-            ]
-            candidate_rows = []
-            offset = 0
-            for size in sizes:
-                row = group[offset:offset + size]
-                offset += size
-                row_width = sum(len(button.text) for button in row) + (
-                    2 * (len(row) - 1)
+
+        def balanced_partitions(
+            remaining: int, parts: int, prefix: tuple[int, ...] = ()
+        ) -> list[tuple[int, ...]]:
+            if parts == 0:
+                return [prefix] if remaining == 0 else []
+            min_size = max(1, remaining - max_buttons * (parts - 1))
+            max_size = min(max_buttons, remaining - (parts - 1))
+            return [
+                partition
+                for size in range(max_size, min_size - 1, -1)
+                for partition in balanced_partitions(
+                    remaining - size, parts - 1, (*prefix, size)
                 )
-                candidate_rows.append(row)
-                if size > max_buttons or (
-                    size > 1 and row_width > max_row_width
-                ):
-                    break
-            else:
-                rows.extend(candidate_rows)
-                group.clear()
-                return
+            ]
+
+        while True:
+            partitions = balanced_partitions(len(group), row_count)
+            partitions.sort(
+                key=lambda sizes: (
+                    max(sizes) - min(sizes),
+                    tuple(-size for size in sizes),
+                )
+            )
+            for sizes in partitions:
+                candidate_rows = []
+                offset = 0
+                for size in sizes:
+                    row = group[offset:offset + size]
+                    offset += size
+                    row_width = sum(len(button.text) for button in row) + (
+                        2 * (len(row) - 1)
+                    )
+                    if size > 1 and row_width > max_row_width:
+                        break
+                    candidate_rows.append(row)
+                else:
+                    rows.extend(candidate_rows)
+                    group.clear()
+                    return
             row_count += 1
 
     for button in regular:

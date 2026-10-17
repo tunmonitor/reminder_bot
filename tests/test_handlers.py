@@ -3973,22 +3973,29 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_service_selection_lists_share_balanced_pagination_layout(self):
+    def test_service_selection_lists_match_services_command_layout(self):
         async def run():
             command_handlers = {
                 item.callback.__name__: item.callback
                 for item in self.admin_router.message.handlers
             }
+            expected_ids = [
+                ["assembly", "broadcast", "slides"],
+                ["order", "kitchen", "coffee"],
+                ["sound", "rehearsal"],
+            ]
             for command_name, operation in (
                 ("/service_settings", "service_settings"),
                 ("/service_contact", "service_contact"),
                 ("/service_notify", "service_notify"),
+                ("/service_chat", "service_chat"),
             ):
                 message = self.message(67890, command_name)
                 handler_name = {
                     "service_settings": "on_service_settings",
                     "service_contact": "on_service_contact",
                     "service_notify": "on_service_notify",
+                    "service_chat": "on_service_chat",
                 }[operation]
                 await command_handlers[handler_name](message)
 
@@ -3996,14 +4003,64 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "reply_markup"
                 ].inline_keyboard
                 self.assertEqual(
-                    [len(row) for row in rows],
-                    [2, 2, 1],
+                    [
+                        [
+                            button.callback_data.rsplit(":", 1)[-1]
+                            for button in row
+                        ]
+                        for row in rows
+                    ],
+                    expected_ids,
                     operation,
                 )
-                self.assertTrue(
-                    rows[-1][0].text.endswith("➡️"),
-                    operation,
-                )
+
+            services_message = self.message(67890, "/services")
+            await command_handlers["on_services"](services_message)
+            services_rows = services_message.answer.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            self.assertEqual(
+                [
+                    [
+                        button.callback_data.rsplit(":", 1)[-1]
+                        for button in row
+                    ]
+                    for row in services_rows
+                ],
+                expected_ids,
+            )
+
+        asyncio.run(run())
+
+    def test_service_selector_paginates_six_buttons_plus_bottom_navigation(self):
+        async def run():
+            services = [
+                {
+                    "id": f"service_{index}",
+                    "name": f"Служение {index}",
+                    "enabled": index % 2 == 0,
+                }
+                for index in range(9)
+            ]
+            message = self.message(67890, "/service_settings")
+            with patch.object(
+                self.registry, "list_services", return_value=services
+            ):
+                await next(
+                    item.callback
+                    for item in self.admin_router.message.handlers
+                    if item.callback.__name__ == "on_service_settings"
+                )(message)
+
+            rows = message.answer.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            self.assertEqual([len(row) for row in rows], [3, 3, 1])
+            self.assertTrue(rows[-1][0].text.endswith("➡️"))
+            self.assertEqual(
+                sum(len(row) for row in rows),
+                7,
+            )
 
         asyncio.run(run())
 
