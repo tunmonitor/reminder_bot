@@ -58,10 +58,12 @@ if __package__:
     from .scheduler import (
         add_service_reminder_jobs,
         build_scheduler,
+        next_sunday_date,
+        reminder_send_date,
         refresh_user_reminder_jobs as refresh_user_reminder_schedule_jobs,
         scheduled_reminder_date,
     )
-    from .service_registry import DEFAULT_GROUP_TEMPLATE, ServiceRegistry
+    from .service_registry import ServiceRegistry
     from .state import StateCache
     from .yandex_disk import download_public
     from .backup import (
@@ -109,10 +111,12 @@ else:  # pragma: no cover - поддержка запуска файла нап�
     from bot.scheduler import (
         add_service_reminder_jobs,
         build_scheduler,
+        next_sunday_date,
+        reminder_send_date,
         refresh_user_reminder_jobs as refresh_user_reminder_schedule_jobs,
         scheduled_reminder_date,
     )
-    from bot.service_registry import DEFAULT_GROUP_TEMPLATE, ServiceRegistry
+    from bot.service_registry import ServiceRegistry
     from bot.state import StateCache
     from bot.yandex_disk import download_public
     from bot.backup import (
@@ -123,11 +127,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
 
 
 def _next_sunday_in_tz(tz) -> date:
-    today = datetime.now(tz).date()
-    days_until_sunday = (6 - today.weekday()) % 7
-    if days_until_sunday == 0:
-        return today + timedelta(days=7)
-    return today + timedelta(days=days_until_sunday)
+    return next_sunday_date(datetime.now(tz).date())
 
 
 def _pid_path(shm_dir: Path) -> Path:
@@ -507,9 +507,11 @@ async def get_group_reminder_preview(
         raise ValueError("Служение для напоминания не найдено.")
 
     event_date = _next_sunday_in_tz(tz)
+    send_date = reminder_send_date(event_date, reminder["reminder_days"])
     date_text = event_date.strftime("%d.%m.%Y")
     result = {
         "date": date_text,
+        "send_date": send_date.strftime("%d.%m.%Y"),
         "time": reminder["reminder_time"],
         "text": "",
         "has_data": False,
@@ -525,7 +527,7 @@ async def get_group_reminder_preview(
             only_date=event_date,
             return_event_found=True,
         )
-    except (OSError, RuntimeError, ValueError):
+    except Exception:
         debug_logger.exception(
             "Не удалось загрузить график для предпросмотра напоминания %s",
             reminder_id,
@@ -535,6 +537,16 @@ async def get_group_reminder_preview(
 
     if not event_found:
         result["error"] = f"Нет данных из графика на {date_text}."
+        return result
+
+    if not any(
+        not task_is_informational(task_info)
+        for task_info in assignments.values()
+    ):
+        result["error"] = (
+            "На эту дату нет задач с ответственными. "
+            "Уведомление не будет отправлено."
+        )
         return result
 
     contacts = registry.list_responsible_contacts(
@@ -547,26 +559,16 @@ async def get_group_reminder_preview(
         assignments, contacts_by_name, mark_unlinked=True
     )
     informational_notes = format_informational_notes(assignments)
-    template = (
-        reminder.get("body")
-        or service.get("group_template")
-        or DEFAULT_GROUP_TEMPLATE
-    )
+    template = registry.resolve_group_text(reminder, service)
     try:
         result["text"] = template.format_map(
-            {
-                "service_name": service["name"],
-                "sunday_date": date_text,
-                "task_assignments": assignment_text,
-                "informational_notes": informational_notes,
-            }
+            _TemplateValues(
+                service_name=service["name"],
+                sunday_date=date_text,
+                task_assignments=assignment_text,
+                informational_notes=informational_notes,
+            )
         )
-    except KeyError as exc:
-        field = exc.args[0]
-        result["error"] = (
-            f"Ошибка в шаблоне: поле {{{field}}} не поддерживается."
-        )
-        return result
     except (AttributeError, IndexError, ValueError):
         result["error"] = "Ошибка в синтаксисе шаблона."
         return result
@@ -1402,6 +1404,7 @@ async def _run_locked(args: CliArgs) -> None:
             bot=bot,
             group_chat_id=registry_context_group_chat_id,
             admin_id=credentials.admin_tg_id,
+            timezone=tz,
             state_cache=state_cache,
             interaction_logger=interaction_logger,
             debug_logger=debug_logger,

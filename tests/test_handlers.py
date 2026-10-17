@@ -7,6 +7,7 @@ from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 from bot.handlers import register, router
 from bot.service_registry import ServiceRegistry
@@ -636,6 +637,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             debug_logger=MagicMock(),
             admin_id=67890,
             group_chat_id=-100,
+            timezone=ZoneInfo("UTC"),
             service_registry=self.registry,
             bot=SimpleNamespace(
                 send_message=AsyncMock(), delete_message=AsyncMock()
@@ -1905,6 +1907,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.context.get_group_reminder_preview = AsyncMock(
                 return_value={
                     "date": "25.10.2026",
+                    "send_date": "23.10.2026",
                     "time": "18:00",
                     "text": "Отрендеренное сообщение группы " + "🙂" * 5000,
                     "has_data": True,
@@ -1963,12 +1966,19 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 ),
                 answer=AsyncMock(),
             )
-            await self.callback_handler("on_group_reminder_action")(
-                reminder_callback
-            )
+            with patch(
+                "bot.handlers.next_sunday_date",
+                return_value=date(2026, 10, 25),
+            ):
+                await self.callback_handler("on_group_reminder_action")(
+                    reminder_callback
+                )
             card_markup = reminder_callback.message.answer.await_args.kwargs[
                 "reply_markup"
             ]
+            card_text = reminder_callback.message.answer.await_args.args[0]
+            self.assertIn("📅 Срок: за 1 дн.", card_text)
+            self.assertIn("✉️ Отправка: 24.10.2026 в 18:00", card_text)
             preview_button = next(
                 button
                 for row in card_markup.inline_keyboard
@@ -1978,8 +1988,27 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             reminder_id = self.registry.list_group_reminders("sound")[0]["id"]
             self.assertEqual(
                 preview_button.callback_data,
-                f"group_reminder:preview:sound:{reminder_id}",
+                f"group_reminder:preview:sound:{reminder_id}:"
+                f"{preview_button.callback_data.split(':')[-1]}",
             )
+            session_id = preview_button.callback_data.split(":")[-1]
+            stale_preview = SimpleNamespace(
+                data=(
+                    f"group_reminder:preview:sound:{reminder_id}:"
+                    f"{session_id}stale"
+                ),
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private", id=67890),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_group_reminder_action")(
+                stale_preview
+            )
+            self.context.get_group_reminder_preview.assert_not_awaited()
+
             preview_callback = SimpleNamespace(
                 data=preview_button.callback_data,
                 from_user=SimpleNamespace(id=67890),
@@ -1998,7 +2027,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             preview_text = preview_callback.message.answer.await_args.args[0]
             self.assertIn("👁 Предпросмотр · ЗВУК", preview_text)
-            self.assertIn("📅 25.10.2026 · 🕒 18:00", preview_text)
+            self.assertIn("📅 Собрание: 25.10.2026", preview_text)
+            self.assertIn("✉️ Отправка: 23.10.2026 в 18:00", preview_text)
             self.assertIn("Отрендеренное сообщение группы", preview_text)
             self.assertIn("... (текст обрезан)", preview_text)
             back_button = preview_callback.message.answer.await_args.kwargs[
@@ -2033,10 +2063,69 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 for button in row
                 if button.text == "👁 Предпросмотр"
             )
-            self.context.get_group_reminder_preview.side_effect = (
-                sqlite3.OperationalError("database unavailable")
+            loader_started = asyncio.Event()
+            release_loader = asyncio.Event()
+
+            async def slow_preview(_reminder_id):
+                loader_started.set()
+                await release_loader.wait()
+                return {
+                    "date": "25.10.2026",
+                    "time": "18:00",
+                    "text": "Старый медленный предпросмотр",
+                    "has_data": True,
+                    "error": None,
+                }
+
+            self.context.get_group_reminder_preview.side_effect = slow_preview
+            slow_callback = SimpleNamespace(
+                data=preview_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private", id=67890),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
             )
-            db_error_callback = SimpleNamespace(
+            slow_preview_task = asyncio.create_task(
+                self.callback_handler("on_group_reminder_action")(slow_callback)
+            )
+            await loader_started.wait()
+            interrupt_callback = SimpleNamespace(
+                data=f"group_reminder:back:sound:{session_id}",
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private", id=67890),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_group_reminder_action")(
+                interrupt_callback
+            )
+            release_loader.set()
+            await slow_preview_task
+            self.assertEqual(slow_callback.message.answer.await_count, 1)
+            restored_card = interrupt_callback.message.answer.await_args.args[0]
+            self.assertIn("<b>📝 Напоминание · ЗВУК</b>", restored_card)
+            self.assertNotIn(
+                "Старый медленный предпросмотр",
+                restored_card,
+            )
+
+            card_markup = interrupt_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            preview_button = next(
+                button
+                for row in card_markup.inline_keyboard
+                for button in row
+                if button.text == "👁 Предпросмотр"
+            )
+            self.context.get_group_reminder_preview.side_effect = (
+                ValueError("Групповое напоминание больше не существует.")
+            )
+            deleted_callback = SimpleNamespace(
                 data=preview_button.callback_data,
                 from_user=SimpleNamespace(id=67890),
                 message=SimpleNamespace(
@@ -2046,15 +2135,83 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 answer=AsyncMock(),
             )
             await self.callback_handler("on_group_reminder_action")(
-                db_error_callback
+                deleted_callback
             )
             self.assertIn(
-                "Не удалось прочитать настройки напоминания.",
-                db_error_callback.message.answer.await_args.args[0],
+                "Групповое напоминание больше не существует.",
+                deleted_callback.message.answer.await_args.args[0],
             )
+            self.assertEqual(deleted_callback.answer.await_count, 1)
+            deleted_markup = deleted_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
             self.assertEqual(
-                self.context.get_group_reminder_preview.await_count, 2
+                deleted_markup.inline_keyboard[0][0].text,
+                "⬅️ К напоминаниям",
             )
+
+            list_callback = SimpleNamespace(
+                data=f"group_reminder:list:sound:{session_id}",
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private", id=67890),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_group_reminder_action")(
+                list_callback
+            )
+            open_button = next(
+                button
+                for row in list_callback.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith(
+                    "group_reminder:open:sound:"
+                )
+            )
+            open_callback = SimpleNamespace(
+                data=open_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private", id=67890),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_group_reminder_action")(
+                open_callback
+            )
+            preview_button = next(
+                button
+                for row in open_callback.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.text == "👁 Предпросмотр"
+            )
+            self.context.get_group_reminder_preview.side_effect = RuntimeError(
+                "corrupt workbook"
+            )
+            failed_callback = SimpleNamespace(
+                data=preview_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private", id=67890),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_group_reminder_action")(
+                failed_callback
+            )
+            self.assertIn(
+                "Не удалось загрузить график. Попробуйте позже.",
+                failed_callback.message.answer.await_args.args[0],
+            )
+            self.assertEqual(failed_callback.answer.await_count, 1)
             self.context.bot.send_message.assert_not_awaited()
 
         asyncio.run(run())

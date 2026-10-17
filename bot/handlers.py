@@ -7,6 +7,7 @@ import re
 import secrets
 import sqlite3
 import time
+from datetime import datetime
 from typing import Any
 
 from aiogram import F, Dispatcher, Router
@@ -38,6 +39,7 @@ from .service_registry import (
     PERSONAL_TEMPLATE_FIELDS,
     validate_notification_template,
 )
+from .scheduler import next_sunday_date, reminder_send_date
 from .ui import (
     callback_text,
     clean_previous_menu,
@@ -1266,6 +1268,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         pending["step"] = "group_reminder_card"
         pending["reminder_id"] = reminder_id
+        event_date = next_sunday_date(datetime.now(context.timezone).date())
+        send_date = reminder_send_date(
+            event_date, reminder["reminder_days"]
+        )
         body_status = (
             "собственный" if reminder["body"] else
             "используется шаблон по умолчанию"
@@ -1276,7 +1282,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         text = (
             f"📝 Напоминание · {service_label(service)}\n\n"
             f"📅 Срок: за {reminder['reminder_days']} дн.\n"
-            f"🕒 Время: {reminder['reminder_time']}\n"
+            f"✉️ Отправка: {send_date:%d.%m.%Y} "
+            f"в {reminder['reminder_time']}\n"
             f"📝 Текст: {body_status}\n"
             f"🔔 Статус: {'включено' if reminder['enabled'] else 'выключено'}"
             f"\n\nТекущий текст напоминания:\n{current_text}"
@@ -1286,7 +1293,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 InlineKeyboardButton(
                     text="👁 Предпросмотр",
                     callback_data=(
-                        f"group_reminder:preview:{service_id}:{reminder_id}"
+                        f"group_reminder:preview:{service_id}:{reminder_id}:"
+                        f"{pending['session_id']}"
                     ),
                 )
             ],
@@ -1451,7 +1459,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         reminder_id = None
         is_preview = action == "preview"
         if is_preview:
-            if len(tail) != 1:
+            if len(tail) != 2:
                 await _answer_callback(callback, "⚠️ Настройка устарела.")
                 return
             try:
@@ -1459,7 +1467,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             except ValueError:
                 await _answer_callback(callback, "⚠️ Некорректный идентификатор.")
                 return
-            session_id = None
+            session_id = tail[1]
         elif len(tail) == 2:
             try:
                 reminder_id = int(tail[0])
@@ -1476,10 +1484,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             pending is None
             or pending.get("operation") != "service_notify"
             or pending.get("service_id") != service_id
-            or (
-                not is_preview
-                and pending.get("session_id") != session_id
-            )
+            or pending.get("session_id") != session_id
             or registry is None
         ):
             await _answer_callback(
@@ -1506,6 +1511,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             if callable(refresh):
                 await refresh()
 
+        callback_answered = False
         try:
             if action == "default":
                 if pending.get("step") != "menu":
@@ -1523,14 +1529,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     callback.message, actor_id, service_id
                 )
             elif action == "list":
-                if pending.get("step") != "menu":
+                if pending.get("step") not in {
+                    "menu",
+                    "group_reminder_preview",
+                }:
                     await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
                     return
                 await show_reminder_rules_menu(
                     callback.message, actor_id, service_id
                 )
             elif action == "preview":
-                pending["step"] = "group_reminder_preview"
+                preview_session_id = session_id
                 reminder = registry.get_group_reminder(reminder_id)
                 if reminder is None or reminder["service_id"] != service_id:
                     raise ValueError(
@@ -1539,12 +1548,37 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 service = registry.get_service(service_id)
                 if service is None:
                     raise ValueError("Служение не найдено.")
+                event_date = next_sunday_date(
+                    datetime.now(context.timezone).date()
+                )
+                send_date = reminder_send_date(
+                    event_date, reminder["reminder_days"]
+                )
+                preview_dates = {
+                    "date": event_date.strftime("%d.%m.%Y"),
+                    "send_date": send_date.strftime("%d.%m.%Y"),
+                    "time": reminder["reminder_time"],
+                }
                 await _answer_callback(callback)
+                callback_answered = True
+                pending["step"] = "group_reminder_preview"
                 await _send_dialog(
                     callback.message,
                     "⏳ Загружаю данные графика для предпросмотра...",
                     parse_mode=None,
                 )
+                def preview_is_current() -> bool:
+                    active = pending_inputs.get(actor_id)
+                    return (
+                        active is pending
+                        and active.get("session_id") == preview_session_id
+                        and active.get("step") == "group_reminder_preview"
+                        and active.get("reminder_id") == reminder_id
+                    )
+
+                if not preview_is_current():
+                    return
+
                 preview_loader = getattr(
                     context, "get_group_reminder_preview", None
                 )
@@ -1554,8 +1588,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "не настроена"
                     )
                     result = {
-                        "date": "",
-                        "time": reminder["reminder_time"],
+                        **preview_dates,
                         "text": "",
                         "has_data": False,
                         "error": "Не удалось загрузить график. Попробуйте позже.",
@@ -1569,31 +1602,46 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             "для предпросмотра"
                         )
                         result = {
-                            "date": "",
-                            "time": reminder["reminder_time"],
+                            **preview_dates,
                             "text": "",
                             "has_data": False,
                             "error": (
                                 "Не удалось прочитать настройки напоминания."
                             ),
                         }
-                    except (OSError, RuntimeError):
+                    except ValueError as exc:
+                        debug.exception(
+                            "Предпросмотр группового напоминания "
+                            "стал недоступен во время загрузки"
+                        )
+                        result = {
+                            **preview_dates,
+                            "text": "",
+                            "has_data": False,
+                            "error": str(exc),
+                        }
+                    except Exception:
                         debug.exception(
                             "Не удалось загрузить график для предпросмотра"
                         )
                         result = {
-                            "date": "",
-                            "time": reminder["reminder_time"],
+                            **preview_dates,
                             "text": "",
                             "has_data": False,
                             "error": (
                                 "Не удалось загрузить график. Попробуйте позже."
                             ),
                         }
+
+                if not preview_is_current():
+                    return
+
                 preview_date = result.get("date", "")
                 header = (
                     f"👁 Предпросмотр · {service_label(service)}\n\n"
-                    f"📅 {preview_date} · 🕒 {result['time']}\n\n"
+                    f"📅 Собрание: {preview_date}\n"
+                    f"✉️ Отправка: {result.get('send_date', '—')} "
+                    f"в {result['time']}\n\n"
                     "──────────────────\n\n"
                 )
                 if result.get("error") == (
@@ -1632,10 +1680,21 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 back_button = InlineKeyboardMarkup(
                     inline_keyboard=[[
                         InlineKeyboardButton(
-                            text="⬅️ К напоминанию",
+                            text=(
+                                "⬅️ К напоминаниям"
+                                if result.get("error")
+                                else "⬅️ К напоминанию"
+                            ),
                             callback_data=(
-                                f"group_reminder:back:{service_id}:"
-                                f"{pending['session_id']}"
+                                (
+                                    f"group_reminder:list:{service_id}:"
+                                    f"{preview_session_id}"
+                                )
+                                if result.get("error")
+                                else (
+                                    f"group_reminder:back:{service_id}:"
+                                    f"{preview_session_id}"
+                                )
                             ),
                         )
                     ]]
@@ -1887,17 +1946,21 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await _answer_callback(callback, "⚠️ Неизвестное действие.")
                 return
         except (PermissionError, ValueError) as exc:
+            if action == "preview" and callback_answered:
+                return
             await _answer_callback(callback, _status_text(str(exc), "⚠️"))
             return
         except sqlite3.Error:
             debug.exception("Ошибка управления групповым напоминанием")
             if action == "preview":
+                if callback_answered:
+                    return
                 back_button = InlineKeyboardMarkup(
                     inline_keyboard=[[
                         InlineKeyboardButton(
-                            text="⬅️ К напоминанию",
+                            text="⬅️ К напоминаниям",
                             callback_data=(
-                                f"group_reminder:back:{service_id}:"
+                                f"group_reminder:list:{service_id}:"
                                 f"{pending['session_id']}"
                             ),
                         )
@@ -1910,6 +1973,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     parse_mode=None,
                 )
                 await _answer_callback(callback)
+                callback_answered = True
                 return
             await _notify_admin(
                 context.bot,
@@ -1920,6 +1984,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await _answer_callback(callback, "❌ Ошибка базы данных.")
             return
         except (OSError, RuntimeError):
+            if action == "preview" and callback_answered:
+                debug.exception(
+                    "Не удалось завершить предпросмотр группового напоминания"
+                )
+                return
             debug.exception("Не удалось обновить задания групповых напоминаний")
             await _notify_admin(
                 context.bot,
@@ -1929,7 +1998,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             await _answer_callback(callback, "❌ Не удалось обновить расписание.")
             return
-        await _answer_callback(callback)
+        if not callback_answered:
+            await _answer_callback(callback)
 
     def service_result_keyboard(service_id: str) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(

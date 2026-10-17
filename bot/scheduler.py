@@ -20,6 +20,17 @@ class ServiceReminderCallback(Protocol):
     ) -> Awaitable[None]: ...
 
 
+def next_sunday_date(today: date) -> date:
+    days_until_sunday = (6 - today.weekday()) % 7
+    if days_until_sunday == 0:
+        days_until_sunday = 7
+    return today + timedelta(days=days_until_sunday)
+
+
+def reminder_send_date(event_date: date, reminder_days: int) -> date:
+    return event_date - timedelta(days=reminder_days)
+
+
 def scheduled_reminder_date(now: datetime, reminder_time: str) -> date:
     """Recover yesterday's cron date when execution is delayed past midnight."""
     scheduled_time = time(
