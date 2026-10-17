@@ -356,6 +356,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 or registry.is_service_admin(actor_id, service_id)
             )
         )
+    def is_user_linked(actor_id: int) -> bool:
+        """Проверяет, привязан ли пользователь хотя бы к одной задаче."""
+        registry = service_registry()
+        if registry is None:
+            return False
+        try:
+            return bool(registry.list_user_services(actor_id))
+        except sqlite3.Error:
+            debug.exception("Ошибка при проверке привязки в /start")
+            return False
 
     def service_by_id(registry: Any, service_id: str) -> dict | None:
         return next(
@@ -2953,10 +2963,74 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def on_start(message: Message) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
+            
+        # Очищаем предыдущие меню/сессии
         await clean_and_clear_pending_actor(message.from_user.id)
-        await _send_dialog(message, "👋 Здравствуйте! Для управления служениями используйте команды "
-            "из меню бота.",
-            parse_mode=None,
+        
+        user_name = message.from_user.first_name or "друг"
+        
+        # Проверяем права
+        registry = service_registry()
+        is_admin = False
+        if registry is not None:
+            try:
+                if registry.is_super_admin(message.from_user.id):
+                    is_admin = True
+                else:
+                    # Проверяем, есть ли хоть одно служение, где он админ
+                    user_services = registry.list_user_services(message.from_user.id)
+                    for s_id in user_services:
+                        if registry.is_service_admin(message.from_user.id, s_id):
+                            is_admin = True
+                            break
+            except sqlite3.Error:
+                debug.exception("Ошибка при проверке прав в /start")
+        
+        # Формируем текст в зависимости от роли
+        if is_admin:
+            text = (
+                f"👋 <b>Здравствуйте, {user_name}!</b>\n\n"
+                "Вы — администратор. Этот бот управляет рассылками и привязкой участников к расписанию служений.\n\n"
+                "<b>Настройки и управление:</b>\n"
+                "📋 /services — список всех служений и их статус.\n"
+                "⚙️ /service_settings — просмотр и настройка конкретного служения.\n"
+                "🔔 /service_notify — настройка напоминаний и шаблонов сообщений.\n"
+                "👥 /service_contact — привязка ответственных из Excel к Telegram.\n"
+                "📡 /service_chat — назначить или отключить групповой чат.\n"
+                "🔄 /service_sync — сверить задачи из графика с привязками.\n\n"
+                "<b>Администрирование:</b>\n"
+                "👤 /service_admin_add — назначить администратора.\n"
+                "🗑 /service_admin_remove — снять администратора.\n"
+                "🧪 /test_notify — отправить тестовое сообщение.\n\n"
+                "<b>Личное:</b>\n"
+                "🔔 /my_notifications — настроить уведомления для себя.\n"
+                "🚫 /cancel — прервать текущий ввод.\n\n"
+                "<i>💡 Для первичной настройки используйте /service_chat, затем /service_contact и /service_notify.</i>"
+            )
+        elif is_user_linked(message.from_user.id):
+            text = (
+                f"👋 <b>Здравствуйте, {user_name}!</b>\n\n"
+                "Вы указаны в расписании служений. Этот бот поможет вам не пропускать назначения.\n\n"
+                "<b>Доступные команды:</b>\n"
+                "• 🔔 /my_notifications — включить или выключить личные уведомления, а также настроить время их отправки.\n"
+                "• 🚫 /cancel — прервать текущий ввод.\n\n"
+                "<i>💡 По умолчанию личные уведомления выключены. Зайдите в /my_notifications, чтобы включить их.</i>"
+            )
+        else:
+            text = (
+                "👋 <b>Здравствуйте!</b>\n\n"
+                "Вы пока не прописаны ни в какой задаче в расписании служений.\n\n"
+                "<b>Что делать дальше?</b>\n"
+                "Обратитесь к администратору вашего служения. Он привяжет ваш Telegram-аккаунт к задачам из графика.\n\n"
+                "Как только это произойдет, вы сможете получать личные напоминания и настраивать их в команде /my_notifications.\n\n"
+                "ℹ️ <i>Если вы администратор, используйте команду /services.</i>"
+            )
+
+        # Отправляем сообщение (parse_mode="HTML" для жирного шрифта)
+        await _send_dialog(
+            message, 
+            text, 
+            parse_mode="HTML"
         )
 
     @admin_router.callback_query(F.data.startswith("service:"))
