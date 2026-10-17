@@ -236,9 +236,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         None,
                     ),
                 )
-                rows = layout_buttons(
-                    [*page_buttons, *navigation, *pinned_buttons]
-                )
+                rows = layout_buttons([*page_buttons, *pinned_buttons])
+                if navigation:
+                    rows.append(navigation)
                 validate_inline_keyboard(rows, max_buttons=keyboard_limit)
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
                 text = f"{text}\n📊 Страница {_dialog_page + 1}/{page_count}"

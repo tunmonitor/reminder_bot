@@ -89,6 +89,42 @@ class DialogRenderingTest(unittest.TestCase):
 
         self.assertEqual(layout_buttons(buttons), [buttons])
 
+    def test_layout_buttons_balances_four_five_and_six_short_buttons(self):
+        for count, expected_sizes in (
+            (4, [2, 2]),
+            (5, [3, 2]),
+            (6, [3, 3]),
+            (7, [3, 2, 2]),
+        ):
+            with self.subTest(count=count):
+                buttons = [
+                    InlineKeyboardButton(
+                        text=f"{index} дн.", callback_data=str(index)
+                    )
+                    for index in range(count)
+                ]
+
+                self.assertEqual(
+                    [len(row) for row in layout_buttons(buttons)],
+                    expected_sizes,
+                )
+
+    def test_layout_buttons_places_pagination_on_its_own_bottom_row(self):
+        buttons = [
+            InlineKeyboardButton(
+                text=f"🟢 S{index}", callback_data=str(index)
+            )
+            for index in range(6)
+        ]
+        next_page = InlineKeyboardButton(
+            text="Далее ➡️", callback_data="next"
+        )
+
+        rows = layout_buttons([*buttons, next_page])
+
+        self.assertEqual([len(row) for row in rows], [3, 3, 1])
+        self.assertEqual(rows[-1], [next_page])
+
     def test_layout_buttons_wraps_four_medium_buttons_as_pairs(self):
         buttons = [
             InlineKeyboardButton(

@@ -281,40 +281,52 @@ def layout_buttons(
     navigation = [button for button in buttons if is_navigation(button)]
     regular = [button for button in buttons if not is_navigation(button)]
     rows: list[list[InlineKeyboardButton]] = []
-    current: list[InlineKeyboardButton] = []
+    group: list[InlineKeyboardButton] = []
 
-    def flush() -> None:
-        if current:
-            rows.append(current.copy())
-            current.clear()
-
-    for button in regular:
-        label = button.text
-        if len(label) > short_button or label.startswith(
-            _SINGLE_ACTION_PREFIXES
-        ):
-            flush()
-            rows.append([button])
-            continue
-
-        proposed = [*current, button]
-        proposed_width = sum(len(item.text) for item in proposed) + (
-            2 * (len(proposed) - 1)
-        )
+    def flush_group() -> None:
+        if not group:
+            return
         max_buttons = (
             max_row_buttons
-            if all(len(item.text) <= very_short_button for item in proposed)
+            if all(len(button.text) <= very_short_button for button in group)
             else min(2, max_row_buttons)
         )
+        row_count = (len(group) + max_buttons - 1) // max_buttons
+        while True:
+            base_size, extra_rows = divmod(len(group), row_count)
+            sizes = [
+                base_size + (1 if index < extra_rows else 0)
+                for index in range(row_count)
+            ]
+            candidate_rows = []
+            offset = 0
+            for size in sizes:
+                row = group[offset:offset + size]
+                offset += size
+                row_width = sum(len(button.text) for button in row) + (
+                    2 * (len(row) - 1)
+                )
+                candidate_rows.append(row)
+                if size > max_buttons or (
+                    size > 1 and row_width > max_row_width
+                ):
+                    break
+            else:
+                rows.extend(candidate_rows)
+                group.clear()
+                return
+            row_count += 1
+
+    for button in regular:
         if (
-            len(proposed) > max_buttons
-            or proposed_width > max_row_width
+            len(button.text) > short_button
+            or button.text.startswith(_SINGLE_ACTION_PREFIXES)
         ):
-            flush()
-            current.append(button)
+            flush_group()
+            rows.append([button])
         else:
-            current.append(button)
-    flush()
+            group.append(button)
+    flush_group()
 
     if len(navigation) in {2, 3} and max_row_buttons >= len(navigation):
         if all(len(button.text) <= 24 for button in navigation):

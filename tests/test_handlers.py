@@ -3973,6 +3973,40 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_service_selection_lists_share_balanced_pagination_layout(self):
+        async def run():
+            command_handlers = {
+                item.callback.__name__: item.callback
+                for item in self.admin_router.message.handlers
+            }
+            for command_name, operation in (
+                ("/service_settings", "service_settings"),
+                ("/service_contact", "service_contact"),
+                ("/service_notify", "service_notify"),
+            ):
+                message = self.message(67890, command_name)
+                handler_name = {
+                    "service_settings": "on_service_settings",
+                    "service_contact": "on_service_contact",
+                    "service_notify": "on_service_notify",
+                }[operation]
+                await command_handlers[handler_name](message)
+
+                rows = message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                self.assertEqual(
+                    [len(row) for row in rows],
+                    [2, 2, 1],
+                    operation,
+                )
+                self.assertTrue(
+                    rows[-1][0].text.endswith("➡️"),
+                    operation,
+                )
+
+        asyncio.run(run())
+
     def test_admin_add_command_without_parameters_guides_user_through_flow(self):
         async def run():
             message = self.message(67890, "/service_admin_add")
