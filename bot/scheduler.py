@@ -4,10 +4,20 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime, time, timedelta
+from typing import Protocol
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+
+
+class ServiceReminderCallback(Protocol):
+    def __call__(
+        self,
+        service_id: str,
+        reminder_id: int,
+        scheduled_run_date: date | None = None,
+    ) -> Awaitable[None]: ...
 
 
 def scheduled_reminder_date(now: datetime, reminder_time: str) -> date:
@@ -24,7 +34,7 @@ def scheduled_reminder_date(now: datetime, reminder_time: str) -> date:
 async def add_service_reminder_jobs(
     scheduler: AsyncIOScheduler,
     services: list[dict],
-    callback: Callable[[str, int], Awaitable[None]],
+    callback: ServiceReminderCallback,
     tz: ZoneInfo,
     debug_logger: logging.Logger,
     *,
@@ -33,7 +43,6 @@ async def add_service_reminder_jobs(
     now = datetime.now(tz)
     desired: dict[str, tuple[str, int, CronTrigger]] = {}
     for service in services:
-        reminders_by_schedule = {}
         if registry is not None:
             reminders = registry.list_group_reminders(service["id"])
         else:
@@ -41,14 +50,6 @@ async def add_service_reminder_jobs(
         for reminder in reminders:
             if not reminder["enabled"]:
                 continue
-            schedule = (
-                reminder["reminder_days"],
-                reminder["reminder_time"],
-            )
-            current = reminders_by_schedule.get(schedule)
-            if current is None or reminder["id"] < current["id"]:
-                reminders_by_schedule[schedule] = reminder
-        for reminder in reminders_by_schedule.values():
             reminder_id = reminder["id"]
             trigger = CronTrigger(
                 hour=int(reminder["reminder_time"][:2]),
@@ -91,7 +92,11 @@ async def add_service_reminder_jobs(
             continue
         next_run_time = getattr(job, "next_run_time", None)
         if next_run_time is not None and next_run_time <= now:
-            await callback(job.args[0], job.args[1])
+            await callback(
+                job.args[0],
+                job.args[1],
+                next_run_time.astimezone(tz).date(),
+            )
         scheduler.remove_job(job_id)
     for job_id, (service_id, reminder_id, trigger) in desired.items():
         if job_id in unchanged:

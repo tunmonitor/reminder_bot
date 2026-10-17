@@ -14,7 +14,7 @@ from bot.scheduler import (
 
 
 class ServiceReminderSchedulerTest(unittest.IsolatedAsyncioTestCase):
-    async def test_registers_deduplicates_and_preserves_unchanged_jobs(self):
+    async def test_registers_each_reminder_and_preserves_unchanged_jobs(self):
         scheduler = AsyncIOScheduler(timezone=ZoneInfo("UTC"))
         callback = AsyncMock()
         services = [
@@ -52,6 +52,7 @@ class ServiceReminderSchedulerTest(unittest.IsolatedAsyncioTestCase):
             {
                 "group-reminder-assembly-11",
                 "group-reminder-assembly-12",
+                "group-reminder-assembly-13",
                 "group-reminder-broadcast-19",
             },
         )
@@ -93,7 +94,9 @@ class ServiceReminderSchedulerTest(unittest.IsolatedAsyncioTestCase):
             logger,
         )
 
-        callback.assert_awaited_once_with("assembly", 11)
+        callback.assert_awaited_once_with(
+            "assembly", 11, scheduled_time.date()
+        )
         self.assertEqual(
             scheduler.get_job("group-reminder-assembly-11").args,
             ("assembly", 11),
@@ -123,6 +126,35 @@ class ServiceReminderSchedulerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scheduler.get_jobs(), [])
         registry.list_legacy_group_reminders.assert_not_called()
         callback.assert_not_awaited()
+
+    async def test_confirmed_duplicate_schedules_get_independent_jobs(self):
+        scheduler = AsyncIOScheduler(timezone=ZoneInfo("UTC"))
+        callback = AsyncMock()
+        reminders = [
+            {
+                "id": reminder_id,
+                "reminder_days": 1,
+                "reminder_time": "18:00",
+                "enabled": True,
+            }
+            for reminder_id in (11, 12)
+        ]
+
+        await add_service_reminder_jobs(
+            scheduler,
+            [{"id": "assembly", "group_reminders": reminders}],
+            callback,
+            ZoneInfo("UTC"),
+            MagicMock(),
+        )
+
+        self.assertEqual(
+            {job.id for job in scheduler.get_jobs()},
+            {
+                "group-reminder-assembly-11",
+                "group-reminder-assembly-12",
+            },
+        )
 
     async def test_user_reminder_jobs_are_independent_and_refreshable(self):
         tz = ZoneInfo("UTC")

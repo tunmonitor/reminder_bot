@@ -177,6 +177,76 @@ class ReminderBotEntrypointTest(unittest.TestCase):
 
         asyncio.run(send_reminder())
 
+    def test_confirmed_duplicate_reminders_send_each_reminders_own_text(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                reminders = registry.list_group_reminders("assembly")
+                original = reminders[0]
+                duplicate_id = registry.add_group_reminder(
+                    1001,
+                    "assembly",
+                    original["reminder_days"],
+                    original["reminder_time"],
+                    "Отдельный текст {service_name}",
+                    allow_duplicate=True,
+                )
+                bot = SimpleNamespace(send_message=AsyncMock())
+                credentials = SimpleNamespace(admin_tg_id=1001)
+                logger = MagicMock()
+                run_date = date(2026, 10, 11) - timedelta(
+                    days=original["reminder_days"]
+                )
+                with patch.object(
+                    app,
+                    "_load_service_task_assignments",
+                    new=AsyncMock(
+                        return_value=({"Камеры": ["Анна"]}, True)
+                    ),
+                ):
+                    for reminder_id in (original["id"], duplicate_id):
+                        await app._process_service_reminder(
+                            bot,
+                            credentials,
+                            Path(tmp_dir),
+                            ZoneInfo("UTC"),
+                            registry,
+                            "assembly",
+                            reminder_id,
+                            logger,
+                            logger,
+                            run_date=run_date,
+                        )
+
+                self.assertEqual(bot.send_message.await_count, 2)
+                sent_texts = [
+                    call.args[1]
+                    for call in bot.send_message.await_args_list
+                ]
+                self.assertTrue(
+                    any("Отдельный текст Собрание" in text for text in sent_texts)
+                )
+                self.assertTrue(
+                    any("Напоминание о служении" in text for text in sent_texts)
+                )
+                event_date = date(2026, 10, 11).isoformat()
+                self.assertTrue(
+                    registry.is_group_reminder_delivered(
+                        original["id"], event_date, "group:-10001"
+                    )
+                )
+                self.assertTrue(
+                    registry.is_group_reminder_delivered(
+                        duplicate_id, event_date, "group:-10001"
+                    )
+                )
+
+        asyncio.run(process())
+
     def test_informational_only_service_reminder_is_not_sent_or_recorded(self):
         from bot import app
         from bot.service_registry import ServiceRegistry
@@ -221,8 +291,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 bot.send_message.assert_not_awaited()
                 notify_admin.assert_awaited_once()
                 self.assertFalse(
-                    registry.is_service_reminder_delivered(
-                        "assembly",
+                    registry.is_group_reminder_delivered(
                         reminder["id"],
                         event_date.isoformat(),
                         "group:-10001",
@@ -275,16 +344,14 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     bot.send_message.await_args.args[0], -10001
                 )
                 self.assertTrue(
-                    registry.is_service_reminder_delivered(
-                        "assembly",
+                    registry.is_group_reminder_delivered(
                         reminder["id"],
                         "2026-10-11",
                         "group:-10001",
                     )
                 )
                 self.assertFalse(
-                    registry.is_service_reminder_delivered(
-                        "assembly",
+                    registry.is_group_reminder_delivered(
                         reminder["id"],
                         "2026-10-11",
                         "personal:Камеры:2002",

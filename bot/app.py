@@ -1418,7 +1418,9 @@ async def _run_locked(args: CliArgs) -> None:
         )
         if service_registry is not None:
             async def scheduled_service_reminder(
-                service_id: str, reminder_id: int
+                service_id: str,
+                reminder_id: int,
+                scheduled_run_date: date | None = None,
             ) -> None:
                 reminder = service_registry.get_group_reminder(reminder_id)
                 if reminder is None:
@@ -1427,7 +1429,7 @@ async def _run_locked(args: CliArgs) -> None:
                         reminder_id,
                     )
                     return
-                run_date = scheduled_reminder_date(
+                run_date = scheduled_run_date or scheduled_reminder_date(
                     datetime.now(tz), reminder["reminder_time"]
                 )
                 event_date = run_date + timedelta(

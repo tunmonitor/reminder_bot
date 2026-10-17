@@ -539,7 +539,7 @@ class ServiceRegistryTest(unittest.TestCase):
             self.registry.get_service("sound")["reminders"], []
         )
 
-    def test_duplicate_reminders_require_confirmation_and_deliver_once(self):
+    def test_duplicate_reminders_keep_independent_delivery_records(self):
         current = self.registry.get_service("sound")["reminders"][0]
         duplicate_rules = [
             {
@@ -572,12 +572,20 @@ class ServiceRegistryTest(unittest.TestCase):
         )
         reminders = self.registry.get_service("sound")["reminders"]
         event_date = "2026-10-18"
-        self.registry.mark_service_reminder_delivered(
-            "sound", reminders[0]["id"], event_date, "group:-10001"
+        self.registry.mark_group_reminder_delivered(
+            reminders[0]["id"], event_date, "group:-10001"
+        )
+        self.assertFalse(
+            self.registry.is_group_reminder_delivered(
+                reminders[1]["id"], event_date, "group:-10001"
+            )
+        )
+        self.registry.mark_group_reminder_delivered(
+            reminders[1]["id"], event_date, "group:-10001"
         )
         self.assertTrue(
-            self.registry.is_service_reminder_delivered(
-                "sound", reminders[1]["id"], event_date, "group:-10001"
+            self.registry.is_group_reminder_delivered(
+                reminders[1]["id"], event_date, "group:-10001"
             )
         )
 
@@ -585,8 +593,8 @@ class ServiceRegistryTest(unittest.TestCase):
         reminder = self.registry.get_service("sound")["reminders"][0]
         event_date = "2026-10-18"
         recipient = "group:-10001"
-        self.registry.mark_service_reminder_delivered(
-            "sound", reminder["id"], event_date, recipient
+        self.registry.mark_group_reminder_delivered(
+            reminder["id"], event_date, recipient
         )
 
         self.registry.set_notification_settings(
@@ -608,8 +616,8 @@ class ServiceRegistryTest(unittest.TestCase):
         edited = self.registry.get_service("sound")["reminders"][0]
         self.assertEqual(edited["id"], reminder["id"])
         self.assertTrue(
-            self.registry.is_service_reminder_delivered(
-                "sound", edited["id"], event_date, recipient
+            self.registry.is_group_reminder_delivered(
+                edited["id"], event_date, recipient
             )
         )
 
@@ -617,8 +625,8 @@ class ServiceRegistryTest(unittest.TestCase):
         reminder = self.registry.get_service("sound")["reminders"][0]
         event_date = "2026-10-18"
         recipient = "group:-10001"
-        self.registry.mark_service_reminder_delivered(
-            "sound", reminder["id"], event_date, recipient
+        self.registry.mark_group_reminder_delivered(
+            reminder["id"], event_date, recipient
         )
 
         self.registry.set_notification_settings(
@@ -640,8 +648,8 @@ class ServiceRegistryTest(unittest.TestCase):
         replacement = self.registry.get_service("sound")["reminders"][0]
         self.assertNotEqual(replacement["id"], reminder["id"])
         self.assertFalse(
-            self.registry.is_service_reminder_delivered(
-                "sound", replacement["id"], event_date, recipient
+            self.registry.is_group_reminder_delivered(
+                replacement["id"], event_date, recipient
             )
         )
 
@@ -665,11 +673,11 @@ class ServiceRegistryTest(unittest.TestCase):
         )
         first, second = self.registry.get_service("sound")["reminders"]
         event_date = "2026-10-18"
-        self.registry.mark_service_reminder_delivered(
-            "sound", first["id"], event_date, "group:-10001"
+        self.registry.mark_group_reminder_delivered(
+            first["id"], event_date, "group:-10001"
         )
-        self.registry.mark_service_reminder_delivered(
-            "sound", second["id"], event_date, "personal:task:2002"
+        self.registry.mark_group_reminder_delivered(
+            second["id"], event_date, "personal:task:2002"
         )
 
         self.registry.set_notification_settings(
@@ -694,46 +702,55 @@ class ServiceRegistryTest(unittest.TestCase):
         )
 
         self.assertFalse(
-            self.registry.is_service_reminder_delivered(
-                "sound", first["id"], event_date, "personal:task:2002"
+            self.registry.is_group_reminder_delivered(
+                first["id"], event_date, "personal:task:2002"
             )
         )
         self.assertTrue(
-            self.registry.is_service_reminder_delivered(
-                "sound", first["id"], event_date, "group:-10001"
+            self.registry.is_group_reminder_delivered(
+                first["id"], event_date, "group:-10001"
             )
         )
         self.assertFalse(
-            self.registry.is_service_reminder_delivered(
-                "sound", second["id"], event_date, "group:-10001"
+            self.registry.is_group_reminder_delivered(
+                second["id"], event_date, "group:-10001"
             )
         )
         self.assertTrue(
-            self.registry.is_service_reminder_delivered(
-                "sound", second["id"], event_date, "personal:task:2002"
+            self.registry.is_group_reminder_delivered(
+                second["id"], event_date, "personal:task:2002"
             )
         )
 
     def test_legacy_reminders_and_deliveries_migrate_once(self):
+        collision_id = self.registry.list_group_reminders("assembly")[0]["id"]
         with self.registry._connection() as connection:
             connection.execute("DELETE FROM group_reminders")
             connection.execute("DELETE FROM group_reminder_migrations")
             connection.execute("DELETE FROM service_reminders")
             connection.execute(
+                "INSERT INTO group_reminders "
+                "(id, service_id, body, reminder_days, reminder_time) "
+                "VALUES (?, 'assembly', NULL, 0, '10:00')",
+                (collision_id,),
+            )
+            connection.execute(
                 "INSERT INTO service_reminders "
                 "(id, service_id, reminder_days, reminder_time) "
-                "VALUES (101, 'sound', 3, '18:00'), "
+                "VALUES (?, 'sound', 3, '18:00'), "
                 "(102, 'sound', 3, '18:00'), "
-                "(103, 'sound', 1, '09:15')"
+                "(103, 'sound', 1, '09:15')",
+                (collision_id,),
             )
             connection.execute(
                 "INSERT INTO service_reminder_deliveries "
                 "(service_id, reminder_id, event_date, recipient_key, "
                 "delivered_at) VALUES "
-                "('sound', 101, '2026-10-18', 'group:-10001', "
+                "('sound', ?, '2026-10-18', 'group:-10001', "
                 "'2026-10-15T10:00:00+00:00'), "
                 "('sound', 102, '2026-10-18', 'group:-10001', "
-                "'2026-10-15T10:01:00+00:00')"
+                "'2026-10-15T10:01:00+00:00')",
+                (collision_id,),
             )
 
         self.registry.initialize(1001, -10001)
@@ -748,6 +765,24 @@ class ServiceRegistryTest(unittest.TestCase):
                 migrated["id"], "2026-10-18", "group:-10001"
             )
         )
+        self.assertNotEqual(migrated["id"], collision_id)
+        self.assertEqual(
+            self.registry.get_group_reminder(collision_id)["service_id"],
+            "assembly",
+        )
+        self.assertTrue(
+            self.registry.is_service_reminder_delivered(
+                "sound", collision_id, "2026-10-18", "group:-10001"
+            )
+        )
+        self.registry.mark_service_reminder_delivered(
+            "sound", collision_id, "2026-10-18", "group:legacy-api"
+        )
+        self.assertTrue(
+            self.registry.is_group_reminder_delivered(
+                migrated["id"], "2026-10-18", "group:legacy-api"
+            )
+        )
         with self.registry._connection() as connection:
             marker_count = connection.execute(
                 "SELECT COUNT(*) FROM group_reminder_migrations "
@@ -757,6 +792,63 @@ class ServiceRegistryTest(unittest.TestCase):
 
         self.registry.initialize(1001, -10001)
         self.assertEqual(self.registry.list_group_reminders("sound"), reminders)
+
+    def test_compatibility_setter_updates_primary_and_preserves_other_reminders(self):
+        original = self.registry.list_group_reminders("sound")
+        second_id = self.registry.add_group_reminder(
+            1001, "sound", 3, "09:15", "Custom {service_name}"
+        )
+        self.registry.set_notification_settings(
+            1001,
+            "sound",
+            reminder_days=2,
+            reminder_time="17:30",
+            group_template=None,
+            personal_templates={},
+        )
+
+        current = self.registry.list_group_reminders("sound")
+        primary = next(item for item in current if item["id"] == original[0]["id"])
+        second = next(item for item in current if item["id"] == second_id)
+        self.assertEqual(
+            (primary["reminder_days"], primary["reminder_time"]),
+            (2, "17:30"),
+        )
+        self.assertEqual(
+            (second["reminder_days"], second["reminder_time"], second["body"]),
+            (3, "09:15", "Custom {service_name}"),
+        )
+
+    def test_compatibility_settings_update_rolls_back_on_stale_reminder_id(self):
+        before = self.registry.get_service("sound")
+        reminders_before = self.registry.list_group_reminders("sound")
+        with self.assertRaisesRegex(ValueError, "устарело"):
+            self.registry.set_notification_settings(
+                1001,
+                "sound",
+                reminder_days=4,
+                reminder_time="16:30",
+                group_template="New {service_name}",
+                personal_templates={"Микшер": "New {name}"},
+                reminders=[
+                    {
+                        "id": 999999,
+                        "reminder_days": 4,
+                        "reminder_time": "16:30",
+                    }
+                ],
+            )
+
+        after = self.registry.get_service("sound")
+        self.assertEqual(after["reminder_days"], before["reminder_days"])
+        self.assertEqual(after["reminder_time"], before["reminder_time"])
+        self.assertEqual(after["group_template"], before["group_template"])
+        self.assertEqual(
+            after["personal_templates"], before["personal_templates"]
+        )
+        self.assertEqual(
+            self.registry.list_group_reminders("sound"), reminders_before
+        )
 
     def test_group_reminder_text_and_schedule_are_independent_records(self):
         default_template = "Общее {service_name} · {sunday_date}"

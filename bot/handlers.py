@@ -1558,7 +1558,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     await _send_dialog(
                         callback.message,
                         "Уже есть напоминание за 1 день в 18:00. "
-                        "Создать ещё одно с этим расписанием?",
+                        "Создать ещё одно? Оно будет отправляться отдельным "
+                        "сообщением со своим текстом.",
                         reply_markup=confirm,
                         parse_mode=None,
                     )
@@ -2031,7 +2032,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
 
     async def save_notification_setup(
-        message: Message, actor_id: int, *, allow_duplicates: bool = False
+        message: Message, actor_id: int
     ) -> None:
         pending = pending_inputs.get(actor_id)
         registry = service_registry()
@@ -2065,41 +2066,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             if callable(refresh_reminders):
                 await refresh_reminders()
         except (PermissionError, ValueError) as exc:
-            if (
-                isinstance(exc, ValueError)
-                and "уже задано" in str(exc)
-                and not allow_duplicates
-            ):
-                keyboard = InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [
-                            InlineKeyboardButton(
-                                text="Подтвердить совпадение",
-                                callback_data=(
-                                    f"notify_duplicate_confirm:"
-                                    f"{pending['service_id']}:"
-                                    f"{pending['session_id']}"
-                                ),
-                            ),
-                            InlineKeyboardButton(
-                                text="⬅️ Назад",
-                                callback_data=(
-                                    f"notify_duplicate_back:"
-                                    f"{pending['service_id']}:"
-                                    f"{pending['session_id']}"
-                                ),
-                            ),
-                        ]
-                    ]
-                )
-                await _send_dialog(message, "⚠️ Есть уведомления с одинаковыми сроком и временем. "
-                    "При подтверждении для одного события одинаковые "
-                    "уведомления не будут отправляться дважды. "
-                    "Сохранить расписание?",
-                    reply_markup=keyboard,
-                    parse_mode=None,
-                )
-                return
             await _send_dialog(message, _status_text(str(exc), "❌"), parse_mode=None)
             return
         except sqlite3.Error:
@@ -3341,83 +3307,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             callback.message, callback.from_user.id
         )
         await _answer_callback(callback,)
-
-    @admin_router.callback_query(
-        F.data.startswith("notify_duplicate_confirm:")
-    )
-    async def on_notification_duplicate_confirm(
-        callback: CallbackQuery,
-    ) -> None:
-        if (
-            not callback.from_user
-            or not callback.message
-            or callback.message.chat.type != ChatType.PRIVATE
-        ):
-            await _answer_callback(callback,)
-            return
-        parts = callback.data.split(":")
-        if len(parts) != 3:
-            await _answer_callback(callback,"⚠️ Подтверждение устарело.")
-            return
-        _, service_id, session_id = parts
-        pending = pending_inputs.get(callback.from_user.id)
-        if (
-            pending is None
-            or pending.get("operation") != "service_notify"
-            or pending.get("service_id") != service_id
-            or pending.get("session_id") != session_id
-        ):
-            await _answer_callback(callback,"⚠️ Подтверждение устарело.")
-            return
-        try:
-            if not is_service_admin(callback.from_user.id, service_id):
-                await _answer_callback(callback,"❌ Недостаточно прав.")
-                return
-        except sqlite3.Error:
-            debug.exception(
-                "Не удалось проверить права на настройки уведомлений"
-            )
-            await _answer_callback(callback,"❌ Не удалось проверить права.")
-            return
-        await save_notification_setup(
-            callback.message,
-            callback.from_user.id,
-            allow_duplicates=True,
-        )
-        await _answer_callback(callback,)
-
-    @admin_router.callback_query(
-        F.data.startswith("notify_duplicate_back:")
-    )
-    async def on_notification_duplicate_back(
-        callback: CallbackQuery,
-    ) -> None:
-        if (
-            not callback.from_user
-            or not callback.message
-            or callback.message.chat.type != ChatType.PRIVATE
-        ):
-            await _answer_callback(callback)
-            return
-        parts = callback.data.split(":")
-        if len(parts) != 3:
-            await _answer_callback(callback, "⚠️ Подтверждение устарело.")
-            return
-        _, service_id, session_id = parts
-        pending = pending_inputs.get(callback.from_user.id)
-        if (
-            pending is None
-            or pending.get("operation") != "service_notify"
-            or pending.get("service_id") != service_id
-            or pending.get("session_id") != session_id
-            or pending.get("step") != "menu"
-        ):
-            await _answer_callback(callback, "⚠️ Подтверждение устарело.")
-            return
-        await show_notification_settings_menu(
-            callback.message, callback.from_user.id, service_id
-        )
-        await _answer_callback(callback)
 
     @admin_router.callback_query(F.data.startswith("notify_cancel:"))
     async def on_notification_setting_cancel(callback: CallbackQuery) -> None:
@@ -4811,8 +4700,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         await _send_dialog(
                             message,
                             "Уже есть напоминание с таким сроком и временем. "
-                            "При совпадении расписания одинаковые уведомления "
-                            "не будут отправлены дважды. Сохранить всё равно?",
+                            "При совпадении расписания оба напоминания будут "
+                            "отправлены отдельными сообщениями. Сохранить?",
                             reply_markup=keyboard,
                             parse_mode=None,
                         )
