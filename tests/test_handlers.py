@@ -1967,8 +1967,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 answer=AsyncMock(),
             )
             with patch(
-                "bot.handlers.next_sunday_date",
-                return_value=date(2026, 10, 25),
+                "bot.handlers.next_reminder_occurrence",
+                return_value=(date(2026, 10, 25), date(2026, 10, 24)),
             ):
                 await self.callback_handler("on_group_reminder_action")(
                     reminder_callback
@@ -2119,6 +2119,129 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             preview_button = next(
                 button
                 for row in card_markup.inline_keyboard
+                for button in row
+                if button.text == "👁 Предпросмотр"
+            )
+            first_answer_started = asyncio.Event()
+            second_answer_started = asyncio.Event()
+            release_first_answer = asyncio.Event()
+            release_second_answer = asyncio.Event()
+            latest_loader_started = asyncio.Event()
+            release_latest_loader = asyncio.Event()
+
+            async def delayed_answer(release, started):
+                started.set()
+                await release.wait()
+
+            async def delay_first_answer():
+                await delayed_answer(
+                    release_first_answer, first_answer_started
+                )
+
+            async def delay_second_answer():
+                await delayed_answer(
+                    release_second_answer, second_answer_started
+                )
+
+            async def latest_preview(_reminder_id):
+                latest_loader_started.set()
+                await release_latest_loader.wait()
+                return {
+                    "date": "25.10.2026",
+                    "send_date": "24.10.2026",
+                    "time": "18:00",
+                    "text": "Только результат нового запроса",
+                    "has_data": True,
+                    "error": None,
+                }
+
+            self.context.get_group_reminder_preview.reset_mock()
+            self.context.get_group_reminder_preview.side_effect = latest_preview
+            first_request = SimpleNamespace(
+                data=preview_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private", id=67890),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(side_effect=delay_first_answer),
+            )
+            second_request = SimpleNamespace(
+                data=preview_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private", id=67890),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(side_effect=delay_second_answer),
+            )
+            first_request_task = asyncio.create_task(
+                self.callback_handler("on_group_reminder_action")(
+                    first_request
+                )
+            )
+            await first_answer_started.wait()
+            second_request_task = asyncio.create_task(
+                self.callback_handler("on_group_reminder_action")(
+                    second_request
+                )
+            )
+            await second_answer_started.wait()
+            release_second_answer.set()
+            await latest_loader_started.wait()
+            release_first_answer.set()
+            await first_request_task
+            release_latest_loader.set()
+            await second_request_task
+            self.assertEqual(
+                self.context.get_group_reminder_preview.await_count,
+                1,
+            )
+            self.assertEqual(first_request.message.answer.await_count, 0)
+            self.assertIn(
+                "Только результат нового запроса",
+                second_request.message.answer.await_args.args[0],
+            )
+
+            list_callback = SimpleNamespace(
+                data=f"group_reminder:list:sound:{session_id}",
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private", id=67890),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_group_reminder_action")(
+                list_callback
+            )
+            open_button = next(
+                button
+                for row in list_callback.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith(
+                    "group_reminder:open:sound:"
+                )
+            )
+            reopen_callback = SimpleNamespace(
+                data=open_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private", id=67890),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_group_reminder_action")(
+                reopen_callback
+            )
+            preview_button = next(
+                button
+                for row in reopen_callback.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
                 for button in row
                 if button.text == "👁 Предпросмотр"
             )

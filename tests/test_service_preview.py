@@ -5,18 +5,23 @@ import tempfile
 import unittest
 import zipfile
 from contextlib import closing
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
 from bot.app import _prepare_service_test_previews, get_group_reminder_preview
-from bot.scheduler import reminder_send_date
+from bot.scheduler import next_reminder_occurrence, reminder_send_date
 from bot.service_registry import ServiceRegistry
 
 
 class ServicePreviewTest(unittest.TestCase):
+    @staticmethod
+    def _fixed_occurrence(_now, reminder_days, _reminder_time):
+        event_date = date(2026, 10, 25)
+        return event_date, event_date - timedelta(days=reminder_days)
+
     def _group_reminder_preview(self, registry, temp_dir, assignments):
         reminder = registry.list_group_reminders("sound")[0]
         credentials = SimpleNamespace(
@@ -26,8 +31,8 @@ class ServicePreviewTest(unittest.TestCase):
 
         async def run():
             with patch(
-                "bot.app._next_sunday_in_tz",
-                return_value=date(2026, 10, 25),
+                "bot.app.next_reminder_occurrence",
+                side_effect=self._fixed_occurrence,
             ), patch(
                 "bot.app._load_service_task_assignments",
                 new=AsyncMock(return_value=(assignments, True)),
@@ -116,8 +121,8 @@ class ServicePreviewTest(unittest.TestCase):
 
             async def run():
                 with patch(
-                    "bot.app._next_sunday_in_tz",
-                    return_value=date(2026, 10, 25),
+                    "bot.app.next_reminder_occurrence",
+                    side_effect=self._fixed_occurrence,
                 ), patch(
                     "bot.app._load_service_task_assignments",
                     new=AsyncMock(
@@ -191,6 +196,50 @@ class ServicePreviewTest(unittest.TestCase):
             date(2026, 12, 31),
         )
 
+    def test_next_reminder_occurrence_skips_past_saturday_send_date(self):
+        tz = ZoneInfo("UTC")
+        event_date, send_date = next_reminder_occurrence(
+            datetime(2026, 10, 17, 12, 0, tzinfo=tz),
+            3,
+            "18:00",
+        )
+
+        self.assertEqual(event_date, date(2026, 10, 25))
+        self.assertEqual(send_date, date(2026, 10, 22))
+
+    def test_next_reminder_occurrence_includes_sunday_before_send_time(self):
+        tz = ZoneInfo("UTC")
+        event_date, send_date = next_reminder_occurrence(
+            datetime(2026, 10, 18, 10, 0, tzinfo=tz),
+            0,
+            "18:00",
+        )
+
+        self.assertEqual(event_date, date(2026, 10, 18))
+        self.assertEqual(send_date, date(2026, 10, 18))
+
+    def test_next_reminder_occurrence_skips_sunday_after_send_time(self):
+        tz = ZoneInfo("UTC")
+        event_date, send_date = next_reminder_occurrence(
+            datetime(2026, 10, 18, 19, 0, tzinfo=tz),
+            0,
+            "18:00",
+        )
+
+        self.assertEqual(event_date, date(2026, 10, 25))
+        self.assertEqual(send_date, date(2026, 10, 25))
+
+    def test_next_reminder_occurrence_skips_send_time_already_passed_today(self):
+        tz = ZoneInfo("UTC")
+        event_date, send_date = next_reminder_occurrence(
+            datetime(2026, 10, 20, 19, 0, tzinfo=tz),
+            5,
+            "18:00",
+        )
+
+        self.assertEqual(event_date, date(2026, 11, 1))
+        self.assertEqual(send_date, date(2026, 10, 27))
+
     def test_group_reminder_preview_preserves_unknown_legacy_fields(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             registry = ServiceRegistry(Path(temp_dir) / "registry.sqlite3")
@@ -227,8 +276,8 @@ class ServicePreviewTest(unittest.TestCase):
 
             async def run():
                 with patch(
-                    "bot.app._next_sunday_in_tz",
-                    return_value=date(2026, 10, 25),
+                    "bot.app.next_reminder_occurrence",
+                    side_effect=self._fixed_occurrence,
                 ), patch(
                     "bot.app._load_service_task_assignments",
                     new=AsyncMock(return_value=({}, False)),
@@ -260,8 +309,8 @@ class ServicePreviewTest(unittest.TestCase):
 
             async def run():
                 with patch(
-                    "bot.app._next_sunday_in_tz",
-                    return_value=date(2026, 10, 25),
+                    "bot.app.next_reminder_occurrence",
+                    side_effect=self._fixed_occurrence,
                 ), patch(
                     "bot.app._load_service_task_assignments",
                     new=AsyncMock(
@@ -303,8 +352,8 @@ class ServicePreviewTest(unittest.TestCase):
 
             async def run():
                 with patch(
-                    "bot.app._next_sunday_in_tz",
-                    return_value=date(2026, 10, 25),
+                    "bot.app.next_reminder_occurrence",
+                    side_effect=self._fixed_occurrence,
                 ), patch(
                     "bot.app._load_service_task_assignments",
                     new=AsyncMock(

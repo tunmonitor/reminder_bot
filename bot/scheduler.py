@@ -31,6 +31,25 @@ def reminder_send_date(event_date: date, reminder_days: int) -> date:
     return event_date - timedelta(days=reminder_days)
 
 
+def next_reminder_occurrence(
+    now: datetime,
+    reminder_days: int,
+    reminder_time: str,
+) -> tuple[date, date]:
+    send_time = time.fromisoformat(reminder_time)
+    days_until_sunday = (6 - now.date().weekday()) % 7
+    event_date = now.date() + timedelta(days=days_until_sunday)
+
+    while True:
+        send_date = reminder_send_date(event_date, reminder_days)
+        send_datetime = datetime.combine(
+            send_date, send_time, tzinfo=now.tzinfo
+        )
+        if send_datetime >= now:
+            return event_date, send_date
+        event_date += timedelta(days=7)
+
+
 def scheduled_reminder_date(now: datetime, reminder_time: str) -> date:
     """Recover yesterday's cron date when execution is delayed past midnight."""
     scheduled_time = time(

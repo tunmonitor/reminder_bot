@@ -39,7 +39,7 @@ from .service_registry import (
     PERSONAL_TEMPLATE_FIELDS,
     validate_notification_template,
 )
-from .scheduler import next_sunday_date, reminder_send_date
+from .scheduler import next_reminder_occurrence
 from .ui import (
     callback_text,
     clean_previous_menu,
@@ -1266,11 +1266,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if service is None:
             await _send_dialog(message, "Служение не найдено.", parse_mode=None)
             return
+        pending.pop("preview_request_id", None)
         pending["step"] = "group_reminder_card"
         pending["reminder_id"] = reminder_id
-        event_date = next_sunday_date(datetime.now(context.timezone).date())
-        send_date = reminder_send_date(
-            event_date, reminder["reminder_days"]
+        event_date, send_date = next_reminder_occurrence(
+            datetime.now(context.timezone),
+            reminder["reminder_days"],
+            reminder["reminder_time"],
         )
         body_status = (
             "собственный" if reminder["body"] else
@@ -1548,35 +1550,47 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 service = registry.get_service(service_id)
                 if service is None:
                     raise ValueError("Служение не найдено.")
-                event_date = next_sunday_date(
-                    datetime.now(context.timezone).date()
-                )
-                send_date = reminder_send_date(
-                    event_date, reminder["reminder_days"]
+                event_date, send_date = next_reminder_occurrence(
+                    datetime.now(context.timezone),
+                    reminder["reminder_days"],
+                    reminder["reminder_time"],
                 )
                 preview_dates = {
                     "date": event_date.strftime("%d.%m.%Y"),
                     "send_date": send_date.strftime("%d.%m.%Y"),
                     "time": reminder["reminder_time"],
                 }
+                preview_request_id = secrets.token_urlsafe(12)
+                pending["preview_request_id"] = preview_request_id
+
+                def preview_is_current(*, require_preview_step: bool) -> bool:
+                    active = pending_inputs.get(actor_id)
+                    return (
+                        active is pending
+                        and active.get("session_id") == preview_session_id
+                        and active.get("reminder_id") == reminder_id
+                        and active.get("preview_request_id")
+                        == preview_request_id
+                        and active.get("step")
+                        == (
+                            "group_reminder_preview"
+                            if require_preview_step
+                            else "group_reminder_card"
+                        )
+                    )
+
                 await _answer_callback(callback)
                 callback_answered = True
+                if not preview_is_current(require_preview_step=False):
+                    return
                 pending["step"] = "group_reminder_preview"
                 await _send_dialog(
                     callback.message,
                     "⏳ Загружаю данные графика для предпросмотра...",
                     parse_mode=None,
                 )
-                def preview_is_current() -> bool:
-                    active = pending_inputs.get(actor_id)
-                    return (
-                        active is pending
-                        and active.get("session_id") == preview_session_id
-                        and active.get("step") == "group_reminder_preview"
-                        and active.get("reminder_id") == reminder_id
-                    )
 
-                if not preview_is_current():
+                if not preview_is_current(require_preview_step=True):
                     return
 
                 preview_loader = getattr(
@@ -1633,7 +1647,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             ),
                         }
 
-                if not preview_is_current():
+                if not preview_is_current(require_preview_step=True):
                     return
 
                 preview_date = result.get("date", "")

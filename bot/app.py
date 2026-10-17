@@ -58,8 +58,8 @@ if __package__:
     from .scheduler import (
         add_service_reminder_jobs,
         build_scheduler,
+        next_reminder_occurrence,
         next_sunday_date,
-        reminder_send_date,
         refresh_user_reminder_jobs as refresh_user_reminder_schedule_jobs,
         scheduled_reminder_date,
     )
@@ -111,8 +111,8 @@ else:  # pragma: no cover - поддержка запуска файла нап�
     from bot.scheduler import (
         add_service_reminder_jobs,
         build_scheduler,
+        next_reminder_occurrence,
         next_sunday_date,
-        reminder_send_date,
         refresh_user_reminder_jobs as refresh_user_reminder_schedule_jobs,
         scheduled_reminder_date,
     )
@@ -506,8 +506,11 @@ async def get_group_reminder_preview(
     if service is None:
         raise ValueError("Служение для напоминания не найдено.")
 
-    event_date = _next_sunday_in_tz(tz)
-    send_date = reminder_send_date(event_date, reminder["reminder_days"])
+    event_date, send_date = next_reminder_occurrence(
+        datetime.now(tz),
+        reminder["reminder_days"],
+        reminder["reminder_time"],
+    )
     date_text = event_date.strftime("%d.%m.%Y")
     result = {
         "date": date_text,
