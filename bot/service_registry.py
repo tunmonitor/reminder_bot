@@ -469,7 +469,9 @@ class ServiceRegistry:
         migrated = connection.execute(
             "SELECT 1 FROM group_reminder_migrations WHERE name = ?",
             (migration_name,),
-        ).fetchone() is not None
+        ).fetchone()
+        if migrated is not None:
+            return
         connection.execute("SAVEPOINT group_reminder_migration")
         try:
             rows = connection.execute(
@@ -501,8 +503,6 @@ class ServiceRegistry:
                 )
                 new_id = new_ids_by_schedule.get(schedule_key)
                 if new_id is None:
-                    if migrated:
-                        continue
                     cursor = connection.execute(
                         "INSERT INTO group_reminders "
                         "(service_id, body, reminder_days, reminder_time, "

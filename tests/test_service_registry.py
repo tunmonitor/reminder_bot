@@ -793,6 +793,78 @@ class ServiceRegistryTest(unittest.TestCase):
         self.registry.initialize(1001, -10001)
         self.assertEqual(self.registry.list_group_reminders("sound"), reminders)
 
+    def test_recreated_reminder_does_not_inherit_legacy_deliveries(self):
+        event_date = "2026-10-19"
+        recipient_key = "group:-10001"
+        with self.registry._connection() as connection:
+            connection.execute("DELETE FROM group_reminders")
+            connection.execute(
+                "DELETE FROM group_reminder_migrations "
+                "WHERE name = 'service-reminders-to-group-reminders'"
+            )
+            connection.execute("DELETE FROM service_reminders")
+            connection.execute("DELETE FROM service_reminder_deliveries")
+            connection.execute(
+                "INSERT INTO service_reminders "
+                "(service_id, reminder_days, reminder_time) "
+                "VALUES ('assembly', 1, '09:00')"
+            )
+            legacy_id = connection.execute(
+                "SELECT id FROM service_reminders WHERE service_id = 'assembly'"
+            ).fetchone()["id"]
+            connection.execute(
+                "INSERT INTO service_reminder_deliveries "
+                "(service_id, reminder_id, event_date, recipient_key, "
+                "delivered_at) "
+                "VALUES ('assembly', ?, ?, ?, '2026-10-18T09:00:00')",
+                (legacy_id, event_date, recipient_key),
+            )
+
+        self.registry.initialize(1001, -10001)
+        migrated = self.registry.list_group_reminders("assembly")
+        self.assertEqual(len(migrated), 1)
+        migrated_id = migrated[0]["id"]
+        self.assertTrue(
+            self.registry.is_group_reminder_delivered(
+                migrated_id, event_date, recipient_key
+            )
+        )
+        with self.registry._connection() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT reminder_id FROM group_reminder_legacy_ids "
+                    "WHERE legacy_id = ?",
+                    (legacy_id,),
+                ).fetchone()["reminder_id"],
+                migrated_id,
+            )
+
+        self.registry.delete_group_reminder(1001, migrated_id)
+        replacement_id = self.registry.add_group_reminder(
+            1001, "assembly", 1, "09:00"
+        )
+        self.assertNotEqual(replacement_id, migrated_id)
+
+        self.registry.initialize(1001, -10001)
+
+        self.assertEqual(
+            self.registry.list_group_reminders("assembly")[0]["id"],
+            replacement_id,
+        )
+        self.assertFalse(
+            self.registry.is_group_reminder_delivered(
+                replacement_id, event_date, recipient_key
+            )
+        )
+        with self.registry._connection() as connection:
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM group_reminder_legacy_ids "
+                    "WHERE legacy_id = ?",
+                    (legacy_id,),
+                ).fetchone()
+            )
+
     def test_compatibility_setter_updates_primary_and_preserves_other_reminders(self):
         original = self.registry.list_group_reminders("sound")
         second_id = self.registry.add_group_reminder(
