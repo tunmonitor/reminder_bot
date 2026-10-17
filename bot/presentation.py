@@ -63,18 +63,31 @@ def format_task_assignments(
         lines = [f"{task_emoji(task)} {task}"]
         if not names:
             lines.append("• Ответственные не указаны")
+            
         for name in names:
             contact = (contacts or {}).get((task, name))
-            username = contact.get("username") if contact else None
-            suffix = f" (@{username})" if username else (
-                " · не привязан"
-                if mark_unlinked and contact is None
-                else ""
-            )
-            lines.append(f"• {name}{suffix}")
+            
+            if contact:
+                tg_id = contact.get("telegram_id")
+                username = contact.get("username")
+                
+                if tg_id:
+                    # Используем HTML-ссылку для гарантированного упоминания (тега)
+                    # Если username есть, показываем его, иначе — просто имя
+                    display_text = f"@{username}" if username else name
+                    person_str = f'<a href="tg://user?id={tg_id}">{display_text}</a>'
+                elif username:
+                    person_str = f"@{username}"
+                else:
+                    person_str = name
+            else:
+                person_str = name
+                if mark_unlinked:
+                    person_str += " · не привязан"
+
+            lines.append(f"• {person_str}")
         groups.append("\n".join(lines))
     return "\n\n".join(groups) or "⚪ Ответственные не указаны"
-
 
 def format_informational_notes(
     assignments: dict[str, dict[str, Any] | list[str]],
