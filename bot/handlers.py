@@ -2959,7 +2959,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             reply_markup=ReplyKeyboardRemove(),
         )
 
-    @admin_router.message(Command("start"))
+     @admin_router.message(Command("start"))
     async def on_start(message: Message) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
