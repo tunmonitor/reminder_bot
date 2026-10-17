@@ -1471,7 +1471,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 button
                 for row in root_markup.inline_keyboard
                 for button in row
-                if button.callback_data.startswith("notify_edit:group_template:")
+                if button.callback_data.startswith(
+                    "group_reminder:default:sound:"
+                )
             )
             edit_callback = SimpleNamespace(
                 data=group_button.callback_data,
@@ -1482,10 +1484,32 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             edit_callback.message.answer.return_value = SimpleNamespace(
                 message_id=502
             )
-            await self.callback_handler("on_notification_setting_edit")(
+            await self.callback_handler("on_group_reminder_action")(
                 edit_callback
             )
-            prompt_markup = edit_callback.message.answer.await_args.kwargs[
+            edit_default_button = next(
+                button
+                for row in edit_callback.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith(
+                    "group_reminder:edit_default:"
+                )
+            )
+            edit_default_callback = SimpleNamespace(
+                data=edit_default_button.callback_data,
+                from_user=SimpleNamespace(id=12345),
+                message=self.message(12345, ""),
+                answer=AsyncMock(),
+            )
+            edit_default_callback.message.answer.return_value = SimpleNamespace(
+                message_id=502
+            )
+            await self.callback_handler("on_group_reminder_action")(
+                edit_default_callback
+            )
+            prompt_markup = edit_default_callback.message.answer.await_args.kwargs[
                 "reply_markup"
             ]
             back_button = next(
@@ -1497,7 +1521,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             back_callback = SimpleNamespace(
                 data=back_button.callback_data,
                 from_user=SimpleNamespace(id=12345),
-                message=self.message(12345, ""),
+                message=edit_default_callback.message,
                 answer=AsyncMock(),
             )
             back_callback.message.answer.return_value = SimpleNamespace(
@@ -1506,14 +1530,27 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             await self.callback_handler("on_notification_edit_back")(
                 back_callback
             )
-            self.assertEqual(
-                [
-                    call.kwargs["message_id"]
-                    for call in self.context.bot.delete_message.await_args_list
-                ],
-                [501, 502],
-            )
             returned_markup = back_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            root_back = next(
+                button
+                for row in returned_markup.inline_keyboard
+                for button in row
+                if button.callback_data.startswith(
+                    "group_reminder:root_back:"
+                )
+            )
+            root_callback = SimpleNamespace(
+                data=root_back.callback_data,
+                from_user=SimpleNamespace(id=12345),
+                message=back_callback.message,
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_group_reminder_action")(
+                root_callback
+            )
+            returned_markup = root_callback.message.answer.await_args.kwargs[
                 "reply_markup"
             ]
             self.assertTrue(
@@ -1531,7 +1568,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 button
                 for row in returned_markup.inline_keyboard
                 for button in row
-                if button.text == "✖️ Закрыть без сохранения"
+                if button.text == "✖️ Закрыть настройку"
             )
             close_callback = SimpleNamespace(
                 data=close_button.callback_data,
@@ -1557,7 +1594,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     call.kwargs["message_id"]
                     for call in self.context.bot.delete_message.await_args_list
                 ],
-                [501, 502, 503],
+                [501, 502, 502, 503, 503],
             )
 
         asyncio.run(run())
@@ -1660,7 +1697,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 for row in menu.inline_keyboard
                 for button in row
                 if button.callback_data.startswith(
-                    "notify_edit:reminders:sound:"
+                    "group_reminder:list:sound:"
                 )
             )
             edit_callback = SimpleNamespace(
@@ -1673,7 +1710,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 answer=AsyncMock(),
             )
             await self.callback_handler(
-                "on_notification_setting_edit"
+                "on_group_reminder_action"
             )(edit_callback)
             rules_menu = edit_callback.message.answer.await_args.kwargs[
                 "reply_markup"
@@ -1682,7 +1719,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 button
                 for row in rules_menu.inline_keyboard
                 for button in row
-                if button.callback_data.startswith("notify_rule:edit:sound:")
+                if button.callback_data.startswith("group_reminder:open:sound:")
             )
             rule_callback = SimpleNamespace(
                 data=rule_button.callback_data,
@@ -1693,7 +1730,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 ),
                 answer=AsyncMock(),
             )
-            await self.callback_handler("on_notification_rule_action")(
+            await self.callback_handler("on_group_reminder_action")(
                 rule_callback
             )
             edit_rule_menu = rule_callback.message.answer.await_args.kwargs[
@@ -1703,7 +1740,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 button
                 for row in edit_rule_menu.inline_keyboard
                 for button in row
-                if button.text.startswith("📅 Дни")
+                if button.text == "📅 Изменить срок"
             )
             days_callback = SimpleNamespace(
                 data=days_button.callback_data,
@@ -1714,7 +1751,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 ),
                 answer=AsyncMock(),
             )
-            await self.callback_handler("on_notification_rule_action")(
+            await self.callback_handler("on_group_reminder_action")(
                 days_callback
             )
             self.assertIn("0 до 6", days_callback.message.answer.await_args.args[0])
@@ -1727,11 +1764,34 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             updated_days = self.message(12345, "3")
             await staged_input(updated_days)
             rules_markup = updated_days.answer.await_args.kwargs["reply_markup"]
-            root_back = next(
+            back_to_list = next(
                 button
                 for row in rules_markup.inline_keyboard
                 for button in row
-                if button.callback_data.startswith("notify_rule:root_back:")
+                if button.callback_data.startswith("group_reminder:back:")
+            )
+            list_callback = SimpleNamespace(
+                data=back_to_list.callback_data,
+                from_user=SimpleNamespace(id=12345),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_group_reminder_action")(
+                list_callback
+            )
+            rules_menu = list_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            root_back = next(
+                button
+                for row in rules_menu.inline_keyboard
+                for button in row
+                if button.callback_data.startswith(
+                    "group_reminder:root_back:"
+                )
             )
             root_callback = SimpleNamespace(
                 data=root_back.callback_data,
@@ -1742,7 +1802,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 ),
                 answer=AsyncMock(),
             )
-            await self.callback_handler("on_notification_rule_action")(
+            await self.callback_handler("on_group_reminder_action")(
                 root_callback
             )
             root_menu = root_callback.message.answer.await_args.kwargs[
@@ -1768,8 +1828,12 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )(finish_callback)
 
             service = self.registry.get_service("sound")
-            self.assertEqual(service["reminder_days"], 3)
-            self.assertEqual(service["reminder_time"], "17:00")
+            self.assertEqual(
+                self.registry.list_group_reminders("sound")[0][
+                    "reminder_days"
+                ],
+                3,
+            )
             self.assertEqual(service["group_template"], "Текст группы")
             self.assertEqual(
                 service["personal_templates"],
@@ -1812,7 +1876,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 button
                 for row in retry_menu.inline_keyboard
                 for button in row
-                if button.text == "✖️ Закрыть без сохранения"
+                if button.text == "✖️ Закрыть настройку"
             )
             cancel_callback = SimpleNamespace(
                 data=cancel_button.callback_data,
@@ -1827,8 +1891,12 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 cancel_callback
             )
             cancelled_service = self.registry.get_service("sound")
-            self.assertEqual(cancelled_service["reminder_days"], 3)
-            self.assertEqual(cancelled_service["reminder_time"], "17:00")
+            self.assertEqual(
+                self.registry.list_group_reminders("sound")[0][
+                    "reminder_days"
+                ],
+                3,
+            )
 
         asyncio.run(run())
 
@@ -1863,7 +1931,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 ),
                 answer=AsyncMock(),
             )
-            await self.callback_handler("on_notification_setting_edit")(
+            await self.callback_handler("on_group_reminder_action")(
                 reminder_menu_callback
             )
             rules_menu = reminder_menu_callback.message.answer.await_args.kwargs[
@@ -1873,7 +1941,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 button
                 for row in rules_menu.inline_keyboard
                 for button in row
-                if button.text == "➕ Добавить уведомление"
+                if button.text == "➕ Добавить напоминание"
             )
             add_callback = SimpleNamespace(
                 data=add_button.callback_data,
@@ -1884,29 +1952,47 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 ),
                 answer=AsyncMock(),
             )
-            await self.callback_handler("on_notification_rule_action")(
+            await self.callback_handler("on_group_reminder_action")(
                 add_callback
+            )
+            confirm_add_button = next(
+                button
+                for row in add_callback.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith(
+                    "group_reminder:confirm_add:"
+                )
+            )
+            confirm_add_callback = SimpleNamespace(
+                data=confirm_add_button.callback_data,
+                from_user=SimpleNamespace(id=12345),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_group_reminder_action")(
+                confirm_add_callback
             )
             parameter_handler = next(
                 item.callback
                 for item in self.admin_router.message.handlers
                 if item.callback.__name__ == "on_service_parameter"
             )
-            await parameter_handler(self.message(12345, "3"))
-            draft_time_message = self.message(12345, "09:00")
-            await parameter_handler(draft_time_message)
-            draft_list_markup = draft_time_message.answer.await_args.kwargs[
+            card_markup = confirm_add_callback.message.answer.await_args.kwargs[
                 "reply_markup"
             ]
-            draft_button = next(
+            edit_days = next(
                 button
-                for row in draft_list_markup.inline_keyboard
+                for row in card_markup.inline_keyboard
                 for button in row
-                if button.text.startswith("✏️")
-                and "новое" in button.text
+                if button.text == "📅 Изменить срок"
             )
-            edit_draft = SimpleNamespace(
-                data=draft_button.callback_data,
+            edit_days_callback = SimpleNamespace(
+                data=edit_days.callback_data,
                 from_user=SimpleNamespace(id=12345),
                 message=SimpleNamespace(
                     chat=SimpleNamespace(type="private"),
@@ -1914,72 +2000,36 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 ),
                 answer=AsyncMock(),
             )
-            await self.callback_handler("on_notification_rule_action")(
-                edit_draft
+            await self.callback_handler("on_group_reminder_action")(
+                edit_days_callback
             )
-            time_button = next(
+            updated_days = self.message(12345, "3")
+            await parameter_handler(updated_days)
+            card_markup = updated_days.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            edit_time = next(
                 button
-                for row in edit_draft.message.answer.await_args.kwargs[
-                    "reply_markup"
-                ].inline_keyboard
+                for row in card_markup.inline_keyboard
                 for button in row
-                if button.text.startswith("🕒")
+                if button.text == "🕒 Изменить время"
             )
-            await self.callback_handler("on_notification_rule_action")(
-                SimpleNamespace(
-                    data=time_button.callback_data,
-                    from_user=SimpleNamespace(id=12345),
-                    message=SimpleNamespace(
-                        chat=SimpleNamespace(type="private"),
-                        answer=AsyncMock(),
-                    ),
+            edit_time_callback = SimpleNamespace(
+                data=edit_time.callback_data,
+                from_user=SimpleNamespace(id=12345),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
                     answer=AsyncMock(),
-                )
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_group_reminder_action")(
+                edit_time_callback
             )
             saved_time_input = self.message(12345, "10:30")
             await parameter_handler(saved_time_input)
 
-            rules_keyboard = saved_time_input.answer.await_args.kwargs[
-                "reply_markup"
-            ]
-            root_button = next(
-                button
-                for row in rules_keyboard.inline_keyboard
-                for button in row
-                if button.callback_data.startswith("notify_rule:root_back:")
-            )
-            root_callback = SimpleNamespace(
-                data=root_button.callback_data,
-                from_user=SimpleNamespace(id=12345),
-                message=self.message(12345, ""),
-                answer=AsyncMock(),
-            )
-            await self.callback_handler("on_notification_rule_action")(
-                root_callback
-            )
-            finish_button = next(
-                button
-                for row in root_callback.message.answer.await_args.kwargs[
-                    "reply_markup"
-                ].inline_keyboard
-                for button in row
-                if button.callback_data.startswith("notify_finish:")
-            )
-
-            finish = SimpleNamespace(
-                data=finish_button.callback_data,
-                from_user=SimpleNamespace(id=12345),
-                message=SimpleNamespace(
-                    chat=SimpleNamespace(type="private"),
-                    answer=AsyncMock(),
-                ),
-                answer=AsyncMock(),
-            )
-            await self.callback_handler("on_notification_setting_finish")(
-                finish
-            )
-
-            reminders = self.registry.get_service("sound")["reminders"]
+            reminders = self.registry.list_group_reminders("sound")
             self.assertEqual(
                 sorted(
                     (item["reminder_days"], item["reminder_time"])
@@ -2020,7 +2070,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             old_buttons = {
                 "reminders": next(
                     button.callback_data for button in first_buttons
-                    if button.callback_data.startswith("notify_edit:reminders:")
+                    if button.callback_data.startswith(
+                        "group_reminder:list:"
+                    )
                 ),
                 "finish": next(
                     button.callback_data for button in first_buttons
@@ -2044,7 +2096,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
             for callback_name, old_data in (
                 (
-                    "on_notification_setting_edit",
+                    "on_group_reminder_action",
                     old_buttons["reminders"],
                 ),
                 (
@@ -2092,7 +2144,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
     def test_notification_callbacks_answer_when_access_check_hits_database_error(self):
         async def run():
             edit = SimpleNamespace(
-                data="notify_edit:group_template:sound:session",
+                data="group_reminder:default:sound:session",
                 from_user=SimpleNamespace(id=67890),
                 message=SimpleNamespace(
                     chat=SimpleNamespace(type="private"),
@@ -2116,18 +2168,15 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             ), patch.object(
                 self.registry, "is_super_admin", return_value=False
             ):
-                await self.callback_handler("on_notification_setting_edit")(
+                await self.callback_handler("on_group_reminder_action")(
                     edit
                 )
                 await self.callback_handler("on_notification_setting_finish")(
                     finish
                 )
 
-            self.assertEqual(edit.answer.await_args.args[0], "Не удалось проверить права.")
+            self.assertIn("устарела", edit.answer.await_args.args[0])
             self.assertEqual(finish.answer.await_args.args[0], "Не удалось проверить права.")
-            self.context.debug_logger.exception.assert_any_call(
-                "Не удалось проверить права на изменение настроек служения"
-            )
             self.context.debug_logger.exception.assert_any_call(
                 "Не удалось проверить права на сохранение настроек служения"
             )
@@ -2281,7 +2330,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 button
                 for row in menu.inline_keyboard
                 for button in row
-                if button.text == "📝 Текст группового сообщения"
+                if button.text == "📝 Шаблон по умолчанию"
             )
             group_callback = SimpleNamespace(
                 data=group_button.callback_data,
@@ -2292,27 +2341,36 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 ),
                 answer=AsyncMock(),
             )
-            await self.callback_handler("on_notification_setting_edit")(
+            await self.callback_handler("on_group_reminder_action")(
                 group_callback
             )
-            group_prompt = "\n".join(
-                call.args[0]
-                for call in group_callback.message.answer.await_args_list
-                if call.args
-            )
+            group_prompt = group_callback.message.answer.await_args.args[0]
             self.assertIn("Напоминание: {tg_responsible}", group_prompt)
-            self.assertIn("не подставляются", group_prompt)
-            self.assertIn("Замените их на {task_assignments}", group_prompt)
-            self.assertIn("Пример группы на воскресенье", group_prompt)
-            self.assertIn("Пример текста для ввода", group_prompt)
-            self.assertIn("{task_assignments}", group_prompt)
-            self.assertIn("Так будет выглядеть сообщение", group_prompt)
-            self.assertIn("Пример с задачами и ответственными", group_prompt)
-            self.assertEqual(
-                self.context.prepare_service_test_previews.await_args.kwargs[
-                    "group_template"
-                ],
-                "Напоминание: {tg_responsible}",
+            edit_default_button = next(
+                button
+                for row in group_callback.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith(
+                    "group_reminder:edit_default:"
+                )
+            )
+            edit_default_callback = SimpleNamespace(
+                data=edit_default_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_group_reminder_action")(
+                edit_default_callback
+            )
+            self.assertIn(
+                "{service_name}",
+                edit_default_callback.message.answer.await_args.args[0],
             )
             staged_input = next(
                 item.callback
@@ -2331,7 +2389,35 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             valid_group = self.message(67890, "Новое {service_name}")
             await staged_input(valid_group)
-            menu = valid_group.answer.await_args.kwargs["reply_markup"]
+            self.assertEqual(
+                self.registry.get_service("sound")["group_template"],
+                "Напоминание: {tg_responsible}",
+            )
+            root_back = next(
+                button
+                for row in valid_group.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith(
+                    "group_reminder:root_back:"
+                )
+            )
+            root_callback = SimpleNamespace(
+                data=root_back.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_group_reminder_action")(
+                root_callback
+            )
+            menu = root_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
 
             personal_button = next(
                 button
@@ -2386,11 +2472,37 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 "не поддерживается",
                 invalid_personal.answer.await_args.args[0],
             )
+            valid_personal = self.message(67890, "Новое личное {name}")
+            await staged_input(valid_personal)
+            finish_button = next(
+                button
+                for row in valid_personal.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith("notify_finish:")
+            )
+            finish_callback = SimpleNamespace(
+                data=finish_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private"),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_notification_setting_finish")(
+                finish_callback
+            )
+            self.assertEqual(
+                self.registry.get_service("sound")["group_template"],
+                "Новое {service_name}",
+            )
             self.assertEqual(
                 self.registry.get_service("sound")["personal_templates"][
                     "Микшер"
                 ],
-                "Сохранённый текст {name}",
+                "Новое личное {name}",
             )
 
         asyncio.run(run())

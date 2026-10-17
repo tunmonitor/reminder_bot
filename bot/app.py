@@ -508,7 +508,7 @@ async def _process_service_reminder(
     tz,
     registry: ServiceRegistry,
     service_id: str,
-    reminder: dict,
+    reminder_id: int,
     interaction_logger,
     debug_logger,
     *,
@@ -517,6 +517,13 @@ async def _process_service_reminder(
 ) -> None:
     service = registry.get_service(service_id)
     if service is None or not service["enabled"]:
+        return
+    reminder = registry.get_group_reminder(reminder_id)
+    if (
+        reminder is None
+        or reminder["service_id"] != service_id
+        or not reminder["enabled"]
+    ):
         return
     event_date = (run_date or datetime.now(tz).date()) + timedelta(
         days=reminder["reminder_days"]
@@ -592,10 +599,7 @@ async def _process_service_reminder(
     assignment_text = format_task_assignments(
         assignments, contacts_by_name, mark_unlinked=True
     )
-    group_template = service["group_template"] or (
-        "Напоминание о служении «{service_name}» в воскресенье "
-        "{sunday_date}:\n{task_assignments}"
-    )
+    group_template = registry.resolve_group_text(reminder, service)
     try:
         group_text = group_template.format_map(
             _TemplateValues(
@@ -636,8 +640,8 @@ async def _process_service_reminder(
             f"Для служения «{service['name']}» не задан групповой чат.",
             debug_logger,
         )
-    elif not registry.is_service_reminder_delivered(
-        service_id, reminder["id"], event_date.isoformat(), group_recipient
+    elif not registry.is_group_reminder_delivered(
+        reminder["id"], event_date.isoformat(), group_recipient
     ):
         if _utf16_length(group_text) > TELEGRAM_TEXT_LIMIT:
             await _notify_admin(
@@ -670,8 +674,7 @@ async def _process_service_reminder(
                     debug_logger,
                 )
             else:
-                registry.mark_service_reminder_delivered(
-                    service_id,
+                registry.mark_group_reminder_delivered(
                     reminder["id"],
                     event_date.isoformat(),
                     group_recipient,
@@ -1415,8 +1418,15 @@ async def _run_locked(args: CliArgs) -> None:
         )
         if service_registry is not None:
             async def scheduled_service_reminder(
-                service_id: str, reminder: dict
+                service_id: str, reminder_id: int
             ) -> None:
+                reminder = service_registry.get_group_reminder(reminder_id)
+                if reminder is None:
+                    debug_logger.warning(
+                        "Запланированное групповое напоминание %s не найдено",
+                        reminder_id,
+                    )
+                    return
                 run_date = scheduled_reminder_date(
                     datetime.now(tz), reminder["reminder_time"]
                 )
@@ -1438,7 +1448,7 @@ async def _run_locked(args: CliArgs) -> None:
                             tz,
                             service_registry,
                             service_id,
-                            reminder,
+                            reminder_id,
                             interaction_logger,
                             debug_logger,
                             run_date=run_date,
@@ -1469,6 +1479,7 @@ async def _run_locked(args: CliArgs) -> None:
                     scheduled_service_reminder,
                     tz,
                     debug_logger,
+                    registry=service_registry,
                 )
 
             context.refresh_service_reminder_jobs = refresh_service_reminders

@@ -20,16 +20,20 @@ class ServiceReminderSchedulerTest(unittest.IsolatedAsyncioTestCase):
         services = [
             {
                 "id": "assembly",
-                "reminders": [
-                    {"id": 11, "reminder_days": 3, "reminder_time": "18:00"},
-                    {"id": 12, "reminder_days": 1, "reminder_time": "09:15"},
-                    {"id": 13, "reminder_days": 3, "reminder_time": "18:00"},
+                "group_reminders": [
+                    {"id": 11, "reminder_days": 3, "reminder_time": "18:00",
+                     "enabled": True},
+                    {"id": 12, "reminder_days": 1, "reminder_time": "09:15",
+                     "enabled": True},
+                    {"id": 13, "reminder_days": 3, "reminder_time": "18:00",
+                     "enabled": True},
                 ],
             },
             {
                 "id": "broadcast",
-                "reminders": [
-                    {"id": 19, "reminder_days": 2, "reminder_time": "12:30"}
+                "group_reminders": [
+                    {"id": 19, "reminder_days": 2, "reminder_time": "12:30",
+                     "enabled": True}
                 ],
             },
         ]
@@ -38,7 +42,7 @@ class ServiceReminderSchedulerTest(unittest.IsolatedAsyncioTestCase):
         await add_service_reminder_jobs(
             scheduler, services, callback, ZoneInfo("UTC"), logger
         )
-        original = scheduler.get_job("service-reminder-broadcast-19")
+        original = scheduler.get_job("group-reminder-broadcast-19")
         await add_service_reminder_jobs(
             scheduler, services, callback, ZoneInfo("UTC"), logger
         )
@@ -46,13 +50,13 @@ class ServiceReminderSchedulerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             {job.id for job in scheduler.get_jobs()},
             {
-                "service-reminder-assembly-11",
-                "service-reminder-assembly-12",
-                "service-reminder-broadcast-19",
+                "group-reminder-assembly-11",
+                "group-reminder-assembly-12",
+                "group-reminder-broadcast-19",
             },
         )
         self.assertIs(
-            scheduler.get_job("service-reminder-broadcast-19"), original
+            scheduler.get_job("group-reminder-broadcast-19"), original
         )
         self.assertEqual(callback.await_count, 0)
 
@@ -61,33 +65,64 @@ class ServiceReminderSchedulerTest(unittest.IsolatedAsyncioTestCase):
         scheduler = AsyncIOScheduler(timezone=tz)
         callback = AsyncMock()
         logger = MagicMock()
-        old_rule = {"id": 11, "reminder_days": 3, "reminder_time": "18:00"}
+        old_rule = {
+            "id": 11, "reminder_days": 3, "reminder_time": "18:00",
+            "enabled": True,
+        }
         await add_service_reminder_jobs(
             scheduler,
-            [{"id": "assembly", "reminders": [old_rule]}],
+            [{"id": "assembly", "group_reminders": [old_rule]}],
             callback,
             tz,
             logger,
         )
         scheduler.start(paused=True)
-        old_job = scheduler.get_job("service-reminder-assembly-11")
+        old_job = scheduler.get_job("group-reminder-assembly-11")
         scheduled_time = datetime.now(tz) - timedelta(minutes=1)
         old_job.modify(next_run_time=scheduled_time)
 
-        new_rule = {"id": 11, "reminder_days": 2, "reminder_time": "18:00"}
+        new_rule = {
+            "id": 11, "reminder_days": 2, "reminder_time": "19:00",
+            "enabled": True,
+        }
         await add_service_reminder_jobs(
             scheduler,
-            [{"id": "assembly", "reminders": [new_rule]}],
+            [{"id": "assembly", "group_reminders": [new_rule]}],
             callback,
             tz,
             logger,
         )
 
-        callback.assert_awaited_once_with("assembly", old_rule)
+        callback.assert_awaited_once_with("assembly", 11)
         self.assertEqual(
-            scheduler.get_job("service-reminder-assembly-11").args,
-            ("assembly", new_rule),
+            scheduler.get_job("group-reminder-assembly-11").args,
+            ("assembly", 11),
         )
+
+    async def test_removes_legacy_jobs_and_does_not_fallback_to_legacy_rows(self):
+        tz = ZoneInfo("UTC")
+        scheduler = AsyncIOScheduler(timezone=tz)
+        callback = AsyncMock()
+        scheduler.add_job(
+            callback,
+            CronTrigger(hour=10, minute=0, timezone=tz),
+            args=("assembly", 11),
+            id="service-reminder-assembly-11",
+        )
+        registry = MagicMock()
+        registry.list_group_reminders.return_value = []
+        await add_service_reminder_jobs(
+            scheduler,
+            [{"id": "assembly"}],
+            callback,
+            tz,
+            MagicMock(),
+            registry=registry,
+        )
+
+        self.assertEqual(scheduler.get_jobs(), [])
+        registry.list_legacy_group_reminders.assert_not_called()
+        callback.assert_not_awaited()
 
     async def test_user_reminder_jobs_are_independent_and_refreshable(self):
         tz = ZoneInfo("UTC")

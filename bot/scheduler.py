@@ -24,15 +24,23 @@ def scheduled_reminder_date(now: datetime, reminder_time: str) -> date:
 async def add_service_reminder_jobs(
     scheduler: AsyncIOScheduler,
     services: list[dict],
-    callback: Callable[[str, dict], Awaitable[None]],
+    callback: Callable[[str, int], Awaitable[None]],
     tz: ZoneInfo,
     debug_logger: logging.Logger,
+    *,
+    registry=None,
 ) -> None:
     now = datetime.now(tz)
-    desired: dict[str, tuple[str, dict, CronTrigger]] = {}
+    desired: dict[str, tuple[str, int, CronTrigger]] = {}
     for service in services:
         reminders_by_schedule = {}
-        for reminder in service["reminders"]:
+        if registry is not None:
+            reminders = registry.list_group_reminders(service["id"])
+        else:
+            reminders = service.get("group_reminders", [])
+        for reminder in reminders:
+            if not reminder["enabled"]:
+                continue
             schedule = (
                 reminder["reminder_days"],
                 reminder["reminder_time"],
@@ -47,25 +55,34 @@ async def add_service_reminder_jobs(
                 minute=int(reminder["reminder_time"][3:]),
                 timezone=tz,
             )
-            job_id = f"service-reminder-{service['id']}-{reminder_id}"
+            job_id = f"group-reminder-{service['id']}-{reminder_id}"
             desired[job_id] = (
                 service["id"],
-                reminder.copy(),
+                reminder_id,
                 trigger,
             )
 
+    jobs = scheduler.get_jobs()
+    legacy = [
+        job for job in jobs if job.id.startswith("service-reminder-")
+    ]
+    for job in legacy:
+        scheduler.remove_job(job.id)
+        debug_logger.info(
+            "Удалено устаревшее задание планировщика %s", job.id
+        )
     existing = {
         job.id: job
-        for job in scheduler.get_jobs()
-        if job.id.startswith("service-reminder-")
+        for job in jobs
+        if job.id.startswith("group-reminder-")
     }
     unchanged = set()
-    for job_id, (service_id, reminder, trigger) in desired.items():
+    for job_id, (service_id, reminder_id, trigger) in desired.items():
         job = existing.get(job_id)
         if (
             job is not None
             and str(job.trigger) == str(trigger)
-            and tuple(job.args) == (service_id, reminder)
+            and tuple(job.args) == (service_id, reminder_id)
             and not job.kwargs
         ):
             unchanged.add(job_id)
@@ -76,13 +93,13 @@ async def add_service_reminder_jobs(
         if next_run_time is not None and next_run_time <= now:
             await callback(job.args[0], job.args[1])
         scheduler.remove_job(job_id)
-    for job_id, (service_id, reminder, trigger) in desired.items():
+    for job_id, (service_id, reminder_id, trigger) in desired.items():
         if job_id in unchanged:
             continue
         scheduler.add_job(
             callback,
             trigger,
-            args=(service_id, reminder),
+            args=(service_id, reminder_id),
             id=job_id,
             replace_existing=True,
             coalesce=True,

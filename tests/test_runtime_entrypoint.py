@@ -157,7 +157,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                         ZoneInfo("UTC"),
                         registry,
                         "assembly",
-                        reminder,
+                        reminder["id"],
                         logger,
                         logger,
                         run_date=(
@@ -209,7 +209,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                         ZoneInfo("UTC"),
                         registry,
                         "assembly",
-                        reminder,
+                        reminder["id"],
                         logger,
                         logger,
                         run_date=(
@@ -260,7 +260,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                         ZoneInfo("UTC"),
                         registry,
                         "assembly",
-                        reminder,
+                        reminder["id"],
                         logger,
                         logger,
                         run_date=(
