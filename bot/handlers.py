@@ -2964,12 +2964,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
             
-        # Очищаем предыдущие меню/сессии
         await clean_and_clear_pending_actor(message.from_user.id)
         
         user_name = message.from_user.first_name or "друг"
         
-        # Проверяем права
+        # Проверка прав (без изменений)
         registry = service_registry()
         is_admin = False
         if registry is not None:
@@ -2977,7 +2976,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 if registry.is_super_admin(message.from_user.id):
                     is_admin = True
                 else:
-                    # Проверяем, есть ли хоть одно служение, где он админ
                     user_services = registry.list_user_services(message.from_user.id)
                     for s_id in user_services:
                         if registry.is_service_admin(message.from_user.id, s_id):
@@ -2986,51 +2984,52 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             except sqlite3.Error:
                 debug.exception("Ошибка при проверке прав в /start")
         
-        # Формируем текст в зависимости от роли
         if is_admin:
+            # Первая строка станет жирной автоматически.
+            # Остальное - обычным текстом.
             text = (
-                f"👋 <b>Здравствуйте, {user_name}!</b>\n\n"
-                "Вы — администратор. Этот бот управляет рассылками и привязкой участников к расписанию служений.\n\n"
-                "<b>Настройки и управление:</b>\n"
-                "📋 /services — список всех служений и их статус.\n"
-                "⚙️ /service_settings — просмотр и настройка конкретного служения.\n"
-                "🔔 /service_notify — настройка напоминаний и шаблонов сообщений.\n"
-                "👥 /service_contact — привязка ответственных из Excel к Telegram.\n"
-                "📡 /service_chat — назначить или отключить групповой чат.\n"
-                "🔄 /service_sync — сверить задачи из графика с привязками.\n\n"
-                "<b>Администрирование:</b>\n"
-                "👤 /service_admin_add — назначить администратора.\n"
-                "🗑 /service_admin_remove — снять администратора.\n"
-                "🧪 /test_notify — отправить тестовое сообщение.\n\n"
-                "<b>Личное:</b>\n"
-                "🔔 /my_notifications — настроить уведомления для себя.\n"
-                "🚫 /cancel — прервать текущий ввод.\n\n"
-                "<i>💡 Для первичной настройки используйте /service_chat, затем /service_contact и /service_notify.</i>"
+                f"👋 Здравствуйте, {user_name}!\n"
+                "Вы — администратор. Этот бот управляет рассылками и привязкой участников.\n\n"
+                "📋 НАСТРОЙКИ И УПРАВЛЕНИЕ:\n"
+                "• /services — список всех служений и их статус.\n"
+                "• /service_settings — просмотр и настройка конкретного служения.\n"
+                "• /service_notify — настройка напоминаний и шаблонов сообщений.\n"
+                "• /service_contact — привязка ответственных из Excel к Telegram.\n"
+                "• /service_chat — назначить или отключить групповой чат.\n"
+                "• /service_sync — сверить задачи из графика с привязками.\n\n"
+                "👤 АДМИНИСТРИРОВАНИЕ:\n"
+                "• /service_admin_add — назначить администратора.\n"
+                "• /service_admin_remove — снять администратора.\n"
+                "• /test_notify — отправить тестовое сообщение.\n\n"
+                "🔔 ЛИЧНОЕ:\n"
+                "• /my_notifications — настроить уведомления для себя.\n"
+                "• /cancel — прервать текущий ввод.\n\n"
+                "💡 Для первичной настройки используйте /service_chat, затем /service_contact и /service_notify."
             )
         elif is_user_linked(message.from_user.id):
             text = (
-                f"👋 <b>Здравствуйте, {user_name}!</b>\n\n"
-                "Вы указаны в расписании служений. Этот бот поможет вам не пропускать назначения.\n\n"
-                "<b>Доступные команды:</b>\n"
-                "• 🔔 /my_notifications — включить или выключить личные уведомления, а также настроить время их отправки.\n"
-                "• 🚫 /cancel — прервать текущий ввод.\n\n"
-                "<i>💡 По умолчанию личные уведомления выключены. Зайдите в /my_notifications, чтобы включить их.</i>"
+                f"👋 Здравствуйте, {user_name}!\n"
+                "Вы привязаны к расписанию служений. Этот бот поможет вам не пропускать назначения.\n\n"
+                "Доступные команды:\n"
+                "• /my_notifications — включить или выключить личные уведомления, а также настроить время их отправки.\n"
+                "• /cancel — прервать текущий ввод.\n\n"
+                "💡 По умолчанию личные уведомления выключены. Зайдите в /my_notifications, чтобы включить их."
             )
         else:
             text = (
-                "👋 <b>Здравствуйте!</b>\n\n"
-                "Вы пока не прописаны ни в какой задаче в расписании служений.\n\n"
-                "<b>Что делать дальше?</b>\n"
+                "👋 Здравствуйте!\n"
+                "Вы пока не привязаны ни к одной задаче в расписании служений.\n\n"
+                "Что делать дальше?\n"
                 "Обратитесь к администратору вашего служения. Он привяжет ваш Telegram-аккаунт к задачам из графика.\n\n"
                 "Как только это произойдет, вы сможете получать личные напоминания и настраивать их в команде /my_notifications.\n\n"
-                "ℹ️ <i>Если вы администратор, используйте команду /services.</i>"
+                "ℹ️ Если вы администратор, используйте команду /services."
             )
 
-        # Отправляем сообщение (parse_mode="HTML" для жирного шрифта)
+        # Вызываем без parse_mode="HTML", 
+        # так как render_screen_chunks (внутри _send_dialog) сам всё сделает.
         await _send_dialog(
             message, 
-            text, 
-            parse_mode="HTML"
+            text
         )
 
     @admin_router.callback_query(F.data.startswith("service:"))

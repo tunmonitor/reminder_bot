@@ -1355,46 +1355,29 @@ async def _run_locked(args: CliArgs) -> None:
             try:
                 await bot.set_my_commands(
                     [
-                        BotCommand(command="services", description="Список служений"),
                         BotCommand(
-                            command="service_settings",
-                            description="Настройки служения",
+                            command="start", 
+                            description="Начать работу с ботом"
                         ),
                         BotCommand(
-                            command="service_admin_add",
-                            description="Назначить администратора служения",
+                            command="my_notifications", 
+                            description="Мои личные уведомления"
                         ),
                         BotCommand(
-                            command="service_admin_remove",
-                            description="Снять администратора служения",
+                            command="services", 
+                            description="Список служений"
                         ),
                         BotCommand(
-                            command="service_chat",
-                            description="Настроить групповой чат",
+                            command="service_notify", 
+                            description="Настроить тексты и время"
                         ),
                         BotCommand(
-                            command="service_contact",
-                            description="Связать ответственного с Telegram",
+                            command="test_notify", 
+                            description="Проверить доставку"
                         ),
                         BotCommand(
-                            command="service_sync",
-                            description="Обновить задачи и ответственных из графика",
-                        ),
-                        BotCommand(
-                            command="service_notify",
-                            description="Настроить тексты и время уведомлений",
-                        ),
-                        BotCommand(
-                            command="cancel",
-                            description="Отменить ввод параметров",
-                        ),
-                        BotCommand(
-                            command="start",
-                            description="Начать работу с ботом",
-                        ),
-                        BotCommand(
-                            command="test_notify",
-                            description="Проверить доставку уведомлений",
+                            command="cancel", 
+                            description="Отменить текущее действие"
                         ),
                     ]
                 )
