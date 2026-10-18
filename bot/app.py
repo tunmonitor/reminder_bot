@@ -54,7 +54,7 @@ if __package__:
         task_assignment_names,
         task_is_informational,
     )
-    from .ui import send_telegram_screen
+    from .ui import send_telegram_screen, visible_units
     from .secure_fs import open_private_directory
     from .scheduler import (
         add_service_reminder_jobs,
@@ -108,7 +108,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         task_assignment_names,
         task_is_informational,
     )
-    from bot.ui import send_telegram_screen
+    from bot.ui import send_telegram_screen, visible_units
     from bot.secure_fs import open_private_directory
     from bot.scheduler import (
         add_service_reminder_jobs,
@@ -736,7 +736,7 @@ async def _process_service_reminder(
     elif not registry.is_group_reminder_delivered(
         reminder["id"], event_date.isoformat(), group_recipient
     ):
-        if _utf16_length(group_text) > TELEGRAM_TEXT_LIMIT:
+        if visible_units(group_text) > TELEGRAM_TEXT_LIMIT:
             await _notify_admin(
                 bot,
                 credentials.admin_tg_id,

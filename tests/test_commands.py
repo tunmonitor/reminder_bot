@@ -28,6 +28,12 @@ class CommandsForRoleTest(unittest.TestCase):
             ["start", "my_notifications", "cancel"],
         )
 
+    def test_main_admin_resolved_as_user_keeps_delivery_check(self):
+        self.assertEqual(
+            command_names(commands_for_role(ROLE_USER, is_main_admin=True)),
+            ["start", "test_notify", "my_notifications", "cancel"],
+        )
+
     def test_service_admin_has_no_super_admin_commands(self):
         names = command_names(commands_for_role(ROLE_SERVICE_ADMIN))
         self.assertEqual(
@@ -76,6 +82,18 @@ class SyncCommandsTest(unittest.TestCase):
         self.assertEqual(set(menus), {24680, 67890})
         self.assertIn("test_notify", menus[67890])
         self.assertNotIn("service_contact", menus[24680])
+
+    def test_main_admin_missing_from_registry_gets_delivery_check(self):
+        bot = MagicMock(set_my_commands=AsyncMock(), delete_my_commands=AsyncMock())
+
+        asyncio.run(sync_admin_commands(bot, self.registry, 11111, MagicMock()))
+
+        menus = {
+            call.kwargs["scope"].chat_id: command_names(call.args[0])
+            for call in bot.set_my_commands.await_args_list[1:]
+        }
+        self.assertIn("test_notify", menus[11111])
+        self.assertNotIn("services", menus[11111])
 
     def test_telegram_errors_do_not_stop_other_menus(self):
         bot = MagicMock(

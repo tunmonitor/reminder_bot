@@ -480,10 +480,22 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 ),
                 key=lambda entry: (entry[1], entry[2]["reminder_time"]),
             )
-            lines.append(
-                f"✉️ Ближайшая отправка · {send_date:%d.%m.%Y} в "
-                f"{reminder['reminder_time']} (собрание {event_date:%d.%m.%Y})"
+            schedule = (
+                f"{send_date:%d.%m.%Y} в {reminder['reminder_time']} "
+                f"(собрание {event_date:%d.%m.%Y})"
             )
+            if not service["enabled"]:
+                lines.append(
+                    f"⚠️ Отправка не выполняется: служение выключено "
+                    f"· по расписанию {schedule}"
+                )
+            elif chat_id is None:
+                lines.append(
+                    f"⚠️ Отправка не выполняется: не задан групповой чат "
+                    f"· по расписанию {schedule}"
+                )
+            else:
+                lines.append(f"✉️ Ближайшая отправка · {schedule}")
         personal_templates = service["personal_templates"]
         lines.extend(
             [

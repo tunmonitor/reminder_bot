@@ -79,17 +79,34 @@ def _units(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
+def visible_units(text: str) -> int:
+    """Measure text as Telegram shows it, with rich-text markers decoded."""
+    return _units(plain_text(text))
+
+
+def _line_tokens(line: str) -> list[str]:
+    """Split a line into characters and whole rich-text markers."""
+    tokens = []
+    cursor = 0
+    for match in _RICH_MARKER.finditer(line):
+        tokens.extend(line[cursor:match.start()])
+        tokens.append(match.group(0))
+        cursor = match.end()
+    tokens.extend(line[cursor:])
+    return tokens
+
+
 def _split_long_line(line: str, limit: int) -> list[str]:
     result = []
     current = []
     current_units = 0
-    for character in line:
-        size = _units(character)
+    for token in _line_tokens(line):
+        size = visible_units(token)
         if current and current_units + size > limit:
             result.append("".join(current))
             current = []
             current_units = 0
-        current.append(character)
+        current.append(token)
         current_units += size
     if current:
         result.append("".join(current))
@@ -118,12 +135,12 @@ def render_screen_chunks(text: str, limit: int = MAX_SCREEN_UNITS) -> list[str]:
     current_units = 0
     for line in lines:
         for segment in _split_long_line(line, limit):
-            extra = _units(segment) + (1 if current else 0)
+            extra = visible_units(segment) + (1 if current else 0)
             if current and current_units + extra > limit:
                 chunks.append("\n".join(current))
                 current = []
                 current_units = 0
-                extra = _units(segment)
+                extra = visible_units(segment)
             current.append(segment)
             current_units += extra
     if current:

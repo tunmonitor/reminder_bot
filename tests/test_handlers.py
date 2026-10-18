@@ -4660,7 +4660,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             settings_response = selection_message.answer.await_args.args[0]
             self.assertIn("⏰ Напоминания групп · 🟢 1", settings_response)
-            self.assertIn("Ближайшая отправка", settings_response)
+            self.assertIn(
+                "⚠️ Отправка не выполняется: служение выключено",
+                settings_response,
+            )
             self.assertIn("в 16:00", settings_response)
             self.assertIn("Шаблон по умолчанию · 🟢 свой", settings_response)
             self.assertIn("Личные шаблоны · 🟢 1", settings_response)
@@ -4866,6 +4869,33 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIn("📡 Групповой чат · «Звук &lt;команда&gt;»", text)
             self.assertNotIn("-100777", text)
             self.context.bot.get_chat.assert_awaited_once_with(-100777)
+
+        asyncio.run(run())
+
+    def test_settings_card_shows_next_send_only_when_deliverable(self):
+        async def run():
+            self.registry.set_group_chat(67890, "sound", -100777, enabled=True)
+            message = self.message(67890, "/service_settings sound")
+            await self.message_handler("on_service_settings")(message)
+            self.assertIn("✉️ Ближайшая отправка", message.answer.await_args.args[0])
+
+            self.registry.set_service_enabled(67890, "sound", False)
+            message = self.message(67890, "/service_settings sound")
+            await self.message_handler("on_service_settings")(message)
+            text = message.answer.await_args.args[0]
+            self.assertNotIn("Ближайшая отправка", text)
+            self.assertIn("служение выключено", text)
+
+        asyncio.run(run())
+
+    def test_settings_card_warns_when_group_chat_missing(self):
+        async def run():
+            self.registry.set_service_enabled(67890, "sound", True)
+            message = self.message(67890, "/service_settings sound")
+            await self.message_handler("on_service_settings")(message)
+            text = message.answer.await_args.args[0]
+            self.assertNotIn("Ближайшая отправка", text)
+            self.assertIn("не задан групповой чат", text)
 
         asyncio.run(run())
 

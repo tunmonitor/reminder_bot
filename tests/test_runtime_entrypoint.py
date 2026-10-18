@@ -192,6 +192,73 @@ class ReminderBotEntrypointTest(unittest.TestCase):
 
         asyncio.run(send_reminder())
 
+    def test_service_reminder_limit_counts_visible_text_of_links(self):
+        from bot import app
+        from bot.notifier import TELEGRAM_TEXT_LIMIT
+        from bot.service_registry import ServiceRegistry
+
+        async def send_reminder():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                names = [
+                    f"Участник {index:02d} " + "Ж" * 45 for index in range(50)
+                ]
+                for index, name in enumerate(names):
+                    registry.set_responsible_contact(
+                        1001, "assembly", "Камеры", name, 3000 + index,
+                        f"user{index:02d}",
+                    )
+                registry.set_service_default_template(
+                    1001, "assembly", "{task_assignments}"
+                )
+                reminder = registry.get_service("assembly")["reminders"][0]
+                bot = SimpleNamespace(send_message=AsyncMock())
+                logger = MagicMock()
+                with patch.object(
+                    app,
+                    "_load_service_task_assignments",
+                    new=AsyncMock(return_value=({"Камеры": names}, True)),
+                ), patch.object(
+                    app, "_notify_admin", new=AsyncMock()
+                ) as notify_admin:
+                    await app._process_service_reminder(
+                        bot,
+                        SimpleNamespace(admin_tg_id=1001),
+                        Path(tmp_dir),
+                        ZoneInfo("UTC"),
+                        registry,
+                        "assembly",
+                        reminder["id"],
+                        logger,
+                        logger,
+                        run_date=(
+                            date(2026, 10, 11)
+                            - timedelta(days=reminder["reminder_days"])
+                        ),
+                        state_cache=SimpleNamespace(state={}, save=MagicMock()),
+                    )
+
+                raw_text = app.format_task_assignments(
+                    {"Камеры": names},
+                    {
+                        (item["task"], item["name"]): item
+                        for item in registry.list_responsible_contacts(
+                            1001, "assembly"
+                        )
+                    },
+                )
+                self.assertGreater(
+                    len(raw_text.encode("utf-16-le")) // 2, TELEGRAM_TEXT_LIMIT
+                )
+                notify_admin.assert_not_awaited()
+                self.assertEqual(bot.send_message.await_count, 1)
+                sent = bot.send_message.await_args.args[1]
+                self.assertIn('<a href="tg://user?id=3049">', sent)
+                self.assertNotIn("\x00", sent)
+
+        asyncio.run(send_reminder())
+
     def test_confirmed_duplicate_reminders_send_each_reminders_own_text(self):
         from bot import app
         from bot.service_registry import ServiceRegistry

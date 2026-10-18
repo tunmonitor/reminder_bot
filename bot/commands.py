@@ -34,9 +34,9 @@ _TEST_NOTIFY = BotCommand(command="test_notify", description="Проверить
 
 def commands_for_role(role: str, *, is_main_admin: bool = False) -> list[BotCommand]:
     """Return menu commands available to a role, most frequent first."""
-    if role == ROLE_USER:
-        return [_START, _MY_NOTIFICATIONS, _CANCEL]
-    commands = [_START, _SERVICES, _SERVICE_NOTIFY]
+    commands = [_START]
+    if role != ROLE_USER:
+        commands.extend([_SERVICES, _SERVICE_NOTIFY])
     if role == ROLE_SUPER_ADMIN:
         commands.extend(_SUPER_ADMIN_COMMANDS)
     if is_main_admin:

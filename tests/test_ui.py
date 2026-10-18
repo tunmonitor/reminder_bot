@@ -53,6 +53,21 @@ class DialogRenderingTest(unittest.TestCase):
             with self.subTest(telegram_id=telegram_id):
                 self.assertEqual(user_link(telegram_id, "Ана"), "Ана")
 
+    def test_long_line_never_splits_a_link_marker(self):
+        line = "x" * 30 + user_link(1, "Длинное имя участника") + "y" * 30
+        chunks = render_screen_chunks(f"T\n{line}", limit=40)
+        joined = "".join(chunks)
+        self.assertIn(
+            '<a href="tg://user?id=1">Длинное имя участника</a>', joined
+        )
+        self.assertNotIn("\x00", joined)
+
+    def test_chunk_limit_counts_visible_link_text(self):
+        links = "\n".join(user_link(10 + index, "Ана") for index in range(10))
+        chunks = render_screen_chunks(f"T\n{links}", limit=50)
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].count("<a href="), 10)
+
     def test_plain_text_replaces_markers_with_visible_text(self):
         self.assertEqual(
             plain_text(f"{user_link('12345', 'Ана (@ana)')} {code(7)}"),
