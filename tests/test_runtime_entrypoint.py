@@ -194,7 +194,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
 
     def test_upcoming_events_cover_next_months_and_skip_missing_sheets(self):
         from bot import app
-        from bot.excel_parser import ServiceEvent
+        from bot.excel_parser import ServiceEvent, SheetNotFoundError
 
         today = datetime.now(ZoneInfo("UTC")).date()
         parsed_months = []
@@ -202,7 +202,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
         def parse(path, month, logger):
             parsed_months.append(month)
             if month != today.replace(day=1):
-                raise RuntimeError("Лист расписания не найден")
+                raise SheetNotFoundError("Лист расписания не найден")
             return {
                 "sound": [
                     ServiceEvent("sound", today - timedelta(days=1), ()),
@@ -229,8 +229,33 @@ class ReminderBotEntrypointTest(unittest.TestCase):
         self.assertGreaterEqual(len(parsed_months), 2)
         self.assertEqual(leftovers, [])
 
+    def test_upcoming_events_propagate_broken_later_sheet(self):
+        from bot import app
+
+        today = datetime.now(ZoneInfo("UTC")).date()
+
+        def parse(path, month, logger):
+            if month != today.replace(day=1):
+                raise RuntimeError("Лист расписания пуст")
+            return {}
+
+        async def load():
+            with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+                app, "download_public", new=AsyncMock()
+            ), patch.object(app, "parse_service_events", side_effect=parse):
+                await app._load_upcoming_service_events(
+                    SimpleNamespace(yandex_public_url="https://example.invalid"),
+                    Path(tmp_dir),
+                    ZoneInfo("UTC"),
+                    MagicMock(),
+                )
+
+        with self.assertRaises(RuntimeError):
+            asyncio.run(load())
+
     def test_upcoming_events_fail_when_current_month_is_missing(self):
         from bot import app
+        from bot.excel_parser import SheetNotFoundError
 
         async def load():
             with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
@@ -238,7 +263,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
             ), patch.object(
                 app,
                 "parse_service_events",
-                side_effect=RuntimeError("Лист расписания не найден"),
+                side_effect=SheetNotFoundError("Лист расписания не найден"),
             ):
                 await app._load_upcoming_service_events(
                     SimpleNamespace(yandex_public_url="https://example.invalid"),

@@ -1274,6 +1274,29 @@ class ServiceRegistryTest(unittest.TestCase):
             )
         self.assertIsNone(self.registry.get_user_text(2002, "sound", "Микшер"))
 
+    def test_service_schedule_keeps_deliveries_of_removed_rules(self):
+        self.registry.set_responsible_contact(1001, "sound", "Микшер", "Анна", 2002)
+        text_id = self.registry.upsert_user_text(2002, "sound", "Микшер", None)
+        kept = self.registry.add_schedule(text_id, 3, "09:00")
+        removed = self.registry.add_schedule(text_id, 1, "18:00")
+        self.registry.mark_user_reminder_delivered(removed["id"], "2026-10-25")
+
+        self.registry.set_user_service_schedule(2002, "sound", ["Микшер"], 1, "20:00")
+
+        self.assertEqual(
+            [item["id"] for item in self.registry.list_schedules(text_id)],
+            [kept["id"]],
+        )
+        self.assertTrue(
+            self.registry.is_user_reminder_delivered(kept["id"], "2026-10-25")
+        )
+
+    def test_templates_reject_control_markers(self):
+        with self.assertRaises(ValueError):
+            self.registry.set_service_default_template(
+                1001, "sound", "{task_assignments}\x00CODE:A\x00"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

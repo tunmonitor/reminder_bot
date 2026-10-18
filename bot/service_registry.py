@@ -41,6 +41,8 @@ def validate_notification_template(
     label: str,
 ) -> None:
     allowed = ", ".join(sorted(f"{{{field}}}" for field in allowed_fields))
+    if "\x00" in template:
+        raise ValueError(f"{label}: текст содержит недопустимые символы.")
     try:
         for _, field_name, format_spec, conversion in Formatter().parse(template):
             if field_name is None:
@@ -2101,6 +2103,18 @@ class ServiceRegistry:
                         "UPDATE user_reminder_schedules SET reminder_days = ?, "
                         "reminder_time = ?, enabled = 1 WHERE id = ?",
                         (days, time, schedule_ids[0]),
+                    )
+                    # Отправки удаляемых правил переносятся на оставшееся,
+                    # чтобы уже напомненное событие не пришло повторно.
+                    connection.executemany(
+                        "INSERT OR IGNORE INTO user_reminder_deliveries "
+                        "(schedule_id, event_date, delivered_at) "
+                        "SELECT ?, event_date, delivered_at "
+                        "FROM user_reminder_deliveries WHERE schedule_id = ?",
+                        [
+                            (schedule_ids[0], schedule_id)
+                            for schedule_id in schedule_ids[1:]
+                        ],
                     )
                     connection.executemany(
                         "DELETE FROM user_reminder_schedules WHERE id = ?",

@@ -6,10 +6,12 @@ import hashlib
 import os
 import stat
 import tempfile
+import time
 from contextlib import suppress
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -34,6 +36,7 @@ if __package__:
         ROLES,
         parse_people,
         parse_schedule,
+        SheetNotFoundError,
         parse_service_events,
         resolve_assignments,
     )
@@ -88,6 +91,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         ROLES,
         parse_people,
         parse_schedule,
+        SheetNotFoundError,
         parse_service_events,
         resolve_assignments,
     )
@@ -126,6 +130,9 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         application_instance_lock,
         environment_name,
     )
+
+
+UPCOMING_EVENTS_CACHE_SECONDS = 300
 
 
 def _next_sunday_in_tz(tz) -> date:
@@ -533,13 +540,18 @@ async def _load_upcoming_service_events(
                 events_by_service = parse_service_events(
                     xlsx_path, month, debug_logger
                 )
-            except RuntimeError:
+            except SheetNotFoundError:
                 if month == months[0]:
                     raise
                 debug_logger.info(
                     "Лист графика на %s пока недоступен", f"{month:%m.%Y}"
                 )
                 continue
+            except RuntimeError:
+                debug_logger.exception(
+                    "Лист графика на %s повреждён", f"{month:%m.%Y}"
+                )
+                raise
             events.extend(
                 event
                 for service_events in events_by_service.values()
@@ -1475,10 +1487,27 @@ async def _run_locked(args: CliArgs) -> None:
         context.prepare_test_previews = prepare_test_previews
         context.load_service_task_assignments = load_service_task_assignments
 
+        upcoming_cache: dict[str, Any] = {"loaded_at": None, "events": []}
+        upcoming_lock = asyncio.Lock()
+
         async def load_upcoming_service_events() -> list:
-            return await _load_upcoming_service_events(
-                credentials, shm_dir, tz, debug_logger
-            )
+            # Один общий скачанный график на несколько минут для всех
+            # пользователей: повторные нажатия не обращаются к Яндекс.Диску.
+            async with upcoming_lock:
+                loaded_at = upcoming_cache["loaded_at"]
+                if (
+                    loaded_at is not None
+                    and time.monotonic() - loaded_at
+                    < UPCOMING_EVENTS_CACHE_SECONDS
+                ):
+                    return upcoming_cache["events"]
+                events = await _load_upcoming_service_events(
+                    credentials, shm_dir, tz, debug_logger
+                )
+                upcoming_cache.update(
+                    loaded_at=time.monotonic(), events=events
+                )
+                return events
 
         context.load_upcoming_service_events = load_upcoming_service_events
         context.prepare_service_test_previews = prepare_service_test_previews

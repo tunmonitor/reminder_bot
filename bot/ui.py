@@ -43,20 +43,33 @@ def _decode_marker_value(encoded: str) -> str:
     )
 
 
+def _decode_marker(match: re.Match) -> tuple[str, str]:
+    """Return a marker's kind and visible text; malformed ones stay literal."""
+    is_code = match.group("code") is not None
+    try:
+        value = _decode_marker_value(
+            match.group("code") if is_code else match.group("label")
+        )
+    except ValueError:
+        return "text", match.group(0).replace("\x00", "")
+    return ("code" if is_code else "link"), value
+
+
 def _escape_rich_text(text: str) -> str:
     pieces = []
     cursor = 0
     for match in _RICH_MARKER.finditer(text):
         pieces.append(html.escape(text[cursor:match.start()]))
-        if match.group("code") is not None:
-            value = _decode_marker_value(match.group("code"))
+        kind, value = _decode_marker(match)
+        if kind == "code":
             pieces.append(f"<code>{html.escape(value)}</code>")
-        else:
-            label = _decode_marker_value(match.group("label"))
+        elif kind == "link":
             pieces.append(
                 f'<a href="tg://user?id={match.group("user_id")}">'
-                f"{html.escape(label)}</a>"
+                f"{html.escape(value)}</a>"
             )
+        else:
+            pieces.append(html.escape(value))
         cursor = match.end()
     pieces.append(html.escape(text[cursor:]))
     return "".join(pieces)
@@ -65,14 +78,7 @@ def _escape_rich_text(text: str) -> str:
 
 def plain_text(text: str) -> str:
     """Replace rich-text markers with their visible text for parse_mode=None."""
-    return _RICH_MARKER.sub(
-        lambda match: _decode_marker_value(
-            match.group("code")
-            if match.group("code") is not None
-            else match.group("label")
-        ),
-        text,
-    )
+    return _RICH_MARKER.sub(lambda match: _decode_marker(match)[1], text)
 
 
 def _units(text: str) -> int:
@@ -101,13 +107,19 @@ def _split_long_line(line: str, limit: int) -> list[str]:
     current = []
     current_units = 0
     for token in _line_tokens(line):
-        size = visible_units(token)
-        if current and current_units + size > limit:
-            result.append("".join(current))
-            current = []
-            current_units = 0
-        current.append(token)
-        current_units += size
+        # Ссылка с подписью длиннее экрана не помещается целиком:
+        # показываем её обычным текстом, разбитым по лимиту.
+        pieces = [token]
+        if len(token) > 1 and visible_units(token) > limit:
+            pieces = list(plain_text(token))
+        for piece in pieces:
+            size = visible_units(piece)
+            if current and current_units + size > limit:
+                result.append("".join(current))
+                current = []
+                current_units = 0
+            current.append(piece)
+            current_units += size
     if current:
         result.append("".join(current))
     return result or [""]

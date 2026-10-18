@@ -68,6 +68,28 @@ class DialogRenderingTest(unittest.TestCase):
         self.assertEqual(len(chunks), 1)
         self.assertEqual(chunks[0].count("<a href="), 10)
 
+    def test_malformed_marker_is_shown_as_text(self):
+        broken = "\x00CODE:A\x00"
+        self.assertEqual(plain_text(f"x {broken}"), "x CODE:A")
+        self.assertEqual(
+            render_screen_chunks(f"T\n<{broken}>"),
+            ["<b>T</b>\n&lt;CODE:A&gt;"],
+        )
+
+    def test_link_longer_than_screen_is_split_as_text(self):
+        label = "Л" * 90
+        chunks = render_screen_chunks(f"T\n{user_link(5, label)}", limit=40)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            visible = re.sub(r"<[^>]+>", "", chunk)
+            self.assertLessEqual(len(visible.encode("utf-16-le")) // 2, 40)
+        self.assertEqual(
+            "".join(re.sub(r"<[^>]+>", "", chunk) for chunk in chunks)
+            .replace("T", "")
+            .replace("\n", ""),
+            label,
+        )
+
     def test_plain_text_replaces_markers_with_visible_text(self):
         self.assertEqual(
             plain_text(f"{user_link('12345', 'Ана (@ana)')} {code(7)}"),

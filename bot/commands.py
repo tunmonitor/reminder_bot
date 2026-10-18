@@ -6,7 +6,7 @@ import sqlite3
 from typing import Any
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
 
 ROLE_USER = "user"
@@ -92,6 +92,15 @@ async def sync_user_commands(
                 commands_for_role(role, is_main_admin=is_main_admin),
                 scope=scope,
             )
+    except TelegramBadRequest as exc:
+        if "chat not found" not in str(exc).lower():
+            debug.exception("Не удалось обновить меню команд пользователя")
+            return
+        # Пользователь ещё не открывал бота: меню появится после его /start.
+        debug.info(
+            "Меню команд для %s отложено: пользователь ещё не писал боту",
+            telegram_id,
+        )
     except TelegramAPIError:
         debug.exception("Не удалось обновить меню команд пользователя")
 

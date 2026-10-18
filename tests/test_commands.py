@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 
 from bot.commands import (
     ROLE_SERVICE_ADMIN,
@@ -94,6 +94,26 @@ class SyncCommandsTest(unittest.TestCase):
         }
         self.assertIn("test_notify", menus[11111])
         self.assertNotIn("services", menus[11111])
+
+    def test_chat_not_found_is_logged_without_traceback(self):
+        bot = MagicMock(
+            set_my_commands=AsyncMock(
+                side_effect=[
+                    None,
+                    TelegramBadRequest(
+                        method=MagicMock(), message="Bad Request: chat not found"
+                    ),
+                    None,
+                ]
+            ),
+            delete_my_commands=AsyncMock(),
+        )
+        debug = MagicMock()
+
+        asyncio.run(sync_admin_commands(bot, self.registry, 67890, debug))
+
+        debug.exception.assert_not_called()
+        debug.info.assert_called_once()
 
     def test_telegram_errors_do_not_stop_other_menus(self):
         bot = MagicMock(
