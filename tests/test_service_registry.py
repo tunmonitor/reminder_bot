@@ -1201,6 +1201,79 @@ class ServiceRegistryTest(unittest.TestCase):
 
             self.assertEqual(target.read_bytes(), b"must remain unchanged")
 
+    def test_list_user_assignments_returns_linked_tasks(self):
+        self.registry.set_responsible_contact(1001, "sound", "Микшер", "Анна", 2002)
+        self.registry.set_responsible_contact(1001, "slides", "Слайды", "Анна", 2002)
+        self.registry.set_responsible_contact(1001, "sound", "Пульт", "Борис", 2003)
+
+        self.assertEqual(
+            self.registry.list_user_assignments(2002),
+            [
+                {"service_id": "slides", "task": "Слайды", "name": "Анна"},
+                {"service_id": "sound", "task": "Микшер", "name": "Анна"},
+            ],
+        )
+
+    def test_service_schedule_creates_one_rule_per_task(self):
+        for task in ("Микшер", "Пульт"):
+            self.registry.set_responsible_contact(1001, "sound", task, "Анна", 2002)
+
+        self.registry.set_user_service_schedule(
+            2002, "sound", ["Микшер", "Пульт"], 1, "18:00"
+        )
+
+        for task in ("Микшер", "Пульт"):
+            entry = self.registry.get_user_text(2002, "sound", task)
+            self.assertEqual(
+                [
+                    (item["reminder_days"], item["reminder_time"], item["enabled"])
+                    for item in self.registry.list_schedules(entry["id"])
+                ],
+                [(1, "18:00", 1)],
+            )
+
+    def test_service_schedule_updates_first_rule_and_keeps_deliveries(self):
+        self.registry.set_responsible_contact(1001, "sound", "Микшер", "Анна", 2002)
+        text_id = self.registry.upsert_user_text(2002, "sound", "Микшер", None)
+        first = self.registry.add_schedule(text_id, 3, "09:00")
+        self.registry.add_schedule(text_id, 2, "10:00")
+        self.registry.update_schedule(first["id"], enabled=False)
+        self.registry.mark_user_reminder_delivered(first["id"], "2026-10-25")
+
+        self.registry.set_user_service_schedule(2002, "sound", ["Микшер"], 0, "07:30")
+
+        schedules = self.registry.list_schedules(text_id)
+        self.assertEqual(
+            schedules,
+            [
+                {
+                    "id": first["id"],
+                    "text_id": text_id,
+                    "reminder_days": 0,
+                    "reminder_time": "07:30",
+                    "enabled": 1,
+                }
+            ],
+        )
+        self.assertTrue(
+            self.registry.is_user_reminder_delivered(first["id"], "2026-10-25")
+        )
+
+    def test_service_schedule_rejects_unlinked_tasks_atomically(self):
+        self.registry.set_responsible_contact(1001, "sound", "Микшер", "Анна", 2002)
+
+        with self.assertRaises(ValueError):
+            self.registry.set_user_service_schedule(
+                2002, "sound", ["Микшер", "Чужая"], 1, "18:00"
+            )
+        with self.assertRaises(ValueError):
+            self.registry.set_user_service_schedule(2002, "sound", [], 1, "18:00")
+        with self.assertRaises(ValueError):
+            self.registry.set_user_service_schedule(
+                2002, "sound", ["Микшер"], 7, "18:00"
+            )
+        self.assertIsNone(self.registry.get_user_text(2002, "sound", "Микшер"))
+
 
 if __name__ == "__main__":
     unittest.main()

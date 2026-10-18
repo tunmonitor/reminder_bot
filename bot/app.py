@@ -493,6 +493,64 @@ async def _load_service_task_assignments(
         xlsx_path.unlink(missing_ok=True)
 
 
+async def _load_upcoming_service_events(
+    credentials,
+    shm_dir: Path,
+    tz,
+    debug_logger,
+    weeks: int = 6,
+) -> list:
+    """Read schedule events from today through the given number of weeks."""
+    today = datetime.now(tz).date()
+    last_day = today + timedelta(days=weeks * 7)
+    months = []
+    month = today.replace(day=1)
+    while month <= last_day:
+        months.append(month)
+        month = (month + timedelta(days=32)).replace(day=1)
+    debug_dir = shm_dir / "debug"
+    directory_fd = open_private_directory(debug_dir, create=True)
+    os.close(directory_fd)
+    file_fd, file_name = tempfile.mkstemp(
+        prefix=f"schedule-upcoming-{today:%Y%m%d}-",
+        suffix=".xlsx",
+        dir=debug_dir,
+    )
+    os.fchmod(file_fd, 0o600)
+    os.close(file_fd)
+    xlsx_path = Path(file_name)
+    try:
+        await download_public(
+            credentials.yandex_public_url,
+            xlsx_path,
+            debug_logger,
+            attempts=1,
+            interval=0,
+        )
+        events = []
+        for month in months:
+            try:
+                events_by_service = parse_service_events(
+                    xlsx_path, month, debug_logger
+                )
+            except RuntimeError:
+                if month == months[0]:
+                    raise
+                debug_logger.info(
+                    "Лист графика на %s пока недоступен", f"{month:%m.%Y}"
+                )
+                continue
+            events.extend(
+                event
+                for service_events in events_by_service.values()
+                for event in service_events
+                if today <= event.event_date <= last_day
+            )
+        return sorted(events, key=lambda event: (event.event_date, event.service_id))
+    finally:
+        xlsx_path.unlink(missing_ok=True)
+
+
 async def get_group_reminder_preview(
     reminder_id: int,
     credentials,
@@ -1416,6 +1474,13 @@ async def _run_locked(args: CliArgs) -> None:
 
         context.prepare_test_previews = prepare_test_previews
         context.load_service_task_assignments = load_service_task_assignments
+
+        async def load_upcoming_service_events() -> list:
+            return await _load_upcoming_service_events(
+                credentials, shm_dir, tz, debug_logger
+            )
+
+        context.load_upcoming_service_events = load_upcoming_service_events
         context.prepare_service_test_previews = prepare_service_test_previews
         context.get_group_reminder_preview = prepare_group_reminder_preview
         register(dp, context)

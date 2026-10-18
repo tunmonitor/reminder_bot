@@ -1772,6 +1772,17 @@ class ServiceRegistry:
             ).fetchall()
         return [row["task"] for row in rows]
 
+    def list_user_assignments(self, actor_id: int) -> list[dict]:
+        """Return every (service, task, schedule name) linked to this user."""
+        _validate_positive_id(actor_id, "actor_id")
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT service_id, task, name FROM responsible_contacts "
+                "WHERE telegram_id = ? ORDER BY service_id, task, name",
+                (actor_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def get_user_notifications_state(self, actor_id: int) -> dict:
         _validate_positive_id(actor_id, "actor_id")
         with self._connection() as connection:
@@ -2037,6 +2048,71 @@ class ServiceRegistry:
                 "DELETE FROM user_reminder_schedules WHERE id = ?",
                 (schedule_id,),
             )
+
+    def set_user_service_schedule(
+        self,
+        actor_id: int,
+        service_id: str,
+        tasks: list[str],
+        days: int,
+        time: str,
+    ) -> None:
+        """Give each listed task exactly one enabled rule with this timing.
+
+        An existing rule is updated in place so its delivery records keep
+        preventing a repeated reminder for an event that was already sent.
+        """
+        _validate_positive_id(actor_id, "actor_id")
+        self._validate_user_schedule(days, time)
+        tasks = sorted({task.strip() for task in tasks if task.strip()})
+        if not tasks:
+            raise ValueError("Нет задач для личного напоминания")
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            for task in tasks:
+                registered = connection.execute(
+                    "SELECT 1 FROM responsible_contacts "
+                    "WHERE service_id = ? AND task = ? AND telegram_id = ?",
+                    (service_id, task, actor_id),
+                ).fetchone()
+                if registered is None:
+                    raise ValueError("Пользователь не привязан к этой задаче")
+                connection.execute(
+                    "INSERT INTO user_reminder_texts "
+                    "(actor_id, service_id, task, body) VALUES (?, ?, ?, NULL) "
+                    "ON CONFLICT(actor_id, service_id, task) DO NOTHING",
+                    (actor_id, service_id, task),
+                )
+                text_id = connection.execute(
+                    "SELECT id FROM user_reminder_texts "
+                    "WHERE actor_id = ? AND service_id = ? AND task = ?",
+                    (actor_id, service_id, task),
+                ).fetchone()["id"]
+                schedule_ids = [
+                    row["id"]
+                    for row in connection.execute(
+                        "SELECT id FROM user_reminder_schedules "
+                        "WHERE text_id = ? ORDER BY id",
+                        (text_id,),
+                    ).fetchall()
+                ]
+                if schedule_ids:
+                    connection.execute(
+                        "UPDATE user_reminder_schedules SET reminder_days = ?, "
+                        "reminder_time = ?, enabled = 1 WHERE id = ?",
+                        (days, time, schedule_ids[0]),
+                    )
+                    connection.executemany(
+                        "DELETE FROM user_reminder_schedules WHERE id = ?",
+                        [(schedule_id,) for schedule_id in schedule_ids[1:]],
+                    )
+                else:
+                    connection.execute(
+                        "INSERT INTO user_reminder_schedules "
+                        "(text_id, reminder_days, reminder_time) "
+                        "VALUES (?, ?, ?)",
+                        (text_id, days, time),
+                    )
 
     @staticmethod
     def _validate_user_schedule(days: int, time: str) -> None:

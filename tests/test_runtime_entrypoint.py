@@ -192,6 +192,64 @@ class ReminderBotEntrypointTest(unittest.TestCase):
 
         asyncio.run(send_reminder())
 
+    def test_upcoming_events_cover_next_months_and_skip_missing_sheets(self):
+        from bot import app
+        from bot.excel_parser import ServiceEvent
+
+        today = datetime.now(ZoneInfo("UTC")).date()
+        parsed_months = []
+
+        def parse(path, month, logger):
+            parsed_months.append(month)
+            if month != today.replace(day=1):
+                raise RuntimeError("Лист расписания не найден")
+            return {
+                "sound": [
+                    ServiceEvent("sound", today - timedelta(days=1), ()),
+                    ServiceEvent("sound", today, ()),
+                    ServiceEvent("sound", today + timedelta(days=60), ()),
+                ]
+            }
+
+        async def load():
+            with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+                app, "download_public", new=AsyncMock()
+            ), patch.object(app, "parse_service_events", side_effect=parse):
+                events = await app._load_upcoming_service_events(
+                    SimpleNamespace(yandex_public_url="https://example.invalid"),
+                    Path(tmp_dir),
+                    ZoneInfo("UTC"),
+                    MagicMock(),
+                )
+                leftovers = list((Path(tmp_dir) / "debug").iterdir())
+            return events, leftovers
+
+        events, leftovers = asyncio.run(load())
+        self.assertEqual([event.event_date for event in events], [today])
+        self.assertGreaterEqual(len(parsed_months), 2)
+        self.assertEqual(leftovers, [])
+
+    def test_upcoming_events_fail_when_current_month_is_missing(self):
+        from bot import app
+
+        async def load():
+            with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+                app, "download_public", new=AsyncMock()
+            ), patch.object(
+                app,
+                "parse_service_events",
+                side_effect=RuntimeError("Лист расписания не найден"),
+            ):
+                await app._load_upcoming_service_events(
+                    SimpleNamespace(yandex_public_url="https://example.invalid"),
+                    Path(tmp_dir),
+                    ZoneInfo("UTC"),
+                    MagicMock(),
+                )
+
+        with self.assertRaises(RuntimeError):
+            asyncio.run(load())
+
     def test_service_reminder_limit_counts_visible_text_of_links(self):
         from bot import app
         from bot.notifier import TELEGRAM_TEXT_LIMIT

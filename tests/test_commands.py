@@ -25,20 +25,20 @@ class CommandsForRoleTest(unittest.TestCase):
     def test_user_sees_only_participant_commands(self):
         self.assertEqual(
             command_names(commands_for_role(ROLE_USER)),
-            ["start", "my_notifications", "cancel"],
+            ["start", "my_schedule", "my_notifications", "cancel"],
         )
 
     def test_main_admin_resolved_as_user_keeps_delivery_check(self):
         self.assertEqual(
             command_names(commands_for_role(ROLE_USER, is_main_admin=True)),
-            ["start", "test_notify", "my_notifications", "cancel"],
+            ["start", "test_notify", "my_schedule", "my_notifications", "cancel"],
         )
 
     def test_service_admin_has_no_super_admin_commands(self):
         names = command_names(commands_for_role(ROLE_SERVICE_ADMIN))
         self.assertEqual(
             names,
-            ["start", "services", "service_notify", "my_notifications", "cancel"],
+            ["start", "services", "service_notify", "my_schedule", "my_notifications", "cancel"],
         )
 
     def test_main_super_admin_gets_full_menu_with_delivery_check(self):

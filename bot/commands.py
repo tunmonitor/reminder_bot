@@ -17,6 +17,7 @@ _START = BotCommand(command="start", description="Главное меню")
 _MY_NOTIFICATIONS = BotCommand(
     command="my_notifications", description="Мои личные уведомления"
 )
+_MY_SCHEDULE = BotCommand(command="my_schedule", description="Мои ближайшие служения")
 _CANCEL = BotCommand(command="cancel", description="Отменить текущее действие")
 _SERVICES = BotCommand(command="services", description="Служения и их настройки")
 _SERVICE_NOTIFY = BotCommand(
@@ -41,7 +42,7 @@ def commands_for_role(role: str, *, is_main_admin: bool = False) -> list[BotComm
         commands.extend(_SUPER_ADMIN_COMMANDS)
     if is_main_admin:
         commands.append(_TEST_NOTIFY)
-    return [*commands, _MY_NOTIFICATIONS, _CANCEL]
+    return [*commands, _MY_SCHEDULE, _MY_NOTIFICATIONS, _CANCEL]
 
 
 def user_role(registry: Any, telegram_id: int) -> str:
