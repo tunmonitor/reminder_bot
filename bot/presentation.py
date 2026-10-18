@@ -4,6 +4,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from .ui import user_link
+
 
 _TASK_EMOJIS = (
     ("камер", "📷"),
@@ -63,28 +65,17 @@ def format_task_assignments(
         lines = [f"{task_emoji(task)} {task}"]
         if not names:
             lines.append("• Ответственные не указаны")
-            
         for name in names:
             contact = (contacts or {}).get((task, name))
-            
-            if contact:
-                tg_id = contact.get("telegram_id")
-                username = contact.get("username")
-                
-                if tg_id:
-                    # Используем HTML-ссылку для гарантированного упоминания (тега)
-                    # Если username есть, показываем его, иначе — просто имя
-                    display_text = f"@{username}" if username else name
-                    person_str = f'<a href="tg://user?id={tg_id}">{display_text}</a>'
-                elif username:
-                    person_str = f"@{username}"
-                else:
-                    person_str = name
+            username = contact.get("username") if contact else None
+            label = f"{name} (@{username})" if username else name
+            telegram_id = contact.get("telegram_id") if contact else None
+            if telegram_id:
+                person_str = user_link(telegram_id, label)
+            elif contact is None and mark_unlinked:
+                person_str = f"{name} · не привязан"
             else:
-                person_str = name
-                if mark_unlinked:
-                    person_str += " · не привязан"
-
+                person_str = label
             lines.append(f"• {person_str}")
         groups.append("\n".join(lines))
     return "\n\n".join(groups) or "⚪ Ответственные не указаны"

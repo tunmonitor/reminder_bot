@@ -16,10 +16,11 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, MenuButtonWebApp, WebAppInfo
+from aiogram.types import MenuButtonWebApp, WebAppInfo
 
 if __package__:
     from .cli import CliArgs
+    from .commands import sync_admin_commands
     from .config import (
         PROJECT_DIR,
         get_tz,
@@ -73,6 +74,7 @@ if __package__:
     )
 else:  # pragma: no cover - поддержка запуска файла напрямую
     from bot.cli import CliArgs
+    from bot.commands import sync_admin_commands
     from bot.config import (
         PROJECT_DIR,
         get_tz,
@@ -1352,39 +1354,9 @@ async def _run_locked(args: CliArgs) -> None:
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         )
         if callable(getattr(bot, "set_my_commands", None)):
-            try:
-                await bot.set_my_commands(
-                    [
-                        BotCommand(
-                            command="start", 
-                            description="Начать работу с ботом"
-                        ),
-                        BotCommand(
-                            command="my_notifications", 
-                            description="Мои личные уведомления"
-                        ),
-                        BotCommand(
-                            command="services", 
-                            description="Список служений"
-                        ),
-                        BotCommand(
-                            command="service_notify", 
-                            description="Настроить тексты и время"
-                        ),
-                        BotCommand(
-                            command="test_notify", 
-                            description="Проверить доставку"
-                        ),
-                        BotCommand(
-                            command="cancel", 
-                            description="Отменить текущее действие"
-                        ),
-                    ]
-                )
-            except TelegramAPIError:
-                debug_logger.exception(
-                    "Не удалось обновить меню команд Telegram"
-                )
+            await sync_admin_commands(
+                bot, service_registry, credentials.admin_tg_id, debug_logger
+            )
         dp = Dispatcher(storage=MemoryStorage())
         context = SimpleNamespace(
             bot=bot,

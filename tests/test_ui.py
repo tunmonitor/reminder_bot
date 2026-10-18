@@ -17,8 +17,10 @@ from bot.ui import (
     code,
     layout_buttons,
     nav_row,
+    plain_text,
     render_screen_chunks,
     send_telegram_screen,
+    user_link,
     validate_inline_keyboard,
 )
 
@@ -34,6 +36,27 @@ class DialogRenderingTest(unittest.TestCase):
         self.assertEqual(
             render_screen_chunks(f"ID\n{code('<123&>')}"),
             ["<b>ID</b>\n<code>&lt;123&amp;&gt;</code>"],
+        )
+
+    def test_user_link_marker_escapes_label_and_renders_mention(self):
+        marker = user_link(12345, "Ана <b>:x\x00 & Co")
+        self.assertEqual(
+            render_screen_chunks(f"Группа\n• {marker}"),
+            [
+                "<b>Группа</b>\n• "
+                '<a href="tg://user?id=12345">Ана &lt;b&gt;:x\x00 &amp; Co</a>'
+            ],
+        )
+
+    def test_user_link_without_valid_id_is_plain_label(self):
+        for telegram_id in (None, "", 0, -5, "abc"):
+            with self.subTest(telegram_id=telegram_id):
+                self.assertEqual(user_link(telegram_id, "Ана"), "Ана")
+
+    def test_plain_text_replaces_markers_with_visible_text(self):
+        self.assertEqual(
+            plain_text(f"{user_link('12345', 'Ана (@ana)')} {code(7)}"),
+            "Ана (@ana) 7",
         )
 
     def test_long_unicode_text_is_split_at_utf16_limit(self):

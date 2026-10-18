@@ -15,7 +15,10 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 MAX_SCREEN_UNITS = 500
 MAX_CALLBACK_UNITS = 200
-_CODE_MARKER = re.compile(r"\x00CODE:([A-Za-z0-9_-]+)\x00")
+_RICH_MARKER = re.compile(
+    r"\x00(?:CODE:(?P<code>[A-Za-z0-9_-]*)"
+    r"|LINK:(?P<user_id>\d+):(?P<label>[A-Za-z0-9_-]*))\x00"
+)
 _STATUS_PREFIX = re.compile(r"^(?:✅|❌|⚠️|ℹ️|⏳)\s*")
 _NAVIGATION_PREFIXES = ("⬅️", "✖️", "✅", "➡️", "↩️", "🏠")
 _SINGLE_ACTION_PREFIXES = ("⏰", "📝", "➕")
@@ -27,23 +30,49 @@ def code(value: int | str | None) -> str:
     """Mark a value for safe display as an HTML code span."""
     if value is None:
         return "⚪ не задано"
-    encoded = base64.urlsafe_b64encode(str(value).encode("utf-8")).decode("ascii")
-    return f"\x00CODE:{encoded.rstrip('=')}\x00"
+    return f"\x00CODE:{_encode_marker_value(str(value))}\x00"
+
+
+def _encode_marker_value(value: str) -> str:
+    return base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _decode_marker_value(encoded: str) -> str:
+    return base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode(
+        "utf-8"
+    )
 
 
 def _escape_rich_text(text: str) -> str:
     pieces = []
     cursor = 0
-    for match in _CODE_MARKER.finditer(text):
+    for match in _RICH_MARKER.finditer(text):
         pieces.append(html.escape(text[cursor:match.start()]))
-        encoded = match.group(1)
-        value = base64.urlsafe_b64decode(
-            encoded + "=" * (-len(encoded) % 4)
-        ).decode("utf-8")
-        pieces.append(f"<code>{html.escape(value)}</code>")
+        if match.group("code") is not None:
+            value = _decode_marker_value(match.group("code"))
+            pieces.append(f"<code>{html.escape(value)}</code>")
+        else:
+            label = _decode_marker_value(match.group("label"))
+            pieces.append(
+                f'<a href="tg://user?id={match.group("user_id")}">'
+                f"{html.escape(label)}</a>"
+            )
         cursor = match.end()
     pieces.append(html.escape(text[cursor:]))
     return "".join(pieces)
+
+
+
+def plain_text(text: str) -> str:
+    """Replace rich-text markers with their visible text for parse_mode=None."""
+    return _RICH_MARKER.sub(
+        lambda match: _decode_marker_value(
+            match.group("code")
+            if match.group("code") is not None
+            else match.group("label")
+        ),
+        text,
+    )
 
 
 def _units(text: str) -> int:
@@ -65,6 +94,14 @@ def _split_long_line(line: str, limit: int) -> list[str]:
     if current:
         result.append("".join(current))
     return result or [""]
+
+
+def user_link(telegram_id: int | str | None, label: str) -> str:
+    """Mark a label as a Telegram mention; invalid IDs leave plain text."""
+    user_id = str(telegram_id or "").strip()
+    if not user_id.isdecimal() or int(user_id) <= 0:
+        return label
+    return f"\x00LINK:{int(user_id)}:{_encode_marker_value(label)}\x00"
 
 
 def render_screen_chunks(text: str, limit: int = MAX_SCREEN_UNITS) -> list[str]:

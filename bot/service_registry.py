@@ -2206,6 +2206,19 @@ class ServiceRegistry:
             ).fetchall()
         return [row["telegram_id"] for row in rows]
 
+    def list_admin_ids(self) -> dict[int, bool]:
+        """Return every administrator Telegram ID mapped to super-admin status."""
+        with self._connection() as connection:
+            service_admins = connection.execute(
+                "SELECT DISTINCT telegram_id FROM service_admins"
+            ).fetchall()
+            super_admins = connection.execute(
+                "SELECT telegram_id FROM super_admins"
+            ).fetchall()
+        admins = {row["telegram_id"]: False for row in service_admins}
+        admins.update({row["telegram_id"]: True for row in super_admins})
+        return admins
+
     def list_service_admin_details(self, service_id: str) -> list[dict]:
         with self._connection() as connection:
             self._require_service(connection, service_id)

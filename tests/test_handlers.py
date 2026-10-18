@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
+from aiogram.exceptions import TelegramAPIError
+
 from bot.handlers import register, router
 from bot.service_registry import ServiceRegistry
 
@@ -3854,7 +3856,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertTrue(
                 all(len(chunk.encode("utf-16-le")) // 2 <= 500 for chunk in chunks)
             )
-            self.assertIn("Настройки", "".join(chunks))
+            self.assertIn("📡 Групповой чат", "".join(chunks))
             self.assertNotIn("Ответственный 59", "".join(chunks))
 
         asyncio.run(run())
@@ -4653,16 +4655,16 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 selection_message.answer.await_args.args[0].lower(),
             )
             self.assertIn(
-                "📡 Настройки",
-                selection_message.answer.await_args.args[0],
-            )
-            self.assertIn(
                 "⚙️ ЗВУК",
                 selection_message.answer.await_args.args[0],
             )
             settings_response = selection_message.answer.await_args.args[0]
-            self.assertIn("Сохранённый групповой текст", settings_response)
-            self.assertIn("Сохранённый личный текст", settings_response)
+            self.assertIn("⏰ Напоминания групп · 🟢 1", settings_response)
+            self.assertIn("Ближайшая отправка", settings_response)
+            self.assertIn("в 16:00", settings_response)
+            self.assertIn("Шаблон по умолчанию · 🟢 свой", settings_response)
+            self.assertIn("Личные шаблоны · 🟢 1", settings_response)
+            self.assertNotIn("Сохранённый групповой текст", settings_response)
             self.assertFalse(settings_response.startswith("✅"))
 
             callback = SimpleNamespace(
@@ -4693,6 +4695,272 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     for button in row
                 ],
             )
+
+        asyncio.run(run())
+
+    def message_handler(self, name):
+        return next(
+            handler.callback
+            for handler in self.admin_router.message.handlers
+            if handler.callback.__name__ == name
+        )
+
+    def start_message(self, actor_id):
+        message = self.message(actor_id, "/start")
+        message.from_user.first_name = "Анна"
+        return message
+
+    @staticmethod
+    def callback_data_list(message):
+        markup = message.answer.await_args.kwargs.get("reply_markup")
+        if markup is None:
+            return []
+        return [
+            button.callback_data
+            for row in markup.inline_keyboard
+            for button in row
+        ]
+
+    def test_start_for_super_admin_shows_all_sections(self):
+        async def run():
+            message = self.start_message(67890)
+            await self.message_handler("on_start")(message)
+
+            self.assertIn(
+                "супер-администратор", message.answer.await_args.args[0]
+            )
+            self.assertEqual(
+                self.callback_data_list(message),
+                [
+                    "menu:service_settings",
+                    "menu:service_notify",
+                    "menu:service_contact",
+                    "menu:service_sync",
+                    "menu:service_chat",
+                    "menu:service_admin_add",
+                    "menu:service_admin_remove",
+                    "menu:test_notify",
+                ],
+            )
+
+        asyncio.run(run())
+
+    def test_start_for_service_admin_lists_only_own_sections(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 24680)
+            message = self.start_message(24680)
+            await self.message_handler("on_start")(message)
+
+            text = message.answer.await_args.args[0]
+            self.assertIn("администратор служений: ЗВУК", text)
+            self.assertEqual(
+                self.callback_data_list(message),
+                ["menu:service_settings", "menu:service_notify"],
+            )
+
+        asyncio.run(run())
+
+    def test_start_for_linked_user_offers_personal_notifications(self):
+        async def run():
+            self.registry.set_responsible_contact(
+                67890, "sound", "Микшер", "Алексей", 4321
+            )
+            message = self.start_message(4321)
+            await self.message_handler("on_start")(message)
+
+            self.assertEqual(
+                self.callback_data_list(message), ["menu:my_notifications"]
+            )
+
+        asyncio.run(run())
+
+    def test_start_for_unlinked_user_shows_telegram_id(self):
+        async def run():
+            message = self.start_message(5555)
+            await self.message_handler("on_start")(message)
+
+            text = message.answer.await_args.args[0]
+            self.assertIn("<code>5555</code>", text)
+            self.assertNotIn("/services", text)
+            self.assertEqual(self.callback_data_list(message), [])
+
+        asyncio.run(run())
+
+    def test_start_menu_button_opens_service_selection(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 24680)
+            callback = SimpleNamespace(
+                data="menu:service_notify",
+                from_user=SimpleNamespace(id=24680),
+                message=self.message(24680, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_start_menu")(callback)
+
+            self.assertIn(
+                "Выберите служение для настройки уведомлений",
+                callback.message.answer.await_args.args[0],
+            )
+            self.assertIn(
+                "service:service_notify:sound",
+                self.callback_data_list(callback.message),
+            )
+
+        asyncio.run(run())
+
+    def test_start_menu_rejects_unknown_operation(self):
+        async def run():
+            callback = SimpleNamespace(
+                data="menu:drop_everything",
+                from_user=SimpleNamespace(id=24680),
+                message=self.message(24680, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_start_menu")(callback)
+
+            callback.message.answer.assert_not_awaited()
+            self.assertIn("устарело", callback.answer.await_args.args[0])
+
+        asyncio.run(run())
+
+    def test_start_refreshes_command_menu_for_role(self):
+        async def run():
+            self.context.bot.set_my_commands = AsyncMock()
+            self.context.bot.delete_my_commands = AsyncMock()
+            self.registry.add_service_admin(67890, "sound", 24680)
+
+            await self.message_handler("on_start")(self.start_message(24680))
+            commands = [
+                item.command
+                for item in self.context.bot.set_my_commands.await_args.args[0]
+            ]
+            self.assertIn("service_notify", commands)
+            self.assertNotIn("service_contact", commands)
+            self.assertEqual(
+                self.context.bot.set_my_commands.await_args.kwargs[
+                    "scope"
+                ].chat_id,
+                24680,
+            )
+
+            await self.message_handler("on_start")(self.start_message(5555))
+            self.assertEqual(
+                self.context.bot.delete_my_commands.await_args.kwargs[
+                    "scope"
+                ].chat_id,
+                5555,
+            )
+
+        asyncio.run(run())
+
+    def test_settings_card_shows_group_chat_title(self):
+        async def run():
+            self.registry.set_group_chat(67890, "sound", -100777, enabled=True)
+            self.context.bot.get_chat = AsyncMock(
+                return_value=SimpleNamespace(title="Звук <команда>")
+            )
+            message = self.message(67890, "/service_settings sound")
+            await self.message_handler("on_service_settings")(message)
+
+            text = message.answer.await_args.args[0]
+            self.assertIn("📡 Групповой чат · «Звук &lt;команда&gt;»", text)
+            self.assertNotIn("-100777", text)
+            self.context.bot.get_chat.assert_awaited_once_with(-100777)
+
+        asyncio.run(run())
+
+    def test_settings_card_falls_back_to_chat_id(self):
+        async def run():
+            self.registry.set_group_chat(67890, "sound", -100777, enabled=True)
+            self.context.bot.get_chat = AsyncMock(
+                side_effect=TelegramAPIError(method=MagicMock(), message="no")
+            )
+            message = self.message(67890, "/service_settings sound")
+            await self.message_handler("on_service_settings")(message)
+
+            self.assertIn(
+                "📡 Групповой чат · <code>-100777</code>",
+                message.answer.await_args.args[0],
+            )
+
+        asyncio.run(run())
+
+    def test_personal_schedule_pages_keep_actions_and_navigation(self):
+        async def run():
+            actor_id = 4501
+            self.registry.set_responsible_contact(
+                67890, "sound", "Микшер", "Имя из расписания", actor_id
+            )
+            text_id = self.registry.upsert_user_text(
+                actor_id, "sound", "Микшер", None
+            )
+            for days in range(4):
+                self.registry.add_schedule(text_id, days, f"0{days + 6}:00")
+            message_id = 600
+
+            def message(text=""):
+                nonlocal message_id
+                message_id += 1
+                return SimpleNamespace(
+                    from_user=SimpleNamespace(id=actor_id),
+                    chat=SimpleNamespace(type="private", id=actor_id),
+                    text=text,
+                    answer=AsyncMock(
+                        return_value=SimpleNamespace(message_id=message_id)
+                    ),
+                )
+
+            handler = self.callback_handler("on_personal_notifications_callback")
+
+            async def press(source, predicate):
+                button = next(
+                    button
+                    for row in source.answer.await_args.kwargs[
+                        "reply_markup"
+                    ].inline_keyboard
+                    for button in row
+                    if predicate(button)
+                )
+                result = SimpleNamespace(
+                    data=button.callback_data,
+                    from_user=SimpleNamespace(id=actor_id),
+                    message=message(),
+                    answer=AsyncMock(),
+                )
+                await handler(result)
+                return result.message
+
+            command = message("/my_notifications")
+            await self.message_handler("on_my_notifications")(command)
+            screen = await press(command, lambda b: "ЗВУК" in b.text)
+            screen = await press(screen, lambda b: b.text == "📝 Мои тексты")
+            screen = await press(screen, lambda b: "Микшер" in b.text)
+            screen = await press(screen, lambda b: b.text == "⏰ Расписание")
+
+            def rows(source):
+                return [
+                    [button.text for button in row]
+                    for row in source.answer.await_args.kwargs[
+                        "reply_markup"
+                    ].inline_keyboard
+                ]
+
+            first = rows(screen)
+            self.assertIn("Страница 1/2", screen.answer.await_args.args[0])
+            self.assertEqual(len(first[0]), 3)
+            self.assertEqual(first[-3], ["➕ Добавить правило"])
+            self.assertEqual(first[-2], ["➡️ Стр. 2"])
+            self.assertEqual(first[-1], ["⬅️ Назад"])
+
+            screen = await press(screen, lambda b: b.text == "➡️ Стр. 2")
+            second = rows(screen)
+            self.assertIn("Страница 2/2", screen.answer.await_args.args[0])
+            self.assertEqual(second[-3], ["➕ Добавить правило"])
+            self.assertEqual(second[-2], ["⬅️ Стр. 1"])
+            self.assertEqual(second[-1], ["⬅️ Назад"])
+            schedule_rows = first[:-3] + second[:-3]
+            self.assertEqual(len(schedule_rows), 4)
+            self.assertTrue(all(len(row) == 3 for row in schedule_rows))
 
         asyncio.run(run())
 
