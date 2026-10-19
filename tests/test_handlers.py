@@ -2610,8 +2610,22 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def _preview_with_data(self):
+        async def preview(reminder_id, body=None):
+            return {
+                "date": "25.10.2026",
+                "send_date": "24.10.2026",
+                "time": "18:00",
+                "text": body or "Текст",
+                "has_data": True,
+                "error": None,
+            }
+
+        self.context.get_group_reminder_preview = AsyncMock(side_effect=preview)
+
     def test_changing_schedule_onto_taken_slot_merges_into_existing(self):
         async def run():
+            self._preview_with_data()
             existing_id = self.registry.list_group_reminders("sound")[0]["id"]
             self.registry.update_group_reminder(
                 67890, existing_id, body="Первый текст"
@@ -2645,6 +2659,123 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIsNone(self.registry.get_group_reminder(other_id))
             self.assertIn(
                 "Первый текст", merged.message.answer.await_args.args[0]
+            )
+
+        asyncio.run(run())
+
+    def test_merge_is_not_offered_without_schedule_preview(self):
+        async def run():
+            self.context.get_group_reminder_preview = AsyncMock(
+                return_value={
+                    "date": "25.10.2026", "send_date": "24.10.2026",
+                    "time": "18:00", "text": "", "has_data": False,
+                    "error": "Не удалось загрузить график. Попробуйте позже.",
+                }
+            )
+            menu = await self._open_sound_reminders()
+            await self._click(
+                menu.message,
+                lambda button: button.text == "➕ Добавить напоминание",
+            )
+            await self._type("1")
+            await self._type("18:00")
+            screen = await self._type("Другой текст")
+
+            labels = [
+                button.text
+                for row in screen.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+            ]
+            self.assertNotIn("🔗 Объединить", labels)
+            self.assertIn("➕ Отдельным сообщением", labels)
+            self.assertIn(
+                "нельзя проверить длину", screen.answer.await_args.args[0]
+            )
+
+        asyncio.run(run())
+
+    def test_disabled_reminder_is_not_a_merge_target(self):
+        async def run():
+            existing_id = self.registry.list_group_reminders("sound")[0]["id"]
+            self.registry.update_group_reminder(
+                67890, existing_id, enabled=False
+            )
+            menu = await self._open_sound_reminders()
+            await self._click(
+                menu.message,
+                lambda button: button.text == "➕ Добавить напоминание",
+            )
+            await self._type("1")
+            text_step = await self._type("18:00")
+            await self._click(
+                text_step,
+                lambda button: button.text == "📝 Шаблон по умолчанию",
+            )
+
+            self.assertEqual(
+                self._sound_slots(),
+                [(1, "18:00", None), (1, "18:00", None)],
+            )
+
+        asyncio.run(run())
+
+    def test_old_merge_button_cannot_confirm_newer_offer(self):
+        async def run():
+            self._preview_with_data()
+            menu = await self._open_sound_reminders()
+            await self._click(
+                menu.message,
+                lambda button: button.text == "➕ Добавить напоминание",
+            )
+            await self._type("1")
+            await self._type("18:00")
+            first_offer = await self._type("Первый")
+            old_merge = next(
+                button.callback_data
+                for row in first_offer.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.text == "🔗 Объединить"
+            )
+            await self._click(
+                first_offer, lambda button: button.text == "✖️ Отмена"
+            )
+            rules = self.registry.list_group_reminders("sound")
+            session_id = old_merge.rsplit(":", 1)[1]
+            await self.callback_handler("on_group_reminder_action")(
+                SimpleNamespace(
+                    data=f"group_reminder:add:sound:{session_id}",
+                    from_user=SimpleNamespace(id=12345),
+                    message=SimpleNamespace(
+                        chat=SimpleNamespace(type="private", id=12345),
+                        answer=AsyncMock(),
+                    ),
+                    answer=AsyncMock(),
+                )
+            )
+            await self._type("1")
+            await self._type("18:00")
+            await self._type("Второй")
+            stale = SimpleNamespace(
+                data=old_merge,
+                from_user=SimpleNamespace(id=12345),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(type="private", id=12345),
+                    answer=AsyncMock(),
+                ),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_group_reminder_action")(stale)
+
+            self.assertIn("устарел", stale.answer.await_args.args[0])
+            self.assertEqual(
+                [item["body"] for item in self.registry.list_group_reminders(
+                    "sound"
+                )],
+                [rules[0]["body"]],
             )
 
         asyncio.run(run())
@@ -5366,6 +5497,86 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def _two_current_tasks(self, actor_id):
+        for task in ("Микшер", "Пульт"):
+            self.registry.set_responsible_contact(
+                67890, "sound", task, "Имя из расписания", actor_id
+            )
+        self.context.load_service_task_assignments = AsyncMock(
+            return_value={
+                "Микшер": ["Имя из расписания"],
+                "Пульт": ["Имя из расписания"],
+            }
+        )
+        return self.registry.upsert_user_text(
+            actor_id, "sound", "Микшер", None
+        )
+
+    def test_enable_adds_default_rule_for_uncovered_task(self):
+        async def run():
+            actor_id = 4612
+            text_id = self._two_current_tasks(actor_id)
+            self.registry.add_schedule(text_id, 3, "09:00")
+            await self.personal_toggle(actor_id)
+
+            self.assertEqual(self.rules(actor_id), [(3, "09:00", True)])
+            self.assertEqual(
+                self.rules(actor_id, "Пульт"), [(1, "18:00", True)]
+            )
+            self.assertTrue(
+                self.registry.get_user_notifications_enabled(actor_id, "sound")
+            )
+
+        asyncio.run(run())
+
+    def test_enable_with_disabled_rule_still_covers_other_task(self):
+        async def run():
+            actor_id = 4613
+            text_id = self._two_current_tasks(actor_id)
+            rule = self.registry.add_schedule(text_id, 3, "09:00")
+            self.registry.update_schedule(rule["id"], enabled=False)
+            await self.personal_toggle(actor_id)
+
+            self.assertEqual(self.rules(actor_id), [(3, "09:00", False)])
+            self.assertEqual(
+                self.rules(actor_id, "Пульт"), [(1, "18:00", True)]
+            )
+            self.assertTrue(
+                self.registry.get_user_notifications_enabled(actor_id, "sound")
+            )
+
+        asyncio.run(run())
+
+    def test_enable_with_stored_rule_is_refused_when_schedule_unavailable(self):
+        async def run():
+            actor_id = 4614
+            self.registry.set_responsible_contact(
+                67890, "sound", "Микшер", "Имя из расписания", actor_id
+            )
+            text_id = self.registry.upsert_user_text(
+                actor_id, "sound", "Микшер", None
+            )
+            self.registry.add_schedule(text_id, 3, "09:00")
+            message, press = self.personal_flow(actor_id)
+            command = message("/my_notifications")
+            await self.message_handler("on_my_notifications")(command)
+            screen = await press(command, lambda b: "ЗВУК" in b.text)
+            self.context.load_service_task_assignments = AsyncMock(
+                side_effect=RuntimeError("offline")
+            )
+            with patch("bot.handlers.PERSONAL_TASK_CACHE_TTL_SECONDS", -1):
+                await press(screen, lambda b: b.text == "🔔 Включить")
+
+            self.assertFalse(
+                self.registry.get_user_notifications_enabled(actor_id, "sound")
+            )
+            self.assertIn(
+                "не загрузился",
+                press.last_callback.answer.await_args.args[0],
+            )
+
+        asyncio.run(run())
+
     def test_bulk_enable_adds_default_rule_per_service(self):
         async def run():
             actor_id = 4604
@@ -5437,15 +5648,17 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 callback
             )
 
+            # Без графика сохранённое правило не проверить: оба служения
+            # остаются выключенными, а не только то, где правил нет.
             self.assertFalse(
                 self.registry.get_user_notifications_enabled(actor_id, "sound")
             )
-            self.assertTrue(
+            self.assertFalse(
                 self.registry.get_user_notifications_enabled(actor_id, "slides")
             )
             toast = callback.answer.await_args.args[0]
             self.assertIn("ЗВУК", toast)
-            self.assertNotIn("ПРЕЗЕНТАЦИЯ", toast)
+            self.assertIn("график не загрузился", toast)
 
         asyncio.run(run())
 

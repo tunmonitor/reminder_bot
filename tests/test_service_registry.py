@@ -546,7 +546,9 @@ class ServiceRegistryTest(unittest.TestCase):
         )
 
         self.registry.merge_group_reminder(
-            1001, target_id, "Первый\n\nВторой", source_id=source_id
+            1001, target_id, "Первый\n\nВторой",
+            expected_slot=(1, "18:00"),
+            source_id=source_id, source_slot=(2, "09:00"),
         )
 
         self.assertEqual(
@@ -569,12 +571,58 @@ class ServiceRegistryTest(unittest.TestCase):
         )
 
         self.registry.merge_group_reminder(
-            1001, target_id, source_id=source_id
+            1001, target_id, expected_slot=(1, "18:00"),
+            source_id=source_id, source_slot=(1, "18:00"),
         )
 
         reminders = self.registry.list_group_reminders("sound")
         self.assertEqual([item["id"] for item in reminders], [target_id])
         self.assertIsNone(reminders[0]["body"])
+
+    def test_merge_group_reminder_keeps_source_delivery_records(self):
+        target_id = self.registry.list_group_reminders("sound")[0]["id"]
+        source_id = self.registry.add_group_reminder(
+            1001, "sound", 2, "09:00", "Второй"
+        )
+        self.registry.mark_group_reminder_delivered(
+            source_id, "2026-10-25", "group:-10001"
+        )
+
+        self.registry.merge_group_reminder(
+            1001, target_id, "Первый\n\nВторой",
+            expected_slot=(1, "18:00"),
+            source_id=source_id, source_slot=(2, "09:00"),
+        )
+
+        self.assertTrue(
+            self.registry.is_group_reminder_delivered(
+                target_id, "2026-10-25", "group:-10001"
+            )
+        )
+
+    def test_merge_group_reminder_rejects_changed_or_disabled_reminders(self):
+        target_id = self.registry.list_group_reminders("sound")[0]["id"]
+        source_id = self.registry.add_group_reminder(
+            1001, "sound", 2, "09:00", "Второй"
+        )
+        self.registry.update_group_reminder(1001, source_id, days=3)
+        with self.assertRaises(ValueError):
+            self.registry.merge_group_reminder(
+                1001, target_id, "Новый", expected_slot=(1, "18:00"),
+                source_id=source_id, source_slot=(2, "09:00"),
+            )
+        with self.assertRaises(ValueError):
+            self.registry.merge_group_reminder(
+                1001, target_id, "Новый", expected_slot=(1, "19:00"),
+            )
+        self.registry.update_group_reminder(1001, target_id, enabled=False)
+        with self.assertRaises(ValueError):
+            self.registry.merge_group_reminder(
+                1001, target_id, "Новый", expected_slot=(1, "18:00"),
+            )
+
+        self.assertIsNone(self.registry.get_group_reminder(target_id)["body"])
+        self.assertIsNotNone(self.registry.get_group_reminder(source_id))
 
     def test_merge_group_reminder_is_atomic_and_checks_service(self):
         target_id = self.registry.list_group_reminders("sound")[0]["id"]
@@ -584,14 +632,18 @@ class ServiceRegistryTest(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             self.registry.merge_group_reminder(
-                1001, target_id, "Новый", source_id=other_service_id
+                1001, target_id, "Новый", expected_slot=(1, "18:00"),
+                source_id=other_service_id, source_slot=(1, "18:00"),
             )
         with self.assertRaises(ValueError):
             self.registry.merge_group_reminder(
-                1001, target_id, "Неизвестное {поле}"
+                1001, target_id, "Неизвестное {поле}",
+                expected_slot=(1, "18:00"),
             )
         with self.assertRaises(PermissionError):
-            self.registry.merge_group_reminder(2002, target_id, "Чужой")
+            self.registry.merge_group_reminder(
+                2002, target_id, "Чужой", expected_slot=(1, "18:00"),
+            )
 
         self.assertIsNone(self.registry.get_group_reminder(target_id)["body"])
         self.assertIsNotNone(self.registry.get_group_reminder(other_service_id))

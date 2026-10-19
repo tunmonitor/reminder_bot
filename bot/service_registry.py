@@ -1000,12 +1000,17 @@ class ServiceRegistry:
         target_id: int,
         body=_UNSET,
         *,
+        expected_slot: tuple[int, str],
         source_id: int | None = None,
+        source_slot: tuple[int, str] | None = None,
     ) -> None:
         """Объединяет напоминания с одинаковым расписанием в target_id.
 
         body — итоговый текст target (по умолчанию не меняется); source_id —
-        напоминание, которое удаляется в той же транзакции.
+        напоминание, которое удаляется в той же транзакции. expected_slot и
+        source_slot — расписания, показанные пользователю: если их успели
+        изменить, объединение отклоняется. Отметки доставки source
+        переносятся на target, чтобы уже отправленное не ушло повторно.
         """
         _validate_positive_id(actor_id, "actor_id")
         _validate_positive_id(target_id, "target_id")
@@ -1013,6 +1018,11 @@ class ServiceRegistry:
             _validate_positive_id(source_id, "source_id")
             if source_id == target_id:
                 raise ValueError("Нельзя объединить напоминание с самим собой.")
+            if source_slot is None:
+                raise ValueError("Не указано расписание объединяемого напоминания.")
+        stale = ValueError(
+            "Напоминания изменились. Откройте список напоминаний заново."
+        )
         with self._connection() as connection:
             target = connection.execute(
                 "SELECT * FROM group_reminders WHERE id = ?", (target_id,)
@@ -1022,15 +1032,27 @@ class ServiceRegistry:
             self._require_service_editor(
                 connection, actor_id, target["service_id"]
             )
+            if (
+                (target["reminder_days"], target["reminder_time"])
+                != tuple(expected_slot)
+                or not target["enabled"]
+            ):
+                raise stale
             if source_id is not None:
                 source = connection.execute(
-                    "SELECT service_id FROM group_reminders WHERE id = ?",
+                    "SELECT service_id, reminder_days, reminder_time "
+                    "FROM group_reminders WHERE id = ?",
                     (source_id,),
                 ).fetchone()
                 if source is None or source["service_id"] != target["service_id"]:
                     raise ValueError(
                         "Объединяемое напоминание больше не существует."
                     )
+                if (
+                    (source["reminder_days"], source["reminder_time"])
+                    != tuple(source_slot)
+                ):
+                    raise stale
             new_body = target["body"] if body is _UNSET else body
             self._validate_group_reminder_values(
                 target["reminder_days"], target["reminder_time"], new_body
@@ -1040,6 +1062,16 @@ class ServiceRegistry:
                 (new_body.strip() if new_body else None, target_id),
             )
             if source_id is not None:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO group_reminder_deliveries (
+                        reminder_id, event_date, recipient_key, delivered_at
+                    )
+                    SELECT ?, event_date, recipient_key, delivered_at
+                    FROM group_reminder_deliveries WHERE reminder_id = ?
+                    """,
+                    (target_id, source_id),
+                )
                 connection.execute(
                     "DELETE FROM group_reminders WHERE id = ?", (source_id,)
                 )

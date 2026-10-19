@@ -178,10 +178,12 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   no rules installs `DEFAULT_PERSONAL_RULE`. `ensure_default_personal_rule`
   returns `None` on success or the reason text. Success requires an enabled
   rule on a task the user has in the current schedule; rules of tasks absent
-  from the schedule do not count. Current tasks without any rule get the
-  default rule; disabled rules are never re-enabled automatically. Reasons:
-  `PERSONAL_SCHEDULE_UNAVAILABLE` (schedule failed to load and no enabled
-  rule exists), `PERSONAL_NO_TASKS`, `PERSONAL_RULES_DISABLED`. Bulk enable
+  from the schedule do not count. Every current task without any rule gets
+  the default rule, even when other tasks already have rules; disabled rules
+  are never re-enabled automatically. Reasons:
+  `PERSONAL_SCHEDULE_UNAVAILABLE` (schedule failed to load — stored rules
+  alone are never trusted), `PERSONAL_NO_TASKS`, `PERSONAL_RULES_DISABLED`
+  (every current task has rules and all are disabled). Bulk enable
   uses the short forms in `PERSONAL_PROBLEM_SHORT` because callback toasts
   are cut at 200 characters. Never mark a service enabled without a usable
   rule.
