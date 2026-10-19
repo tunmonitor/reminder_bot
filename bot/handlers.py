@@ -101,6 +101,10 @@ PERSONAL_SCHEDULE_UNAVAILABLE = (
     "График сейчас не загрузился, поэтому время напоминания не задано. "
     "Попробуйте позже."
 )
+PERSONAL_NO_TASKS = (
+    "В текущем графике нет ваших задач в этом служении, "
+    "поэтому напоминать пока не о чем."
+)
 PERSONAL_RULE_PRESETS = (
     (1, "18:00"),
     (1, "20:00"),
@@ -902,11 +906,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             callback_data=f"task:{operation}:{token}",
         )
 
+    def contact_navigation_callback(
+        actor_id: int, service_id: str, action: str
+    ) -> str:
+        token = secrets.token_urlsafe(8)
+        pending_contact_navigation[token] = (actor_id, service_id, action)
+        return f"contact_nav:{token}"
+
     def contact_navigation_button(
         actor_id: int, service_id: str, action: str
     ) -> InlineKeyboardButton:
-        token = secrets.token_urlsafe(8)
-        pending_contact_navigation[token] = (actor_id, service_id, action)
         labels = {
             "tasks": "⬅️ К задачам",
             "services": "⬅️ К служениям",
@@ -919,7 +928,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         label = labels.get(action) or labels[action.partition(":")[0]]
         return InlineKeyboardButton(
             text=label,
-            callback_data=f"contact_nav:{token}",
+            callback_data=contact_navigation_callback(
+                actor_id, service_id, action
+            ),
         )
 
     async def send_task_choices_page(
@@ -1365,18 +1376,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             dates.append(
                 InlineKeyboardButton(
                     text=f"⬅️ {events[index - 1].event_date:%d.%m}",
-                    callback_data=contact_navigation_button(
+                    callback_data=contact_navigation_callback(
                         actor_id, service_id, f"overview:{index - 1}"
-                    ).callback_data,
+                    ),
                 )
             )
         if events and index + 1 < len(events):
             dates.append(
                 InlineKeyboardButton(
                     text=f"➡️ {events[index + 1].event_date:%d.%m}",
-                    callback_data=contact_navigation_button(
+                    callback_data=contact_navigation_callback(
                         actor_id, service_id, f"overview:{index + 1}"
-                    ).callback_data,
+                    ),
                 )
             )
         if dates:
@@ -4652,17 +4663,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     async def ensure_default_personal_rule(
         registry: Any, actor_id: int, service_id: str, state: dict[str, Any]
-    ) -> bool:
+    ) -> str | None:
         """Give a service without personal rules the default rule.
 
-        Returns False when the service has no rules and the schedule could
-        not be loaded, so enabling it would silently send nothing.
+        Returns the reason it could not, since enabling a service without
+        rules would silently send nothing.
         """
         if any(
             registry.list_schedules(entry["id"])
             for entry in registry.list_user_texts(actor_id, service_id)
         ):
-            return True
+            return None
         try:
             tasks = await current_personal_tasks(
                 registry, actor_id, service_id, state
@@ -4671,12 +4682,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             debug.exception(
                 "Не удалось загрузить задачи для правила по умолчанию"
             )
-            return False
-        if tasks:
-            registry.set_user_service_schedule(
-                actor_id, service_id, tasks, *DEFAULT_PERSONAL_RULE
-            )
-        return True
+            return PERSONAL_SCHEDULE_UNAVAILABLE
+        if not tasks:
+            return PERSONAL_NO_TASKS
+        registry.set_user_service_schedule(
+            actor_id, service_id, tasks, *DEFAULT_PERSONAL_RULE
+        )
+        return None
 
     async def apply_personal_service_rule(
         registry: Any,
@@ -5208,10 +5220,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 if service_id not in registry.list_user_services(actor_id):
                     raise ValueError("Вы не привязаны к этому служению.")
                 enabled = registry.get_user_notifications_enabled(actor_id, service_id)
-                if not enabled and not await ensure_default_personal_rule(
-                    registry, actor_id, service_id, state
-                ):
-                    raise ValueError(PERSONAL_SCHEDULE_UNAVAILABLE)
+                if not enabled:
+                    problem = await ensure_default_personal_rule(
+                        registry, actor_id, service_id, state
+                    )
+                    if problem:
+                        raise ValueError(problem)
                 registry.set_user_notifications_enabled(
                     actor_id, service_id, not enabled
                 )
@@ -5219,23 +5233,24 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 if not payload["enabled"]:
                     registry.set_user_notifications_all(actor_id, False)
                 else:
-                    failed = []
+                    failed: dict[str, list[str]] = {}
                     for service_id in registry.list_user_services(actor_id):
-                        if await ensure_default_personal_rule(
+                        problem = await ensure_default_personal_rule(
                             registry, actor_id, service_id, state
-                        ):
+                        )
+                        if problem is None:
                             registry.set_user_notifications_enabled(
                                 actor_id, service_id, True
                             )
                         else:
                             service = service_by_id(registry, service_id)
-                            failed.append(
+                            failed.setdefault(problem, []).append(
                                 service_label(service) if service else service_id
                             )
                     if failed:
-                        notice = (
-                            f"⚠️ Не включено: {', '.join(failed)}. "
-                            + PERSONAL_SCHEDULE_UNAVAILABLE
+                        notice = " ".join(
+                            f"⚠️ Не включено: {', '.join(labels)}. {problem}"
+                            for problem, labels in failed.items()
                         )
             elif action_name == "open_service_time":
                 service_id = payload["service_id"]

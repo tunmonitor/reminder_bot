@@ -1257,6 +1257,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 actor_id, "sound", "Микшер", None
             )
             schedule = self.registry.add_schedule(text_id, 1, "09:00")
+            self.context.load_service_task_assignments = AsyncMock(
+                return_value={"Микшер": ["Алексей"], "Слайды": ["Алексей"]}
+            )
             next_message_id = 20
 
             def message(text=""):
@@ -5260,6 +5263,44 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 self.registry.get_user_notifications_enabled(actor_id, "sound")
             )
             self.assertIn("не загрузился", callback.answer.await_args.args[0])
+
+        asyncio.run(run())
+
+    def test_enable_is_refused_when_user_has_no_current_tasks(self):
+        async def run():
+            actor_id = 4608
+            self.registry.set_responsible_contact(
+                67890, "sound", "Микшер", "Имя из расписания", actor_id
+            )
+            self.context.load_service_task_assignments = AsyncMock(
+                return_value={"Пульт": ["Иван"]}
+            )
+            message, press = self.personal_flow(actor_id)
+            command = message("/my_notifications")
+            await self.message_handler("on_my_notifications")(command)
+            button = next(
+                button
+                for row in command.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.text == "✅ Включить все"
+            )
+            callback = SimpleNamespace(
+                data=button.callback_data,
+                from_user=SimpleNamespace(id=actor_id),
+                message=message(),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_personal_notifications_callback")(
+                callback
+            )
+
+            self.assertFalse(
+                self.registry.get_user_notifications_enabled(actor_id, "sound")
+            )
+            self.assertEqual(self.rules(actor_id), [])
+            self.assertIn("нет ваших задач", callback.answer.await_args.args[0])
 
         asyncio.run(run())
 

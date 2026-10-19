@@ -242,6 +242,7 @@ class ServiceRegistry:
             if any(row["unique"] for row in reminder_indexes):
                 connection.executescript(
                     """
+                    BEGIN IMMEDIATE;
                     CREATE TABLE service_reminders_v2 (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         service_id TEXT NOT NULL REFERENCES services(id)
