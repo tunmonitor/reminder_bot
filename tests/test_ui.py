@@ -17,8 +17,10 @@ from bot.ui import (
     code,
     layout_buttons,
     nav_row,
+    plain_text,
     render_screen_chunks,
     send_telegram_screen,
+    user_link,
     validate_inline_keyboard,
 )
 
@@ -34,6 +36,64 @@ class DialogRenderingTest(unittest.TestCase):
         self.assertEqual(
             render_screen_chunks(f"ID\n{code('<123&>')}"),
             ["<b>ID</b>\n<code>&lt;123&amp;&gt;</code>"],
+        )
+
+    def test_user_link_marker_escapes_label_and_renders_mention(self):
+        marker = user_link(12345, "Ана <b>:x\x00 & Co")
+        self.assertEqual(
+            render_screen_chunks(f"Группа\n• {marker}"),
+            [
+                "<b>Группа</b>\n• "
+                '<a href="tg://user?id=12345">Ана &lt;b&gt;:x\x00 &amp; Co</a>'
+            ],
+        )
+
+    def test_user_link_without_valid_id_is_plain_label(self):
+        for telegram_id in (None, "", 0, -5, "abc"):
+            with self.subTest(telegram_id=telegram_id):
+                self.assertEqual(user_link(telegram_id, "Ана"), "Ана")
+
+    def test_long_line_never_splits_a_link_marker(self):
+        line = "x" * 30 + user_link(1, "Длинное имя участника") + "y" * 30
+        chunks = render_screen_chunks(f"T\n{line}", limit=40)
+        joined = "".join(chunks)
+        self.assertIn(
+            '<a href="tg://user?id=1">Длинное имя участника</a>', joined
+        )
+        self.assertNotIn("\x00", joined)
+
+    def test_chunk_limit_counts_visible_link_text(self):
+        links = "\n".join(user_link(10 + index, "Ана") for index in range(10))
+        chunks = render_screen_chunks(f"T\n{links}", limit=50)
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].count("<a href="), 10)
+
+    def test_malformed_marker_is_shown_as_text(self):
+        broken = "\x00CODE:A\x00"
+        self.assertEqual(plain_text(f"x {broken}"), "x CODE:A")
+        self.assertEqual(
+            render_screen_chunks(f"T\n<{broken}>"),
+            ["<b>T</b>\n&lt;CODE:A&gt;"],
+        )
+
+    def test_link_longer_than_screen_is_split_as_text(self):
+        label = "Л" * 90
+        chunks = render_screen_chunks(f"T\n{user_link(5, label)}", limit=40)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            visible = re.sub(r"<[^>]+>", "", chunk)
+            self.assertLessEqual(len(visible.encode("utf-16-le")) // 2, 40)
+        self.assertEqual(
+            "".join(re.sub(r"<[^>]+>", "", chunk) for chunk in chunks)
+            .replace("T", "")
+            .replace("\n", ""),
+            label,
+        )
+
+    def test_plain_text_replaces_markers_with_visible_text(self):
+        self.assertEqual(
+            plain_text(f"{user_link('12345', 'Ана (@ana)')} {code(7)}"),
+            "Ана (@ana) 7",
         )
 
     def test_long_unicode_text_is_split_at_utf16_limit(self):

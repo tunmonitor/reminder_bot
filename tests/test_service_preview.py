@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 from bot.app import _prepare_service_test_previews, get_group_reminder_preview
 from bot.scheduler import next_reminder_occurrence, reminder_send_date
 from bot.service_registry import ServiceRegistry
+from bot.ui import plain_text, render_screen_chunks
 
 
 class ServicePreviewTest(unittest.TestCase):
@@ -82,7 +83,7 @@ class ServicePreviewTest(unittest.TestCase):
             self.assertEqual(result["send_date"], "24.10.2026")
             self.assertEqual(result["time"], reminder["reminder_time"])
             self.assertIn("Звук · 25.10.2026", result["text"])
-            self.assertIn("Алексей (@alex)", result["text"])
+            self.assertIn("Алексей (@alex)", plain_text(result["text"]))
             self.assertIn("📌 2-я часть — нет", result["text"])
 
     def test_group_reminder_preview_falls_back_to_builtin_template(self):
@@ -426,12 +427,18 @@ class ServicePreviewTest(unittest.TestCase):
             preview = asyncio.run(run())
 
             self.assertIn("Звук", preview["group_text"])
-            self.assertIn("🎚️ Микшер\n• Алексей (@alex)", preview["group_text"])
-            self.assertNotIn("12345", preview["group_text"])
+            group_text = plain_text(preview["group_text"])
+            self.assertIn("🎚️ Микшер\n• Алексей (@alex)", group_text)
+            self.assertNotIn("12345", group_text)
+            self.assertIn(
+                '<a href="tg://user?id=12345">Алексей (@alex)</a>',
+                "".join(render_screen_chunks(preview["group_text"], limit=4096)),
+            )
             self.assertIn("• Мария · не привязан", preview["group_text"])
             self.assertIn("{task_assignments}", preview["example_group_template"])
-            self.assertIn("Алексей (@alex)", preview["example_group_text"])
-            self.assertNotIn("12345", preview["example_group_text"])
+            example_text = plain_text(preview["example_group_text"])
+            self.assertIn("Алексей (@alex)", example_text)
+            self.assertNotIn("12345", example_text)
             self.assertEqual(len(preview["personal_messages"]), 3)
             alex_message = preview["personal_messages"][0]
             self.assertEqual(alex_message["telegram_id"], "12345")
@@ -647,8 +654,9 @@ class ServicePreviewTest(unittest.TestCase):
 
             previews = asyncio.run(run())
             self.assertIn("Новый Звук", previews["group_text"])
-            self.assertIn("Алексей (@alex)", previews["group_text"])
-            self.assertNotIn("12345", previews["group_text"])
+            group_text = plain_text(previews["group_text"])
+            self.assertIn("Алексей (@alex)", group_text)
+            self.assertNotIn("12345", group_text)
             self.assertEqual(
                 previews["personal_messages"][0]["text"],
                 "Алексей (12345, @alex)",

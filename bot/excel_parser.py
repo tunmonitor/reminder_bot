@@ -18,6 +18,10 @@ from .services import SERVICES, ServiceDefinition
 ROLES = ("Ответственный", "Ведущий", "Проповедник")
 
 
+class SheetNotFoundError(RuntimeError):
+    """The workbook has no sheet for the requested month."""
+
+
 @dataclass(frozen=True)
 class ServiceAssignment:
     task: str
@@ -335,7 +339,9 @@ def parse_service_events(
             workbook, expected_sheet, legacy_names=("График",)
         )
         if worksheet is None:
-            raise RuntimeError(f"Лист расписания '{expected_sheet}' не найден")
+            raise SheetNotFoundError(
+                f"Лист расписания '{expected_sheet}' не найден"
+            )
 
         worksheet.reset_dimensions()
         rows = list(worksheet.iter_rows(values_only=True))

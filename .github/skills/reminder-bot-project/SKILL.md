@@ -14,6 +14,8 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 ## Safety and working-tree rules
 
 - Run project Python commands with `/home/pi/.venv/bin/python`.
+- Put temporary files (test `TMPDIR`, scratch worktrees) under
+  `/dev/shm/app/reminder_bot/src/.tmp`, not `/tmp` or the SD card.
 - Start by checking `git status --short`. Preserve existing user changes; never
   revert unrelated edits or commit/push unless asked.
 - Never print `BOT_TOKEN`, credential files, full participant records, or
@@ -43,10 +45,12 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   parsing, aliases, contacts, and assignment resolution.
 - `bot/presentation.py`, `bot/notifier.py` — shared assignment/message
   formatting, sending, delivery handling, and administrator warnings.
+- `bot/commands.py` — role resolution and per-role Telegram command menus.
 - `bot/scheduler.py` — cron jobs, reminder occurrence/date rules, and refresh.
 - `bot/state.py` — persisted delivery/confirmation state cache.
-- `bot/ui.py` — shared Telegram screen rendering, button layout, pagination,
-  callback limits, and menu cleanup.
+- `bot/ui.py` — shared Telegram screen rendering, rich-text markers
+  (`code()`, `user_link()`, `plain_text()`, `visible_units()`), button
+  layout, pagination, callback limits, and menu cleanup.
 - `bot/backup.py`, `bot/backup_cli.py`, `bot/secure_fs.py` — private,
   validated snapshots, restore, filesystem safety, and instance locking.
 - `bot/webapp_server.py`, `webapp/` — static Web App only; there is no data API.
@@ -136,6 +140,46 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - Preserve idempotent delivery records and per-service/event locking. A
   failed delivery must not be recorded as success.
 
+### Rich text, mentions, and message length
+
+- Never build HTML by hand in message text. Use markers: `code(value)` for
+  code spans and `user_link(telegram_id, label)` for mentions; the renderer
+  (`render_screen_chunks` / `send_telegram_screen`) escapes everything else.
+- Text sent with `parse_mode=None` must go through `plain_text()` first.
+- Measure Telegram limits with `visible_units()` (decoded text), not the raw
+  marker string. Markers are never split across chunks; a link label longer
+  than the screen is shown as plain text. Malformed markers render as
+  literal text instead of raising. Templates reject `\x00`.
+- Linked contacts render as `Имя (@username)` wrapped in a mention.
+
+### Roles, /start, and command menus
+
+- Roles: super admin (registry `super_admins`), service admin, participant;
+  the configured main admin (`ADMIN_TG_ID`) additionally gets `/test_notify`
+  even if the registry resolves them as a participant.
+- `/start` shows inline buttons (`menu:<operation>`) for the caller's role;
+  unlinked users see their Telegram ID. Command menus are set per chat via
+  `BotCommandScopeChat` at startup, on `/start`, and on admin add/remove;
+  "chat not found" for users who never opened the bot is logged at info.
+
+### Responsibles overview and personal schedule
+
+- `/service_contact` and `/service_sync` open an overview of upcoming events
+  (6 weeks, via `context.load_upcoming_service_events`) with per-person link
+  status; without that loader they fall back to the task list. Do not show
+  Telegram IDs on these screens.
+- `_load_upcoming_service_events` skips only a missing future sheet
+  (`SheetNotFoundError`); malformed sheets propagate. The loaded events are
+  cached for 5 minutes per process behind a lock.
+- `/my_schedule` lists the user's own non-informational assignments.
+- Personal service-level time uses `set_user_service_schedule`: it updates
+  the first rule in place, deletes extras after copying their delivery
+  records, and creates rules for tasks without one. Enabling a service with
+  no rules installs `DEFAULT_PERSONAL_RULE`; if tasks cannot be loaded the
+  service stays disabled with a visible notice.
+- Personal screens paginate only item rows; actions, page buttons, and
+  back/close stay as separate bottom rows (`_dialog_keep_rows`).
+
 ### Service-selection menus and Telegram UI
 
 - All service-selection commands (`/services`, `/service_settings`,
@@ -188,8 +232,10 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - Excel parser and informational-task behavior: `tests/test_excel_parser.py`
 - Schedule and reminder occurrence rules: `tests/test_scheduler.py`,
   `tests/test_service_preview.py`
-- Telegram workflows, sessions, permissions, and service menus:
-  `tests/test_handlers.py`
+- Telegram workflows, sessions, permissions, service menus, `/start`,
+  responsibles overview, personal screens: `tests/test_handlers.py`
+- Command menus by role: `tests/test_commands.py`
+- Assignment formatting and mentions: `tests/test_presentation.py`
 - Button layout, pagination, screen rendering: `tests/test_ui.py`
 - Registry and migrations: `tests/test_service_registry.py`,
   `tests/test_config_service_registry.py`

@@ -4,6 +4,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from .ui import user_link
+
 
 _TASK_EMOJIS = (
     ("камер", "📷"),
@@ -66,15 +68,17 @@ def format_task_assignments(
         for name in names:
             contact = (contacts or {}).get((task, name))
             username = contact.get("username") if contact else None
-            suffix = f" (@{username})" if username else (
-                " · не привязан"
-                if mark_unlinked and contact is None
-                else ""
-            )
-            lines.append(f"• {name}{suffix}")
+            label = f"{name} (@{username})" if username else name
+            telegram_id = contact.get("telegram_id") if contact else None
+            if telegram_id:
+                person_str = user_link(telegram_id, label)
+            elif contact is None and mark_unlinked:
+                person_str = f"{name} · не привязан"
+            else:
+                person_str = label
+            lines.append(f"• {person_str}")
         groups.append("\n".join(lines))
     return "\n\n".join(groups) or "⚪ Ответственные не указаны"
-
 
 def format_informational_notes(
     assignments: dict[str, dict[str, Any] | list[str]],

@@ -6,20 +6,23 @@ import hashlib
 import os
 import stat
 import tempfile
+import time
 from contextlib import suppress
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, MenuButtonWebApp, WebAppInfo
+from aiogram.types import MenuButtonWebApp, WebAppInfo
 
 if __package__:
     from .cli import CliArgs
+    from .commands import sync_admin_commands
     from .config import (
         PROJECT_DIR,
         get_tz,
@@ -33,6 +36,7 @@ if __package__:
         ROLES,
         parse_people,
         parse_schedule,
+        SheetNotFoundError,
         parse_service_events,
         resolve_assignments,
     )
@@ -53,7 +57,7 @@ if __package__:
         task_assignment_names,
         task_is_informational,
     )
-    from .ui import send_telegram_screen
+    from .ui import send_telegram_screen, visible_units
     from .secure_fs import open_private_directory
     from .scheduler import (
         add_service_reminder_jobs,
@@ -73,6 +77,7 @@ if __package__:
     )
 else:  # pragma: no cover - поддержка запуска файла напрямую
     from bot.cli import CliArgs
+    from bot.commands import sync_admin_commands
     from bot.config import (
         PROJECT_DIR,
         get_tz,
@@ -86,6 +91,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         ROLES,
         parse_people,
         parse_schedule,
+        SheetNotFoundError,
         parse_service_events,
         resolve_assignments,
     )
@@ -106,7 +112,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         task_assignment_names,
         task_is_informational,
     )
-    from bot.ui import send_telegram_screen
+    from bot.ui import send_telegram_screen, visible_units
     from bot.secure_fs import open_private_directory
     from bot.scheduler import (
         add_service_reminder_jobs,
@@ -124,6 +130,9 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         application_instance_lock,
         environment_name,
     )
+
+
+UPCOMING_EVENTS_CACHE_SECONDS = 300
 
 
 def _next_sunday_in_tz(tz) -> date:
@@ -491,6 +500,69 @@ async def _load_service_task_assignments(
         xlsx_path.unlink(missing_ok=True)
 
 
+async def _load_upcoming_service_events(
+    credentials,
+    shm_dir: Path,
+    tz,
+    debug_logger,
+    weeks: int = 6,
+) -> list:
+    """Read schedule events from today through the given number of weeks."""
+    today = datetime.now(tz).date()
+    last_day = today + timedelta(days=weeks * 7)
+    months = []
+    month = today.replace(day=1)
+    while month <= last_day:
+        months.append(month)
+        month = (month + timedelta(days=32)).replace(day=1)
+    debug_dir = shm_dir / "debug"
+    directory_fd = open_private_directory(debug_dir, create=True)
+    os.close(directory_fd)
+    file_fd, file_name = tempfile.mkstemp(
+        prefix=f"schedule-upcoming-{today:%Y%m%d}-",
+        suffix=".xlsx",
+        dir=debug_dir,
+    )
+    os.fchmod(file_fd, 0o600)
+    os.close(file_fd)
+    xlsx_path = Path(file_name)
+    try:
+        await download_public(
+            credentials.yandex_public_url,
+            xlsx_path,
+            debug_logger,
+            attempts=1,
+            interval=0,
+        )
+        events = []
+        for month in months:
+            try:
+                events_by_service = parse_service_events(
+                    xlsx_path, month, debug_logger
+                )
+            except SheetNotFoundError:
+                if month == months[0]:
+                    raise
+                debug_logger.info(
+                    "Лист графика на %s пока недоступен", f"{month:%m.%Y}"
+                )
+                continue
+            except RuntimeError:
+                debug_logger.exception(
+                    "Лист графика на %s повреждён", f"{month:%m.%Y}"
+                )
+                raise
+            events.extend(
+                event
+                for service_events in events_by_service.values()
+                for event in service_events
+                if today <= event.event_date <= last_day
+            )
+        return sorted(events, key=lambda event: (event.event_date, event.service_id))
+    finally:
+        xlsx_path.unlink(missing_ok=True)
+
+
 async def get_group_reminder_preview(
     reminder_id: int,
     credentials,
@@ -734,7 +806,7 @@ async def _process_service_reminder(
     elif not registry.is_group_reminder_delivered(
         reminder["id"], event_date.isoformat(), group_recipient
     ):
-        if _utf16_length(group_text) > TELEGRAM_TEXT_LIMIT:
+        if visible_units(group_text) > TELEGRAM_TEXT_LIMIT:
             await _notify_admin(
                 bot,
                 credentials.admin_tg_id,
@@ -1352,39 +1424,9 @@ async def _run_locked(args: CliArgs) -> None:
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         )
         if callable(getattr(bot, "set_my_commands", None)):
-            try:
-                await bot.set_my_commands(
-                    [
-                        BotCommand(
-                            command="start", 
-                            description="Начать работу с ботом"
-                        ),
-                        BotCommand(
-                            command="my_notifications", 
-                            description="Мои личные уведомления"
-                        ),
-                        BotCommand(
-                            command="services", 
-                            description="Список служений"
-                        ),
-                        BotCommand(
-                            command="service_notify", 
-                            description="Настроить тексты и время"
-                        ),
-                        BotCommand(
-                            command="test_notify", 
-                            description="Проверить доставку"
-                        ),
-                        BotCommand(
-                            command="cancel", 
-                            description="Отменить текущее действие"
-                        ),
-                    ]
-                )
-            except TelegramAPIError:
-                debug_logger.exception(
-                    "Не удалось обновить меню команд Telegram"
-                )
+            await sync_admin_commands(
+                bot, service_registry, credentials.admin_tg_id, debug_logger
+            )
         dp = Dispatcher(storage=MemoryStorage())
         context = SimpleNamespace(
             bot=bot,
@@ -1444,6 +1486,30 @@ async def _run_locked(args: CliArgs) -> None:
 
         context.prepare_test_previews = prepare_test_previews
         context.load_service_task_assignments = load_service_task_assignments
+
+        upcoming_cache: dict[str, Any] = {"loaded_at": None, "events": []}
+        upcoming_lock = asyncio.Lock()
+
+        async def load_upcoming_service_events() -> list:
+            # Один общий скачанный график на несколько минут для всех
+            # пользователей: повторные нажатия не обращаются к Яндекс.Диску.
+            async with upcoming_lock:
+                loaded_at = upcoming_cache["loaded_at"]
+                if (
+                    loaded_at is not None
+                    and time.monotonic() - loaded_at
+                    < UPCOMING_EVENTS_CACHE_SECONDS
+                ):
+                    return upcoming_cache["events"]
+                events = await _load_upcoming_service_events(
+                    credentials, shm_dir, tz, debug_logger
+                )
+                upcoming_cache.update(
+                    loaded_at=time.monotonic(), events=events
+                )
+                return events
+
+        context.load_upcoming_service_events = load_upcoming_service_events
         context.prepare_service_test_previews = prepare_service_test_previews
         context.get_group_reminder_preview = prepare_group_reminder_preview
         register(dp, context)
