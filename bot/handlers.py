@@ -105,6 +105,16 @@ PERSONAL_NO_TASKS = (
     "В текущем графике нет ваших задач в этом служении, "
     "поэтому напоминать пока не о чем."
 )
+PERSONAL_RULES_DISABLED = (
+    "Все ваши правила напоминаний в этом служении выключены. "
+    "Выберите время в «⏰ Изменить время» или включите правило "
+    "в «⚙️ Тексты и правила по задачам»."
+)
+PERSONAL_PROBLEM_SHORT = {
+    PERSONAL_SCHEDULE_UNAVAILABLE: "график не загрузился",
+    PERSONAL_NO_TASKS: "нет ваших задач в графике",
+    PERSONAL_RULES_DISABLED: "все правила выключены",
+}
 PERSONAL_RULE_PRESETS = (
     (1, "18:00"),
     (1, "20:00"),
@@ -4664,16 +4674,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def ensure_default_personal_rule(
         registry: Any, actor_id: int, service_id: str, state: dict[str, Any]
     ) -> str | None:
-        """Give a service without personal rules the default rule.
+        """Make sure enabling the service will actually send something.
 
-        Returns the reason it could not, since enabling a service without
-        rules would silently send nothing.
+        Returns the reason it cannot: an enabled rule must cover a task the
+        user has in the current schedule. Current tasks without any rule get
+        the default rule; disabled rules are left as the user set them.
         """
-        if any(
-            registry.list_schedules(entry["id"])
+        rules_by_task = {
+            entry["task"]: registry.list_schedules(entry["id"])
             for entry in registry.list_user_texts(actor_id, service_id)
-        ):
-            return None
+        }
         try:
             tasks = await current_personal_tasks(
                 registry, actor_id, service_id, state
@@ -4682,9 +4692,22 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             debug.exception(
                 "Не удалось загрузить задачи для правила по умолчанию"
             )
+            if any(
+                rule["enabled"]
+                for rules in rules_by_task.values()
+                for rule in rules
+            ):
+                return None
             return PERSONAL_SCHEDULE_UNAVAILABLE
         if not tasks:
             return PERSONAL_NO_TASKS
+        current_rules = [
+            rule for task in tasks for rule in rules_by_task.get(task, [])
+        ]
+        if any(rule["enabled"] for rule in current_rules):
+            return None
+        if current_rules:
+            return PERSONAL_RULES_DISABLED
         registry.set_user_service_schedule(
             actor_id, service_id, tasks, *DEFAULT_PERSONAL_RULE
         )
@@ -5248,10 +5271,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                                 service_label(service) if service else service_id
                             )
                     if failed:
-                        notice = " ".join(
-                            f"⚠️ Не включено: {', '.join(labels)}. {problem}"
+                        notice = "⚠️ Не включено: " + "; ".join(
+                            f"{', '.join(labels)} — "
+                            f"{PERSONAL_PROBLEM_SHORT.get(problem, problem)}"
                             for problem, labels in failed.items()
-                        )
+                        ) + "."
             elif action_name == "open_service_time":
                 service_id = payload["service_id"]
                 if service_id not in registry.list_user_services(actor_id):

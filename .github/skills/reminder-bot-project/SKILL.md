@@ -175,8 +175,22 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - Personal service-level time uses `set_user_service_schedule`: it updates
   the first rule in place, deletes extras after copying their delivery
   records, and creates rules for tasks without one. Enabling a service with
-  no rules installs `DEFAULT_PERSONAL_RULE`; if tasks cannot be loaded the
-  service stays disabled with a visible notice.
+  no rules installs `DEFAULT_PERSONAL_RULE`. `ensure_default_personal_rule`
+  returns `None` on success or the reason text. Success requires an enabled
+  rule on a task the user has in the current schedule; rules of tasks absent
+  from the schedule do not count. Current tasks without any rule get the
+  default rule; disabled rules are never re-enabled automatically. Reasons:
+  `PERSONAL_SCHEDULE_UNAVAILABLE` (schedule failed to load and no enabled
+  rule exists), `PERSONAL_NO_TASKS`, `PERSONAL_RULES_DISABLED`. Bulk enable
+  uses the short forms in `PERSONAL_PROBLEM_SHORT` because callback toasts
+  are cut at 200 characters. Never mark a service enabled without a usable
+  rule.
+- `current_personal_tasks` caches only the Excel assignments; it re-reads
+  bindings from SQLite on every call on purpose so admin changes apply
+  immediately.
+- Build contact-navigation callback data with
+  `contact_navigation_callback`; use `contact_navigation_button` only when
+  the labeled button itself is needed.
 - Personal screens paginate only item rows; actions, page buttons, and
   back/close stay as separate bottom rows (`_dialog_keep_rows`).
 
@@ -204,6 +218,10 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - Use `ServiceRegistry` methods for persistent state; avoid ad hoc SQL except
   in migrations or focused tests. Migrations must be safe to rerun and
   preserve legacy data/IDs where compatibility requires it.
+- `executescript` commits any pending transaction before it runs. A
+  migration script that rebuilds a table (`CREATE … _v2` / `DROP` /
+  `RENAME`) must start with `BEGIN IMMEDIATE;` so it stays atomic; the
+  enclosing `with connection` commits it.
 - Snapshots are environment-specific and must be fully written, validated
   (manifest/checksums and SQLite integrity), then atomically published.
   Credentials, tokens, logs, and temporary files do not belong in a snapshot.

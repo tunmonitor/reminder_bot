@@ -5048,6 +5048,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 answer=AsyncMock(),
             )
             await handler(result)
+            press.last_callback = result
             return result.message
 
         return message, press
@@ -5123,7 +5124,19 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_enable_keeps_existing_rules_instead_of_default(self):
+    def personal_toggle(self, actor_id):
+        async def run():
+            message, press = self.personal_flow(actor_id)
+            command = message("/my_notifications")
+            await self.message_handler("on_my_notifications")(command)
+            screen = await press(command, lambda b: "ЗВУК" in b.text)
+            await press(screen, lambda b: b.text == "🔔 Включить")
+            args = press.last_callback.answer.await_args.args
+            return args[0] if args else None
+
+        return run()
+
+    def test_enable_keeps_existing_enabled_rule_instead_of_default(self):
         async def run():
             actor_id = 4603
             self.registry.set_responsible_contact(
@@ -5132,15 +5145,76 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             text_id = self.registry.upsert_user_text(
                 actor_id, "sound", "Микшер", None
             )
+            self.registry.add_schedule(text_id, 3, "09:00")
+            await self.personal_toggle(actor_id)
+
+            self.assertEqual(self.rules(actor_id), [(3, "09:00", True)])
+            self.assertTrue(
+                self.registry.get_user_notifications_enabled(actor_id, "sound")
+            )
+
+        asyncio.run(run())
+
+    def test_enable_is_refused_when_all_current_rules_are_disabled(self):
+        async def run():
+            actor_id = 4609
+            self.registry.set_responsible_contact(
+                67890, "sound", "Микшер", "Имя из расписания", actor_id
+            )
+            text_id = self.registry.upsert_user_text(
+                actor_id, "sound", "Микшер", None
+            )
             rule = self.registry.add_schedule(text_id, 3, "09:00")
             self.registry.update_schedule(rule["id"], enabled=False)
-            message, press = self.personal_flow(actor_id)
-            command = message("/my_notifications")
-            await self.message_handler("on_my_notifications")(command)
-            screen = await press(command, lambda b: "ЗВУК" in b.text)
-            await press(screen, lambda b: b.text == "🔔 Включить")
+            toast = await self.personal_toggle(actor_id)
 
             self.assertEqual(self.rules(actor_id), [(3, "09:00", False)])
+            self.assertFalse(
+                self.registry.get_user_notifications_enabled(actor_id, "sound")
+            )
+            self.assertIn("выключены", toast)
+
+        asyncio.run(run())
+
+    def test_enable_ignores_rules_of_tasks_missing_from_schedule(self):
+        async def run():
+            actor_id = 4610
+            for task in ("Микшер", "Пульт"):
+                self.registry.set_responsible_contact(
+                    67890, "sound", task, "Имя из расписания", actor_id
+                )
+            stale = self.registry.upsert_user_text(
+                actor_id, "sound", "Пульт", None
+            )
+            self.registry.add_schedule(stale, 2, "10:00")
+            await self.personal_toggle(actor_id)
+
+            self.assertEqual(self.rules(actor_id), [(1, "18:00", True)])
+            self.assertEqual(
+                self.rules(actor_id, "Пульт"), [(2, "10:00", True)]
+            )
+            self.assertTrue(
+                self.registry.get_user_notifications_enabled(actor_id, "sound")
+            )
+
+        asyncio.run(run())
+
+    def test_enable_is_refused_when_only_stale_rules_exist(self):
+        async def run():
+            actor_id = 4611
+            self.registry.set_responsible_contact(
+                67890, "sound", "Пульт", "Имя из расписания", actor_id
+            )
+            stale = self.registry.upsert_user_text(
+                actor_id, "sound", "Пульт", None
+            )
+            self.registry.add_schedule(stale, 2, "10:00")
+            toast = await self.personal_toggle(actor_id)
+
+            self.assertFalse(
+                self.registry.get_user_notifications_enabled(actor_id, "sound")
+            )
+            self.assertIn("нет ваших задач", toast)
 
         asyncio.run(run())
 
@@ -5300,7 +5374,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 self.registry.get_user_notifications_enabled(actor_id, "sound")
             )
             self.assertEqual(self.rules(actor_id), [])
-            self.assertIn("нет ваших задач", callback.answer.await_args.args[0])
+            self.assertIn(
+                "нет ваших задач в графике", callback.answer.await_args.args[0]
+            )
 
         asyncio.run(run())
 
