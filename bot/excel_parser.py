@@ -34,6 +34,7 @@ class ServiceEvent:
     service_id: str
     event_date: date
     assignments: tuple[ServiceAssignment, ...]
+    issues: tuple[str, ...] = ()
 
 _MONTH_SHEETS = (
     "ЯНВАРЬ", "ФЕВРАЛЬ", "МАРТ", "АПРЕЛЬ", "МАЙ", "ИЮНЬ",
@@ -62,6 +63,7 @@ _ROLE_ALIASES = {
     "проповедет": "Проповедник",
     "проповедник": "Проповедник",
 }
+_COMMENTS_MARKER = "комментарии"
 _MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 
 
@@ -153,6 +155,41 @@ def is_informational_name(raw: str) -> tuple[bool, str]:
 
 def _normalized(value: str) -> str:
     return " ".join(value.casefold().replace("ё", "е").split())
+
+
+def _rows_before_comments(rows: list) -> list:
+    """Обрезает строки листа, начиная со строки «КОММЕНТАРИИ…»."""
+    for index, row in enumerate(rows):
+        if any(
+            isinstance(value, str)
+            and _normalized(value).startswith(_COMMENTS_MARKER)
+            for value in row or ()
+        ):
+            return rows[:index]
+    return rows
+
+
+def _rows_before_other_month(
+    rows: list, date_columns, month: date
+) -> list:
+    """Обрезает лист на первой дате другого месяца после дат этого месяца.
+
+    Даты предыдущего месяца в начале листа пропускаются, а дата следующего
+    месяца завершает чтение: её блок и все строки ниже не учитываются.
+    """
+    seen_month = False
+    for index, row in enumerate(rows):
+        for column in date_columns:
+            if len(row) <= column:
+                continue
+            event_date = _cell_date(row[column], month.year)
+            if event_date is None:
+                continue
+            if (event_date.year, event_date.month) == (month.year, month.month):
+                seen_month = True
+            elif seen_month:
+                return rows[:index]
+    return rows
 
 
 def _canonical_role(value: str) -> str | None:
@@ -283,7 +320,9 @@ def parse_schedule(path: Path, target: date,
             raise RuntimeError(f"Лист расписания '{expected_sheet}' не найден")
 
         worksheet.reset_dimensions()
-        rows = list(worksheet.iter_rows(values_only=True))
+        rows = _rows_before_comments(
+            list(worksheet.iter_rows(values_only=True))
+        )
         target_row = next(
             (
                 index for index, row in enumerate(rows)
@@ -348,11 +387,13 @@ def parse_service_events(
         if not rows:
             raise RuntimeError(f"Лист расписания '{sheet_name}' пуст")
         sheet_width = max(len(row) for row in rows)
+        rows = _rows_before_comments(rows)
 
         result: dict[str, list[ServiceEvent]] = {
             service.id: [] for service in SERVICES
         }
         if _normalized(sheet_name) == "график":
+            rows = _rows_before_other_month(rows, (0,), month)
             event_rows = [
                 (row_index, event_date)
                 for row_index, row in enumerate(rows)
@@ -408,6 +449,9 @@ def parse_service_events(
                 )
             service_columns[service.id] = column
 
+        rows = _rows_before_other_month(
+            rows, tuple(service_columns.values()), month
+        )
         for service in SERVICES:
             start_column = service_columns.get(service.id)
             if start_column is None:
@@ -442,6 +486,13 @@ def parse_service_events(
                 if (event_date.year, event_date.month) != (month.year, month.month):
                     continue
                 assignments = []
+                issues = []
+                # Строки без задачи продолжают последнюю задачу блока, пока
+                # не встретится пустая ячейка имени, новая задача или пометка.
+                # До первой задачи блока такие строки относятся к самому
+                # служению (служения без задач, например «Кофе»).
+                current_task: str | None = None
+                block_has_task = False
                 for row in rows[row_index + 1:next_row]:
                     if service.assignment_layout == "single":
                         name = _clean(row[start_column]) if len(row) > start_column else ""
@@ -476,11 +527,33 @@ def parse_service_events(
                     task_label, separator, inline_name = task_text.partition(";")
                     if not name and separator:
                         name = inline_name.strip()
-                    task = (
-                        _canonical_role(task_label.strip())
-                        or task_label.strip()
-                        or service.name
-                    )
+                    task_label = task_label.strip()
+                    if is_informational:
+                        current_task = None
+                        block_has_task = True
+                        task = task_label
+                    elif task_label:
+                        task = _canonical_role(task_label) or task_label
+                        current_task = task
+                        block_has_task = True
+                    elif not name:
+                        current_task = None
+                        continue
+                    elif current_task is not None:
+                        task = current_task
+                    elif not block_has_task:
+                        task = service.name
+                    else:
+                        issue = (
+                            f"«{service.name}», {event_date:%d.%m.%Y}: "
+                            "строка без задачи"
+                        )
+                        issues.append(issue)
+                        debug_logger.warning(
+                            "Пропущена строка без задачи: служение=%s, дата=%s",
+                            service.name, event_date,
+                        )
+                        continue
                     if not name and not is_informational:
                         continue
                     if not task:
@@ -498,6 +571,7 @@ def parse_service_events(
                         service_id=service.id,
                         event_date=event_date,
                         assignments=tuple(assignments),
+                        issues=tuple(issues),
                     )
                 )
                 debug_logger.debug(

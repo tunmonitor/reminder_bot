@@ -182,7 +182,7 @@ class ExcelParserTest(unittest.TestCase):
         )
         self.assertEqual(
             [(item.task, item.name) for item in parsed["sound"][0].assignments],
-            [("Микшер", "Звук А"), ("Звук", "Звук Б")],
+            [("Микшер", "Звук А"), ("Микшер", "Звук Б")],
         )
         self.assertEqual(
             [(item.task, item.name) for item in parsed["rehearsal"][0].assignments],
@@ -220,6 +220,135 @@ class ExcelParserTest(unittest.TestCase):
             for event in events
             for item in event.assignments
         ])
+
+    def _parse_kitchen_rows(self, rows):
+        workbook = Workbook()
+        schedule = workbook.active
+        schedule.title = "ОКТЯБРЬ26"
+        schedule.append(["КУХНЯ", None])
+        schedule.append([date(2026, 10, 11), None])
+        for row in rows:
+            schedule.append(row)
+        workbook.save(self.path)
+        logger = MagicMock()
+        event = parse_service_events(
+            self.path, date(2026, 10, 1), logger
+        )["kitchen"][0]
+        return event, logger
+
+    def test_rows_without_task_continue_previous_task(self):
+        event, _ = self._parse_kitchen_rows([
+            ["старший", "А"],
+            ["в смене", "Б"],
+            [None, "В"],
+            [None, "Г"],
+            ["Пироги", "Д"],
+        ])
+
+        self.assertEqual(
+            [(item.task, item.name) for item in event.assignments],
+            [
+                ("старший", "А"),
+                ("в смене", "Б"),
+                ("в смене", "В"),
+                ("в смене", "Г"),
+                ("Пироги", "Д"),
+            ],
+        )
+        self.assertEqual(event.issues, ())
+
+    def test_task_row_without_name_opens_list_for_next_rows(self):
+        event, _ = self._parse_kitchen_rows([
+            ["старший", None],
+            [None, "А"],
+            [None, "Б"],
+        ])
+
+        self.assertEqual(
+            [(item.task, item.name) for item in event.assignments],
+            [("старший", "А"), ("старший", "Б")],
+        )
+
+    def test_empty_name_cell_ends_task_list_and_reports_orphan_rows(self):
+        event, logger = self._parse_kitchen_rows([
+            ["старший", "А"],
+            [None, None],
+            [None, "Б"],
+            ["* Причастие", None],
+            [None, "В"],
+        ])
+
+        self.assertEqual(
+            [(item.task, item.name, item.is_informational)
+             for item in event.assignments],
+            [("старший", "А", False), ("Причастие", "", True)],
+        )
+        self.assertEqual(
+            event.issues,
+            ("«Кухня», 11.10.2026: строка без задачи",) * 2,
+        )
+        logger.warning.assert_any_call(
+            "Пропущена строка без задачи: служение=%s, дата=%s",
+            "Кухня", date(2026, 10, 11),
+        )
+
+    def test_rows_before_first_task_belong_to_service(self):
+        event, _ = self._parse_kitchen_rows([
+            [None, "А"],
+            [None, None],
+            [None, "Б"],
+        ])
+
+        self.assertEqual(
+            [(item.task, item.name) for item in event.assignments],
+            [("Кухня", "А"), ("Кухня", "Б")],
+        )
+        self.assertEqual(event.issues, ())
+
+    def test_comments_row_stops_schedule_parsing(self):
+        workbook = Workbook()
+        schedule = workbook.active
+        schedule.title = "ОКТЯБРЬ26"
+        schedule.append(["СОБРАНИЕ", None, "СЛАЙДЫ"])
+        schedule.append([date(2026, 10, 11), None, date(2026, 10, 11)])
+        schedule.append(["ХКЦ", "Алексей", "Слайды А"])
+        schedule.append([None, None, "Комментарии для составления графиков"])
+        schedule.append(["Проповедует", "Не из графика", "Не из графика"])
+        schedule.append([date(2026, 10, 18), None, date(2026, 10, 18)])
+        schedule.append(["ХКЦ", "Не из графика"])
+        workbook.save(self.path)
+
+        parsed = parse_service_events(
+            self.path, date(2026, 10, 1), self.debug_logger
+        )
+
+        self.assertEqual(len(parsed["assembly"]), 1)
+        self.assertEqual(
+            [(item.task, item.name) for item in parsed["assembly"][0].assignments],
+            [("Ответственный", "Алексей")],
+        )
+        self.assertEqual(
+            [item.name for item in parsed["slides"][0].assignments],
+            ["Слайды А"],
+        )
+        self.assertEqual(len(parsed["slides"]), 1)
+
+    def test_comments_row_stops_target_date_schedule(self):
+        workbook = Workbook()
+        schedule = workbook.active
+        schedule.title = "ОКТЯБРЬ26"
+        schedule.append(["СОБРАНИЕ"])
+        schedule.append([date(2026, 10, 11)])
+        schedule.append(["ХКЦ", "Алексей"])
+        schedule.append(["КОММЕНТАРИИ ДЛЯ СОСТАВЛЕНИЯ ГРАФИКОВ"])
+        schedule.append(["Ведущий", "Не из графика"])
+        workbook.save(self.path)
+
+        parsed = parse_schedule(
+            self.path, date(2026, 10, 11), self.debug_logger
+        )
+
+        self.assertEqual(parsed, {"Ответственный": "Алексей"})
 
     def test_service_events_support_legacy_schedule_sheet_for_assembly(self):
         workbook = Workbook()
@@ -285,6 +414,65 @@ class ExcelParserTest(unittest.TestCase):
         self.assertEqual(
             [item.name for item in parsed["assembly"][0].assignments],
             ["Октябрьский ответственный"],
+        )
+
+    def test_next_month_date_stops_month_sheet(self):
+        workbook = Workbook()
+        schedule = workbook.active
+        schedule.title = "ОКТЯБРЬ26"
+        schedule.append(["СОБРАНИЕ", None, "СЛАЙДЫ"])
+        schedule.append([date(2026, 9, 27), None, date(2026, 9, 27)])
+        schedule.append(["ХКЦ", "Сентябрьский", "Сентябрьские слайды"])
+        schedule.append([date(2026, 10, 25), None, date(2026, 10, 25)])
+        schedule.append(["ХКЦ", "Октябрьский", "Октябрьские слайды"])
+        schedule.append([None, "Октябрьский второй"])
+        schedule.append([None, None, date(2026, 11, 1)])
+        schedule.append([None, "Ноябрьский", "Ноябрьские слайды"])
+        schedule.append([date(2026, 10, 31), None, date(2026, 10, 31)])
+        schedule.append(["ХКЦ", "После ноября", "После ноября"])
+        workbook.save(self.path)
+
+        parsed = parse_service_events(
+            self.path, date(2026, 10, 1), self.debug_logger
+        )
+
+        self.assertEqual(
+            [event.event_date for event in parsed["assembly"]],
+            [date(2026, 10, 25)],
+        )
+        self.assertEqual(
+            [item.name for item in parsed["assembly"][0].assignments],
+            ["Октябрьский", "Октябрьский второй"],
+        )
+        self.assertEqual(
+            [
+                [item.name for item in event.assignments]
+                for event in parsed["slides"]
+            ],
+            [["Октябрьские слайды"]],
+        )
+
+    def test_december_sheet_stops_at_january_text_date(self):
+        workbook = Workbook()
+        schedule = workbook.active
+        schedule.title = "ДЕКАБРЬ26"
+        schedule.append(["СОБРАНИЕ"])
+        schedule.append(["27 декабря"])
+        schedule.append(["ХКЦ", "Декабрьский"])
+        schedule.append(["3 января"])
+        schedule.append(["ХКЦ", "Январский"])
+        workbook.save(self.path)
+
+        parsed = parse_service_events(
+            self.path, date(2026, 12, 1), self.debug_logger
+        )
+
+        self.assertEqual(
+            [
+                (event.event_date, [item.name for item in event.assignments])
+                for event in parsed["assembly"]
+            ],
+            [(date(2026, 12, 27), ["Декабрьский"])],
         )
 
     def test_parses_month_sheet_and_schedule_blocks_case_insensitively(self):

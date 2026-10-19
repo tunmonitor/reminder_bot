@@ -570,7 +570,10 @@ async def get_group_reminder_preview(
     tz,
     registry: ServiceRegistry,
     debug_logger,
+    *,
+    body: str | None = None,
 ) -> dict:
+    """Готовит предпросмотр; body подменяет текст напоминания (объединение)."""
     reminder = registry.get_group_reminder(reminder_id)
     if reminder is None:
         raise ValueError("Групповое напоминание больше не существует.")
@@ -634,7 +637,10 @@ async def get_group_reminder_preview(
         assignments, contacts_by_name, mark_unlinked=True
     )
     informational_notes = format_informational_notes(assignments)
-    template = registry.resolve_group_text(reminder, service)
+    template = (
+        body if body is not None
+        else registry.resolve_group_text(reminder, service)
+    )
     try:
         result["text"] = template.format_map(
             _TemplateValues(
@@ -1472,6 +1478,7 @@ async def _run_locked(args: CliArgs) -> None:
 
         async def prepare_group_reminder_preview(
             reminder_id: int,
+            body: str | None = None,
         ) -> dict:
             if service_registry is None:
                 raise ValueError("Реестр настроек служений недоступен")
@@ -1482,6 +1489,7 @@ async def _run_locked(args: CliArgs) -> None:
                 tz,
                 service_registry,
                 debug_logger,
+                body=body,
             )
 
         context.prepare_test_previews = prepare_test_previews

@@ -539,6 +539,63 @@ class ServiceRegistryTest(unittest.TestCase):
             self.registry.get_service("sound")["reminders"], []
         )
 
+    def test_merge_group_reminder_updates_target_and_removes_source(self):
+        target_id = self.registry.list_group_reminders("sound")[0]["id"]
+        source_id = self.registry.add_group_reminder(
+            1001, "sound", 2, "09:00", "Второй"
+        )
+
+        self.registry.merge_group_reminder(
+            1001, target_id, "Первый\n\nВторой", source_id=source_id
+        )
+
+        self.assertEqual(
+            [
+                (item["id"], item["body"])
+                for item in self.registry.list_group_reminders("sound")
+            ],
+            [(target_id, "Первый\n\nВторой")],
+        )
+        with sqlite3.connect(self.path) as connection:
+            action = connection.execute(
+                "SELECT action FROM configuration_audit ORDER BY id DESC"
+            ).fetchone()[0]
+        self.assertEqual(action, "group_reminder_merged")
+
+    def test_merge_group_reminder_without_body_keeps_target_text(self):
+        target_id = self.registry.list_group_reminders("sound")[0]["id"]
+        source_id = self.registry.add_group_reminder(
+            1001, "sound", 1, "18:00", allow_duplicate=True
+        )
+
+        self.registry.merge_group_reminder(
+            1001, target_id, source_id=source_id
+        )
+
+        reminders = self.registry.list_group_reminders("sound")
+        self.assertEqual([item["id"] for item in reminders], [target_id])
+        self.assertIsNone(reminders[0]["body"])
+
+    def test_merge_group_reminder_is_atomic_and_checks_service(self):
+        target_id = self.registry.list_group_reminders("sound")[0]["id"]
+        other_service_id = self.registry.list_group_reminders("kitchen")[0][
+            "id"
+        ]
+
+        with self.assertRaises(ValueError):
+            self.registry.merge_group_reminder(
+                1001, target_id, "Новый", source_id=other_service_id
+            )
+        with self.assertRaises(ValueError):
+            self.registry.merge_group_reminder(
+                1001, target_id, "Неизвестное {поле}"
+            )
+        with self.assertRaises(PermissionError):
+            self.registry.merge_group_reminder(2002, target_id, "Чужой")
+
+        self.assertIsNone(self.registry.get_group_reminder(target_id)["body"])
+        self.assertIsNotNone(self.registry.get_group_reminder(other_service_id))
+
     def test_duplicate_reminders_keep_independent_delivery_records(self):
         current = self.registry.get_service("sound")["reminders"][0]
         duplicate_rules = [

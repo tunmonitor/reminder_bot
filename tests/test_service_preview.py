@@ -23,7 +23,9 @@ class ServicePreviewTest(unittest.TestCase):
         event_date = date(2026, 10, 25)
         return event_date, event_date - timedelta(days=reminder_days)
 
-    def _group_reminder_preview(self, registry, temp_dir, assignments):
+    def _group_reminder_preview(
+        self, registry, temp_dir, assignments, body=None
+    ):
         reminder = registry.list_group_reminders("sound")[0]
         credentials = SimpleNamespace(
             admin_tg_id=67890,
@@ -45,9 +47,29 @@ class ServicePreviewTest(unittest.TestCase):
                     ZoneInfo("UTC"),
                     registry,
                     logging.getLogger("test-group-reminder-preview"),
+                    body=body,
                 )
 
         return asyncio.run(run()), reminder
+
+    def test_group_reminder_preview_renders_body_override(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ServiceRegistry(Path(temp_dir) / "registry.sqlite3")
+            registry.initialize(67890, -100)
+            result, reminder = self._group_reminder_preview(
+                registry,
+                temp_dir,
+                {"Микшер": {"names": ["Алексей"], "is_informational": False}},
+                body="Общий текст {sunday_date}\n\nВторой {service_name}",
+            )
+
+            self.assertTrue(result["has_data"])
+            self.assertEqual(
+                result["text"], "Общий текст 25.10.2026\n\nВторой Звук"
+            )
+            self.assertIsNone(
+                registry.get_group_reminder(reminder["id"])["body"]
+            )
 
     def test_group_reminder_preview_uses_default_template_and_informational_notes(self):
         with tempfile.TemporaryDirectory() as temp_dir:

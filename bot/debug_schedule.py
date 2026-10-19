@@ -72,6 +72,12 @@ async def run_check(target: date | None, output_dir: Path) -> Path:
     except RuntimeError as exc:
         service_events = {}
         issues.append(f"Не удалось прочитать задачи служений: {exc}")
+    issues.extend(
+        issue
+        for events in service_events.values()
+        for event in events
+        for issue in event.issues
+    )
     task_kinds = sorted(
         {
             (

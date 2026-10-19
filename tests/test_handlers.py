@@ -2361,142 +2361,290 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    async def _click(self, message, predicate, actor_id=12345):
+        markup = message.answer.await_args.kwargs["reply_markup"]
+        button = next(
+            button
+            for row in markup.inline_keyboard
+            for button in row
+            if predicate(button)
+        )
+        callback = SimpleNamespace(
+            data=button.callback_data,
+            from_user=SimpleNamespace(id=actor_id),
+            message=SimpleNamespace(
+                chat=SimpleNamespace(type="private", id=actor_id),
+                answer=AsyncMock(),
+            ),
+            answer=AsyncMock(),
+        )
+        handler_name = (
+            "on_notification_edit_back"
+            if button.callback_data.startswith("notify_back:")
+            else "on_group_reminder_action"
+        )
+        await self.callback_handler(handler_name)(callback)
+        return callback
+
+    async def _type(self, text, actor_id=12345):
+        parameter_handler = next(
+            item.callback
+            for item in self.admin_router.message.handlers
+            if item.callback.__name__ == "on_service_parameter"
+        )
+        message = self.message(actor_id, text)
+        await parameter_handler(message)
+        return message
+
+    async def _open_sound_reminders(self, actor_id=12345):
+        self.registry.add_service_admin(67890, "sound", actor_id)
+        command = self.message(actor_id, "/service_notify")
+        await self.admin_router.message.handlers[6].callback(command)
+        selection = SimpleNamespace(
+            data="service:service_notify:sound",
+            from_user=SimpleNamespace(id=actor_id),
+            message=SimpleNamespace(
+                chat=SimpleNamespace(type="private"),
+                answer=AsyncMock(),
+            ),
+            answer=AsyncMock(),
+        )
+        await self.callback_handler("on_service_selected")(selection)
+        return await self._click(
+            selection.message,
+            lambda button: button.text.startswith("⏰ Напоминания"),
+            actor_id,
+        )
+
+    def _sound_slots(self):
+        return sorted(
+            (
+                (item["reminder_days"], item["reminder_time"], item["body"])
+                for item in self.registry.list_group_reminders("sound")
+            ),
+            key=lambda slot: (slot[0], slot[1], slot[2] or ""),
+        )
+
     def test_guided_notification_setup_adds_independent_reminder(self):
         async def run():
-            self.registry.add_service_admin(67890, "sound", 12345)
-            command = self.message(12345, "/service_notify")
-            await self.admin_router.message.handlers[6].callback(command)
-            selection = SimpleNamespace(
-                data="service:service_notify:sound",
-                from_user=SimpleNamespace(id=12345),
-                message=SimpleNamespace(
-                    chat=SimpleNamespace(type="private"),
-                    answer=AsyncMock(),
-                ),
-                answer=AsyncMock(),
+            menu = await self._open_sound_reminders()
+            add = await self._click(
+                menu.message,
+                lambda button: button.text == "➕ Добавить напоминание",
             )
-            await self.callback_handler("on_service_selected")(selection)
-            main_menu = selection.message.answer.await_args.kwargs["reply_markup"]
-            reminder_button = next(
-                button
-                for row in main_menu.inline_keyboard
-                for button in row
-                if button.text.startswith("⏰ Напоминания")
+            # An existing «1 дн. 18:00» reminder must not trigger a warning
+            # before the new reminder's schedule is entered.
+            self.assertIn(
+                "шаг 1 из 3", add.message.answer.await_args.args[0]
             )
-            reminder_menu_callback = SimpleNamespace(
-                data=reminder_button.callback_data,
-                from_user=SimpleNamespace(id=12345),
-                message=SimpleNamespace(
-                    chat=SimpleNamespace(type="private"),
-                    answer=AsyncMock(),
-                ),
-                answer=AsyncMock(),
+            self.assertNotIn(
+                "уже есть", add.message.answer.await_args.args[0]
             )
-            await self.callback_handler("on_group_reminder_action")(
-                reminder_menu_callback
+            await self._type("3")
+            time_step = await self._type("10:30")
+            self.assertIn(
+                "шаг 3 из 3", time_step.answer.await_args.args[0]
             )
-            rules_menu = reminder_menu_callback.message.answer.await_args.kwargs[
-                "reply_markup"
-            ]
-            add_button = next(
-                button
-                for row in rules_menu.inline_keyboard
-                for button in row
-                if button.text == "➕ Добавить напоминание"
+            card = await self._click(
+                time_step,
+                lambda button: button.text == "📝 Шаблон по умолчанию",
             )
-            add_callback = SimpleNamespace(
-                data=add_button.callback_data,
-                from_user=SimpleNamespace(id=12345),
-                message=SimpleNamespace(
-                    chat=SimpleNamespace(type="private"),
-                    answer=AsyncMock(),
-                ),
-                answer=AsyncMock(),
-            )
-            await self.callback_handler("on_group_reminder_action")(
-                add_callback
-            )
-            confirm_add_button = next(
-                button
-                for row in add_callback.message.answer.await_args.kwargs[
-                    "reply_markup"
-                ].inline_keyboard
-                for button in row
-                if button.callback_data.startswith(
-                    "group_reminder:confirm_add:"
-                )
-            )
-            confirm_add_callback = SimpleNamespace(
-                data=confirm_add_button.callback_data,
-                from_user=SimpleNamespace(id=12345),
-                message=SimpleNamespace(
-                    chat=SimpleNamespace(type="private"),
-                    answer=AsyncMock(),
-                ),
-                answer=AsyncMock(),
-            )
-            await self.callback_handler("on_group_reminder_action")(
-                confirm_add_callback
-            )
-            parameter_handler = next(
-                item.callback
-                for item in self.admin_router.message.handlers
-                if item.callback.__name__ == "on_service_parameter"
-            )
-            card_markup = confirm_add_callback.message.answer.await_args.kwargs[
-                "reply_markup"
-            ]
-            edit_days = next(
-                button
-                for row in card_markup.inline_keyboard
-                for button in row
-                if button.text == "📅 Срок"
-            )
-            edit_days_callback = SimpleNamespace(
-                data=edit_days.callback_data,
-                from_user=SimpleNamespace(id=12345),
-                message=SimpleNamespace(
-                    chat=SimpleNamespace(type="private"),
-                    answer=AsyncMock(),
-                ),
-                answer=AsyncMock(),
-            )
-            await self.callback_handler("on_group_reminder_action")(
-                edit_days_callback
-            )
-            updated_days = self.message(12345, "3")
-            await parameter_handler(updated_days)
-            card_markup = updated_days.answer.await_args.kwargs[
-                "reply_markup"
-            ]
-            edit_time = next(
-                button
-                for row in card_markup.inline_keyboard
-                for button in row
-                if button.text == "🕒 Время"
-            )
-            edit_time_callback = SimpleNamespace(
-                data=edit_time.callback_data,
-                from_user=SimpleNamespace(id=12345),
-                message=SimpleNamespace(
-                    chat=SimpleNamespace(type="private"),
-                    answer=AsyncMock(),
-                ),
-                answer=AsyncMock(),
-            )
-            await self.callback_handler("on_group_reminder_action")(
-                edit_time_callback
-            )
-            saved_time_input = self.message(12345, "10:30")
-            await parameter_handler(saved_time_input)
 
-            reminders = self.registry.list_group_reminders("sound")
             self.assertEqual(
-                sorted(
-                    (item["reminder_days"], item["reminder_time"])
-                    for item in reminders
+                self._sound_slots(),
+                [(1, "18:00", None), (3, "10:30", None)],
+            )
+            self.assertIn(
+                "📝 Напоминание",
+                card.message.answer.await_args.args[0],
+            )
+
+        asyncio.run(run())
+
+    def test_cancelled_add_wizard_creates_nothing(self):
+        async def run():
+            menu = await self._open_sound_reminders()
+            add = await self._click(
+                menu.message,
+                lambda button: button.text == "➕ Добавить напоминание",
+            )
+            await self._type("2")
+            time_step = await self._type("09:00")
+            back = await self._click(
+                time_step,
+                lambda button: button.callback_data.startswith("notify_back:"),
+            )
+
+            self.assertEqual(self._sound_slots(), [(1, "18:00", None)])
+            self.assertIn(
+                "напоминания", back.message.answer.await_args.args[0]
+            )
+            del add
+
+        asyncio.run(run())
+
+    def test_add_wizard_rejects_invalid_days_and_time(self):
+        async def run():
+            menu = await self._open_sound_reminders()
+            await self._click(
+                menu.message,
+                lambda button: button.text == "➕ Добавить напоминание",
+            )
+            wrong_days = await self._type("9")
+            self.assertIn(
+                "от 0 до 6", wrong_days.answer.await_args.args[0]
+            )
+            await self._type("2")
+            wrong_time = await self._type("25:00")
+            self.assertIn("HH:MM", wrong_time.answer.await_args.args[0])
+            self.assertEqual(self._sound_slots(), [(1, "18:00", None)])
+
+        asyncio.run(run())
+
+    def test_same_slot_offers_merge_with_rendered_preview(self):
+        async def run():
+            self.context.get_group_reminder_preview = AsyncMock(
+                return_value={
+                    "date": "25.10.2026",
+                    "send_date": "24.10.2026",
+                    "time": "18:00",
+                    "text": "Итоговый текст для группы",
+                    "has_data": True,
+                    "error": None,
+                }
+            )
+            existing_id = self.registry.list_group_reminders("sound")[0]["id"]
+            menu = await self._open_sound_reminders()
+            await self._click(
+                menu.message,
+                lambda button: button.text == "➕ Добавить напоминание",
+            )
+            await self._type("1")
+            await self._type("18:00")
+            merge_screen = await self._type("Не забудьте ноты! {sunday_date}")
+
+            screen_text = merge_screen.answer.await_args.args[0]
+            self.assertIn("уже есть напоминание", screen_text)
+            self.assertIn("Итоговый текст для группы", screen_text)
+            self.assertIn("25.10.2026", screen_text)
+            loader_args = self.context.get_group_reminder_preview.await_args
+            self.assertEqual(loader_args.args[0], existing_id)
+            merged_body = loader_args.args[1]
+            self.assertTrue(
+                merged_body.endswith("\n\nНе забудьте ноты! {sunday_date}")
+            )
+            self.assertIn("{task_assignments}", merged_body)
+
+            await self._click(
+                merge_screen, lambda button: button.text == "🔗 Объединить"
+            )
+            self.assertEqual(
+                self._sound_slots(), [(1, "18:00", merged_body)]
+            )
+
+        asyncio.run(run())
+
+    def test_same_slot_can_still_be_saved_separately(self):
+        async def run():
+            menu = await self._open_sound_reminders()
+            await self._click(
+                menu.message,
+                lambda button: button.text == "➕ Добавить напоминание",
+            )
+            await self._type("1")
+            await self._type("18:00")
+            merge_screen = await self._type("Отдельный текст")
+            # Without a preview loader the merged template is shown instead.
+            self.assertIn(
+                "Отдельный текст", merge_screen.answer.await_args.args[0]
+            )
+            await self._click(
+                merge_screen,
+                lambda button: button.text == "➕ Отдельным сообщением",
+            )
+            self.assertEqual(
+                self._sound_slots(),
+                [(1, "18:00", None), (1, "18:00", "Отдельный текст")],
+            )
+
+        asyncio.run(run())
+
+    def test_same_slot_and_same_text_keeps_one_reminder(self):
+        async def run():
+            menu = await self._open_sound_reminders()
+            await self._click(
+                menu.message,
+                lambda button: button.text == "➕ Добавить напоминание",
+            )
+            await self._type("1")
+            text_step = await self._type("18:00")
+            same = await self._click(
+                text_step,
+                lambda button: button.text == "📝 Шаблон по умолчанию",
+            )
+            self.assertIn(
+                "с таким же текстом", same.message.answer.await_args.args[0]
+            )
+            await self._click(
+                same.message,
+                lambda button: button.text == "🔗 Оставить одно",
+            )
+            self.assertEqual(self._sound_slots(), [(1, "18:00", None)])
+
+        asyncio.run(run())
+
+    def test_merge_cancel_keeps_reminders_unchanged(self):
+        async def run():
+            menu = await self._open_sound_reminders()
+            await self._click(
+                menu.message,
+                lambda button: button.text == "➕ Добавить напоминание",
+            )
+            await self._type("1")
+            await self._type("18:00")
+            merge_screen = await self._type("Другой текст")
+            await self._click(
+                merge_screen, lambda button: button.text == "✖️ Отмена"
+            )
+            self.assertEqual(self._sound_slots(), [(1, "18:00", None)])
+
+        asyncio.run(run())
+
+    def test_changing_schedule_onto_taken_slot_merges_into_existing(self):
+        async def run():
+            existing_id = self.registry.list_group_reminders("sound")[0]["id"]
+            self.registry.update_group_reminder(
+                67890, existing_id, body="Первый текст"
+            )
+            other_id = self.registry.add_group_reminder(
+                67890, "sound", 2, "18:00", "Второй текст"
+            )
+            menu = await self._open_sound_reminders()
+            card = await self._click(
+                menu.message,
+                lambda button: button.callback_data.startswith(
+                    f"group_reminder:open:sound:{other_id}:"
                 ),
-                [(1, "18:00"), (3, "10:30")],
+            )
+            await self._click(
+                card.message, lambda button: button.text == "📅 Срок"
+            )
+            merge_screen = await self._type("1")
+            self.assertIn(
+                "Первый текст\n\nВторой текст",
+                merge_screen.answer.await_args.args[0],
+            )
+            merged = await self._click(
+                merge_screen, lambda button: button.text == "🔗 Объединить"
+            )
+
+            self.assertEqual(
+                self._sound_slots(),
+                [(1, "18:00", "Первый текст\n\nВторой текст")],
+            )
+            self.assertIsNone(self.registry.get_group_reminder(other_id))
+            self.assertIn(
+                "Первый текст", merged.message.answer.await_args.args[0]
             )
 
         asyncio.run(run())

@@ -994,6 +994,67 @@ class ServiceRegistry:
                 {"reminder_id": reminder_id},
             )
 
+    def merge_group_reminder(
+        self,
+        actor_id: int,
+        target_id: int,
+        body=_UNSET,
+        *,
+        source_id: int | None = None,
+    ) -> None:
+        """Объединяет напоминания с одинаковым расписанием в target_id.
+
+        body — итоговый текст target (по умолчанию не меняется); source_id —
+        напоминание, которое удаляется в той же транзакции.
+        """
+        _validate_positive_id(actor_id, "actor_id")
+        _validate_positive_id(target_id, "target_id")
+        if source_id is not None:
+            _validate_positive_id(source_id, "source_id")
+            if source_id == target_id:
+                raise ValueError("Нельзя объединить напоминание с самим собой.")
+        with self._connection() as connection:
+            target = connection.execute(
+                "SELECT * FROM group_reminders WHERE id = ?", (target_id,)
+            ).fetchone()
+            if target is None:
+                raise ValueError("Групповое напоминание больше не существует.")
+            self._require_service_editor(
+                connection, actor_id, target["service_id"]
+            )
+            if source_id is not None:
+                source = connection.execute(
+                    "SELECT service_id FROM group_reminders WHERE id = ?",
+                    (source_id,),
+                ).fetchone()
+                if source is None or source["service_id"] != target["service_id"]:
+                    raise ValueError(
+                        "Объединяемое напоминание больше не существует."
+                    )
+            new_body = target["body"] if body is _UNSET else body
+            self._validate_group_reminder_values(
+                target["reminder_days"], target["reminder_time"], new_body
+            )
+            connection.execute(
+                "UPDATE group_reminders SET body = ? WHERE id = ?",
+                (new_body.strip() if new_body else None, target_id),
+            )
+            if source_id is not None:
+                connection.execute(
+                    "DELETE FROM group_reminders WHERE id = ?", (source_id,)
+                )
+            self._audit(
+                connection,
+                actor_id,
+                "group_reminder_merged",
+                target["service_id"],
+                {
+                    "reminder_id": target_id,
+                    "merged_reminder_id": source_id,
+                    "has_custom_body": new_body is not None,
+                },
+            )
+
     def resolve_group_text(self, reminder: dict, service: dict) -> str:
         if reminder.get("body") is not None:
             return reminder["body"]
