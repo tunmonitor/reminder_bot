@@ -584,6 +584,12 @@ class ServiceRegistry:
                 "ALTER TABLE services ADD COLUMN archived INTEGER NOT NULL "
                 "DEFAULT 0 CHECK (archived IN (0, 1))"
             )
+        if "group_thread_id" not in columns:
+            # Тема (topic) группового чата; NULL — общая тема.
+            connection.execute(
+                "ALTER TABLE services ADD COLUMN group_thread_id INTEGER "
+                "CHECK (group_thread_id IS NULL OR group_thread_id > 0)"
+            )
         for service in SERVICES:
             is_assembly = service.id == "assembly"
             connection.execute(
@@ -938,8 +944,8 @@ class ServiceRegistry:
         with self._connection() as connection:
             rows = connection.execute(
                 "SELECT id, name, aliases_json, assignment_layout, "
-                "group_chat_id, enabled, reminder_days, reminder_time, "
-                "group_template, personal_templates_json "
+                "group_chat_id, group_thread_id, enabled, reminder_days, "
+                "reminder_time, group_template, personal_templates_json "
                 "FROM services WHERE archived = 0 ORDER BY id"
             ).fetchall()
             reminders = connection.execute(
@@ -1182,13 +1188,61 @@ class ServiceRegistry:
         with self._connection() as connection:
             self._require_super_admin(connection, actor_id)
             self._require_service(connection, service_id)
+            # Новый чат — тема прежнего чата к нему не относится.
             connection.execute(
-                "UPDATE services SET group_chat_id = ?, enabled = ? WHERE id = ?",
-                (group_chat_id, int(enabled), service_id),
+                "UPDATE services SET group_thread_id = CASE "
+                "WHEN group_chat_id IS ? THEN group_thread_id ELSE NULL END, "
+                "group_chat_id = ?, enabled = ? WHERE id = ?",
+                (group_chat_id, group_chat_id, int(enabled), service_id),
             )
             self._audit(
                 connection, actor_id, "service_chat_updated", service_id,
                 {"group_chat_id": group_chat_id, "enabled": enabled},
+            )
+
+    def set_group_thread(
+        self,
+        actor_id: int,
+        service_id: str,
+        group_chat_id: int,
+        thread_id: int | None,
+    ) -> None:
+        """Тема чата служения для напоминаний (команда /here в теме).
+
+        Задать может суперадмин или админ служения и только в чате,
+        привязанном к служению; thread_id None — общая тема.
+        """
+        _validate_positive_id(actor_id, "actor_id")
+        if thread_id is not None:
+            _validate_positive_id(thread_id, "thread_id")
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            self._require_service_editor(connection, actor_id, service_id)
+            current = connection.execute(
+                "SELECT group_chat_id FROM services WHERE id = ?",
+                (service_id,),
+            ).fetchone()
+            if current["group_chat_id"] != group_chat_id:
+                raise ValueError(
+                    "Этот чат не привязан к служению. Сначала выберите его "
+                    "в карточке служения."
+                )
+            connection.execute(
+                "UPDATE services SET group_thread_id = ? WHERE id = ?",
+                (thread_id, service_id),
+            )
+            self._audit(
+                connection, actor_id, "service_thread_updated", service_id,
+                {"group_chat_id": group_chat_id, "thread_id": thread_id},
+            )
+
+    def reset_group_thread(self, service_id: str, thread_id: int) -> None:
+        """Системный сброс темы, которой больше нет в чате (тема удалена)."""
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE services SET group_thread_id = NULL "
+                "WHERE id = ? AND group_thread_id = ?",
+                (service_id, thread_id),
             )
 
     def set_service_enabled(

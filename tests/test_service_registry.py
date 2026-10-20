@@ -578,6 +578,21 @@ class ServiceRegistryTest(unittest.TestCase):
         }
         self.assertNotIn("Файл", names)
 
+    def test_group_thread_belongs_to_bound_chat(self):
+        self.registry.set_group_chat(1001, "sound", -10002, enabled=True)
+        with self.assertRaisesRegex(ValueError, "не привязан"):
+            self.registry.set_group_thread(1001, "sound", -19999, 7)
+        with self.assertRaises(PermissionError):
+            self.registry.set_group_thread(2002, "sound", -10002, 7)
+        self.registry.add_service_admin(1001, "sound", 2002)
+        self.registry.set_group_thread(2002, "sound", -10002, 7)
+        self.assertEqual(self.registry.get_service("sound")["group_thread_id"], 7)
+
+        self.registry.set_group_chat(1001, "sound", -10002, enabled=False)
+        self.assertEqual(self.registry.get_service("sound")["group_thread_id"], 7)
+        self.registry.set_group_chat(1001, "sound", -10003, enabled=True)
+        self.assertIsNone(self.registry.get_service("sound")["group_thread_id"])
+
     def test_bootstrap_is_idempotent_and_does_not_promote_new_env_admin(self):
         self.registry.set_group_chat(1001, "sound", -10002, enabled=True)
 
