@@ -407,6 +407,35 @@ class BackupDebounceTest(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(manager._debounce_handle)
             manager._create_snapshot.assert_called_once_with()
 
+    async def test_failed_background_backup_rearms_debounce(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = BackupManager(
+                "test",
+                Path(tmp) / "shm",
+                ZoneInfo("Europe/Moscow"),
+                logging.getLogger("test.backup.retry"),
+                backup_base=Path(tmp) / "backups",
+                mount_point=Path(tmp),
+                require_mount=False,
+                debounce_seconds=60,
+            )
+            manager._create_snapshot = MagicMock(side_effect=OSError("disk"))
+            manager.mark_dirty()
+            handle = manager._debounce_handle
+
+            await manager._run_background_backup("ночное")
+
+            self.assertTrue(handle.cancelled())
+            retry = manager._debounce_handle
+            self.assertIsNotNone(retry)
+            self.assertIsNot(retry, handle)
+
+            await manager._run_background_backup("повтор")
+
+            self.assertTrue(retry.cancelled())
+            self.assertIsNone(manager._debounce_handle)
+            await manager.close()
+
 
 class RestoreProcessGuardTest(unittest.TestCase):
     def test_rejects_malformed_pid_file(self):

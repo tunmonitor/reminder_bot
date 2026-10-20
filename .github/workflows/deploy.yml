@@ -178,6 +178,10 @@ jobs:
             sleep 1
             if ! SHM_DIR="$SHM_DIR" LOG_DIR="$LOG_DIR" ./manage.sh status >/dev/null; then
               echo "❌ Бот остановился вскоре после запуска"
+              # Повторный start при откате очистит sys_nohup.log.
+              cp -p "$LOG_DIR/sys_nohup.log" \
+                "$LOG_DIR/sys_nohup.failed-deploy.log" || true
+              echo "Трейсбек сохранён в $LOG_DIR/sys_nohup.failed-deploy.log"
               exit 1
             fi
           done

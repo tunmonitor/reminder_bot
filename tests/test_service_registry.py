@@ -934,6 +934,9 @@ class ServiceRegistryTest(unittest.TestCase):
         reminder = self.registry.get_group_reminder(live_id)
         self.assertIsNone(reminder["body"])
         self.assertFalse(reminder["enabled"])
+        self.registry.update_group_reminder(1001, target_id, enabled=True)
+        with self.assertRaisesRegex(ValueError, "уже задано"):
+            self.registry.update_group_reminder(1001, live_id, enabled=True)
         with self.assertRaisesRegex(ValueError, "уже задано"):
             self.registry.update_group_reminder(
                 1001,

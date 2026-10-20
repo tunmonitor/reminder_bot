@@ -270,18 +270,26 @@ def _legacy_role_cell(value) -> tuple[str, str] | None:
         return role, inline_name.strip() if separator else ""
     if separator:
         return None
-    # «Ведущий Павел»: роль и имя через пробел, как в прежнем формате.
-    words = task.split()
-    for size in range(len(words) - 1, 0, -1):
-        role = _canonical_role(" ".join(words[:size]))
-        if role is not None:
-            return role, " ".join(words[size:])
-    return None
+    # «Ведущий Павел»: каноническая роль и имя через пробел, как в прежнем
+    # формате; синонимы («Ведет собрание») так не разбираются.
+    role_text, _, name = task.partition(" ")
+    role = next(
+        (role for role in ROLES if _normalized(role) == _normalized(role_text)),
+        None,
+    )
+    if role is None or not name.strip():
+        return None
+    return role, name.strip()
 
 
 # Перед датой допускается только день недели: «Воскресенье, 11.10.2026».
+_WEEKDAYS = (
+    "понедельник", "вторник", "среда", "четверг", "пятница", "суббота",
+    "воскресенье", "пн", "вт", "ср", "чт", "пт", "сб", "вс",
+)
 _LEGACY_DATE_RE = re.compile(
-    r"^[а-яё]+\.?,?\s+(\d{1,2})[./](\d{1,2})[./](\d{4})(?!\d)",
+    rf"^(?:{'|'.join(_WEEKDAYS)})\.?,?\s+"
+    r"(\d{1,2})[./](\d{1,2})[./](\d{4})(?!\d)",
     re.IGNORECASE,
 )
 

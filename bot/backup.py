@@ -254,6 +254,7 @@ class BackupManager:
         self.debounce_seconds = debounce_seconds
         self.registry_path = registry_path or service_registry_path()
         self._debounce_handle: asyncio.TimerHandle | None = None
+        self._retry_armed = False
         self._backup_lock = asyncio.Lock()
         self._tasks: set[asyncio.Task] = set()
         self._failure_callback: Callable[[str], Awaitable[None]] | None = None
@@ -308,10 +309,24 @@ class BackupManager:
 
     async def create_snapshot(self, reason: str) -> Path:
         async with self._backup_lock:
-            if self._debounce_handle is not None:
-                self._debounce_handle.cancel()
+            pending = self._debounce_handle
+            if pending is not None:
+                pending.cancel()
                 self._debounce_handle = None
-            snapshot = await asyncio.to_thread(self._create_snapshot)
+            try:
+                snapshot = await asyncio.to_thread(self._create_snapshot)
+            except Exception:
+                # Отменённый отложенный снимок повторяется один раз до
+                # следующего успешного снимка, чтобы не спамить при отказе.
+                if (
+                    pending is not None
+                    and self._debounce_handle is None
+                    and not self._retry_armed
+                ):
+                    self._retry_armed = True
+                    self.mark_dirty()
+                raise
+            self._retry_armed = False
             self.logger.info("Резервная копия создана (%s): %s", reason, snapshot)
             return snapshot
 
