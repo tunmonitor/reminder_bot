@@ -693,7 +693,7 @@ class ExcelParserTest(unittest.TestCase):
             [date(2026, 10, 4), date(2026, 10, 11), date(2026, 10, 18)],
         )
 
-    def test_service_rosters_read_task_blocks_and_contacts(self):
+    def test_service_rosters_read_names_and_tasks_only(self):
         workbook = Workbook()
         sheet = workbook.active
         sheet.title = "Списки"
@@ -705,6 +705,9 @@ class ExcelParserTest(unittest.TestCase):
         sheet.append(["Пётр"])
         sheet.append(["спевка"])
         sheet.append(["Иван"])
+        sheet.append(["Перевозка + сборка"])
+        sheet.append(["пётр"])
+        sheet.append(["ivan_petrov", 55555])
         sheet["G1"] = "Книги"
         sheet["G2"] = "Ольга"
         sheet["H3"] = "@lost_user"
@@ -720,8 +723,6 @@ class ExcelParserTest(unittest.TestCase):
         sound = {member.name: member for member in rosters["sound"]}
         self.assertEqual(sorted(sound), ["Алексей", "Пётр"])
         self.assertEqual(sound["Алексей"].tasks, ("звук", "сборка"))
-        self.assertEqual(sound["Алексей"].username, "alex_sound")
-        self.assertEqual(sound["Алексей"].telegram_id, 11111)
         self.assertEqual(sound["Пётр"].tasks, ("сборка",))
         self.assertEqual(
             [(member.name, member.tasks) for member in rosters["kitchen"]],
@@ -734,9 +735,8 @@ class ExcelParserTest(unittest.TestCase):
         self.assertEqual(
             issues,
             [
-                "«Списки», Звук: в строке задачи «звук» указаны "
-                "username/Telegram ID без имени",
-                "«Списки», Книги: строка 3 — username/Telegram ID без имени",
+                "«Списки», Звук: задача «сборка»: «пётр» указан дважды — "
+                "уточните фамилией",
             ],
         )
 

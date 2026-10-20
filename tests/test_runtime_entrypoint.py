@@ -254,8 +254,9 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     "«Списки», Кухня: «Анна» указан без задачи",
                     "«Списки»: служение «Хор» не найдено в каталоге",
                 ])
-                return {"sound": [RosterMember("Иван", ("звук",), "", 7007)]}
+                return {"sound": [RosterMember("Иван", ("звук",))]}
 
+            registry.bind_service_member(1001, "sound", "Иван", 7007)
             issues = []
             with patch.object(app, "parse_service_rosters", side_effect=parse):
                 app._sync_rosters_and_contacts(

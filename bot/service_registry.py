@@ -491,7 +491,52 @@ class ServiceRegistry:
                 )
             self._migrate_to_service_catalog(connection)
             self._migrate_members(connection)
+            self._drop_file_telegram_ids(connection)
             self._migrate_service_reminders(connection)
+
+    @staticmethod
+    def _drop_file_telegram_ids(connection: sqlite3.Connection) -> None:
+        """Однократно снимает Telegram ID, взятые из «Списков».
+
+        Telegram задаётся только в боте. Участник, созданный из «Списков»
+        (source='excel'), с Telegram ID без записи о привязке в боте получил
+        ID из файла: ID и созданные из него привязки к задачам удаляются.
+        """
+        if connection.execute(
+            "SELECT 1 FROM catalog_migrations WHERE name = 'members-v2'"
+        ).fetchone():
+            return
+        members = connection.execute(
+            "SELECT service_id, name, telegram_id FROM service_members "
+            "WHERE source = 'excel' AND telegram_id IS NOT NULL"
+        ).fetchall()
+        for member in members:
+            bound_in_bot = connection.execute(
+                "SELECT 1 FROM configuration_audit "
+                "WHERE service_id = ? AND action IN "
+                "('responsible_contact_updated', 'service_member_bound') "
+                "AND json_extract(details_json, '$.name') = ? "
+                "AND json_extract(details_json, '$.telegram_id') = ?",
+                (member["service_id"], member["name"], member["telegram_id"]),
+            ).fetchone()
+            if bound_in_bot:
+                continue
+            connection.execute(
+                "DELETE FROM responsible_contacts "
+                "WHERE service_id = ? AND name = ? AND telegram_id = ?",
+                (member["service_id"], member["name"], member["telegram_id"]),
+            )
+            connection.execute(
+                "UPDATE service_members SET telegram_id = NULL, username = '' "
+                "WHERE service_id = ? AND name = ?",
+                (member["service_id"], member["name"]),
+            )
+            ServiceRegistry._cleanup_unbound_user_data(
+                connection, member["service_id"]
+            )
+        connection.execute(
+            "INSERT INTO catalog_migrations (name) VALUES ('members-v2')"
+        )
 
     @staticmethod
     def _migrate_members(connection: sqlite3.Connection) -> None:
@@ -2190,10 +2235,9 @@ class ServiceRegistry:
     def sync_service_rosters(self, rosters) -> None:
         """Переносит состав служений с листа «Списки» (системная операция).
 
-        rosters — {service_id: [RosterMember]}. Задачи берутся из файла;
-        Telegram ID и username из файла заполняют только пустые значения
-        (привязку, сделанную в боте, файл не перезаписывает). Люди, которых
-        больше нет в «Списках», остаются с отметкой «нет в списке».
+        rosters — {service_id: [RosterMember]}. Из файла берутся только
+        имена и задачи; Telegram ID и username задаются только в боте. Люди,
+        которых больше нет в «Списках», остаются с отметкой «нет в списке».
         """
         now = _utc_now()
         with self._connection() as connection:
@@ -2211,36 +2255,21 @@ class ServiceRegistry:
                     connection.execute(
                         """
                         INSERT INTO service_members (
-                            service_id, name, telegram_id, username,
-                            tasks_json, in_list, source, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, 1, 'excel', ?)
+                            service_id, name, tasks_json, in_list, source,
+                            updated_at
+                        ) VALUES (?, ?, ?, 1, 'excel', ?)
                         ON CONFLICT(service_id, name) DO UPDATE SET
                             tasks_json = excluded.tasks_json,
-                            in_list = 1,
-                            telegram_id = COALESCE(
-                                service_members.telegram_id,
-                                excluded.telegram_id
-                            ),
-                            username = CASE
-                                WHEN service_members.username = ''
-                                THEN excluded.username
-                                ELSE service_members.username
-                            END
+                            in_list = 1
                         -- Без изменений строка не пишется: запись считается
                         -- изменением данных (бэкап, обновление задач).
                         WHERE service_members.tasks_json
                                   IS NOT excluded.tasks_json
                            OR service_members.in_list = 0
-                           OR (service_members.telegram_id IS NULL
-                               AND excluded.telegram_id IS NOT NULL)
-                           OR (service_members.username = ''
-                               AND excluded.username != '')
                         """,
                         (
                             service_id,
                             member.name,
-                            member.telegram_id,
-                            member.username,
                             json.dumps(list(member.tasks), ensure_ascii=False),
                             now,
                         ),

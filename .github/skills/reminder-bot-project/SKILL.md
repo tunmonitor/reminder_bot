@@ -97,9 +97,11 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   `parse_people`).
 - `parse_service_rosters` reads `Списки` for all services: row 1 holds service
   headers (block runs right to the next header), task cells start a task in
-  their column, people below; username/ID sit in the next two columns.
-  `ServiceRegistry.sync_service_rosters` stores them in `service_members`
-  (file fills only empty Telegram ID/username; writes only on real changes,
+  their column, people below. Username/ID cells are skipped, never read:
+  Telegram binding happens only in the bot. A person is identified by name
+  within a service (names must be unique; a repeated name in one task is an
+  issue). `ServiceRegistry.sync_service_rosters` stores names and tasks in
+  `service_members` (writes only on real changes,
   because any write triggers a backup and job refresh). `_load_service_task_
   assignments(..., registry=...)` syncs rosters and `ensure_member_contacts`
   on every schedule read; roster failures are logged and never block

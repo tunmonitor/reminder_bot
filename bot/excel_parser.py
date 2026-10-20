@@ -887,11 +887,17 @@ class RosterMember:
     """Человек из состава служения на листе «Списки»."""
     name: str
     tasks: tuple[str, ...] = ()
-    username: str = ""
-    telegram_id: int | None = None
 
 
 _USERNAME_CELL = re.compile(r"@?([A-Za-z][A-Za-z0-9_]{4,31})")
+
+
+def _is_contact_cell(text: str) -> bool:
+    """«@username» или Telegram ID — не имя участника."""
+    return bool(
+        (text.startswith("@") and _USERNAME_CELL.fullmatch(text))
+        or _telegram_id(text) is not None
+    )
 
 
 def parse_service_rosters(
@@ -905,8 +911,10 @@ def parse_service_rosters(
     В строке 1 — названия служений; блок служения тянется вправо до
     следующего названия. Ячейка с названием или синонимом задачи служения
     начинает задачу в своей колонке; остальные ячейки ниже — люди этой
-    задачи. Люди под выключенной задачей пропускаются. Справа от имени
-    могут стоять username и Telegram ID (как в блоке Собрания).
+    задачи. Люди под выключенной задачей пропускаются. Username и
+    Telegram ID из «Списков» не читаются (привязка — только в боте); пока
+    такие колонки есть, их ячейки не считаются людьми. Повтор имени в
+    одной задаче — предупреждение: имена в служении должны быть уникальны.
     В результате только служения, у которых есть блок на листе.
     """
     services = SERVICES if services is None else services
@@ -950,8 +958,9 @@ def parse_service_rosters(
                 for task in service.tasks
                 for key in (task.name, *task.aliases)
             }
-            people: dict[str, dict] = {}
+            people: dict[str, list[str]] = {}
             consumed: set[tuple[int, int]] = set()
+            seen: dict[str | None, set[str]] = {}
             for column in range(start, end):
                 current_task = None
                 for row_index in range(1, len(rows)):
@@ -959,76 +968,41 @@ def parse_service_rosters(
                     if (row_index, column) in consumed or column >= len(row):
                         continue
                     text = _clean(row[column])
-                    if not text:
-                        # Username/ID рядом с пустым именем — не люди. Без
-                        # имени username узнаём только по «@» или по ID
-                        # правее (латинское имя или задача — не username).
-                        def cell(offset):
-                            neighbour = column + offset
-                            if (
-                                neighbour < end
-                                and neighbour < len(row)
-                                and (row_index, neighbour) not in consumed
-                            ):
-                                return _clean(row[neighbour])
-                            return ""
-                        has_id = _telegram_id(cell(2)) is not None if cell(2) else False
-                        username_cell = cell(1)
-                        has_username = bool(
-                            username_cell
-                            and _USERNAME_CELL.fullmatch(username_cell)
-                            and normalized_name(username_cell) not in task_by_key
-                            and (username_cell.startswith("@") or has_id)
-                        )
-                        if has_username:
-                            consumed.add((row_index, column + 1))
-                        if has_id:
-                            consumed.add((row_index, column + 2))
-                        orphan = has_username or has_id
-                        if orphan:
-                            issues.append(
-                                f"«Списки», {service.name}: строка "
-                                f"{row_index + 1} — username/Telegram ID без "
-                                "имени"
-                            )
+                    if not text or _is_contact_cell(text):
                         continue
                     task = task_by_key.get(normalized_name(text))
-                    if task is not None:
-                        current_task = task
-                        # Username и Telegram ID в строке с названием задачи
-                        # не принадлежат никому — сообщаем, но не читаем их
-                        # как людей.
-                        orphan = False
-                        for offset, looks_right in (
-                            (1, lambda v: _USERNAME_CELL.fullmatch(_clean(v))),
-                            (2, lambda v: _telegram_id(v) is not None),
-                        ):
-                            neighbour = column + offset
+                    right = (
+                        _clean(row[column + 1])
+                        if column + 1 < end and column + 1 < len(row)
+                        else ""
+                    )
+                    if (
+                        task is None
+                        and _USERNAME_CELL.fullmatch(text)
+                        and _telegram_id(right) is not None
+                    ):
+                        # Username без «@» с Telegram ID правее — контакт.
+                        consumed.add((row_index, column + 1))
+                        continue
+                    # Username и Telegram ID правее имени или задачи из
+                    # «Списков» не читаются (привязка — только в боте), но
+                    # и людьми не считаются.
+                    for offset, looks_like in (
+                        (1, lambda v: _USERNAME_CELL.fullmatch(v)),
+                        (2, lambda v: _telegram_id(v) is not None),
+                    ):
+                        neighbour = column + offset
+                        if neighbour < end and neighbour < len(row):
+                            value = _clean(row[neighbour])
                             if (
-                                neighbour < end
-                                and neighbour < len(row)
-                                and looks_right(row[neighbour])
+                                value
+                                and normalized_name(value) not in task_by_key
+                                and looks_like(value)
                             ):
                                 consumed.add((row_index, neighbour))
-                                orphan = True
-                        if orphan:
-                            issues.append(
-                                f"«Списки», {service.name}: в строке задачи "
-                                f"«{text}» указаны username/Telegram ID без "
-                                "имени"
-                            )
+                    if task is not None:
+                        current_task = task
                         continue
-                    username = ""
-                    telegram_id = None
-                    if column + 1 < end and column + 1 < len(row):
-                        match = _USERNAME_CELL.fullmatch(_clean(row[column + 1]))
-                        if match:
-                            username = match.group(1)
-                            consumed.add((row_index, column + 1))
-                    if column + 2 < end and column + 2 < len(row):
-                        telegram_id = _telegram_id(row[column + 2])
-                        if telegram_id is not None:
-                            consumed.add((row_index, column + 2))
                     if service.tasks and current_task is None:
                         issues.append(
                             f"«Списки», {service.name}: «{text}» указан "
@@ -1037,23 +1011,22 @@ def parse_service_rosters(
                         continue
                     if current_task is not None and not current_task.enabled:
                         continue
-                    person = people.setdefault(
-                        text, {"tasks": [], "username": "", "telegram_id": None}
-                    )
-                    if current_task is not None and (
-                        current_task.name not in person["tasks"]
-                    ):
-                        person["tasks"].append(current_task.name)
-                    person["username"] = person["username"] or username
-                    person["telegram_id"] = person["telegram_id"] or telegram_id
+                    task_name = current_task.name if current_task else None
+                    names = seen.setdefault(task_name, set())
+                    if normalized_name(text) in names:
+                        where = f"задача «{task_name}»: " if task_name else ""
+                        issues.append(
+                            f"«Списки», {service.name}: {where}«{text}» "
+                            "указан дважды — уточните фамилией"
+                        )
+                        continue
+                    names.add(normalized_name(text))
+                    person = people.setdefault(text, [])
+                    if task_name is not None and task_name not in person:
+                        person.append(task_name)
             result[service.id] = [
-                RosterMember(
-                    name=name,
-                    tasks=tuple(info["tasks"]),
-                    username=info["username"],
-                    telegram_id=info["telegram_id"],
-                )
-                for name, info in people.items()
+                RosterMember(name=name, tasks=tuple(tasks))
+                for name, tasks in people.items()
             ]
             debug_logger.debug(
                 "Лист 'Списки': служение %s, людей=%s",
