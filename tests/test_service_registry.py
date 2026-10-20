@@ -185,6 +185,160 @@ class ServiceRegistryTest(unittest.TestCase):
         )
         self.assertTrue(self.registry.is_service_admin(3003, "broadcast"))
 
+    def _rerun_catalog_migration(self, *statements):
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO services (id, name, aliases_json, "
+                "assignment_layout) VALUES ('slides', 'Слайды', '[]', 'single')"
+            )
+            for statement, parameters in statements:
+                connection.execute(statement, parameters)
+            connection.execute("DELETE FROM catalog_migrations")
+        self.registry.initialize(1001, -10001)
+
+    @staticmethod
+    def _contact(service_id, task, name, telegram_id):
+        return (
+            "INSERT INTO responsible_contacts (service_id, task, name, "
+            "telegram_id, username, updated_by, updated_at) "
+            "VALUES (?, ?, ?, ?, '', 1001, 'now')",
+            (service_id, task, name, telegram_id),
+        )
+
+    def test_migration_keeps_contact_when_name_belongs_to_other_person(self):
+        self._rerun_catalog_migration(
+            self._contact("assembly", "Проповедник", "Иван", 4001),
+            self._contact("assembly", "Проповедь", "Иван", 4009),
+        )
+
+        with sqlite3.connect(self.path) as connection:
+            rows = sorted(connection.execute(
+                "SELECT task, telegram_id FROM responsible_contacts "
+                "WHERE service_id = 'assembly'"
+            ).fetchall())
+        self.assertEqual(rows, [("Проповедник", 4001), ("Проповедь", 4009)])
+
+    def test_migration_merges_personal_rules_of_alias_and_canonical_task(self):
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "INSERT INTO user_reminder_texts (id, actor_id, service_id, "
+                "task, body) VALUES (901, 4001, 'assembly', 'Проповедник', "
+                "'Свой текст')"
+            )
+            connection.execute(
+                "INSERT INTO user_reminder_texts (id, actor_id, service_id, "
+                "task) VALUES (902, 4001, 'assembly', 'Проповедь')"
+            )
+            connection.execute(
+                "INSERT INTO user_reminder_schedules (text_id, reminder_days, "
+                "reminder_time) VALUES (901, 2, '10:00')"
+            )
+        self._rerun_catalog_migration()
+
+        texts = self.registry.list_user_texts(4001, "assembly")
+        self.assertEqual(
+            [(text["id"], text["task"], text["body"]) for text in texts],
+            [(902, "Проповедь", "Свой текст")],
+        )
+        self.assertEqual(
+            [
+                (rule["reminder_days"], rule["reminder_time"])
+                for rule in self.registry.list_schedules(902)
+            ],
+            [(2, "10:00")],
+        )
+
+    def test_migration_moves_slides_people_to_broadcast(self):
+        self._rerun_catalog_migration(
+            self._contact("slides", "Слайды", "Анна", 4020),
+            (
+                "INSERT INTO user_reminder_texts (actor_id, service_id, task) "
+                "VALUES (4020, 'slides', 'Слайды')",
+                (),
+            ),
+            (
+                "INSERT INTO user_notification_prefs (service_id, actor_id, "
+                "enabled) VALUES ('slides', 4020, 1)",
+                (),
+            ),
+        )
+
+        self.assertEqual(self.registry.list_user_services(4020), ["broadcast"])
+        self.assertEqual(
+            self.registry.list_user_tasks(4020, "broadcast"), ["Слайды"]
+        )
+        self.assertEqual(
+            [text["task"] for text in self.registry.list_user_texts(4020, "broadcast")],
+            ["Слайды"],
+        )
+        self.assertTrue(
+            self.registry.get_user_notifications_enabled(4020, "broadcast")
+        )
+
+    def test_archived_services_are_hidden_from_user_lists(self):
+        self._rerun_catalog_migration(
+            self._contact("slides", "Старая задача", "Анна", 4021),
+        )
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "UPDATE responsible_contacts SET service_id = 'slides' "
+                "WHERE telegram_id = 4021"
+            )
+        self.registry.set_responsible_contact(
+            1001, "sound", "звук", "Анна", 4021
+        )
+
+        self.assertEqual(self.registry.list_user_services(4021), ["sound"])
+        self.assertEqual(
+            {item["service_id"] for item in self.registry.list_user_assignments(4021)},
+            {"sound"},
+        )
+        self.registry.set_user_notifications_all(4021, True)
+        self.assertEqual(
+            [
+                item["service_id"]
+                for item in self.registry.get_user_notifications_state(4021)[
+                    "per_service"
+                ]
+            ],
+            ["sound"],
+        )
+
+    def test_migration_keeps_conflicting_personal_template_under_alias(self):
+        self._rerun_catalog_migration((
+            "UPDATE services SET personal_templates_json = ? "
+            "WHERE id = 'assembly'",
+            ('{"Проповедник": "старый", "Проповедь": "новый", '
+             '"ХКЦ": "ответственный"}',),
+        ))
+
+        self.assertEqual(
+            self.registry.get_service("assembly")["personal_templates"],
+            {
+                "Проповедник": "старый",
+                "Проповедь": "новый",
+                "Ответственный по ХКЦ": "ответственный",
+            },
+        )
+
+    def test_admin_task_positions_stay_unique_after_catalog_sync(self):
+        self.registry.add_service_task(1001, "sound", "Перевозка")
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "UPDATE service_tasks SET position = 0 "
+                "WHERE service_id = 'sound' AND name = 'Перевозка'"
+            )
+        self.registry.initialize(1001, -10001)
+
+        positions = [
+            (task["name"], task["position"])
+            for task in self.registry.list_service_tasks("sound")
+        ]
+        self.assertEqual(
+            positions,
+            [("звук", 0), ("сборка", 1), ("спевка", 2), ("Перевозка", 3)],
+        )
+
     def test_bootstrap_is_idempotent_and_does_not_promote_new_env_admin(self):
         self.registry.set_group_chat(1001, "sound", -10002, enabled=True)
 

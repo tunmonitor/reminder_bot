@@ -105,8 +105,14 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - `ServiceRegistry.initialize` syncs the catalog into `services` /
   `service_tasks`; services missing from the file are archived, never
   deleted, and `list_services` hides them. Task enable state and
-  admin-added tasks live only in SQLite. Migration `catalog-v1` renames
-  stored task names once.
+  admin-added tasks live only in SQLite; admin tasks are renumbered after
+  catalog tasks so `position` stays a unique button id. Migration
+  `catalog-v1` runs once: it moves admins, contacts, personal texts (with
+  rules) and prefs of slides/rehearsal/coffee into broadcast/sound/kitchen
+  and renames stored task names via `_move_contact` / `_move_user_text`,
+  which never drop another person's binding or a user's rules. User-facing
+  lists (`list_user_services`, notification state, bulk toggle) skip
+  archived services.
 - The legacy assembly role flow (`parse_schedule`/`parse_people`) keeps its
   own aliases: `ХКЦ` → `Ответственный`; `Ведущий`/`Ведет` → `Ведущий`;
   `Проповедует`/`Проповедет` → `Проповедник`.

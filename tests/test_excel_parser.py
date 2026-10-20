@@ -337,6 +337,20 @@ class ExcelParserTest(unittest.TestCase):
         )
         self.assertEqual(event.issues, ())
 
+    def test_untasked_rows_at_block_start_of_tasked_service_are_reported(self):
+        event, _ = self._parse_kitchen_rows([
+            [None, "А"],
+            ["старший", "Б"],
+        ])
+
+        self.assertEqual(
+            [(item.task, item.name) for item in event.assignments],
+            [("старший", "Б")],
+        )
+        self.assertEqual(
+            event.issues, ("«Кухня», 11.10.2026: строка без задачи",)
+        )
+
     def test_comments_row_stops_schedule_parsing(self):
         workbook = Workbook()
         schedule = workbook.active
