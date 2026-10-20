@@ -1,0 +1,46 @@
+import unittest
+
+from bot.presentation import format_task_assignments
+from bot.ui import plain_text, render_screen_chunks, user_link
+
+
+class FormatTaskAssignmentsTest(unittest.TestCase):
+    def setUp(self):
+        self.assignments = {
+            "Микшер": {"names": ["Алексей", "Мария", "Иван", "Олег"]},
+        }
+        self.contacts = {
+            ("Микшер", "Алексей"): {"telegram_id": 12345, "username": "alex"},
+            ("Микшер", "Мария"): {"telegram_id": 67890, "username": None},
+            ("Микшер", "Иван"): {"telegram_id": None, "username": "ivan"},
+        }
+
+    def test_contacts_with_telegram_id_become_mentions(self):
+        text = format_task_assignments(
+            self.assignments, self.contacts, mark_unlinked=True
+        )
+
+        self.assertIn(f"• {user_link(12345, 'Алексей (@alex)')}", text)
+        self.assertIn(f"• {user_link(67890, 'Мария')}", text)
+        self.assertEqual(
+            plain_text(text),
+            "🎚️ Микшер\n"
+            "• Алексей (@alex)\n"
+            "• Мария\n"
+            "• Иван (@ivan)\n"
+            "• Олег · не привязан",
+        )
+        rendered = "".join(render_screen_chunks(text, limit=4096))
+        self.assertIn('<a href="tg://user?id=12345">Алексей (@alex)</a>', rendered)
+        self.assertIn('<a href="tg://user?id=67890">Мария</a>', rendered)
+        self.assertNotIn("\x00", rendered)
+
+    def test_unlinked_mark_is_optional(self):
+        text = format_task_assignments(self.assignments, self.contacts)
+
+        self.assertIn("• Олег", plain_text(text))
+        self.assertNotIn("не привязан", text)
+
+
+if __name__ == "__main__":
+    unittest.main()

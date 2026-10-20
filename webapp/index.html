@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Test Mini App</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+    <h1>Привет от Raspberry Pi!</h1>
+    <p id="user">Загрузка...</p>
+    <script>
+        const userElement = document.getElementById("user");
+        const tg = window.Telegram?.WebApp;
+        if (tg) {
+            tg.ready();
+            tg.expand();
+            const userId = tg.initDataUnsafe?.user?.id;
+            userElement.textContent = userId ? `User ID: ${userId}` : "Откройте приложение через Telegram.";
+        } else {
+            userElement.textContent = "Telegram Web App недоступен. Откройте эту страницу через Telegram.";
+        }
+    </script>
+</body>
+</html>
