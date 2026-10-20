@@ -700,8 +700,8 @@ class ExcelParserTest(unittest.TestCase):
         sheet.append(["Звук", None, None, "Кухня"])
         sheet.append(["звук", "@orphan_user", None, "старший"])
         sheet.append(["Алексей", "@alex_sound", 11111, "Мария"])
-        sheet.append(["Перевозка + сборка"])
-        sheet.append(["Алексей"])
+        sheet.append(["Перевозка + сборка", "звук"])
+        sheet.append(["Алексей", "Daniel"])
         sheet.append(["Пётр"])
         sheet.append(["спевка"])
         sheet.append(["Иван"])
@@ -721,7 +721,8 @@ class ExcelParserTest(unittest.TestCase):
         )
 
         sound = {member.name: member for member in rosters["sound"]}
-        self.assertEqual(sorted(sound), ["Алексей", "Пётр"])
+        self.assertEqual(sorted(sound), ["Daniel", "Алексей", "Пётр"])
+        self.assertEqual(sound["Daniel"].tasks, ("звук",))
         self.assertEqual(sound["Алексей"].tasks, ("звук", "сборка"))
         self.assertEqual(sound["Пётр"].tasks, ("сборка",))
         self.assertEqual(

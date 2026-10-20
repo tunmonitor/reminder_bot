@@ -987,19 +987,22 @@ def parse_service_rosters(
                     # Username и Telegram ID правее имени или задачи из
                     # «Списков» не читаются (привязка — только в боте), но
                     # и людьми не считаются.
-                    for offset, looks_like in (
-                        (1, lambda v: _USERNAME_CELL.fullmatch(v)),
-                        (2, lambda v: _telegram_id(v) is not None),
-                    ):
+                    # Username без «@» узнаётся только по Telegram ID правее:
+                    # латинское имя в соседней задаче — тоже человек.
+                    def neighbour_value(offset):
                         neighbour = column + offset
                         if neighbour < end and neighbour < len(row):
-                            value = _clean(row[neighbour])
-                            if (
-                                value
-                                and normalized_name(value) not in task_by_key
-                                and looks_like(value)
-                            ):
-                                consumed.add((row_index, neighbour))
+                            return _clean(row[neighbour])
+                        return ""
+                    username_cell = neighbour_value(1)
+                    has_id = _telegram_id(neighbour_value(2)) is not None
+                    if username_cell and normalized_name(username_cell) not in task_by_key and (
+                        (username_cell.startswith("@") or has_id)
+                        and _USERNAME_CELL.fullmatch(username_cell)
+                    ):
+                        consumed.add((row_index, column + 1))
+                    if has_id:
+                        consumed.add((row_index, column + 2))
                     if task is not None:
                         current_task = task
                         continue
