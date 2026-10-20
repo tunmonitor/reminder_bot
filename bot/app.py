@@ -442,7 +442,10 @@ async def _load_service_task_assignments(
     only_date: date | None = None,
     *,
     return_event_found: bool = False,
+    services=None,
+    issues: list[str] | None = None,
 ) -> dict[str, dict[str, object]] | tuple[dict[str, dict[str, object]], bool]:
+    """Назначения служения из графика; issues пополняется предупреждениями."""
     sunday_date = only_date or _next_sunday_in_tz(tz)
     debug_dir = shm_dir / "debug"
     directory_fd = open_private_directory(debug_dir, create=True)
@@ -464,7 +467,7 @@ async def _load_service_task_assignments(
             interval=0,
         )
         events_by_service = parse_service_events(
-            xlsx_path, sunday_date, debug_logger
+            xlsx_path, sunday_date, debug_logger, services
         )
         service_events = events_by_service.get(service_id, [])
         event_found = any(
@@ -474,6 +477,8 @@ async def _load_service_task_assignments(
         for event in service_events:
             if only_date is not None and event.event_date != only_date:
                 continue
+            if issues is not None:
+                issues.extend(event.issues)
             for assignment in event.assignments:
                 task_info = assignments.setdefault(
                     assignment.task,
@@ -506,6 +511,7 @@ async def _load_upcoming_service_events(
     tz,
     debug_logger,
     weeks: int = 6,
+    services=None,
 ) -> list:
     """Read schedule events from today through the given number of weeks."""
     today = datetime.now(tz).date()
@@ -538,7 +544,7 @@ async def _load_upcoming_service_events(
         for month in months:
             try:
                 events_by_service = parse_service_events(
-                    xlsx_path, month, debug_logger
+                    xlsx_path, month, debug_logger, services
                 )
             except SheetNotFoundError:
                 if month == months[0]:
@@ -604,6 +610,7 @@ async def get_group_reminder_preview(
             debug_logger,
             only_date=event_date,
             return_event_found=True,
+            services=registry.service_catalog(),
         )
     except Exception:
         debug_logger.exception(
@@ -696,6 +703,7 @@ async def _process_service_reminder(
     event_date = (run_date or datetime.now(tz).date()) + timedelta(
         days=reminder["reminder_days"]
     )
+    schedule_issues: list[str] = []
     try:
         assignments, event_found = await _load_service_task_assignments(
             credentials,
@@ -705,6 +713,8 @@ async def _process_service_reminder(
             debug_logger,
             only_date=event_date,
             return_event_found=True,
+            services=registry.service_catalog(),
+            issues=schedule_issues,
         )
     except Exception as exc:
         debug_logger.exception(
@@ -727,6 +737,23 @@ async def _process_service_reminder(
             event_date,
         )
         return
+    issues_recipient = "admin:schedule-issues"
+    if schedule_issues and not registry.is_group_reminder_delivered(
+        reminder["id"], event_date.isoformat(), issues_recipient
+    ):
+        unique_issues = list(dict.fromkeys(schedule_issues))
+        notified = await _notify_admin(
+            bot,
+            credentials.admin_tg_id,
+            f"Проверьте график «{service['name']}» на "
+            f"{event_date:%d.%m.%Y}:\n"
+            + "\n".join(f"• {issue}" for issue in unique_issues),
+            debug_logger,
+        )
+        if notified:
+            registry.mark_group_reminder_delivered(
+                reminder["id"], event_date.isoformat(), issues_recipient
+            )
 
     try:
         contacts = registry.list_responsible_contacts(
@@ -901,6 +928,7 @@ async def _process_user_reminder_schedule(
             debug_logger,
             only_date=event_date,
             return_event_found=True,
+            services=registry.service_catalog(),
         )
     except Exception as exc:
         debug_logger.exception(
@@ -1098,6 +1126,7 @@ async def _prepare_service_test_previews(
         service_id,
         debug_logger,
         only_date=sunday_date,
+        services=registry.service_catalog(),
     )
     contacts = registry.list_responsible_contacts(
         credentials.admin_tg_id, service_id
@@ -1455,7 +1484,11 @@ async def _run_locked(args: CliArgs) -> None:
             service_id: str,
         ) -> dict[str, dict[str, object]]:
             return await _load_service_task_assignments(
-                credentials, shm_dir, tz, service_id, debug_logger
+                credentials, shm_dir, tz, service_id, debug_logger,
+                services=(
+                    service_registry.service_catalog()
+                    if service_registry is not None else None
+                ),
             )
 
         async def prepare_service_test_previews(
@@ -1510,7 +1543,11 @@ async def _run_locked(args: CliArgs) -> None:
                 ):
                     return upcoming_cache["events"]
                 events = await _load_upcoming_service_events(
-                    credentials, shm_dir, tz, debug_logger
+                    credentials, shm_dir, tz, debug_logger,
+                    services=(
+                        service_registry.service_catalog()
+                        if service_registry is not None else None
+                    ),
                 )
                 upcoming_cache.update(
                     loaded_at=time.monotonic(), events=events

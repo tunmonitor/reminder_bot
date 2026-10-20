@@ -37,8 +37,8 @@ class ServiceRegistryTest(unittest.TestCase):
         self.assertTrue(services["assembly"]["enabled"])
         self.assertEqual(services["assembly"]["group_chat_id"], -10001)
         for service_id in (
-            "sound", "rehearsal", "slides", "broadcast",
-            "order", "kitchen", "coffee",
+            "broadcast", "kitchen", "sound", "order",
+            "office_cleaning", "books", "children",
         ):
             self.assertFalse(services[service_id]["enabled"])
             self.assertIsNone(services[service_id]["group_chat_id"])
@@ -47,6 +47,143 @@ class ServiceRegistryTest(unittest.TestCase):
         self.assertEqual(
             stat.S_IMODE(self.path.parent.stat().st_mode) & 0o077, 0
         )
+
+    def test_catalog_tasks_are_seeded_and_admin_toggles_survive_restart(self):
+        self.assertEqual(
+            [
+                (task["name"], task["enabled"])
+                for task in self.registry.list_service_tasks("sound")
+            ],
+            [("звук", True), ("сборка", True), ("спевка", False)],
+        )
+        self.registry.set_service_task_enabled(1001, "sound", "спевка", True)
+        self.registry.add_service_task(1001, "sound", "  Перевозка  техники ")
+
+        self.registry.initialize(1001, -10001)
+
+        tasks = self.registry.list_service_tasks("sound")
+        self.assertEqual(
+            [(task["name"], task["enabled"], task["source"]) for task in tasks],
+            [
+                ("звук", True, "catalog"),
+                ("сборка", True, "catalog"),
+                ("спевка", True, "catalog"),
+                ("Перевозка техники", True, "admin"),
+            ],
+        )
+        catalog = {
+            service.id: service for service in self.registry.service_catalog()
+        }
+        self.assertIn(
+            "Перевозка техники",
+            [task.name for task in catalog["sound"].tasks],
+        )
+        self.assertEqual(
+            [column.headers for column in catalog["sound"].columns],
+            [("звук",), ("спевка",)],
+        )
+
+    def test_service_task_changes_require_super_admin_and_unique_names(self):
+        self.registry.add_service_admin(1001, "sound", 2002)
+        with self.assertRaises(PermissionError):
+            self.registry.set_service_task_enabled(2002, "sound", "звук", False)
+        with self.assertRaises(PermissionError):
+            self.registry.add_service_task(2002, "sound", "Новая")
+        with self.assertRaises(ValueError):
+            self.registry.add_service_task(1001, "sound", "Сборка оборудования")
+        with self.assertRaises(ValueError):
+            self.registry.add_service_task(1001, "sound", " ")
+        with self.assertRaises(ValueError):
+            self.registry.set_service_task_enabled(1001, "sound", "нет", True)
+
+    def test_services_missing_from_catalog_are_archived_not_deleted(self):
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "INSERT INTO services (id, name, aliases_json, "
+                "assignment_layout, enabled) "
+                "VALUES ('slides', 'Слайды', '[]', 'single', 1)"
+            )
+        self.registry.initialize(1001, -10001)
+
+        self.assertNotIn(
+            "slides",
+            [service["id"] for service in self.registry.list_services()],
+        )
+        with self.assertRaises(ValueError):
+            self.registry.add_group_reminder(1001, "slides", 1, "18:00")
+        with sqlite3.connect(self.path) as connection:
+            archived = connection.execute(
+                "SELECT archived, enabled FROM services WHERE id = 'slides'"
+            ).fetchone()
+        self.assertEqual(archived, (1, 0))
+
+    def test_catalog_migration_renames_tasks_and_moves_slides_admins(self):
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "INSERT INTO services (id, name, aliases_json, "
+                "assignment_layout) "
+                "VALUES ('slides', 'Слайды', '[]', 'single')"
+            )
+            connection.execute(
+                "INSERT INTO service_admins (service_id, telegram_id, "
+                "username, created_by, created_at) "
+                "VALUES ('slides', 3003, 'slides_admin', 1001, 'now')"
+            )
+            for service_id, task, name, telegram_id in (
+                ("assembly", "Проповедник", "Иван", 4001),
+                ("assembly", "Ответственный", "Алексей", 4002),
+                ("broadcast", "трансляция", "Даша", 4003),
+                ("kitchen", "Кухня", "Ольга", 4004),
+                ("order", "Орг. порядка", "Сергей", 4005),
+                ("order", "в смене", "Сергей", 4005),
+                ("sound", "сборка оборудования", "Денис", 4006),
+                ("assembly", "Вторая часть", "Павел", 4007),
+            ):
+                connection.execute(
+                    "INSERT INTO responsible_contacts (service_id, task, "
+                    "name, telegram_id, username, updated_by, updated_at) "
+                    "VALUES (?, ?, ?, ?, '', 1001, 'now')",
+                    (service_id, task, name, telegram_id),
+                )
+            connection.execute(
+                "INSERT INTO user_reminder_texts (actor_id, service_id, task) "
+                "VALUES (4001, 'assembly', 'Проповедник')"
+            )
+            connection.execute(
+                "UPDATE services SET personal_templates_json = ? "
+                "WHERE id = 'assembly'",
+                ('{"Проповедник": "{name}, проповедь {sunday_date}"}',),
+            )
+            connection.execute("DELETE FROM catalog_migrations")
+
+        self.registry.initialize(1001, -10001)
+        self.registry.initialize(1001, -10001)
+
+        with sqlite3.connect(self.path) as connection:
+            contacts = sorted(connection.execute(
+                "SELECT service_id, task, name FROM responsible_contacts"
+            ).fetchall())
+            text_task = connection.execute(
+                "SELECT task FROM user_reminder_texts WHERE actor_id = 4001"
+            ).fetchone()[0]
+        self.assertEqual(
+            contacts,
+            [
+                ("assembly", "Вторая часть", "Павел"),
+                ("assembly", "Ответственный по ХКЦ", "Алексей"),
+                ("assembly", "Проповедь", "Иван"),
+                ("broadcast", "Компьютер", "Даша"),
+                ("kitchen", "в смене", "Ольга"),
+                ("order", "в смене", "Сергей"),
+                ("sound", "сборка", "Денис"),
+            ],
+        )
+        self.assertEqual(text_task, "Проповедь")
+        self.assertEqual(
+            self.registry.get_service("assembly")["personal_templates"],
+            {"Проповедь": "{name}, проповедь {sunday_date}"},
+        )
+        self.assertTrue(self.registry.is_service_admin(3003, "broadcast"))
 
     def test_bootstrap_is_idempotent_and_does_not_promote_new_env_admin(self):
         self.registry.set_group_chat(1001, "sound", -10002, enabled=True)
@@ -104,7 +241,7 @@ class ServiceRegistryTest(unittest.TestCase):
 
         self.registry.add_service_admin(1001, "sound", 3003)
         self.assertTrue(self.registry.is_service_admin(3003, "sound"))
-        self.assertFalse(self.registry.is_service_admin(3003, "slides"))
+        self.assertFalse(self.registry.is_service_admin(3003, "books"))
         self.assertEqual(self.registry.list_service_admins("sound"), [3003])
 
         self.registry.remove_service_admin(1001, "sound", 3003)
@@ -113,7 +250,7 @@ class ServiceRegistryTest(unittest.TestCase):
     def test_admins_can_be_shared_across_services_and_have_usernames(self):
         self.registry.add_service_admin(1001, "sound", 3003, "sound_user")
         self.registry.add_service_admin(1001, "sound", 4004, "@other_user")
-        self.registry.add_service_admin(1001, "slides", 3003, "sound_user")
+        self.registry.add_service_admin(1001, "books", 3003, "sound_user")
 
         self.assertEqual(
             self.registry.list_service_admin_details("sound"),
@@ -123,11 +260,11 @@ class ServiceRegistryTest(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            self.registry.list_service_admin_details("slides"),
+            self.registry.list_service_admin_details("books"),
             [{"telegram_id": 3003, "username": "sound_user"}],
         )
         self.assertTrue(self.registry.is_service_admin(3003, "sound"))
-        self.assertTrue(self.registry.is_service_admin(3003, "slides"))
+        self.assertTrue(self.registry.is_service_admin(3003, "books"))
 
     def test_existing_admin_username_can_be_refreshed_without_duplicate_audit(self):
         self.registry.add_service_admin(1001, "sound", 3003)
@@ -244,7 +381,7 @@ class ServiceRegistryTest(unittest.TestCase):
             1001, "sound", "Микшер", "Алексей", 4004
         )
         self.registry.set_responsible_contact(
-            1001, "slides", "Слайды", "Алексей", 4004
+            1001, "books", "Слайды", "Алексей", 4004
         )
 
         self.assertFalse(
@@ -260,7 +397,7 @@ class ServiceRegistryTest(unittest.TestCase):
             self.registry.get_user_notifications_enabled(4004, "sound")
         )
         self.assertFalse(
-            self.registry.get_user_notifications_enabled(4004, "slides")
+            self.registry.get_user_notifications_enabled(4004, "books")
         )
         self.assertEqual(
             self.registry.list_users_with_notifications_enabled("sound"),
@@ -331,7 +468,7 @@ class ServiceRegistryTest(unittest.TestCase):
             1001, "sound", "Микшер", "Алексей", 4004
         )
         self.registry.set_responsible_contact(
-            1001, "slides", "Слайды", "Алексей", 4004
+            1001, "books", "Слайды", "Алексей", 4004
         )
         sound_text_id = self.registry.upsert_user_text(
             4004, "sound", "Микшер", None
@@ -339,12 +476,12 @@ class ServiceRegistryTest(unittest.TestCase):
         self.registry.add_schedule(sound_text_id, 2, "09:00")
         self.registry.add_schedule(sound_text_id, 0, "18:00")
         slides_text_id = self.registry.upsert_user_text(
-            4004, "slides", "Слайды", None
+            4004, "books", "Слайды", None
         )
         self.registry.add_schedule(slides_text_id, 1, "07:00")
 
         self.assertEqual(
-            self.registry.list_user_services(4004), ["slides", "sound"]
+            self.registry.list_user_services(4004), ["books", "sound"]
         )
         self.assertEqual(
             self.registry.get_user_notifications_state(4004),
@@ -354,7 +491,7 @@ class ServiceRegistryTest(unittest.TestCase):
                 "disabled_count": 2,
                 "per_service": [
                     {
-                        "service_id": "slides",
+                        "service_id": "books",
                         "enabled": False,
                         "texts_count": 1,
                         "schedules_count": 1,
@@ -1244,7 +1381,7 @@ class ServiceRegistryTest(unittest.TestCase):
 
     def test_service_admin_can_edit_only_own_notification_settings(self):
         self.registry.add_service_admin(1001, "sound", 3003)
-        self.registry.add_service_admin(1001, "slides", 4004)
+        self.registry.add_service_admin(1001, "books", 4004)
         self.registry.set_notification_settings(
             3003,
             "sound",
@@ -1267,7 +1404,7 @@ class ServiceRegistryTest(unittest.TestCase):
         with self.assertRaises(PermissionError):
             self.registry.set_notification_settings(
                 3003,
-                "slides",
+                "books",
                 reminder_days=1,
                 reminder_time="17:00",
                 group_template="Слайды",
@@ -1312,13 +1449,13 @@ class ServiceRegistryTest(unittest.TestCase):
 
     def test_list_user_assignments_returns_linked_tasks(self):
         self.registry.set_responsible_contact(1001, "sound", "Микшер", "Анна", 2002)
-        self.registry.set_responsible_contact(1001, "slides", "Слайды", "Анна", 2002)
+        self.registry.set_responsible_contact(1001, "books", "Слайды", "Анна", 2002)
         self.registry.set_responsible_contact(1001, "sound", "Пульт", "Борис", 2003)
 
         self.assertEqual(
             self.registry.list_user_assignments(2002),
             [
-                {"service_id": "slides", "task": "Слайды", "name": "Анна"},
+                {"service_id": "books", "task": "Слайды", "name": "Анна"},
                 {"service_id": "sound", "task": "Микшер", "name": "Анна"},
             ],
         )

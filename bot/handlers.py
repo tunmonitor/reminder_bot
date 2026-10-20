@@ -47,6 +47,7 @@ from .service_registry import (
     validate_notification_template,
 )
 from .scheduler import next_reminder_occurrence
+from .services import SERVICES
 from .ui import (
     callback_text,
     clean_previous_menu,
@@ -582,13 +583,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         services: list[dict],
         operation: str,
     ) -> InlineKeyboardMarkup:
-        service_order = (
-            "assembly", "broadcast", "slides", "order",
-            "kitchen", "coffee", "sound", "rehearsal",
-        )
+        # Порядок служений — как в каталоге reminder_bot_services.json.
         service_rank = {
-            service_id: index
-            for index, service_id in enumerate(service_order)
+            service.id: index for index, service in enumerate(SERVICES)
         }
         ordered_services = sorted(
             services,
@@ -888,6 +885,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ]
             for label, operation in items
         ]
+        if is_super_admin:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text="📋 Задачи служения",
+                        callback_data=f"svc_tasks:open:{service_id}",
+                    )
+                ]
+            )
         rows.append(
             [
                 InlineKeyboardButton(
@@ -1833,6 +1839,156 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
             ]]
         )
+
+    async def show_service_tasks(
+        message: Message, actor_id: int, service_id: str,
+        notice: str | None = None,
+    ) -> None:
+        """Super-admin screen: catalog tasks of a service with on/off toggles."""
+        registry = service_registry()
+        service = service_by_id(registry, service_id) if registry else None
+        if service is None:
+            await _send_dialog(message, "Служение не найдено.", parse_mode=None)
+            return
+        await clean_and_clear_pending_actor(actor_id)
+        session_id = secrets.token_urlsafe(9)
+        pending_inputs[actor_id] = {
+            "operation": "service_tasks",
+            "service_id": service_id,
+            "session_id": session_id,
+            "step": "tasks",
+        }
+        tasks = registry.list_service_tasks(service_id)
+        lines = [f"📋 {service_label(service)} · задачи", ""]
+        if tasks:
+            for task in tasks:
+                status = "🟢" if task["enabled"] else "🔴"
+                aliases = (
+                    f" · также: {', '.join(task['aliases'])}"
+                    if task["aliases"] else ""
+                )
+                off = "" if task["enabled"] else " · выключена"
+                lines.append(
+                    f"{status} {task_emoji(task['name'])} {task['name']}"
+                    f"{off}{aliases}"
+                )
+            lines += [
+                "",
+                "ℹ️ Нажмите задачу, чтобы включить или выключить. "
+                "Выключенные задачи не читаются из графика.",
+            ]
+        else:
+            lines.append(
+                "⚪ задачи не заданы · в графике и напоминаниях служение "
+                "без деления на задачи"
+            )
+        if notice:
+            lines = [notice, ""] + lines
+        buttons = [
+            InlineKeyboardButton(
+                text=f"{'🟢' if task['enabled'] else '🔴'} {task['name']}"[:60],
+                callback_data=(
+                    f"svc_tasks:tog:{service_id}:{task['position']}:"
+                    f"{session_id}"
+                ),
+            )
+            for task in tasks
+        ]
+        rows = layout_buttons(buttons) if buttons else []
+        rows.append([
+            InlineKeyboardButton(
+                text="➕ Добавить задачу",
+                callback_data=f"svc_tasks:add:{service_id}:{session_id}",
+            )
+        ])
+        rows.append([
+            InlineKeyboardButton(
+                text="⬅️ К карточке служения",
+                callback_data=f"service:service_settings:{service_id}",
+            )
+        ])
+        await _send_dialog(
+            message,
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
+            parse_mode=None,
+        )
+
+    @admin_router.callback_query(F.data.startswith("svc_tasks:"))
+    async def on_service_tasks(callback: CallbackQuery) -> None:
+        if (
+            not callback.from_user
+            or not callback.message
+            or callback.message.chat.type != ChatType.PRIVATE
+        ):
+            await _answer_callback(callback)
+            return
+        actor_id = callback.from_user.id
+        registry = service_registry()
+        parts = callback.data.split(":")
+        action, service_id = (parts[1], parts[2]) if len(parts) >= 3 else ("", "")
+        try:
+            if registry is None or not registry.is_super_admin(actor_id):
+                await _answer_callback(callback, "❌ Недостаточно прав.")
+                return
+            if action == "open" and len(parts) == 3:
+                await show_service_tasks(callback.message, actor_id, service_id)
+                await _answer_callback(callback)
+                return
+            pending = pending_inputs.get(actor_id)
+            session_id = parts[-1]
+            if (
+                pending is None
+                or pending.get("operation") != "service_tasks"
+                or pending.get("service_id") != service_id
+                or pending.get("session_id") != session_id
+            ):
+                await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
+                return
+            if action == "tog" and len(parts) == 5:
+                position = int(parts[3])
+                task = next(
+                    (
+                        item for item in registry.list_service_tasks(service_id)
+                        if item["position"] == position
+                    ),
+                    None,
+                )
+                if task is None:
+                    raise ValueError("Задача больше не существует.")
+                registry.set_service_task_enabled(
+                    actor_id, service_id, task["name"], not task["enabled"]
+                )
+                await show_service_tasks(
+                    callback.message, actor_id, service_id,
+                    f"✅ «{task['name']}» "
+                    f"{'выключена' if task['enabled'] else 'включена'}",
+                )
+            elif action == "add" and len(parts) == 4:
+                pending["step"] = "add_task"
+                await _send_dialog(
+                    callback.message,
+                    "ℹ️ Введите название новой задачи (до 60 символов).",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(
+                            text="⬅️ Назад без изменения",
+                            callback_data=f"svc_tasks:open:{service_id}",
+                        )
+                    ]]),
+                    parse_mode=None,
+                )
+            else:
+                await _answer_callback(callback, "⚠️ Неизвестное действие.")
+                return
+        except (PermissionError, ValueError) as exc:
+            await _answer_callback(callback, _status_text(str(exc), "⚠️"))
+            return
+        except sqlite3.Error:
+            debug.exception("Не удалось изменить задачи служения")
+            await _answer_callback(callback, "❌ Ошибка базы данных.")
+            return
+        await _answer_callback(callback)
 
     async def refresh_group_reminder_jobs() -> None:
         refresh = getattr(context, "refresh_service_reminder_jobs", None)
@@ -5916,6 +6072,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         text = message.text.strip()
         try:
+            if operation == "service_tasks":
+                if pending.get("step") != "add_task":
+                    raise ValueError(
+                        "Чтобы добавить задачу, нажмите «➕ Добавить задачу»."
+                    )
+                registry.add_service_task(message.from_user.id, service_id, text)
+                await show_service_tasks(
+                    message, message.from_user.id, service_id,
+                    f"✅ Задача «{' '.join(text.split())}» добавлена",
+                )
+                return
             if operation == "service_admin_add":
                 if pending.get("step") != "await_user":
                     raise ValueError(

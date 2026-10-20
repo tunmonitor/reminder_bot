@@ -1251,7 +1251,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 67890, "sound", "Микшер", "Алексей", actor_id
             )
             self.registry.set_responsible_contact(
-                67890, "slides", "Слайды", "Алексей", actor_id
+                67890, "books", "Слайды", "Алексей", actor_id
             )
             text_id = self.registry.upsert_user_text(
                 actor_id, "sound", "Микшер", None
@@ -1313,7 +1313,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 self.registry.get_user_notifications_enabled(actor_id, "sound")
             )
             self.assertTrue(
-                self.registry.get_user_notifications_enabled(actor_id, "slides")
+                self.registry.get_user_notifications_enabled(actor_id, "books")
             )
             self.assertEqual(
                 self.registry.list_schedules(text_id), [schedule]
@@ -1375,9 +1375,11 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     for row in markup.inline_keyboard
                 ],
                 [
-                    ["assembly", "broadcast", "slides"],
-                    ["order", "kitchen", "coffee"],
-                    ["sound", "rehearsal"],
+                    ["assembly"],
+                    ["broadcast"],
+                    ["kitchen", "sound"],
+                    ["order", "office_cleaning"],
+                    ["books", "children"],
                 ],
             )
             self.assertEqual(sum(map(len, markup.inline_keyboard)), 8)
@@ -2378,11 +2380,12 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             ),
             answer=AsyncMock(),
         )
-        handler_name = (
-            "on_notification_edit_back"
-            if button.callback_data.startswith("notify_back:")
-            else "on_group_reminder_action"
-        )
+        if button.callback_data.startswith("notify_back:"):
+            handler_name = "on_notification_edit_back"
+        elif button.callback_data.startswith("svc_tasks:"):
+            handler_name = "on_service_tasks"
+        else:
+            handler_name = "on_group_reminder_action"
         await self.callback_handler(handler_name)(callback)
         return callback
 
@@ -4231,7 +4234,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 67890,
             )
             self.assertTrue(assembly.text.endswith("СОБРАНИЕ"))
-            self.assertTrue(broadcast.text.endswith("ТРАНСЛЯЦИЯ"))
+            self.assertTrue(broadcast.text.endswith("ТРАНСЛЯЦИЯ И СЛАЙДЫ"))
 
         asyncio.run(run())
 
@@ -4281,9 +4284,11 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 for item in self.admin_router.message.handlers
             }
             expected_ids = [
-                ["assembly", "broadcast", "slides"],
-                ["order", "kitchen", "coffee"],
-                ["sound", "rehearsal"],
+                ["assembly"],
+                ["broadcast"],
+                ["kitchen", "sound"],
+                ["order", "office_cleaning"],
+                ["books", "children"],
             ]
             for command_name, operation in (
                 ("/service_settings", "service_settings"),
@@ -4486,7 +4491,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
     def test_services_listing_separates_services_and_shows_admin_usernames(self):
         async def run():
             self.registry.add_service_admin(67890, "sound", 12345, "sound_admin")
-            self.registry.add_service_admin(67890, "slides", 12345, "sound_admin")
+            self.registry.add_service_admin(67890, "books", 12345, "sound_admin")
             message = self.message(67890, "/services")
 
             await self.admin_router.message.handlers[0].callback(message)
@@ -4504,13 +4509,13 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             slides_button = await self.dialog_button(
                 message,
                 lambda button: button.callback_data
-                == "service:service_settings:slides",
+                == "service:service_settings:books",
                 67890,
             )
             self.assertTrue(sound_button.text.endswith("ЗВУК"))
-            self.assertTrue(slides_button.text.endswith("СЛАЙДЫ"))
+            self.assertTrue(slides_button.text.endswith("КНИГИ"))
             self.assertTrue(self.registry.is_service_admin(12345, "sound"))
-            self.assertTrue(self.registry.is_service_admin(12345, "slides"))
+            self.assertTrue(self.registry.is_service_admin(12345, "books"))
 
         asyncio.run(run())
 
@@ -4738,7 +4743,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             new_admin_router = (
                 new_dispatcher.include_router.call_args_list[0].args[0]
             )
-            new_command = self.message(67890, "/service_chat coffee")
+            new_command = self.message(67890, "/service_chat children")
             await new_admin_router.message.handlers[4].callback(new_command)
             new_request_id = (
                 new_command.answer.await_args.kwargs["reply_markup"]
@@ -4757,7 +4762,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
             self.assertIn("не соответствует активному запросу", stale_response.answer.await_args.args[0])
             self.assertIsNone(self.registry.get_service("sound")["group_chat_id"])
-            self.assertIsNone(self.registry.get_service("coffee")["group_chat_id"])
+            self.assertIsNone(self.registry.get_service("children")["group_chat_id"])
 
         asyncio.run(run())
 
@@ -5616,12 +5621,12 @@ class ServiceManagementHandlerTest(unittest.TestCase):
     def test_bulk_enable_reports_services_that_could_not_get_a_rule(self):
         async def run():
             actor_id = 4606
-            for service_id, task in (("sound", "Микшер"), ("slides", "Слайды")):
+            for service_id, task in (("sound", "Микшер"), ("books", "Слайды")):
                 self.registry.set_responsible_contact(
                     67890, service_id, task, "Имя из расписания", actor_id
                 )
             slides_text = self.registry.upsert_user_text(
-                actor_id, "slides", "Слайды", None
+                actor_id, "books", "Слайды", None
             )
             self.registry.add_schedule(slides_text, 2, "10:00")
             self.context.load_service_task_assignments = AsyncMock(
@@ -5654,7 +5659,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 self.registry.get_user_notifications_enabled(actor_id, "sound")
             )
             self.assertFalse(
-                self.registry.get_user_notifications_enabled(actor_id, "slides")
+                self.registry.get_user_notifications_enabled(actor_id, "books")
             )
             toast = callback.answer.await_args.args[0]
             self.assertIn("ЗВУК", toast)
@@ -5850,6 +5855,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "service:service_admin_add:sound",
                     "service:service_admin_remove:sound",
                     "service:test_notify:sound",
+                    "svc_tasks:open:sound",
                     "service:back_to_services:list",
                 ],
             )
@@ -5857,6 +5863,65 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 "👤 Администраторы · ⚪ не назначены",
                 message.answer.await_args.args[0],
             )
+
+        asyncio.run(run())
+
+    def test_super_admin_toggles_and_adds_service_tasks(self):
+        async def run():
+            card = self.message(67890, "/service_settings sound")
+            await self.message_handler("on_service_settings")(card)
+            opened = SimpleNamespace(
+                data="svc_tasks:open:sound",
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_tasks")(opened)
+            screen = opened.message.answer.await_args.args[0]
+            self.assertIn("ЗВУК · задачи", screen)
+            self.assertIn("🔴 🎶 спевка · выключена", screen)
+
+            toggle = await self._click(
+                opened.message,
+                lambda button: button.text == "🔴 спевка",
+                actor_id=67890,
+            )
+            self.assertTrue(
+                next(
+                    task for task in self.registry.list_service_tasks("sound")
+                    if task["name"] == "спевка"
+                )["enabled"]
+            )
+            await self._click(
+                toggle.message,
+                lambda button: button.text == "➕ Добавить задачу",
+                actor_id=67890,
+            )
+            added = await self._type("Перевозка", actor_id=67890)
+            self.assertIn(
+                "✅ Задача «Перевозка» добавлена",
+                added.answer.await_args.args[0],
+            )
+            self.assertIn(
+                "Перевозка",
+                [task["name"] for task in self.registry.list_service_tasks("sound")],
+            )
+
+        asyncio.run(run())
+
+    def test_service_admin_cannot_open_service_tasks(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 24680)
+            callback = SimpleNamespace(
+                data="svc_tasks:open:sound",
+                from_user=SimpleNamespace(id=24680),
+                message=self.message(24680, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_tasks")(callback)
+
+            self.assertIn("Недостаточно прав", callback.answer.await_args.args[0])
+            callback.message.answer.assert_not_awaited()
 
         asyncio.run(run())
 
@@ -5914,7 +5979,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 ),
             ),
             ServiceEvent(
-                "slides", date(2026, 10, 25), (ServiceAssignment("Слайды", "Ольга"),)
+                "books", date(2026, 10, 25), (ServiceAssignment("Слайды", "Ольга"),)
             ),
             ServiceEvent(
                 "sound", date(2026, 11, 1), (ServiceAssignment("Микшер", "Олег"),)

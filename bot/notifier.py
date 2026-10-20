@@ -68,13 +68,16 @@ def build_personal_message(
 
 
 async def _notify_admin(bot: Bot, admin_id: int, text: str,
-                        debug_logger: logging.Logger) -> None:
+                        debug_logger: logging.Logger) -> bool:
+    """Отправляет предупреждение администратору; True — если доставлено."""
     try:
         await send_telegram_screen(
             bot.send_message, admin_id, f"⚠️ {text}"
         )
     except Exception:  # noqa: BLE001
         debug_logger.exception("Не удалось уведомить администратора")
+        return False
+    return True
 
 
 async def send_assignments(

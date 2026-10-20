@@ -11,10 +11,16 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from string import Formatter
+from dataclasses import replace
 from typing import Callable
 
 from .secure_fs import open_private_directory
-from .services import SERVICES
+from .services import (
+    SERVICES,
+    ServiceDefinition,
+    ServiceTask,
+    normalized_name,
+)
 
 
 GROUP_TEMPLATE_FIELDS = frozenset(
@@ -229,6 +235,23 @@ class ServiceRegistry:
                     name TEXT PRIMARY KEY
                 );
 
+                CREATE TABLE IF NOT EXISTS service_tasks (
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1
+                        CHECK (enabled IN (0, 1)),
+                    aliases_json TEXT NOT NULL DEFAULT '[]',
+                    source TEXT NOT NULL
+                        CHECK (source IN ('catalog', 'admin')),
+                    PRIMARY KEY (service_id, name)
+                );
+
+                CREATE TABLE IF NOT EXISTS catalog_migrations (
+                    name TEXT PRIMARY KEY
+                );
+
                 CREATE TABLE IF NOT EXISTS group_reminder_legacy_ids (
                     legacy_id INTEGER PRIMARY KEY,
                     reminder_id INTEGER NOT NULL
@@ -417,24 +440,7 @@ class ServiceRegistry:
                 (secrets.randbelow(2**30) + 2**30,),
             )
             now = _utc_now()
-            for service in SERVICES:
-                is_assembly = service.id == "assembly"
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO services (
-                        id, name, aliases_json, assignment_layout,
-                        group_chat_id, enabled
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        service.id,
-                        service.name,
-                        json.dumps(service.aliases, ensure_ascii=False),
-                        service.assignment_layout,
-                        assembly_group_chat_id if is_assembly else None,
-                        int(is_assembly),
-                    ),
-                )
+            self._sync_service_catalog(connection, assembly_group_chat_id)
             has_super_admin = connection.execute(
                 "SELECT 1 FROM super_admins LIMIT 1"
             ).fetchone()
@@ -467,7 +473,182 @@ class ServiceRegistry:
                     "INSERT INTO service_reminder_migrations (name) "
                     "VALUES ('legacy-reminders')"
                 )
+            self._migrate_to_service_catalog(connection)
             self._migrate_service_reminders(connection)
+
+    @staticmethod
+    def _sync_service_catalog(
+        connection: sqlite3.Connection, assembly_group_chat_id: int
+    ) -> None:
+        """Переносит каталог служений и задач из файла в БД.
+
+        Названия, синонимы и колонки задаёт файл; включение задач и задачи,
+        добавленные суперадмином, хранятся в БД и файлом не перезаписываются.
+        Служения, которых нет в каталоге, уходят в архив без удаления данных.
+        """
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(services)")
+        }
+        if "archived" not in columns:
+            connection.execute(
+                "ALTER TABLE services ADD COLUMN archived INTEGER NOT NULL "
+                "DEFAULT 0 CHECK (archived IN (0, 1))"
+            )
+        for service in SERVICES:
+            is_assembly = service.id == "assembly"
+            connection.execute(
+                """
+                INSERT INTO services (
+                    id, name, aliases_json, assignment_layout,
+                    group_chat_id, enabled
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    aliases_json = excluded.aliases_json,
+                    assignment_layout = excluded.assignment_layout,
+                    archived = 0
+                """,
+                (
+                    service.id,
+                    service.name,
+                    json.dumps(service.aliases, ensure_ascii=False),
+                    service.assignment_layout,
+                    assembly_group_chat_id if is_assembly else None,
+                    int(is_assembly),
+                ),
+            )
+            for position, task in enumerate(service.tasks):
+                connection.execute(
+                    """
+                    INSERT INTO service_tasks (
+                        service_id, name, position, enabled, aliases_json,
+                        source
+                    ) VALUES (?, ?, ?, ?, ?, 'catalog')
+                    ON CONFLICT(service_id, name) DO UPDATE SET
+                        position = excluded.position,
+                        aliases_json = excluded.aliases_json,
+                        source = 'catalog'
+                    """,
+                    (
+                        service.id,
+                        task.name,
+                        position,
+                        int(task.enabled),
+                        json.dumps(task.aliases, ensure_ascii=False),
+                    ),
+                )
+        catalog_ids = [service.id for service in SERVICES]
+        connection.execute(
+            "UPDATE services SET archived = 1, enabled = 0 "
+            f"WHERE id NOT IN ({', '.join('?' for _ in catalog_ids)})",
+            catalog_ids,
+        )
+
+    @staticmethod
+    def _migrate_to_service_catalog(connection: sqlite3.Connection) -> None:
+        """Однократно переводит данные на каталог служений и задач.
+
+        Администраторы «Слайдов» становятся администраторами «Трансляции и
+        слайдов»; задачи привязок, личных текстов и шаблонов переименовываются
+        в названия каталога по синонимам. Выполняется в общей транзакции
+        initialize() и отмечается в catalog_migrations.
+        """
+        if connection.execute(
+            "SELECT 1 FROM catalog_migrations WHERE name = 'catalog-v1'"
+        ).fetchone():
+            return
+        if connection.execute(
+            "SELECT 1 FROM services WHERE id = 'slides'"
+        ).fetchone() and connection.execute(
+            "SELECT 1 FROM services WHERE id = 'broadcast'"
+        ).fetchone():
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO service_admins (
+                    service_id, telegram_id, username, created_by, created_at
+                )
+                SELECT 'broadcast', telegram_id, username, created_by,
+                       created_at
+                FROM service_admins WHERE service_id = 'slides'
+                """
+            )
+        # Строки без задачи раньше получали название служения; в этих
+        # служениях так записывались участники «в смене».
+        legacy_tasks = {
+            ("kitchen", "кухня"): "в смене",
+            ("order", "орг. порядка"): "в смене",
+        }
+        renames: dict[tuple[str, str], str] = {}
+
+        def canonical(service_id: str, task: str) -> str | None:
+            key = (service_id, task)
+            if key not in renames:
+                normalized = normalized_name(task)
+                target = legacy_tasks.get((service_id, normalized))
+                if target is None:
+                    target = next(
+                        (
+                            row["name"]
+                            for row in connection.execute(
+                                "SELECT name, aliases_json FROM service_tasks "
+                                "WHERE service_id = ?",
+                                (service_id,),
+                            )
+                            if normalized in {
+                                normalized_name(name)
+                                for name in (
+                                    row["name"],
+                                    *json.loads(row["aliases_json"]),
+                                )
+                            }
+                        ),
+                        None,
+                    )
+                renames[key] = target
+            target = renames[key]
+            return target if target and target != task else None
+
+        for table in ("responsible_contacts", "user_reminder_texts"):
+            pairs = connection.execute(
+                f"SELECT DISTINCT service_id, task FROM {table}"
+            ).fetchall()
+            for row in pairs:
+                target = canonical(row["service_id"], row["task"])
+                if target is None:
+                    continue
+                connection.execute(
+                    f"UPDATE OR IGNORE {table} SET task = ? "
+                    "WHERE service_id = ? AND task = ?",
+                    (target, row["service_id"], row["task"]),
+                )
+                if table == "responsible_contacts":
+                    # Оставшиеся строки дублируют уже существующую привязку
+                    # того же человека к целевой задаче.
+                    connection.execute(
+                        "DELETE FROM responsible_contacts "
+                        "WHERE service_id = ? AND task = ?",
+                        (row["service_id"], row["task"]),
+                    )
+        for row in connection.execute(
+            "SELECT id, personal_templates_json FROM services "
+            "WHERE personal_templates_json IS NOT NULL"
+        ).fetchall():
+            templates = json.loads(row["personal_templates_json"])
+            renamed = {}
+            for task, template in templates.items():
+                renamed.setdefault(
+                    canonical(row["id"], task) or task, template
+                )
+            if renamed != templates:
+                connection.execute(
+                    "UPDATE services SET personal_templates_json = ? "
+                    "WHERE id = ?",
+                    (json.dumps(renamed, ensure_ascii=False), row["id"]),
+                )
+        connection.execute(
+            "INSERT INTO catalog_migrations (name) VALUES ('catalog-v1')"
+        )
 
     @staticmethod
     def _migrate_service_reminders(
@@ -624,7 +805,7 @@ class ServiceRegistry:
                 "SELECT id, name, aliases_json, assignment_layout, "
                 "group_chat_id, enabled, reminder_days, reminder_time, "
                 "group_template, personal_templates_json "
-                "FROM services ORDER BY id"
+                "FROM services WHERE archived = 0 ORDER BY id"
             ).fetchall()
             reminders = connection.execute(
                 "SELECT id, service_id, body, reminder_days, reminder_time, "
@@ -671,6 +852,107 @@ class ServiceRegistry:
             ),
             None,
         )
+
+    def list_service_tasks(self, service_id: str) -> list[dict]:
+        """Задачи служения в порядке каталога, включая выключенные."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT name, position, enabled, aliases_json, source "
+                "FROM service_tasks WHERE service_id = ? "
+                "ORDER BY position, name",
+                (service_id,),
+            ).fetchall()
+        return [
+            {
+                "name": row["name"],
+                "position": row["position"],
+                "enabled": bool(row["enabled"]),
+                "aliases": json.loads(row["aliases_json"]),
+                "source": row["source"],
+            }
+            for row in rows
+        ]
+
+    def service_catalog(self) -> tuple[ServiceDefinition, ...]:
+        """Каталог из файла с задачами в состоянии из БД (для парсера)."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT service_id, name, enabled, aliases_json "
+                "FROM service_tasks ORDER BY service_id, position, name"
+            ).fetchall()
+        tasks: dict[str, list[ServiceTask]] = {}
+        for row in rows:
+            tasks.setdefault(row["service_id"], []).append(
+                ServiceTask(
+                    row["name"],
+                    tuple(json.loads(row["aliases_json"])),
+                    bool(row["enabled"]),
+                )
+            )
+        return tuple(
+            replace(service, tasks=tuple(tasks.get(service.id, ())))
+            for service in SERVICES
+        )
+
+    def set_service_task_enabled(
+        self, actor_id: int, service_id: str, task: str, enabled: bool
+    ) -> None:
+        _validate_positive_id(actor_id, "actor_id")
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled должен быть логическим значением")
+        with self._connection() as connection:
+            self._require_super_admin(connection, actor_id)
+            self._require_service(connection, service_id)
+            cursor = connection.execute(
+                "UPDATE service_tasks SET enabled = ? "
+                "WHERE service_id = ? AND name = ?",
+                (int(enabled), service_id, task),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(f"Задача «{task}» не найдена.")
+            self._audit(
+                connection, actor_id, "service_task_updated", service_id,
+                {"task": task, "enabled": enabled},
+            )
+
+    def add_service_task(
+        self, actor_id: int, service_id: str, name: str
+    ) -> None:
+        _validate_positive_id(actor_id, "actor_id")
+        name = " ".join(name.split()) if isinstance(name, str) else ""
+        if not name or len(name) > 60 or "\x00" in name:
+            raise ValueError("Название задачи: от 1 до 60 символов.")
+        with self._connection() as connection:
+            self._require_super_admin(connection, actor_id)
+            self._require_service(connection, service_id)
+            existing = connection.execute(
+                "SELECT name, aliases_json, position FROM service_tasks "
+                "WHERE service_id = ?",
+                (service_id,),
+            ).fetchall()
+            key = normalized_name(name)
+            for row in existing:
+                if key in {
+                    normalized_name(value)
+                    for value in (row["name"], *json.loads(row["aliases_json"]))
+                }:
+                    raise ValueError(
+                        f"Задача «{name}» уже есть: «{row['name']}»."
+                    )
+            connection.execute(
+                "INSERT INTO service_tasks "
+                "(service_id, name, position, enabled, source) "
+                "VALUES (?, ?, ?, 1, 'admin')",
+                (
+                    service_id,
+                    name,
+                    max((row["position"] for row in existing), default=-1) + 1,
+                ),
+            )
+            self._audit(
+                connection, actor_id, "service_task_added", service_id,
+                {"task": name},
+            )
 
     def is_super_admin(self, telegram_id: int) -> bool:
         with self._connection() as connection:
@@ -2428,7 +2710,8 @@ class ServiceRegistry:
         connection: sqlite3.Connection, service_id: str
     ) -> None:
         if connection.execute(
-            "SELECT 1 FROM services WHERE id = ?", (service_id,)
+            "SELECT 1 FROM services WHERE id = ? AND archived = 0",
+            (service_id,),
         ).fetchone() is None:
             raise ValueError(f"Неизвестное служение: {service_id}")
 

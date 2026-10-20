@@ -94,8 +94,26 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   `ОКТЯБРЬ26`. Schedule dates are in column A; task names and assignees are in
   columns A and B. The `Списки` sheet contains task headers in A and contact
   name, username, and Telegram ID in A, B, and C.
-- Task aliases are case-insensitive: `ХКЦ` → `Ответственный`; `Ведущий` or
-  `Ведет` → `Ведущий`; `Проповедует` or `Проповедет` → `Проповедник`.
+- Services, tasks, and month-sheet columns come from
+  `reminder_bot_services.json` (`bot/services.py` validates it at import).
+  `parse_service_events(..., services)` maps column headers to services,
+  merges several columns of one service into one event per date, renames
+  tasks to catalog names via aliases (`normalized_name`), silently drops
+  disabled tasks (and columns whose fixed task is disabled), and reports
+  unknown tasks in `ServiceEvent.issues`. Pass
+  `registry.service_catalog()` so super-admin task toggles apply.
+- `ServiceRegistry.initialize` syncs the catalog into `services` /
+  `service_tasks`; services missing from the file are archived, never
+  deleted, and `list_services` hides them. Task enable state and
+  admin-added tasks live only in SQLite. Migration `catalog-v1` renames
+  stored task names once.
+- The legacy assembly role flow (`parse_schedule`/`parse_people`) keeps its
+  own aliases: `ХКЦ` → `Ответственный`; `Ведущий`/`Ведет` → `Ведущий`;
+  `Проповедует`/`Проповедет` → `Проповедник`.
+- Rows without a task continue the previous task until an empty name cell,
+  another task, a marker, or a date; before the first task they belong to
+  the column task or the service. A row starting with `КОММЕНТАРИИ` and the
+  first Sunday of another month end the sheet.
 - Informational tasks may be marked with a leading `*`, `[...]`, or `[*]`.
   They remain available to group templates as `{informational_notes}`, but
   are excluded from responsible-contact selection, personal reminders, and
