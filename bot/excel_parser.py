@@ -960,6 +960,37 @@ def parse_service_rosters(
                         continue
                     text = _clean(row[column])
                     if not text:
+                        # Username/ID рядом с пустым именем — не люди. Без
+                        # имени username узнаём только по «@» или по ID
+                        # правее (латинское имя или задача — не username).
+                        def cell(offset):
+                            neighbour = column + offset
+                            if (
+                                neighbour < end
+                                and neighbour < len(row)
+                                and (row_index, neighbour) not in consumed
+                            ):
+                                return _clean(row[neighbour])
+                            return ""
+                        has_id = _telegram_id(cell(2)) is not None if cell(2) else False
+                        username_cell = cell(1)
+                        has_username = bool(
+                            username_cell
+                            and _USERNAME_CELL.fullmatch(username_cell)
+                            and normalized_name(username_cell) not in task_by_key
+                            and (username_cell.startswith("@") or has_id)
+                        )
+                        if has_username:
+                            consumed.add((row_index, column + 1))
+                        if has_id:
+                            consumed.add((row_index, column + 2))
+                        orphan = has_username or has_id
+                        if orphan:
+                            issues.append(
+                                f"«Списки», {service.name}: строка "
+                                f"{row_index + 1} — username/Telegram ID без "
+                                "имени"
+                            )
                         continue
                     task = task_by_key.get(normalized_name(text))
                     if task is not None:

@@ -252,6 +252,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 issues.extend([
                     "«Списки», Звук: «Иван» указан без задачи",
                     "«Списки», Кухня: «Анна» указан без задачи",
+                    "«Списки»: служение «Хор» не найдено в каталоге",
                 ])
                 return {"sound": [RosterMember("Иван", ("звук",), "", 7007)]}
 
@@ -263,6 +264,16 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     None, logger, issues,
                 )
             self.assertEqual(issues, ["«Списки», Звук: «Иван» указан без задачи"])
+            assembly_issues = []
+            with patch.object(app, "parse_service_rosters", side_effect=parse):
+                app._sync_rosters_and_contacts(
+                    registry, Path(tmp_dir) / "x.xlsx", "assembly", {}, None,
+                    logger, assembly_issues,
+                )
+            self.assertEqual(
+                assembly_issues,
+                ["«Списки»: служение «Хор» не найдено в каталоге"],
+            )
             tasks = sorted(
                 contact["task"]
                 for contact in registry.list_responsible_contacts(1001, "sound")

@@ -489,18 +489,57 @@ class ServiceRegistryTest(unittest.TestCase):
                 ("спевка", 5005, "maria_x"),
             ],
         )
-        self.registry.bind_service_member(1001, "sound", "Пётр", 5005)
-        holders = [
-            member["name"]
-            for member in self.registry.list_service_members("sound")
-            if member["telegram_id"] == 5005
-        ]
-        self.assertEqual(holders, ["Пётр"])
-        self.registry.add_service_member(1001, "sound", "  Новый   Человек ")
-        with self.assertRaisesRegex(ValueError, "уже есть"):
-            self.registry.add_service_member(1001, "sound", "Новый Человек")
+        self.registry.bind_service_member(1001, "sound", "  Новый   Человек ", 7007)
+        self.assertIn(
+            "Новый Человек",
+            [m["name"] for m in self.registry.list_service_members("sound")],
+        )
+        with self.assertRaisesRegex(ValueError, "от 1 до 60"):
+            self.registry.bind_service_member(1001, "sound", "  ", 7007)
         with self.assertRaises(PermissionError):
             self.registry.bind_service_member(2002, "sound", "Мария", 6006)
+
+    def test_rebinding_one_task_moves_all_tasks_of_the_name(self):
+        self.registry.set_responsible_contact(1001, "sound", "звук", "Олег", 2002)
+        self.registry.set_responsible_contact(1001, "sound", "сборка", "Олег", 2002)
+
+        self.registry.set_responsible_contact(
+            1001, "sound", "звук", "Олег", 3003, "oleg_new"
+        )
+
+        contacts = sorted(
+            (contact["task"], contact["telegram_id"])
+            for contact in self.registry.list_responsible_contacts(1001, "sound")
+            if contact["name"] == "Олег"
+        )
+        self.assertEqual(contacts, [("звук", 3003), ("сборка", 3003)])
+
+    def test_renamed_person_binding_follows_schedule_name(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.set_responsible_contact(1001, "sound", "звук", "Саша", 2002)
+        self.registry.bind_service_member(1001, "sound", "Александр", 2002)
+        self.registry.set_responsible_contact(1001, "sound", "сборка", "Шура", 2002)
+        self.registry.ensure_member_contacts("sound", {"сборка": ["Александр"]})
+        self.assertIn(
+            ("сборка", "Шура"),
+            [
+                (c["task"], c["name"])
+                for c in self.registry.list_responsible_contacts(1001, "sound")
+            ],
+        )
+        self.registry.sync_service_rosters(
+            {"sound": [RosterMember("Александр", ("звук",))]}
+        )
+
+        self.registry.ensure_member_contacts("sound", {"звук": ["Александр"]})
+
+        names = [
+            contact["name"]
+            for contact in self.registry.list_responsible_contacts(1001, "sound")
+            if contact["task"] == "звук"
+        ]
+        self.assertEqual(names, ["Александр"])
 
     def test_bootstrap_is_idempotent_and_does_not_promote_new_env_admin(self):
         self.registry.set_group_chat(1001, "sound", -10002, enabled=True)

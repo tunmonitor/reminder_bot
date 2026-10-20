@@ -705,6 +705,11 @@ class ExcelParserTest(unittest.TestCase):
         sheet.append(["Пётр"])
         sheet.append(["спевка"])
         sheet.append(["Иван"])
+        sheet["G1"] = "Книги"
+        sheet["G2"] = "Ольга"
+        sheet["H3"] = "@lost_user"
+        sheet["I3"] = 99999
+        sheet["H4"] = "Daniel"
         workbook.save(self.path)
         issues = []
 
@@ -724,10 +729,14 @@ class ExcelParserTest(unittest.TestCase):
         )
         self.assertNotIn("order", rosters)
         self.assertEqual(
+            [member.name for member in rosters["books"]], ["Ольга", "Daniel"]
+        )
+        self.assertEqual(
             issues,
             [
                 "«Списки», Звук: в строке задачи «звук» указаны "
-                "username/Telegram ID без имени"
+                "username/Telegram ID без имени",
+                "«Списки», Книги: строка 3 — username/Telegram ID без имени",
             ],
         )
 

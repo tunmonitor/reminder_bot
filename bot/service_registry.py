@@ -2055,7 +2055,11 @@ class ServiceRegistry:
         telegram_id: int,
         username: str = "",
     ) -> None:
-        """Привязывает Telegram к имени в одной задаче (и к человеку)."""
+        """Привязывает Telegram к имени в задаче и ко всем задачам этого имени.
+
+        Привязка — к человеку: прежний Telegram ID этого имени в других
+        задачах заменяется, чтобы у человека не осталось двух ID.
+        """
         _validate_positive_id(actor_id, "actor_id")
         _validate_positive_id(telegram_id, "telegram_id")
         task = task.strip()
@@ -2065,10 +2069,19 @@ class ServiceRegistry:
         with self._connection() as connection:
             self._require_super_admin(connection, actor_id)
             self._require_service(connection, service_id)
-            self._write_contact(
-                connection, actor_id, service_id, task, name, telegram_id,
-                username.strip().lstrip("@"),
-            )
+            other_tasks = [
+                row["task"]
+                for row in connection.execute(
+                    "SELECT DISTINCT task FROM responsible_contacts "
+                    "WHERE service_id = ? AND name = ? AND task != ?",
+                    (service_id, name, task),
+                )
+            ]
+            for contact_task in (task, *other_tasks):
+                self._write_contact(
+                    connection, actor_id, service_id, contact_task, name,
+                    telegram_id, username.strip().lstrip("@"),
+                )
             connection.execute(
                 """
                 INSERT INTO service_members (
@@ -2084,9 +2097,6 @@ class ServiceRegistry:
                     service_id, name, telegram_id,
                     username.strip().lstrip("@"), _utc_now(),
                 ),
-            )
-            self._release_member_telegram(
-                connection, service_id, name, telegram_id
             )
             self._cleanup_unbound_user_data(connection, service_id)
             self._audit(
@@ -2247,33 +2257,6 @@ class ServiceRegistry:
                         connection, service_id, member.name, member.tasks
                     )
 
-    def add_service_member(
-        self, actor_id: int, service_id: str, name: str
-    ) -> None:
-        """Добавляет человека не из «Списков» (суперадмин)."""
-        _validate_positive_id(actor_id, "actor_id")
-        name = " ".join(name.split()) if isinstance(name, str) else ""
-        if not name or len(name) > 60 or "\x00" in name:
-            raise ValueError("Имя участника: от 1 до 60 символов.")
-        with self._connection() as connection:
-            self._require_super_admin(connection, actor_id)
-            self._require_service(connection, service_id)
-            if connection.execute(
-                "SELECT 1 FROM service_members "
-                "WHERE service_id = ? AND name = ?",
-                (service_id, name),
-            ).fetchone():
-                raise ValueError(f"«{name}» уже есть в составе служения.")
-            connection.execute(
-                "INSERT INTO service_members (service_id, name, source, "
-                "updated_at) VALUES (?, ?, 'manual', ?)",
-                (service_id, name, _utc_now()),
-            )
-            self._audit(
-                connection, actor_id, "service_member_added", service_id,
-                {"name": name},
-            )
-
     def bind_service_member(
         self,
         actor_id: int,
@@ -2290,9 +2273,7 @@ class ServiceRegistry:
         """
         _validate_positive_id(actor_id, "actor_id")
         _validate_positive_id(telegram_id, "telegram_id")
-        name = name.strip() if isinstance(name, str) else ""
-        if not name:
-            raise ValueError("Имя ответственного обязательно")
+        name = normalize_member_name(name)
         username = username.strip().lstrip("@")
         with self._connection() as connection:
             self._require_super_admin(connection, actor_id)
@@ -2319,9 +2300,6 @@ class ServiceRegistry:
                     (telegram_id, username, now, service_id, name),
                 )
                 roster_tasks = json.loads(member["tasks_json"])
-            self._release_member_telegram(
-                connection, service_id, name, telegram_id
-            )
             bound_tasks = [
                 row["task"]
                 for row in connection.execute(
@@ -2342,20 +2320,6 @@ class ServiceRegistry:
                 {"name": name, "telegram_id": telegram_id, "tasks": all_tasks},
             )
 
-    @staticmethod
-    def _release_member_telegram(
-        connection: sqlite3.Connection,
-        service_id: str,
-        name: str,
-        telegram_id: int,
-    ) -> None:
-        """Один Telegram ID — у одного человека служения."""
-        connection.execute(
-            "UPDATE service_members SET telegram_id = NULL, username = '' "
-            "WHERE service_id = ? AND telegram_id = ? AND name != ?",
-            (service_id, telegram_id, name),
-        )
-
     def ensure_member_contacts(self, service_id: str, assignments) -> None:
         """Создаёт привязки «задача + имя» для привязанных людей служения.
 
@@ -2373,13 +2337,22 @@ class ServiceRegistry:
                     names = info
                 for name in names:
                     self._ensure_member_task_contacts(
-                        connection, service_id, name, (task,)
+                        connection, service_id, name, (task,),
+                        scheduled_names=names,
                     )
 
     @staticmethod
     def _ensure_member_task_contacts(
-        connection: sqlite3.Connection, service_id: str, name: str, tasks
+        connection: sqlite3.Connection,
+        service_id: str,
+        name: str,
+        tasks,
+        scheduled_names=None,
     ) -> None:
+        """scheduled_names — имена задачи в графике. Привязка этого Telegram
+        под другим именем, которого в графике задачи уже нет (человека
+        переименовали), переходит на имя из графика.
+        """
         member = connection.execute(
             "SELECT telegram_id, username FROM service_members "
             "WHERE service_id = ? AND name = ? AND telegram_id IS NOT NULL",
@@ -2391,6 +2364,23 @@ class ServiceRegistry:
             "SELECT telegram_id FROM super_admins ORDER BY created_at LIMIT 1"
         ).fetchone()
         for task in tasks:
+            if scheduled_names is not None:
+                # Переименование подтверждают «Списки»: новое имя в списке,
+                # старого там нет. Иначе (варианты написания, разные даты)
+                # привязка не переходит между именами.
+                connection.execute(
+                    "UPDATE OR IGNORE responsible_contacts SET name = ? "
+                    "WHERE service_id = ? AND task = ? AND telegram_id = ? "
+                    f"AND name NOT IN ({', '.join('?' for _ in scheduled_names)}) "
+                    "AND name NOT IN (SELECT name FROM service_members "
+                    "WHERE service_id = ? AND in_list = 1) "
+                    "AND EXISTS (SELECT 1 FROM service_members "
+                    "WHERE service_id = ? AND name = ? AND in_list = 1)",
+                    (
+                        name, service_id, task, member["telegram_id"],
+                        *scheduled_names, service_id, service_id, name,
+                    ),
+                )
             connection.execute(
                 """
                 INSERT OR IGNORE INTO responsible_contacts (
@@ -3245,6 +3235,14 @@ def _move_user_text(
 def _validate_positive_id(value: int, field: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{field} должен быть положительным целым числом")
+
+
+def normalize_member_name(name) -> str:
+    """Имя участника служения: пробелы схлопываются, 1–60 символов."""
+    name = " ".join(name.split()) if isinstance(name, str) else ""
+    if not name or len(name) > 60 or "\x00" in name:
+        raise ValueError("Имя участника: от 1 до 60 символов.")
+    return name
 
 
 def _utc_now() -> str:

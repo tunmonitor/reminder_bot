@@ -539,10 +539,14 @@ def _sync_rosters_and_contacts(
         debug_logger.exception("Не удалось обновить состав служений из «Списков»")
     else:
         service = registry.get_service(service_id)
-        prefix = f"«Списки», {service['name']}:" if service else None
-        if issues is not None and prefix:
+        prefixes = (f"«Списки», {service['name']}:",) if service else ()
+        if service_id == "assembly":
+            # Проблемы листа в целом (неизвестное служение) — один раз,
+            # вместе с Собранием, а не в каждом служении.
+            prefixes += ("«Списки»:",)
+        if issues is not None and prefixes:
             issues.extend(
-                issue for issue in roster_issues if issue.startswith(prefix)
+                issue for issue in roster_issues if issue.startswith(prefixes)
             )
     try:
         registry.ensure_member_contacts(service_id, assignments)

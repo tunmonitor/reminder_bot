@@ -44,6 +44,7 @@ from .ui import code as ui_code
 from .service_registry import (
     GROUP_TEMPLATE_FIELDS,
     PERSONAL_TEMPLATE_FIELDS,
+    normalize_member_name,
     validate_notification_template,
 )
 from .scheduler import next_reminder_occurrence
@@ -6455,9 +6456,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     )
                     return
                 if step == "await_member_name":
-                    name = " ".join(text.split())
-                    if not name or len(name) > 60 or name.startswith("/"):
-                        raise ValueError("Имя участника: от 1 до 60 символов.")
+                    name = normalize_member_name(text)
                     await offer_contact_user_selection(
                         message, message.from_user.id, service_id, None, name
                     )
