@@ -567,55 +567,6 @@ class ReminderBotEntrypointTest(unittest.TestCase):
 
         asyncio.run(process())
 
-    def test_personal_reminder_matches_name_from_other_task_binding(self):
-        from bot import app
-        from bot.service_registry import ServiceRegistry
-
-        async def process():
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
-                registry.initialize(1001, -10001)
-                registry.set_group_chat(1001, "kitchen", -10055, enabled=True)
-                registry.set_responsible_contact(
-                    1001, "kitchen", "в смене", "Ольга", 2002
-                )
-                registry.set_responsible_contact(
-                    1001, "kitchen", "Кухня", "Оля", 2002
-                )
-                registry.set_user_notifications_enabled(2002, "kitchen", True)
-                text_id = registry.upsert_user_text(
-                    2002, "kitchen", "в смене", None
-                )
-                schedule = registry.add_schedule(text_id, 1, "18:00")
-                bot = SimpleNamespace(
-                    send_message=AsyncMock(
-                        return_value=SimpleNamespace(message_id=55)
-                    )
-                )
-                with patch.object(
-                    app,
-                    "_load_service_task_assignments",
-                    new=AsyncMock(return_value=({"в смене": ["Оля"]}, True)),
-                ):
-                    await app._process_user_reminder_schedule(
-                        bot,
-                        SimpleNamespace(admin_tg_id=1001),
-                        Path(tmp_dir),
-                        ZoneInfo("UTC"),
-                        registry,
-                        schedule["id"],
-                        MagicMock(),
-                        MagicMock(),
-                        run_date=date(2026, 10, 17),
-                    )
-
-                self.assertEqual(bot.send_message.await_count, 1)
-                self.assertEqual(
-                    bot.send_message.await_args.args[0], 2002
-                )
-
-        asyncio.run(process())
-
     def test_user_text_with_three_schedules_sends_once_per_enabled_rule(self):
         from bot import app
         from bot.service_registry import ServiceRegistry

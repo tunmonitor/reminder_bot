@@ -2801,8 +2801,7 @@ def _move_contact(
     Если та же привязка (тот же человек с тем же именем) уже есть — старая
     строка удаляется как дубль. Если под целевой задачей то же имя
     принадлежит другому человеку или этот человек записан под другим
-    именем, старая строка остаётся как есть: ничьё имя не теряется, а
-    поиск привязки по имени внутри служения её находит.
+    именем, старая строка остаётся как есть: ничья привязка не удаляется.
     """
     conflict = connection.execute(
         "SELECT telegram_id, name FROM responsible_contacts "
@@ -2835,13 +2834,22 @@ def _move_user_text(
 ) -> None:
     """Переносит личный текст под (service_id, task) вместе с правилами.
 
-    Если у пользователя уже есть текст под целевой задачей, правила
-    переходят к нему (свой текст сохраняется, если у цели его нет), а
-    старая запись удаляется.
+    Текст переезжает только вслед за привязкой пользователя к целевой
+    задаче (_move_contact выполняется раньше): иначе текст и правила
+    остаются рядом со своей привязкой под старым названием. Если у
+    пользователя уже есть текст под целевой задачей, правила переходят к
+    нему (свой текст сохраняется, если у цели его нет), а старая запись
+    удаляется.
     """
     row = connection.execute(
         "SELECT * FROM user_reminder_texts WHERE id = ?", (text_id,)
     ).fetchone()
+    if connection.execute(
+        "SELECT 1 FROM responsible_contacts "
+        "WHERE service_id = ? AND task = ? AND telegram_id = ?",
+        (service_id, task, row["actor_id"]),
+    ).fetchone() is None:
+        return
     target = connection.execute(
         "SELECT id, body FROM user_reminder_texts "
         "WHERE actor_id = ? AND service_id = ? AND task = ? AND id != ?",

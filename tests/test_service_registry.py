@@ -233,6 +233,9 @@ class ServiceRegistryTest(unittest.TestCase):
 
     def test_migration_merges_personal_rules_of_alias_and_canonical_task(self):
         with sqlite3.connect(self.path) as connection:
+            connection.execute(*self._contact(
+                "assembly", "Проповедник", "Иван", 4001
+            ))
             connection.execute(
                 "INSERT INTO user_reminder_texts (id, actor_id, service_id, "
                 "task, body) VALUES (901, 4001, 'assembly', 'Проповедник', "
@@ -260,6 +263,36 @@ class ServiceRegistryTest(unittest.TestCase):
             ],
             [(2, "10:00")],
         )
+
+    def test_migration_keeps_text_with_binding_left_under_old_task(self):
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(*self._contact(
+                "assembly", "Проповедник", "Иван", 4001
+            ))
+            connection.execute(*self._contact(
+                "assembly", "Проповедь", "Иван", 4009
+            ))
+            connection.execute(
+                "INSERT INTO user_reminder_texts (id, actor_id, service_id, "
+                "task) VALUES (903, 4001, 'assembly', 'Проповедник')"
+            )
+            connection.execute(
+                "INSERT INTO user_reminder_schedules (text_id, reminder_days, "
+                "reminder_time) VALUES (903, 2, '10:00')"
+            )
+        self._rerun_catalog_migration()
+
+        self.assertEqual(
+            self.registry.list_user_tasks(4001, "assembly"), ["Проповедник"]
+        )
+        self.assertEqual(
+            [
+                (text["id"], text["task"])
+                for text in self.registry.list_user_texts(4001, "assembly")
+            ],
+            [(903, "Проповедник")],
+        )
+        self.assertEqual(len(self.registry.list_schedules(903)), 1)
 
     def test_migration_moves_slides_people_to_broadcast(self):
         self._rerun_catalog_migration(

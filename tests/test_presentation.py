@@ -1,28 +1,10 @@
 import unittest
 
-from bot.presentation import format_task_assignments, index_contacts
+from bot.presentation import format_task_assignments
 from bot.ui import plain_text, render_screen_chunks, user_link
 
 
 class FormatTaskAssignmentsTest(unittest.TestCase):
-    def test_contact_bound_under_other_task_is_found_by_name(self):
-        contacts = index_contacts([
-            {"task": "Кухня", "name": "Оля", "telegram_id": 4030,
-             "username": "olya"},
-            {"task": "в смене", "name": "Ольга", "telegram_id": 4030,
-             "username": "olya"},
-        ])
-
-        text = format_task_assignments(
-            {"в смене": {"names": ["Оля", "Ольга"]}},
-            contacts,
-            mark_unlinked=True,
-        )
-
-        self.assertNotIn("не привязан", plain_text(text))
-        self.assertIn(user_link(4030, "Оля (@olya)"), text)
-        self.assertIn(user_link(4030, "Ольга (@olya)"), text)
-
     def setUp(self):
         self.assignments = {
             "Микшер": {"names": ["Алексей", "Мария", "Иван", "Олег"]},
