@@ -39,6 +39,7 @@ if __package__:
         SheetEmptyError,
         SheetNotFoundError,
         parse_service_events,
+        parse_service_rosters,
         resolve_assignments,
     )
     from .handlers import register
@@ -95,6 +96,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         SheetEmptyError,
         SheetNotFoundError,
         parse_service_events,
+        parse_service_rosters,
         resolve_assignments,
     )
     from bot.handlers import register
@@ -446,8 +448,13 @@ async def _load_service_task_assignments(
     return_event_found: bool = False,
     services=None,
     issues: list[str] | None = None,
+    registry: ServiceRegistry | None = None,
 ) -> dict[str, dict[str, object]] | tuple[dict[str, dict[str, object]], bool]:
-    """Назначения служения из графика; issues пополняется предупреждениями."""
+    """Назначения служения из графика; issues пополняется предупреждениями.
+
+    С registry заодно обновляется состав служений из «Списков», а люди,
+    уже привязанные к Telegram, получают привязки к новым задачам графика.
+    """
     sunday_date = only_date or _next_sunday_in_tz(tz)
     debug_dir = shm_dir / "debug"
     directory_fd = open_private_directory(debug_dir, create=True)
@@ -500,11 +507,47 @@ async def _load_service_task_assignments(
             }
             for task, task_info in sorted(assignments.items())
         }
+        if registry is not None:
+            _sync_rosters_and_contacts(
+                registry, xlsx_path, service_id, result, services,
+                debug_logger, issues,
+            )
         if return_event_found:
             return result, event_found
         return result
     finally:
         xlsx_path.unlink(missing_ok=True)
+
+
+def _sync_rosters_and_contacts(
+    registry: ServiceRegistry,
+    xlsx_path: Path,
+    service_id: str,
+    assignments: dict,
+    services,
+    debug_logger,
+    issues: list[str] | None,
+) -> None:
+    """Сбой «Списков» не мешает напоминаниям: он только записывается в лог."""
+    roster_issues: list[str] = []
+    try:
+        rosters = parse_service_rosters(
+            xlsx_path, debug_logger, services, roster_issues
+        )
+        registry.sync_service_rosters(rosters)
+    except Exception:
+        debug_logger.exception("Не удалось обновить состав служений из «Списков»")
+    else:
+        service = registry.get_service(service_id)
+        prefix = f"«Списки», {service['name']}:" if service else None
+        if issues is not None and prefix:
+            issues.extend(
+                issue for issue in roster_issues if issue.startswith(prefix)
+            )
+    try:
+        registry.ensure_member_contacts(service_id, assignments)
+    except Exception:
+        debug_logger.exception("Не удалось дополнить привязки участников служения")
 
 
 async def _load_upcoming_service_events(
@@ -614,6 +657,7 @@ async def get_group_reminder_preview(
             only_date=event_date,
             return_event_found=True,
             services=registry.service_catalog(),
+            registry=registry,
         )
     except Exception:
         debug_logger.exception(
@@ -718,6 +762,7 @@ async def _process_service_reminder(
             return_event_found=True,
             services=registry.service_catalog(),
             issues=schedule_issues,
+            registry=registry,
         )
     except Exception as exc:
         debug_logger.exception(
@@ -932,6 +977,7 @@ async def _process_user_reminder_schedule(
             only_date=event_date,
             return_event_found=True,
             services=registry.service_catalog(),
+            registry=registry,
         )
     except Exception as exc:
         debug_logger.exception(
@@ -1130,6 +1176,7 @@ async def _prepare_service_test_previews(
         debug_logger,
         only_date=sunday_date,
         services=registry.service_catalog(),
+        registry=registry,
     )
     contacts = registry.list_responsible_contacts(
         credentials.admin_tg_id, service_id
@@ -1492,6 +1539,7 @@ async def _run_locked(args: CliArgs) -> None:
                     service_registry.service_catalog()
                     if service_registry is not None else None
                 ),
+                registry=service_registry,
             )
 
         async def prepare_service_test_previews(

@@ -404,6 +404,104 @@ class ServiceRegistryTest(unittest.TestCase):
             [("звук", 0), ("сборка", 1), ("спевка", 2), ("Перевозка", 3)],
         )
 
+    def test_roster_sync_keeps_bot_bindings_and_skips_noop_writes(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.set_responsible_contact(
+            1001, "sound", "звук", "Алексей", 2002, "alex_bot"
+        )
+        rosters = {
+            "sound": [
+                RosterMember("Алексей", ("звук", "сборка"), "alex_file", 3003),
+                RosterMember("Пётр", ("сборка",), "petr_file", 4004),
+            ]
+        }
+        self.registry.sync_service_rosters(rosters)
+
+        members = {
+            member["name"]: member
+            for member in self.registry.list_service_members("sound")
+        }
+        self.assertEqual(members["Алексей"]["telegram_id"], 2002)
+        self.assertEqual(members["Алексей"]["username"], "alex_bot")
+        self.assertEqual(members["Алексей"]["tasks"], ["звук", "сборка"])
+        self.assertTrue(members["Алексей"]["in_list"])
+        self.assertEqual(members["Пётр"]["telegram_id"], 4004)
+        contacts = {
+            (contact["task"], contact["name"]): contact["telegram_id"]
+            for contact in self.registry.list_responsible_contacts(
+                1001, "sound"
+            )
+        }
+        self.assertEqual(contacts[("сборка", "Алексей")], 2002)
+        self.assertEqual(contacts[("сборка", "Пётр")], 4004)
+
+        changes = []
+        self.registry.on_change = lambda: changes.append(True)
+        self.registry.sync_service_rosters(rosters)
+        self.assertEqual(changes, [])
+
+        self.registry.sync_service_rosters({"sound": rosters["sound"][1:]})
+        members = {
+            member["name"]: member
+            for member in self.registry.list_service_members("sound")
+        }
+        self.assertFalse(members["Алексей"]["in_list"])
+        self.registry.sync_service_rosters({"kitchen": []})
+        self.assertTrue(
+            any(m["in_list"] for m in self.registry.list_service_members("sound"))
+        )
+        self.registry.sync_service_rosters({"sound": []})
+        self.assertFalse(
+            any(m["in_list"] for m in self.registry.list_service_members("sound"))
+        )
+
+    def test_member_binding_and_schedule_tasks(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.sync_service_rosters(
+            {"sound": [RosterMember("Мария", ("звук",))]}
+        )
+        self.registry.bind_service_member(
+            1001, "sound", "Мария", 5005, "@maria_x", tasks=("сборка",)
+        )
+        self.registry.ensure_member_contacts(
+            "sound",
+            {
+                "спевка": {"names": ["Мария"], "is_informational": False},
+                "Праздник": {"names": ["Мария"], "is_informational": True},
+                "звук": ["Кто-то"],
+            },
+        )
+
+        contacts = sorted(
+            (contact["task"], contact["telegram_id"], contact["username"])
+            for contact in self.registry.list_responsible_contacts(
+                1001, "sound"
+            )
+            if contact["name"] == "Мария"
+        )
+        self.assertEqual(
+            contacts,
+            [
+                ("звук", 5005, "maria_x"),
+                ("сборка", 5005, "maria_x"),
+                ("спевка", 5005, "maria_x"),
+            ],
+        )
+        self.registry.bind_service_member(1001, "sound", "Пётр", 5005)
+        holders = [
+            member["name"]
+            for member in self.registry.list_service_members("sound")
+            if member["telegram_id"] == 5005
+        ]
+        self.assertEqual(holders, ["Пётр"])
+        self.registry.add_service_member(1001, "sound", "  Новый   Человек ")
+        with self.assertRaisesRegex(ValueError, "уже есть"):
+            self.registry.add_service_member(1001, "sound", "Новый Человек")
+        with self.assertRaises(PermissionError):
+            self.registry.bind_service_member(2002, "sound", "Мария", 6006)
+
     def test_bootstrap_is_idempotent_and_does_not_promote_new_env_admin(self):
         self.registry.set_group_chat(1001, "sound", -10002, enabled=True)
 

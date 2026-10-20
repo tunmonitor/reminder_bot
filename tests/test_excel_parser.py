@@ -16,6 +16,7 @@ from bot.excel_parser import (
     parse_people,
     parse_schedule,
     parse_service_events as parse_with_catalog,
+    parse_service_rosters,
     resolve_assignments,
 )
 from bot.services import SERVICES, parse_catalog
@@ -690,6 +691,44 @@ class ExcelParserTest(unittest.TestCase):
         self.assertEqual(
             [event.event_date for event in events],
             [date(2026, 10, 4), date(2026, 10, 11), date(2026, 10, 18)],
+        )
+
+    def test_service_rosters_read_task_blocks_and_contacts(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Списки"
+        sheet.append(["Звук", None, None, "Кухня"])
+        sheet.append(["звук", "@orphan_user", None, "старший"])
+        sheet.append(["Алексей", "@alex_sound", 11111, "Мария"])
+        sheet.append(["Перевозка + сборка"])
+        sheet.append(["Алексей"])
+        sheet.append(["Пётр"])
+        sheet.append(["спевка"])
+        sheet.append(["Иван"])
+        workbook.save(self.path)
+        issues = []
+
+        rosters = parse_service_rosters(
+            self.path, self.debug_logger, SERVICES, issues
+        )
+
+        sound = {member.name: member for member in rosters["sound"]}
+        self.assertEqual(sorted(sound), ["Алексей", "Пётр"])
+        self.assertEqual(sound["Алексей"].tasks, ("звук", "сборка"))
+        self.assertEqual(sound["Алексей"].username, "alex_sound")
+        self.assertEqual(sound["Алексей"].telegram_id, 11111)
+        self.assertEqual(sound["Пётр"].tasks, ("сборка",))
+        self.assertEqual(
+            [(member.name, member.tasks) for member in rosters["kitchen"]],
+            [("Мария", ("старший",))],
+        )
+        self.assertNotIn("order", rosters)
+        self.assertEqual(
+            issues,
+            [
+                "«Списки», Звук: в строке задачи «звук» указаны "
+                "username/Telegram ID без имени"
+            ],
         )
 
     def test_parses_multiple_legacy_assignments_from_one_row(self):

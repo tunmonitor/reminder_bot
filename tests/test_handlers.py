@@ -6117,7 +6117,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             tasks = await self.press_contact(message, "✏️ Изменить привязки")
 
             self.assertIn(
-                "Привязка ответственных", tasks.message.answer.await_args.args[0]
+                "👥 Состав · ЗВУК", tasks.message.answer.await_args.args[0]
             )
             overview = await self.press_contact(tasks.message, "⬅️ К обзору")
             self.assertIn(
@@ -6159,8 +6159,162 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             tasks = await self.press_contact(message, "✏️ Изменить привязки")
             self.assertIn(
-                "Привязка ответственных", tasks.message.answer.await_args.args[0]
+                "👥 Состав · ЗВУК", tasks.message.answer.await_args.args[0]
             )
+
+        asyncio.run(run())
+
+    @staticmethod
+    def inline_labels(message):
+        return [
+            button.text
+            for row in message.answer.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            for button in row
+        ]
+
+    async def press_inline(self, source, label, handler):
+        button = next(
+            button
+            for row in source.answer.await_args.kwargs["reply_markup"].inline_keyboard
+            for button in row
+            if button.text == label
+        )
+        callback = SimpleNamespace(
+            data=button.callback_data,
+            from_user=SimpleNamespace(id=67890),
+            message=self.message(67890, ""),
+            answer=AsyncMock(),
+        )
+        await self.callback_handler(handler)(callback)
+        return callback
+
+    async def open_members(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.sync_service_rosters({
+            "sound": [
+                RosterMember("Алексей", ("Микшер",)),
+                RosterMember("Пётр", ("Пульт",)),
+            ]
+        })
+        message = await self.open_contact_overview()
+        return await self.press_contact(message, "✏️ Изменить привязки")
+
+    async def type_text(self, text):
+        message = self.message(67890, text)
+        await self.message_handler("on_service_parameter")(message)
+        return message
+
+    def test_member_list_marks_roster_bound_and_unlisted_people(self):
+        async def run():
+            members = await self.open_members()
+
+            text = members.message.answer.await_args.args[0]
+            self.assertIn("📊 Привязано 2 из 4", text)
+            self.assertIn("⚠️ нет в списке", text)
+            self.assertEqual(
+                self.inline_labels(members.message),
+                [
+                    "✅ Алексей · @alex",
+                    "⚪ Пётр · не привязан",
+                    "✅ Иван",
+                    "⚠️ Мария · нет в списке",
+                    "➕ Добавить участника",
+                    "⬅️ К обзору",
+                ],
+            )
+
+        asyncio.run(run())
+
+    def test_member_binding_covers_all_schedule_tasks(self):
+        async def run():
+            members = await self.open_members()
+            person = await self.press_inline(
+                members.message, "⚠️ Мария · нет в списке",
+                "on_contact_person_choice",
+            )
+            prompt = person.message.answer.await_args
+            self.assertIn("все его задачи служения", prompt.args[0])
+            keyboard = prompt.kwargs["reply_markup"].keyboard
+            self.assertEqual(keyboard[1][0].text, "⬅️ Назад")
+
+            confirmation = await self.type_text("55555 @maria_x")
+            self.assertIn(
+                "привязать «Мария» во всех задачах служения",
+                confirmation.answer.await_args.args[0],
+            )
+            result = await self.press_inline(
+                confirmation, "✅ Подтвердить", "on_shared_admin_confirmation"
+            )
+
+            text = result.message.answer.await_args.args[0]
+            self.assertIn("«Мария» связан", text)
+            self.assertIn("во всех задачах", text)
+            self.assertIn("👥 Состав · ЗВУК", text)
+            contacts = {
+                (contact["task"], contact["name"]): contact["telegram_id"]
+                for contact in self.registry.list_responsible_contacts(
+                    67890, "sound"
+                )
+            }
+            self.assertEqual(contacts[("Микшер", "Мария")], 55555)
+            member = next(
+                item for item in self.registry.list_service_members("sound")
+                if item["name"] == "Мария"
+            )
+            self.assertEqual(member["telegram_id"], 55555)
+
+        asyncio.run(run())
+
+    def test_member_user_step_back_and_cancel_return_to_people(self):
+        async def run():
+            members = await self.open_members()
+            await self.press_inline(
+                members.message, "⚪ Пётр · не привязан",
+                "on_contact_person_choice",
+            )
+            back = await self.type_text("⬅️ Назад")
+            self.assertIn("👥 Состав", back.answer.await_args.args[0])
+            self.assertEqual(
+                self.registry.list_responsible_contacts(67890, "sound")[0][
+                    "name"
+                ],
+                "Алексей",
+            )
+
+            await self.press_inline(
+                back, "⚪ Пётр · не привязан", "on_contact_person_choice"
+            )
+            cancel = self.message(67890, "/cancel")
+            await self.message_handler("on_cancel_service_command")(cancel)
+            calls = [call.args[0] for call in cancel.answer.await_args_list]
+            self.assertIn("↩️ Шаг отменён.", calls[0])
+            self.assertIn("👥 Состав", calls[-1])
+
+            stale = await self.type_text("55555")
+            self.assertNotIn("Подтвердить", str(stale.answer.await_args))
+
+        asyncio.run(run())
+
+    def test_member_can_be_added_beyond_the_roster(self):
+        async def run():
+            members = await self.open_members()
+            await self.press_contact(members.message, "➕ Добавить участника")
+            prompt = await self.type_text("Новый   Человек")
+            self.assertIn("«Новый Человек»", prompt.answer.await_args.args[0])
+            confirmation = await self.type_text("77777")
+            await self.press_inline(
+                confirmation, "✅ Подтвердить", "on_shared_admin_confirmation"
+            )
+
+            member = next(
+                item for item in self.registry.list_service_members("sound")
+                if item["name"] == "Новый Человек"
+            )
+            self.assertEqual(member["telegram_id"], 77777)
+            self.assertFalse(member["in_list"])
 
         asyncio.run(run())
 

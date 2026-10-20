@@ -882,6 +882,157 @@ def parse_people(path: Path,
         workbook.close()
 
 
+@dataclass(frozen=True)
+class RosterMember:
+    """Человек из состава служения на листе «Списки»."""
+    name: str
+    tasks: tuple[str, ...] = ()
+    username: str = ""
+    telegram_id: int | None = None
+
+
+_USERNAME_CELL = re.compile(r"@?([A-Za-z][A-Za-z0-9_]{4,31})")
+
+
+def parse_service_rosters(
+    path: Path,
+    debug_logger: logging.Logger,
+    services: tuple[ServiceDefinition, ...] | None = None,
+    issues: list[str] | None = None,
+) -> dict[str, list[RosterMember]]:
+    """Читает состав служений с листа «Списки».
+
+    В строке 1 — названия служений; блок служения тянется вправо до
+    следующего названия. Ячейка с названием или синонимом задачи служения
+    начинает задачу в своей колонке; остальные ячейки ниже — люди этой
+    задачи. Люди под выключенной задачей пропускаются. Справа от имени
+    могут стоять username и Telegram ID (как в блоке Собрания).
+    В результате только служения, у которых есть блок на листе.
+    """
+    services = SERVICES if services is None else services
+    issues = [] if issues is None else issues
+    workbook = _load_workbook(path, debug_logger)
+    try:
+        worksheet, sheet_name = _find_sheet(workbook, "Списки")
+        if worksheet is None:
+            raise RuntimeError("Лист 'Списки' не найден")
+        worksheet.reset_dimensions()
+        rows = [list(row) for row in worksheet.iter_rows(values_only=True)]
+        if not rows:
+            raise RuntimeError("Лист 'Списки' пуст")
+        aliases = {
+            normalized_name(alias): service
+            for service in services
+            for alias in (service.name, *service.aliases)
+        }
+        headers: list[tuple[int, ServiceDefinition | None]] = []
+        for column, value in enumerate(rows[0]):
+            header = _clean(value)
+            if not header:
+                continue
+            service = aliases.get(normalized_name(header))
+            if service is None:
+                issues.append(f"«Списки»: служение «{header}» не найдено в каталоге")
+                debug_logger.warning(
+                    "Лист 'Списки': неизвестное служение '%s'", header
+                )
+            headers.append((column, service))
+        width = max(len(row) for row in rows)
+        # Служения без блока на листе в результат не попадают: их состав
+        # не трогается (иначе опечатка в заголовке сняла бы всех из списка).
+        result: dict[str, list[RosterMember]] = {}
+        for index, (start, service) in enumerate(headers):
+            if service is None:
+                continue
+            end = headers[index + 1][0] if index + 1 < len(headers) else width
+            task_by_key = {
+                normalized_name(key): task
+                for task in service.tasks
+                for key in (task.name, *task.aliases)
+            }
+            people: dict[str, dict] = {}
+            consumed: set[tuple[int, int]] = set()
+            for column in range(start, end):
+                current_task = None
+                for row_index in range(1, len(rows)):
+                    row = rows[row_index]
+                    if (row_index, column) in consumed or column >= len(row):
+                        continue
+                    text = _clean(row[column])
+                    if not text:
+                        continue
+                    task = task_by_key.get(normalized_name(text))
+                    if task is not None:
+                        current_task = task
+                        # Username и Telegram ID в строке с названием задачи
+                        # не принадлежат никому — сообщаем, но не читаем их
+                        # как людей.
+                        orphan = False
+                        for offset, looks_right in (
+                            (1, lambda v: _USERNAME_CELL.fullmatch(_clean(v))),
+                            (2, lambda v: _telegram_id(v) is not None),
+                        ):
+                            neighbour = column + offset
+                            if (
+                                neighbour < end
+                                and neighbour < len(row)
+                                and looks_right(row[neighbour])
+                            ):
+                                consumed.add((row_index, neighbour))
+                                orphan = True
+                        if orphan:
+                            issues.append(
+                                f"«Списки», {service.name}: в строке задачи "
+                                f"«{text}» указаны username/Telegram ID без "
+                                "имени"
+                            )
+                        continue
+                    username = ""
+                    telegram_id = None
+                    if column + 1 < end and column + 1 < len(row):
+                        match = _USERNAME_CELL.fullmatch(_clean(row[column + 1]))
+                        if match:
+                            username = match.group(1)
+                            consumed.add((row_index, column + 1))
+                    if column + 2 < end and column + 2 < len(row):
+                        telegram_id = _telegram_id(row[column + 2])
+                        if telegram_id is not None:
+                            consumed.add((row_index, column + 2))
+                    if service.tasks and current_task is None:
+                        issues.append(
+                            f"«Списки», {service.name}: «{text}» указан "
+                            "без задачи"
+                        )
+                        continue
+                    if current_task is not None and not current_task.enabled:
+                        continue
+                    person = people.setdefault(
+                        text, {"tasks": [], "username": "", "telegram_id": None}
+                    )
+                    if current_task is not None and (
+                        current_task.name not in person["tasks"]
+                    ):
+                        person["tasks"].append(current_task.name)
+                    person["username"] = person["username"] or username
+                    person["telegram_id"] = person["telegram_id"] or telegram_id
+            result[service.id] = [
+                RosterMember(
+                    name=name,
+                    tasks=tuple(info["tasks"]),
+                    username=info["username"],
+                    telegram_id=info["telegram_id"],
+                )
+                for name, info in people.items()
+            ]
+            debug_logger.debug(
+                "Лист 'Списки': служение %s, людей=%s",
+                service.id, len(result[service.id]),
+            )
+        return result
+    finally:
+        workbook.close()
+
+
 def resolve_assignments(schedule: dict[str, str],
                         people: dict[str, dict[str, dict]],
                         debug_logger: logging.Logger | None = None,

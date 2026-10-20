@@ -252,6 +252,22 @@ class ServiceRegistry:
                     name TEXT PRIMARY KEY
                 );
 
+                CREATE TABLE IF NOT EXISTS service_members (
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    telegram_id INTEGER
+                        CHECK (telegram_id IS NULL OR telegram_id > 0),
+                    username TEXT NOT NULL DEFAULT '',
+                    tasks_json TEXT NOT NULL DEFAULT '[]',
+                    in_list INTEGER NOT NULL DEFAULT 0
+                        CHECK (in_list IN (0, 1)),
+                    source TEXT NOT NULL
+                        CHECK (source IN ('excel', 'manual', 'legacy')),
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (service_id, name)
+                );
+
                 CREATE TABLE IF NOT EXISTS group_reminder_legacy_ids (
                     legacy_id INTEGER PRIMARY KEY,
                     reminder_id INTEGER NOT NULL
@@ -474,7 +490,35 @@ class ServiceRegistry:
                     "VALUES ('legacy-reminders')"
                 )
             self._migrate_to_service_catalog(connection)
+            self._migrate_members(connection)
             self._migrate_service_reminders(connection)
+
+    @staticmethod
+    def _migrate_members(connection: sqlite3.Connection) -> None:
+        """Однократно создаёт участников служений из привязок к задачам.
+
+        При нескольких Telegram ID у одного имени берётся последняя привязка;
+        сами привязки к задачам не меняются.
+        """
+        if connection.execute(
+            "SELECT 1 FROM catalog_migrations WHERE name = 'members-v1'"
+        ).fetchone():
+            return
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO service_members (
+                service_id, name, telegram_id, username, source, updated_at
+            )
+            SELECT service_id, name, telegram_id, username, 'legacy',
+                   updated_at
+            FROM responsible_contacts
+            WHERE service_id IN (SELECT id FROM services WHERE archived = 0)
+            ORDER BY updated_at DESC
+            """
+        )
+        connection.execute(
+            "INSERT INTO catalog_migrations (name) VALUES ('members-v1')"
+        )
 
     @staticmethod
     def _sync_service_catalog(
@@ -2011,6 +2055,7 @@ class ServiceRegistry:
         telegram_id: int,
         username: str = "",
     ) -> None:
+        """Привязывает Telegram к имени в одной задаче (и к человеку)."""
         _validate_positive_id(actor_id, "actor_id")
         _validate_positive_id(telegram_id, "telegram_id")
         task = task.strip()
@@ -2020,53 +2065,345 @@ class ServiceRegistry:
         with self._connection() as connection:
             self._require_super_admin(connection, actor_id)
             self._require_service(connection, service_id)
-            connection.execute(
-                "DELETE FROM responsible_contacts "
-                "WHERE service_id = ? AND task = ? "
-                "AND (name = ? OR telegram_id = ?)",
-                (service_id, task, name, telegram_id),
+            self._write_contact(
+                connection, actor_id, service_id, task, name, telegram_id,
+                username.strip().lstrip("@"),
             )
             connection.execute(
                 """
-                INSERT INTO responsible_contacts (
+                INSERT INTO service_members (
+                    service_id, name, telegram_id, username, source,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, 'manual', ?)
+                ON CONFLICT(service_id, name) DO UPDATE SET
+                    telegram_id = excluded.telegram_id,
+                    username = excluded.username,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    service_id, name, telegram_id,
+                    username.strip().lstrip("@"), _utc_now(),
+                ),
+            )
+            self._release_member_telegram(
+                connection, service_id, name, telegram_id
+            )
+            self._cleanup_unbound_user_data(connection, service_id)
+            self._audit(
+                connection, actor_id, "responsible_contact_updated", service_id,
+                {"task": task, "name": name, "telegram_id": telegram_id},
+            )
+
+    @staticmethod
+    def _write_contact(
+        connection: sqlite3.Connection,
+        actor_id: int,
+        service_id: str,
+        task: str,
+        name: str,
+        telegram_id: int,
+        username: str,
+    ) -> None:
+        connection.execute(
+            "DELETE FROM responsible_contacts "
+            "WHERE service_id = ? AND task = ? "
+            "AND (name = ? OR telegram_id = ?)",
+            (service_id, task, name, telegram_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO responsible_contacts (
+                service_id, task, name, telegram_id, username,
+                updated_by, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                service_id, task, name, telegram_id, username, actor_id,
+                _utc_now(),
+            ),
+        )
+
+    @staticmethod
+    def _cleanup_unbound_user_data(
+        connection: sqlite3.Connection, service_id: str
+    ) -> None:
+        """Удаляет личные настройки задач, к которым пользователь не привязан."""
+        connection.execute(
+            """
+            DELETE FROM user_notification_prefs
+            WHERE service_id = ? AND NOT EXISTS (
+                SELECT 1 FROM responsible_contacts
+                WHERE responsible_contacts.service_id = ?
+                  AND responsible_contacts.telegram_id =
+                          user_notification_prefs.actor_id
+            )
+            """,
+            (service_id, service_id),
+        )
+        connection.execute(
+            """
+            DELETE FROM user_reminder_texts
+            WHERE service_id = ? AND NOT EXISTS (
+                SELECT 1 FROM responsible_contacts
+                WHERE responsible_contacts.service_id =
+                          user_reminder_texts.service_id
+                  AND responsible_contacts.task = user_reminder_texts.task
+                  AND responsible_contacts.telegram_id =
+                          user_reminder_texts.actor_id
+            )
+            """,
+            (service_id,),
+        )
+
+    def list_service_members(self, service_id: str) -> list[dict]:
+        """Состав служения: сначала люди из «Списков», затем остальные."""
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            rows = connection.execute(
+                "SELECT name, telegram_id, username, tasks_json, in_list, "
+                "source FROM service_members WHERE service_id = ? "
+                "ORDER BY in_list DESC, rowid",
+                (service_id,),
+            ).fetchall()
+        return [
+            {
+                "name": row["name"],
+                "telegram_id": row["telegram_id"],
+                "username": row["username"],
+                "tasks": json.loads(row["tasks_json"]),
+                "in_list": bool(row["in_list"]),
+                "source": row["source"],
+            }
+            for row in rows
+        ]
+
+    def sync_service_rosters(self, rosters) -> None:
+        """Переносит состав служений с листа «Списки» (системная операция).
+
+        rosters — {service_id: [RosterMember]}. Задачи берутся из файла;
+        Telegram ID и username из файла заполняют только пустые значения
+        (привязку, сделанную в боте, файл не перезаписывает). Люди, которых
+        больше нет в «Списках», остаются с отметкой «нет в списке».
+        """
+        now = _utc_now()
+        with self._connection() as connection:
+            active = {
+                row["id"]
+                for row in connection.execute(
+                    "SELECT id FROM services WHERE archived = 0"
+                )
+            }
+            for service_id, members in rosters.items():
+                if service_id not in active:
+                    continue
+                names = [member.name for member in members]
+                for member in members:
+                    connection.execute(
+                        """
+                        INSERT INTO service_members (
+                            service_id, name, telegram_id, username,
+                            tasks_json, in_list, source, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, 1, 'excel', ?)
+                        ON CONFLICT(service_id, name) DO UPDATE SET
+                            tasks_json = excluded.tasks_json,
+                            in_list = 1,
+                            telegram_id = COALESCE(
+                                service_members.telegram_id,
+                                excluded.telegram_id
+                            ),
+                            username = CASE
+                                WHEN service_members.username = ''
+                                THEN excluded.username
+                                ELSE service_members.username
+                            END
+                        -- Без изменений строка не пишется: запись считается
+                        -- изменением данных (бэкап, обновление задач).
+                        WHERE service_members.tasks_json
+                                  IS NOT excluded.tasks_json
+                           OR service_members.in_list = 0
+                           OR (service_members.telegram_id IS NULL
+                               AND excluded.telegram_id IS NOT NULL)
+                           OR (service_members.username = ''
+                               AND excluded.username != '')
+                        """,
+                        (
+                            service_id,
+                            member.name,
+                            member.telegram_id,
+                            member.username,
+                            json.dumps(list(member.tasks), ensure_ascii=False),
+                            now,
+                        ),
+                    )
+                placeholders = ", ".join("?" for _ in names) or "''"
+                connection.execute(
+                    "UPDATE service_members SET in_list = 0 "
+                    "WHERE service_id = ? AND in_list = 1 "
+                    f"AND name NOT IN ({placeholders})",
+                    (service_id, *names),
+                )
+                for member in members:
+                    self._ensure_member_task_contacts(
+                        connection, service_id, member.name, member.tasks
+                    )
+
+    def add_service_member(
+        self, actor_id: int, service_id: str, name: str
+    ) -> None:
+        """Добавляет человека не из «Списков» (суперадмин)."""
+        _validate_positive_id(actor_id, "actor_id")
+        name = " ".join(name.split()) if isinstance(name, str) else ""
+        if not name or len(name) > 60 or "\x00" in name:
+            raise ValueError("Имя участника: от 1 до 60 символов.")
+        with self._connection() as connection:
+            self._require_super_admin(connection, actor_id)
+            self._require_service(connection, service_id)
+            if connection.execute(
+                "SELECT 1 FROM service_members "
+                "WHERE service_id = ? AND name = ?",
+                (service_id, name),
+            ).fetchone():
+                raise ValueError(f"«{name}» уже есть в составе служения.")
+            connection.execute(
+                "INSERT INTO service_members (service_id, name, source, "
+                "updated_at) VALUES (?, ?, 'manual', ?)",
+                (service_id, name, _utc_now()),
+            )
+            self._audit(
+                connection, actor_id, "service_member_added", service_id,
+                {"name": name},
+            )
+
+    def bind_service_member(
+        self,
+        actor_id: int,
+        service_id: str,
+        name: str,
+        telegram_id: int,
+        username: str = "",
+        tasks=(),
+    ) -> None:
+        """Привязывает Telegram к человеку служения во всех его задачах.
+
+        Задачи — из «Списков», из прежних привязок этого имени и tasks
+        (например, задачи из графика). Человек не из состава добавляется.
+        """
+        _validate_positive_id(actor_id, "actor_id")
+        _validate_positive_id(telegram_id, "telegram_id")
+        name = name.strip() if isinstance(name, str) else ""
+        if not name:
+            raise ValueError("Имя ответственного обязательно")
+        username = username.strip().lstrip("@")
+        with self._connection() as connection:
+            self._require_super_admin(connection, actor_id)
+            self._require_service(connection, service_id)
+            member = connection.execute(
+                "SELECT tasks_json FROM service_members "
+                "WHERE service_id = ? AND name = ?",
+                (service_id, name),
+            ).fetchone()
+            now = _utc_now()
+            if member is None:
+                connection.execute(
+                    "INSERT INTO service_members (service_id, name, "
+                    "telegram_id, username, source, updated_at) "
+                    "VALUES (?, ?, ?, ?, 'manual', ?)",
+                    (service_id, name, telegram_id, username, now),
+                )
+                roster_tasks = []
+            else:
+                connection.execute(
+                    "UPDATE service_members SET telegram_id = ?, "
+                    "username = ?, updated_at = ? "
+                    "WHERE service_id = ? AND name = ?",
+                    (telegram_id, username, now, service_id, name),
+                )
+                roster_tasks = json.loads(member["tasks_json"])
+            self._release_member_telegram(
+                connection, service_id, name, telegram_id
+            )
+            bound_tasks = [
+                row["task"]
+                for row in connection.execute(
+                    "SELECT DISTINCT task FROM responsible_contacts "
+                    "WHERE service_id = ? AND name = ?",
+                    (service_id, name),
+                )
+            ]
+            all_tasks = list(dict.fromkeys([*roster_tasks, *bound_tasks, *tasks]))
+            for task in all_tasks:
+                self._write_contact(
+                    connection, actor_id, service_id, task, name,
+                    telegram_id, username,
+                )
+            self._cleanup_unbound_user_data(connection, service_id)
+            self._audit(
+                connection, actor_id, "service_member_bound", service_id,
+                {"name": name, "telegram_id": telegram_id, "tasks": all_tasks},
+            )
+
+    @staticmethod
+    def _release_member_telegram(
+        connection: sqlite3.Connection,
+        service_id: str,
+        name: str,
+        telegram_id: int,
+    ) -> None:
+        """Один Telegram ID — у одного человека служения."""
+        connection.execute(
+            "UPDATE service_members SET telegram_id = NULL, username = '' "
+            "WHERE service_id = ? AND telegram_id = ? AND name != ?",
+            (service_id, telegram_id, name),
+        )
+
+    def ensure_member_contacts(self, service_id: str, assignments) -> None:
+        """Создаёт привязки «задача + имя» для привязанных людей служения.
+
+        assignments — {задача: [имена] | {"names": [...]}} из графика. Новая
+        задача человека в графике сразу считается привязанной. Чужие
+        привязки (то же имя у другого Telegram ID) не меняются.
+        """
+        with self._connection() as connection:
+            for task, info in assignments.items():
+                if isinstance(info, dict):
+                    if info.get("is_informational"):
+                        continue
+                    names = info.get("names", [])
+                else:
+                    names = info
+                for name in names:
+                    self._ensure_member_task_contacts(
+                        connection, service_id, name, (task,)
+                    )
+
+    @staticmethod
+    def _ensure_member_task_contacts(
+        connection: sqlite3.Connection, service_id: str, name: str, tasks
+    ) -> None:
+        member = connection.execute(
+            "SELECT telegram_id, username FROM service_members "
+            "WHERE service_id = ? AND name = ? AND telegram_id IS NOT NULL",
+            (service_id, name),
+        ).fetchone()
+        if member is None:
+            return
+        actor = connection.execute(
+            "SELECT telegram_id FROM super_admins ORDER BY created_at LIMIT 1"
+        ).fetchone()
+        for task in tasks:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO responsible_contacts (
                     service_id, task, name, telegram_id, username,
                     updated_by, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    service_id, task, name, telegram_id,
-                    username.strip().lstrip("@"), actor_id, _utc_now(),
+                    service_id, task, name, member["telegram_id"],
+                    member["username"],
+                    actor["telegram_id"] if actor else member["telegram_id"],
+                    _utc_now(),
                 ),
-            )
-            connection.execute(
-                """
-                DELETE FROM user_notification_prefs
-                WHERE service_id = ? AND NOT EXISTS (
-                    SELECT 1 FROM responsible_contacts
-                    WHERE responsible_contacts.service_id = ?
-                      AND responsible_contacts.telegram_id =
-                              user_notification_prefs.actor_id
-                )
-                """,
-                (service_id, service_id),
-            )
-            connection.execute(
-                """
-                DELETE FROM user_reminder_texts
-                WHERE service_id = ? AND NOT EXISTS (
-                    SELECT 1 FROM responsible_contacts
-                    WHERE responsible_contacts.service_id =
-                              user_reminder_texts.service_id
-                      AND responsible_contacts.task = user_reminder_texts.task
-                      AND responsible_contacts.telegram_id =
-                              user_reminder_texts.actor_id
-                )
-                """,
-                (service_id,),
-            )
-            self._audit(
-                connection, actor_id, "responsible_contact_updated", service_id,
-                {"task": task, "name": name, "telegram_id": telegram_id},
             )
 
     def get_user_notifications_enabled(

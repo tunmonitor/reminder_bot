@@ -93,7 +93,18 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - Monthly sheets are named with a Russian month and two-digit year, e.g.
   `ОКТЯБРЬ26`. Schedule dates are in column A; task names and assignees are in
   columns A and B. The `Списки` sheet contains task headers in A and contact
-  name, username, and Telegram ID in A, B, and C.
+  name, username, and Telegram ID in A, B, and C (legacy assembly parser
+  `parse_people`).
+- `parse_service_rosters` reads `Списки` for all services: row 1 holds service
+  headers (block runs right to the next header), task cells start a task in
+  their column, people below; username/ID sit in the next two columns.
+  `ServiceRegistry.sync_service_rosters` stores them in `service_members`
+  (file fills only empty Telegram ID/username; writes only on real changes,
+  because any write triggers a backup and job refresh). `_load_service_task_
+  assignments(..., registry=...)` syncs rosters and `ensure_member_contacts`
+  on every schedule read; roster failures are logged and never block
+  reminders. Binding UI is person-centric (`bind_service_member` covers all
+  the person's tasks); `members-v1` migrates old contacts once.
 - Services, tasks, and month-sheet columns come from
   `reminder_bot_services.json` (`bot/services.py` validates it at import).
   `parse_service_events(..., services)` maps column headers to services,

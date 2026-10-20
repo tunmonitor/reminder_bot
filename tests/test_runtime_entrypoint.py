@@ -229,6 +229,47 @@ class ReminderBotEntrypointTest(unittest.TestCase):
         self.assertGreaterEqual(len(parsed_months), 2)
         self.assertEqual(leftovers, [])
 
+    def test_roster_sync_failure_is_logged_and_issues_are_per_service(self):
+        from bot import app
+        from bot.excel_parser import RosterMember
+        from bot.service_registry import ServiceRegistry
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+            registry.initialize(1001, -10001)
+            logger = MagicMock()
+            with patch.object(
+                app, "parse_service_rosters",
+                side_effect=RuntimeError("Лист 'Списки' не найден"),
+            ):
+                app._sync_rosters_and_contacts(
+                    registry, Path(tmp_dir) / "x.xlsx", "sound", {}, None,
+                    logger, [],
+                )
+            logger.exception.assert_called_once()
+
+            def parse(path, logger, services, issues):
+                issues.extend([
+                    "«Списки», Звук: «Иван» указан без задачи",
+                    "«Списки», Кухня: «Анна» указан без задачи",
+                ])
+                return {"sound": [RosterMember("Иван", ("звук",), "", 7007)]}
+
+            issues = []
+            with patch.object(app, "parse_service_rosters", side_effect=parse):
+                app._sync_rosters_and_contacts(
+                    registry, Path(tmp_dir) / "x.xlsx", "sound",
+                    {"сборка": {"names": ["Иван"], "is_informational": False}},
+                    None, logger, issues,
+                )
+            self.assertEqual(issues, ["«Списки», Звук: «Иван» указан без задачи"])
+            tasks = sorted(
+                contact["task"]
+                for contact in registry.list_responsible_contacts(1001, "sound")
+                if contact["name"] == "Иван"
+            )
+            self.assertEqual(tasks, ["звук", "сборка"])
+
     def test_upcoming_events_skip_empty_later_sheet(self):
         from bot import app
         from bot.excel_parser import ServiceEvent, SheetEmptyError
