@@ -2540,6 +2540,36 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_reminder_task_can_be_chosen_on_card(self):
+        async def run():
+            menu = await self._open_sound_reminders()
+            card = await self._click(
+                menu.message, lambda button: button.text.startswith("📝 1 дн.")
+            )
+            self.assertIn("📌 Задача: все задачи", card.message.answer.await_args.args[0])
+            tasks = await self._click(
+                card.message, lambda button: button.text == "📌 Задача"
+            )
+            picked = await self._click(
+                tasks.message, lambda button: button.text.endswith(" звук")
+            )
+            self.assertIn("📌 Задача: «звук»", picked.message.answer.await_args.args[0])
+            reminder = self.registry.list_group_reminders("sound")[0]
+            self.assertEqual(reminder["task"], "звук")
+            stale = await self._click(
+                tasks.message, lambda button: button.text == "📋 Все задачи"
+            )
+            self.assertIn("устарел", stale.answer.await_args.args[0])
+            again = await self._click(
+                picked.message, lambda button: button.text == "📌 Задача"
+            )
+            await self._click(
+                again.message, lambda button: button.text == "📋 Все задачи"
+            )
+            self.assertIsNone(self.registry.list_group_reminders("sound")[0]["task"])
+
+        asyncio.run(run())
+
     def test_here_command_stores_chat_topic_for_service_admin(self):
         async def run():
             handler = self.message_handler("on_here_command")

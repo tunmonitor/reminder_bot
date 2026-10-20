@@ -593,6 +593,50 @@ class ServiceRegistryTest(unittest.TestCase):
         self.registry.set_group_chat(1001, "sound", -10003, enabled=True)
         self.assertIsNone(self.registry.get_service("sound")["group_thread_id"])
 
+    def test_reminder_task_must_be_enabled_service_task(self):
+        reminder = self.registry.list_group_reminders("sound")[0]
+        with self.assertRaisesRegex(ValueError, "не из списка"):
+            self.registry.set_group_reminder_task(1001, reminder["id"], "спевка")
+        self.registry.set_group_reminder_task(1001, reminder["id"], "звук")
+        self.assertEqual(
+            self.registry.get_group_reminder(reminder["id"])["task"], "звук"
+        )
+        # Напоминание другой задачи в тот же слот — не дубликат.
+        self.registry.add_group_reminder(
+            1001, "sound", reminder["reminder_days"], reminder["reminder_time"]
+        )
+        with self.assertRaisesRegex(ValueError, "уже задано"):
+            self.registry.add_group_reminder(
+                1001, "sound", reminder["reminder_days"],
+                reminder["reminder_time"],
+            )
+        self.assertIn(
+            "{task_responsibles}",
+            self.registry.resolve_group_text(
+                self.registry.get_group_reminder(reminder["id"]),
+                self.registry.get_service("sound"),
+            ),
+        )
+        # Общее напоминание в том же слоте уже есть — сброс на «все задачи»
+        # дал бы два общих напоминания в один слот.
+        with self.assertRaisesRegex(ValueError, "уже задано"):
+            self.registry.set_group_reminder_task(1001, reminder["id"], None)
+        other = next(
+            item for item in self.registry.list_group_reminders("sound")
+            if item["id"] != reminder["id"]
+        )
+        with self.assertRaisesRegex(ValueError, "изменились"):
+            self.registry.merge_group_reminder(
+                1001, other["id"],
+                expected_slot=(other["reminder_days"], other["reminder_time"]),
+                source_id=reminder["id"],
+                source_slot=(reminder["reminder_days"], reminder["reminder_time"]),
+            )
+        self.registry.set_service_task_enabled(1001, "sound", "звук", False)
+        detached = self.registry.get_group_reminder(reminder["id"])
+        self.assertIsNone(detached["task"])
+        self.assertFalse(detached["enabled"])
+
     def test_bootstrap_is_idempotent_and_does_not_promote_new_env_admin(self):
         self.registry.set_group_chat(1001, "sound", -10002, enabled=True)
 

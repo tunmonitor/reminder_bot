@@ -682,6 +682,74 @@ class ReminderBotEntrypointTest(unittest.TestCase):
 
         asyncio.run(process())
 
+    def test_task_reminder_lists_only_its_responsibles_or_warns(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                registry.set_responsible_contact(
+                    1001, "assembly", "Ведущий", "Анна", 2002, "anna_lead"
+                )
+                reminder = registry.list_group_reminders("assembly")[0]
+                registry.set_group_reminder_task(1001, reminder["id"], "Ведущий")
+                bot = SimpleNamespace(send_message=AsyncMock())
+                logger = MagicMock()
+                run_date = date(2026, 10, 11) - timedelta(
+                    days=reminder["reminder_days"]
+                )
+                assignments = {
+                    "Ведущий": {"names": ["Анна"], "is_informational": False},
+                    "Проповедь": {"names": ["Иван"], "is_informational": False},
+                }
+                with patch.object(
+                    app, "_load_service_task_assignments",
+                    new=AsyncMock(return_value=(assignments, True)),
+                ):
+                    await app._process_service_reminder(
+                        bot, SimpleNamespace(admin_tg_id=1001), Path(tmp_dir),
+                        ZoneInfo("UTC"), registry, "assembly", reminder["id"],
+                        logger, logger, run_date=run_date,
+                    )
+                group_text = next(
+                    call.args[1] for call in bot.send_message.await_args_list
+                    if call.args[0] == -10001
+                )
+                self.assertIn("Ведущий:", group_text)
+                self.assertIn("anna_lead", group_text)
+                self.assertNotIn("Иван", group_text)
+
+                other_date = date(2026, 10, 18) - timedelta(
+                    days=reminder["reminder_days"]
+                )
+                with patch.object(
+                    app, "_load_service_task_assignments",
+                    new=AsyncMock(return_value=({"Проповедь": ["Иван"]}, True)),
+                ), patch.object(
+                    app, "_notify_admin", new=AsyncMock(return_value=True)
+                ) as notify_admin:
+                    for _ in range(2):
+                        await app._process_service_reminder(
+                            bot, SimpleNamespace(admin_tg_id=1001),
+                            Path(tmp_dir), ZoneInfo("UTC"), registry,
+                            "assembly", reminder["id"], logger, logger,
+                            run_date=other_date,
+                        )
+                warnings = [
+                    call.args[2] for call in notify_admin.await_args_list
+                    if "никто не назначен" in call.args[2]
+                ]
+                self.assertEqual(len(warnings), 1)
+                self.assertFalse(
+                    registry.is_group_reminder_delivered(
+                        reminder["id"], "2026-10-18", "group:-10001"
+                    )
+                )
+
+        asyncio.run(process())
+
     def test_informational_only_service_reminder_is_not_sent_or_recorded(self):
         from bot import app
         from bot.service_registry import ServiceRegistry
