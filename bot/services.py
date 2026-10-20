@@ -32,8 +32,10 @@ class ServiceTask:
 class ScheduleColumn:
     headers: tuple[str, ...]
     layout: Literal["pairs", "single"]
-    # Задача по умолчанию для всех строк колонки («Слайды», «кофе»).
+    # Задача всех строк колонки без своей задачи («Слайды», «кофе»).
     task: str | None = None
+    # Задача строк без задачи в начале блока даты («в смене» у Кухни).
+    default_task: str | None = None
 
 
 @dataclass(frozen=True)
@@ -75,13 +77,16 @@ def _parse_task(raw, service_id: str) -> ServiceTask:
 def _parse_column(raw, service_id: str) -> ScheduleColumn:
     if not isinstance(raw, dict) or raw.get("layout") not in {"pairs", "single"}:
         raise ValueError(f"{service_id}: колонка должна иметь layout pairs или single")
-    task = raw.get("task")
-    if task is not None and (not isinstance(task, str) or not task.strip()):
-        raise ValueError(f"{service_id}: некорректная задача колонки")
+    values = {}
+    for field in ("task", "default_task"):
+        value = raw.get(field)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError(f"{service_id}: некорректное поле колонки {field}")
+        values[field] = value.strip() if value else None
     return ScheduleColumn(
         _strings(raw.get("headers"), f"{service_id}.columns.headers"),
         raw["layout"],
-        task.strip() if task else None,
+        **values,
     )
 
 
@@ -120,10 +125,12 @@ def parse_catalog(data) -> tuple[ServiceDefinition, ...]:
             _parse_column(column, service_id) for column in raw.get("columns", [])
         )
         for column in columns:
-            if column.task and normalized_name(column.task) not in task_keys:
-                raise ValueError(
-                    f"{service_id}: задача колонки «{column.task}» не описана в tasks"
-                )
+            for column_task in (column.task, column.default_task):
+                if column_task and normalized_name(column_task) not in task_keys:
+                    raise ValueError(
+                        f"{service_id}: задача колонки «{column_task}» "
+                        "не описана в tasks"
+                    )
             for header in column.headers:
                 owner = seen_headers.setdefault(normalized_name(header), service_id)
                 if owner != service_id:

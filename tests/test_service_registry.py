@@ -218,6 +218,19 @@ class ServiceRegistryTest(unittest.TestCase):
             ).fetchall())
         self.assertEqual(rows, [("Проповедник", 4001), ("Проповедь", 4009)])
 
+    def test_migration_keeps_same_person_bound_under_other_name(self):
+        self._rerun_catalog_migration(
+            self._contact("kitchen", "Кухня", "Оля", 4030),
+            self._contact("kitchen", "в смене", "Ольга", 4030),
+        )
+
+        with sqlite3.connect(self.path) as connection:
+            rows = sorted(connection.execute(
+                "SELECT task, name FROM responsible_contacts "
+                "WHERE telegram_id = 4030"
+            ).fetchall())
+        self.assertEqual(rows, [("Кухня", "Оля"), ("в смене", "Ольга")])
+
     def test_migration_merges_personal_rules_of_alias_and_canonical_task(self):
         with sqlite3.connect(self.path) as connection:
             connection.execute(

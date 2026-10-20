@@ -2798,17 +2798,23 @@ def _move_contact(
 ) -> None:
     """Переносит привязку под (service_id, task), не теряя людей.
 
-    Если такая же привязка (тот же Telegram ID или то же имя с тем же ID)
-    уже есть — старая строка удаляется как дубль. Если под целевой задачей
-    то же имя принадлежит другому человеку, старая строка остаётся как есть.
+    Если та же привязка (тот же человек с тем же именем) уже есть — старая
+    строка удаляется как дубль. Если под целевой задачей то же имя
+    принадлежит другому человеку или этот человек записан под другим
+    именем, старая строка остаётся как есть: ничьё имя не теряется, а
+    поиск привязки по имени внутри служения её находит.
     """
     conflict = connection.execute(
-        "SELECT telegram_id FROM responsible_contacts "
+        "SELECT telegram_id, name FROM responsible_contacts "
         "WHERE service_id = ? AND task = ? "
         "AND (telegram_id = ? OR name = ?)",
         (service_id, task, row["telegram_id"], row["name"]),
     ).fetchall()
-    if any(item["telegram_id"] != row["telegram_id"] for item in conflict):
+    if any(
+        (item["telegram_id"], item["name"])
+        != (row["telegram_id"], row["name"])
+        for item in conflict
+    ):
         return
     if conflict:
         connection.execute(

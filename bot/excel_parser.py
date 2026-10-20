@@ -388,9 +388,9 @@ def _column_assignments(
     assignments: list[ServiceAssignment] = []
     issues: list[str] = []
     # Строки без задачи продолжают последнюю задачу блока, пока не встретится
-    # пустая ячейка имени, новая задача или пометка. До первой задачи блока
-    # такие строки относятся к задаче колонки или к служению без задач; у
-    # служения с задачами это «строка без задачи».
+    # пустая ячейка имени, новая задача или пометка. Иначе они относятся к
+    # задаче колонки или к служению без задач; в начале блока — к задаче
+    # default_task колонки; в остальных случаях это «строка без задачи».
     current_task: str | None = None
     block_has_task = False
     for row in rows[row_index + 1:next_row]:
@@ -429,9 +429,12 @@ def _column_assignments(
             continue
         elif current_task is not None:
             task = current_task
-        elif not block_has_task and (column.task or not service.tasks):
-            # Задача колонки («кофе») или служение без задач (Книги).
+        elif column.task or not service.tasks:
+            # Задача колонки («кофе») или служение без задач (Книги)
+            # относятся ко всем строкам без своей задачи, и после пометок.
             task = default_task
+        elif not block_has_task and column.default_task:
+            task = column.default_task
         else:
             issues.append(
                 f"«{service.name}», {event_date:%d.%m.%Y}: строка без задачи"

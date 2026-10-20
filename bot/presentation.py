@@ -58,6 +58,19 @@ def task_is_informational(task_info: Mapping | list[str]) -> bool:
     )
 
 
+def index_contacts(contacts) -> dict:
+    """Index contacts by (task, name) with a per-service fallback by name.
+
+    The fallback key (None, name) finds a person bound under another task
+    name, e.g. after a catalog rename, so they are not shown as unlinked.
+    """
+    index: dict = {}
+    for contact in contacts:
+        index[(contact["task"], contact["name"])] = contact
+        index.setdefault((None, contact["name"]), contact)
+    return index
+
+
 def format_task_assignments(
     assignments: dict[str, dict[str, Any] | list[str]],
     contacts: dict[tuple[str, str], dict] | None = None,
@@ -76,7 +89,9 @@ def format_task_assignments(
         if not names:
             lines.append("• Ответственные не указаны")
         for name in names:
-            contact = (contacts or {}).get((task, name))
+            contact = (contacts or {}).get((task, name)) or (
+                contacts or {}
+            ).get((None, name))
             username = contact.get("username") if contact else None
             label = f"{name} (@{username})" if username else name
             telegram_id = contact.get("telegram_id") if contact else None

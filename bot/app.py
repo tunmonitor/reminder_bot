@@ -54,6 +54,7 @@ if __package__:
     from .presentation import (
         format_informational_notes,
         format_task_assignments,
+        index_contacts,
         task_assignment_names,
         task_is_informational,
     )
@@ -109,6 +110,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
     from bot.presentation import (
         format_informational_notes,
         format_task_assignments,
+        index_contacts,
         task_assignment_names,
         task_is_informational,
     )
@@ -637,9 +639,7 @@ async def get_group_reminder_preview(
     contacts = registry.list_responsible_contacts(
         credentials.admin_tg_id, service["id"]
     )
-    contacts_by_name = {
-        (contact["task"], contact["name"]): contact for contact in contacts
-    }
+    contacts_by_name = index_contacts(contacts)
     assignment_text = format_task_assignments(
         assignments, contacts_by_name, mark_unlinked=True
     )
@@ -771,9 +771,7 @@ async def _process_service_reminder(
             debug_logger,
         )
         return
-    contacts_by_name = {
-        (contact["task"], contact["name"]): contact for contact in contacts
-    }
+    contacts_by_name = index_contacts(contacts)
     for task, task_info in assignments.items():
         if not task_is_informational(task_info):
             continue
@@ -952,8 +950,15 @@ async def _process_user_reminder_schedule(
             schedule["task"],
         )
         return
-    if not event_found or schedule["name"] not in task_assignment_names(
-        task_info or []
+    # Имя может отличаться от имени в привязке к этой задаче (переименование
+    # задач каталога): подходит любое имя пользователя в этом служении.
+    user_names = {schedule["name"]} | {
+        item["name"]
+        for item in registry.list_user_assignments(schedule["actor_id"])
+        if item["service_id"] == schedule["service_id"]
+    }
+    if not event_found or not user_names & set(
+        task_assignment_names(task_info or [])
     ):
         return
 
@@ -1131,9 +1136,7 @@ async def _prepare_service_test_previews(
     contacts = registry.list_responsible_contacts(
         credentials.admin_tg_id, service_id
     )
-    contacts_by_name = {
-        (contact["task"], contact["name"]): contact for contact in contacts
-    }
+    contacts_by_name = index_contacts(contacts)
     rendered_assignment_names: dict[str, list[str]] = {}
     personal_messages = []
     issues = []

@@ -119,7 +119,12 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - Rows without a task continue the previous task until an empty name cell,
   another task, a marker, or a date; before the first task they belong to
   the column task or the service. A row starting with `КОММЕНТАРИИ` and the
-  first Sunday of another month end the sheet.
+  first Sunday of another month end the sheet. A column `task` applies to
+  every untasked row (also after markers); `default_task` covers untasked
+  rows at the start of a date block (kitchen/order → «в смене»).
+- Build contact lookups with `presentation.index_contacts`: it falls back
+  from (task, name) to the name within the service. Personal delivery
+  accepts any of the user's contact names in that service.
 - Informational tasks may be marked with a leading `*`, `[...]`, or `[*]`.
   They remain available to group templates as `{informational_notes}`, but
   are excluded from responsible-contact selection, personal reminders, and

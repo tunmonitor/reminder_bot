@@ -69,6 +69,9 @@ class ServicesCatalogTest(unittest.TestCase):
             _catalog(columns=[
                 {"headers": ["спевка"], "layout": "single", "task": "спевка"}
             ]),
+            _catalog(columns=[
+                {"headers": ["звук"], "layout": "pairs", "default_task": "нет"}
+            ]),
             {"services": [
                 _catalog()["services"][0],
                 {**_catalog()["services"][0], "id": "other", "tasks": []},

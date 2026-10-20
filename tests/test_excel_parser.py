@@ -351,6 +351,38 @@ class ExcelParserTest(unittest.TestCase):
             event.issues, ("«Кухня», 11.10.2026: строка без задачи",)
         )
 
+    def test_fixed_task_column_keeps_names_after_informational_row(self):
+        catalog = parse_catalog({
+            "services": [{
+                "id": "kitchen", "name": "Кухня", "aliases": [],
+                "columns": [
+                    {"headers": ["кофе"], "layout": "pairs", "task": "кофе"}
+                ],
+                "tasks": ["кофе"],
+            }]
+        })
+        event, _ = self._parse_kitchen_rows(
+            [[None, "А"], ["* Пометка", None], [None, "Б"]],
+            header="КОФЕ", services=catalog,
+        )
+
+        self.assertEqual(
+            [(item.task, item.name) for item in event.assignments],
+            [("кофе", "А"), ("Пометка", ""), ("кофе", "Б")],
+        )
+        self.assertEqual(event.issues, ())
+
+    def test_production_kitchen_rows_before_first_task_are_on_shift(self):
+        event, _ = self._parse_kitchen_rows(
+            [[None, "А"], ["старший", "Б"]], services=SERVICES
+        )
+
+        self.assertEqual(
+            [(item.task, item.name) for item in event.assignments],
+            [("в смене", "А"), ("старший", "Б")],
+        )
+        self.assertEqual(event.issues, ())
+
     def test_comments_row_stops_schedule_parsing(self):
         workbook = Workbook()
         schedule = workbook.active
