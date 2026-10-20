@@ -630,11 +630,14 @@ class ReminderBotEntrypointTest(unittest.TestCase):
         from bot import app
         from bot.service_registry import ServiceRegistry
 
+        errors = iter((
+            "Bad Request: message thread not found",
+            "Bad Request: TOPIC_CLOSED",
+        ))
+
         async def send(chat_id, text, **kwargs):
             if kwargs.get("message_thread_id"):
-                raise TelegramBadRequest(
-                    method=MagicMock(), message="Bad Request: message thread not found"
-                )
+                raise TelegramBadRequest(method=MagicMock(), message=next(errors))
             return SimpleNamespace(message_id=1)
 
         async def process():
@@ -665,6 +668,16 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     registry.is_group_reminder_delivered(
                         reminder["id"], event_date.isoformat(), "group:-10001"
                     )
+                )
+                from bot.handlers import send_to_service_group
+
+                registry.set_group_thread(1001, "assembly", -10001, 9)
+                await send_to_service_group(
+                    bot.send_message, -10001, "тест",
+                    registry.get_service("assembly"), registry=registry,
+                )
+                self.assertEqual(
+                    registry.get_service("assembly")["group_thread_id"], 9
                 )
 
         asyncio.run(process())

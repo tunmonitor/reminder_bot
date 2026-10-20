@@ -87,22 +87,26 @@ async def send_to_service_group(
 ):
     """Отправка в чат служения с учётом темы.
 
-    Если тема удалена или закрыта, сообщение уходит в общую тему, а
-    сохранённая тема сбрасывается — иначе служение перестало бы получать
-    напоминания.
+    Если тема удалена или закрыта, сообщение уходит в общую тему; удалённая
+    тема сбрасывается (иначе служение перестало бы получать напоминания),
+    закрытая остаётся выбранной.
     """
     thread = thread_kwargs(service)
     try:
         return await send(chat_id, text, **kwargs, **thread)
     except TelegramAPIError as exc:
-        if not thread or "thread" not in str(exc).lower():
+        error = str(exc).lower()
+        # «message thread not found», TOPIC_CLOSED/TOPIC_DELETED/... —
+        # тема недоступна, сообщение уходит в общую тему.
+        if not thread or ("thread" not in error and "topic" not in error):
             raise
         if logger is not None:
             logger.warning(
                 "Тема %s чата служения %s недоступна (%s); отправка в общую тему",
                 thread["message_thread_id"], service["id"], exc,
             )
-    if registry is not None:
+    # Закрытую тему могут открыть снова — она остаётся выбранной.
+    if registry is not None and "closed" not in error:
         try:
             registry.reset_group_thread(
                 service["id"], thread["message_thread_id"]
