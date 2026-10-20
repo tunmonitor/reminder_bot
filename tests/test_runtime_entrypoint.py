@@ -229,6 +229,69 @@ class ReminderBotEntrypointTest(unittest.TestCase):
         self.assertGreaterEqual(len(parsed_months), 2)
         self.assertEqual(leftovers, [])
 
+    def test_roster_sync_failure_is_logged_and_issues_are_per_service(self):
+        from bot import app
+        from bot.excel_parser import RosterMember
+        from bot.service_registry import ServiceRegistry
+
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+            registry.initialize(1001, -10001)
+            logger = MagicMock()
+            with patch.object(
+                app, "parse_service_rosters",
+                side_effect=RuntimeError("Лист 'Списки' не найден"),
+            ):
+                app._sync_rosters_and_contacts(
+                    registry, Path(tmp_dir) / "x.xlsx", "sound", {}, None,
+                    logger, [],
+                )
+            logger.exception.assert_called_once()
+
+            def parse(path, logger, services, issues):
+                issues.extend([
+                    "«Списки», Звук: «Иван» указан без задачи",
+                    "«Списки», Кухня: «Анна» указан без задачи",
+                    "«Списки»: служение «Хор» не найдено в каталоге",
+                ])
+                return {"sound": [RosterMember("Иван", ("звук",))]}
+
+            registry.bind_service_member(1001, "sound", "Иван", 7007)
+            issues = []
+            with patch.object(app, "parse_service_rosters", side_effect=parse):
+                app._sync_rosters_and_contacts(
+                    registry, Path(tmp_dir) / "x.xlsx", "sound",
+                    {"сборка": {"names": ["Иван"], "is_informational": False}},
+                    None, logger, issues,
+                )
+            self.assertEqual(
+                issues,
+                [
+                    "«Списки», Звук: «Иван» указан без задачи",
+                    "«Списки»: служение «Хор» не найдено в каталоге",
+                ],
+            )
+            repeated = []
+            with patch.object(app, "parse_service_rosters", side_effect=parse):
+                app._sync_rosters_and_contacts(
+                    registry, Path(tmp_dir) / "x.xlsx", "kitchen", {}, None,
+                    logger, repeated,
+                )
+            self.assertEqual(
+                repeated,
+                [
+                    "«Списки», Кухня: «Анна» указан без задачи",
+                    "«Списки»: служение «Хор» не найдено в каталоге",
+                ],
+            )
+            tasks = sorted(
+                contact["task"]
+                for contact in registry.list_responsible_contacts(1001, "sound")
+                if contact["name"] == "Иван"
+            )
+            self.assertEqual(tasks, ["звук", "сборка"])
+
     def test_upcoming_events_skip_empty_later_sheet(self):
         from bot import app
         from bot.excel_parser import ServiceEvent, SheetEmptyError
@@ -475,6 +538,55 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 self.assertEqual(len(admin_messages), 1)
                 self.assertIn("строка без задачи", admin_messages[0])
                 self.assertIn("Проверьте график «Собрание»", admin_messages[0])
+
+        asyncio.run(process())
+
+    def test_sheet_wide_roster_issue_is_sent_once_after_delivery(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        sheet_issue = "«Списки»: служение «Хор» не найдено в каталоге"
+        found = {"sound": False, "assembly": True, "broadcast": True}
+
+        async def load(credentials, shm_dir, tz, service_id, *args,
+                       issues=None, **kwargs):
+            issues.append(sheet_issue)
+            return {"Ведущий": ["Анна"]}, found[service_id]
+
+        async def process():
+            app._REPORTED_SHEET_ISSUES.clear()
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                for service_id in ("sound", "broadcast"):
+                    registry.set_group_chat(
+                        1001, service_id, -10002, enabled=True
+                    )
+                bot = SimpleNamespace(send_message=AsyncMock())
+                logger = MagicMock()
+                with patch.object(
+                    app, "_load_service_task_assignments",
+                    new=AsyncMock(side_effect=load),
+                ), patch.object(
+                    app, "_notify_admin", new=AsyncMock(return_value=True)
+                ) as notify_admin:
+                    for service_id in ("sound", "assembly", "broadcast"):
+                        reminder = registry.list_group_reminders(service_id)[0]
+                        await app._process_service_reminder(
+                            bot, SimpleNamespace(admin_tg_id=1001),
+                            Path(tmp_dir), ZoneInfo("UTC"), registry,
+                            service_id, reminder["id"], logger, logger,
+                            run_date=date(2026, 10, 11) - timedelta(
+                                days=reminder["reminder_days"]
+                            ),
+                        )
+                texts = [call.args[2] for call in notify_admin.await_args_list]
+                self.assertEqual(
+                    [text for text in texts if sheet_issue in text
+                     and "Проверьте график" in text],
+                    [next(t for t in texts if "«Собрание»" in t)],
+                )
+            app._REPORTED_SHEET_ISSUES.clear()
 
         asyncio.run(process())
 

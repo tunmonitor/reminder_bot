@@ -16,6 +16,7 @@ from bot.excel_parser import (
     parse_people,
     parse_schedule,
     parse_service_events as parse_with_catalog,
+    parse_service_rosters,
     resolve_assignments,
 )
 from bot.services import SERVICES, parse_catalog
@@ -690,6 +691,54 @@ class ExcelParserTest(unittest.TestCase):
         self.assertEqual(
             [event.event_date for event in events],
             [date(2026, 10, 4), date(2026, 10, 11), date(2026, 10, 18)],
+        )
+
+    def test_service_rosters_read_names_and_tasks_only(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Списки"
+        sheet.append(["Звук", None, None, "Кухня"])
+        sheet.append(["звук", "@orphan_user", None, "старший"])
+        sheet.append(["Алексей", "@alex_sound", 11111, "Мария"])
+        sheet.append(["Перевозка + сборка", "звук"])
+        sheet.append(["Алексей", "Daniel"])
+        sheet.append(["Пётр"])
+        sheet.append(["спевка"])
+        sheet.append(["Иван"])
+        sheet.append(["Перевозка + сборка"])
+        sheet.append(["пётр"])
+        sheet.append(["ivan_petrov", 55555])
+        sheet["G1"] = "Книги"
+        sheet["G2"] = "Ольга"
+        sheet["H3"] = "@lost_user"
+        sheet["I3"] = 99999
+        sheet["H4"] = "Daniel"
+        workbook.save(self.path)
+        issues = []
+
+        rosters = parse_service_rosters(
+            self.path, self.debug_logger, SERVICES, issues
+        )
+
+        sound = {member.name: member for member in rosters["sound"]}
+        self.assertEqual(sorted(sound), ["Daniel", "Алексей", "Пётр"])
+        self.assertEqual(sound["Daniel"].tasks, ("звук",))
+        self.assertEqual(sound["Алексей"].tasks, ("звук", "сборка"))
+        self.assertEqual(sound["Пётр"].tasks, ("сборка",))
+        self.assertEqual(
+            [(member.name, member.tasks) for member in rosters["kitchen"]],
+            [("Мария", ("старший",))],
+        )
+        self.assertNotIn("order", rosters)
+        self.assertEqual(
+            [member.name for member in rosters["books"]], ["Ольга", "Daniel"]
+        )
+        self.assertEqual(
+            issues,
+            [
+                "«Списки», Звук: задача «сборка»: «пётр» указан дважды — "
+                "уточните фамилией",
+            ],
         )
 
     def test_parses_multiple_legacy_assignments_from_one_row(self):

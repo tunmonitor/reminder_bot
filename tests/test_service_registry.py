@@ -404,6 +404,180 @@ class ServiceRegistryTest(unittest.TestCase):
             [("звук", 0), ("сборка", 1), ("спевка", 2), ("Перевозка", 3)],
         )
 
+    def test_roster_sync_keeps_bot_bindings_and_skips_noop_writes(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.set_responsible_contact(
+            1001, "sound", "звук", "Алексей", 2002, "alex_bot"
+        )
+        rosters = {
+            "sound": [
+                RosterMember("Алексей", ("звук", "сборка")),
+                RosterMember("Пётр", ("сборка",)),
+            ]
+        }
+        self.registry.sync_service_rosters(rosters)
+
+        members = {
+            member["name"]: member
+            for member in self.registry.list_service_members("sound")
+        }
+        self.assertEqual(members["Алексей"]["telegram_id"], 2002)
+        self.assertEqual(members["Алексей"]["username"], "alex_bot")
+        self.assertEqual(members["Алексей"]["tasks"], ["звук", "сборка"])
+        self.assertTrue(members["Алексей"]["in_list"])
+        self.assertIsNone(members["Пётр"]["telegram_id"])
+        contacts = {
+            (contact["task"], contact["name"]): contact["telegram_id"]
+            for contact in self.registry.list_responsible_contacts(
+                1001, "sound"
+            )
+        }
+        self.assertEqual(contacts[("сборка", "Алексей")], 2002)
+        self.assertNotIn(("сборка", "Пётр"), contacts)
+
+        changes = []
+        self.registry.on_change = lambda: changes.append(True)
+        self.registry.sync_service_rosters(rosters)
+        self.assertEqual(changes, [])
+
+        self.registry.sync_service_rosters({"sound": rosters["sound"][1:]})
+        members = {
+            member["name"]: member
+            for member in self.registry.list_service_members("sound")
+        }
+        self.assertFalse(members["Алексей"]["in_list"])
+        self.registry.sync_service_rosters({"kitchen": []})
+        self.assertTrue(
+            any(m["in_list"] for m in self.registry.list_service_members("sound"))
+        )
+        self.registry.sync_service_rosters({"sound": []})
+        self.assertFalse(
+            any(m["in_list"] for m in self.registry.list_service_members("sound"))
+        )
+
+    def test_member_binding_and_schedule_tasks(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.sync_service_rosters(
+            {"sound": [RosterMember("Мария", ("звук",))]}
+        )
+        self.registry.bind_service_member(
+            1001, "sound", "Мария", 5005, "@maria_x", tasks=("сборка",)
+        )
+        self.registry.ensure_member_contacts(
+            "sound",
+            {
+                "спевка": {"names": ["Мария"], "is_informational": False},
+                "Праздник": {"names": ["Мария"], "is_informational": True},
+                "звук": ["Кто-то"],
+            },
+        )
+
+        contacts = sorted(
+            (contact["task"], contact["telegram_id"], contact["username"])
+            for contact in self.registry.list_responsible_contacts(
+                1001, "sound"
+            )
+            if contact["name"] == "Мария"
+        )
+        self.assertEqual(
+            contacts,
+            [
+                ("звук", 5005, "maria_x"),
+                ("сборка", 5005, "maria_x"),
+                ("спевка", 5005, "maria_x"),
+            ],
+        )
+        long_name = "Иван  " + "Очень" * 15
+        self.registry.bind_service_member(1001, "sound", f" {long_name} ", 7007)
+        self.assertIn(
+            long_name,
+            [m["name"] for m in self.registry.list_service_members("sound")],
+        )
+        with self.assertRaisesRegex(ValueError, "обязательно"):
+            self.registry.bind_service_member(1001, "sound", "  ", 7007)
+        with self.assertRaises(PermissionError):
+            self.registry.bind_service_member(2002, "sound", "Мария", 6006)
+
+    def test_rebinding_one_task_moves_all_tasks_of_the_name(self):
+        self.registry.set_responsible_contact(1001, "sound", "звук", "Олег", 2002)
+        self.registry.set_responsible_contact(1001, "sound", "сборка", "Олег", 2002)
+
+        self.registry.set_responsible_contact(
+            1001, "sound", "звук", "Олег", 3003, "oleg_new"
+        )
+
+        contacts = sorted(
+            (contact["task"], contact["telegram_id"])
+            for contact in self.registry.list_responsible_contacts(1001, "sound")
+            if contact["name"] == "Олег"
+        )
+        self.assertEqual(contacts, [("звук", 3003), ("сборка", 3003)])
+
+    def test_renamed_person_binding_follows_schedule_name(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.set_responsible_contact(1001, "sound", "звук", "Саша", 2002)
+        self.registry.bind_service_member(1001, "sound", "Александр", 2002)
+        self.registry.set_responsible_contact(1001, "sound", "сборка", "Шура", 2002)
+        self.registry.ensure_member_contacts("sound", {"сборка": ["Александр"]})
+        self.assertIn(
+            ("сборка", "Шура"),
+            [
+                (c["task"], c["name"])
+                for c in self.registry.list_responsible_contacts(1001, "sound")
+            ],
+        )
+        self.registry.sync_service_rosters(
+            {"sound": [RosterMember("Александр", ("звук",))]}
+        )
+
+        self.registry.ensure_member_contacts("sound", {"звук": ["Александр"]})
+
+        names = [
+            contact["name"]
+            for contact in self.registry.list_responsible_contacts(1001, "sound")
+            if contact["task"] == "звук"
+        ]
+        self.assertEqual(names, ["Александр"])
+
+    def test_file_telegram_ids_are_dropped_once(self):
+        self.registry.bind_service_member(1001, "sound", "Олег", 2002)
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "INSERT INTO service_members (service_id, name, telegram_id, "
+                "username, tasks_json, in_list, source, updated_at) VALUES "
+                "('sound', 'Файл', 3003, 'from_file', '[\"звук\"]', 1, "
+                "'excel', '2026-10-20T00:00:00+00:00')"
+            )
+            connection.execute(
+                "INSERT INTO responsible_contacts (service_id, task, name, "
+                "telegram_id, username, updated_by, updated_at) VALUES "
+                "('sound', 'звук', 'Файл', 3003, 'from_file', 1001, "
+                "'2026-10-20T00:00:00+00:00')"
+            )
+            connection.execute(
+                "UPDATE service_members SET source = 'excel' WHERE name = 'Олег'"
+            )
+            connection.execute(
+                "DELETE FROM catalog_migrations WHERE name = 'members-v2'"
+            )
+
+        self.registry.initialize(1001, -10001)
+
+        members = {
+            member["name"]: member["telegram_id"]
+            for member in self.registry.list_service_members("sound")
+        }
+        self.assertIsNone(members["Файл"])
+        self.assertEqual(members["Олег"], 2002)
+        names = {
+            contact["name"]
+            for contact in self.registry.list_responsible_contacts(1001, "sound")
+        }
+        self.assertNotIn("Файл", names)
+
     def test_bootstrap_is_idempotent_and_does_not_promote_new_env_admin(self):
         self.registry.set_group_chat(1001, "sound", -10002, enabled=True)
 
