@@ -3650,7 +3650,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             if operation == "service_admin_add"
             else (
                 f"привязать к записи «{contact_name}» из файла "
-                f"для задачи «{task}»"
+                f"для задачи «{task}» и других задач этого имени"
             )
             if task
             else f"привязать «{contact_name}» во всех задачах служения"
@@ -4927,7 +4927,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     f"Ответственный «{contact_name}» из файла расписания "
                     f"связан с {display_name}"
                     + (f" (@{username})" if username else "")
-                    + f" для задачи «{task}»."
+                    + f" для задачи «{task}» и других задач этого имени."
                 )
         if operation == "service_admin_add":
             await clean_and_clear_pending_actor(callback.from_user.id)

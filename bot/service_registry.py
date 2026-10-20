@@ -2302,7 +2302,11 @@ class ServiceRegistry:
         """
         _validate_positive_id(actor_id, "actor_id")
         _validate_positive_id(telegram_id, "telegram_id")
-        name = normalize_member_name(name)
+        # Имя как в графике и «Списках» (без схлопывания пробелов), иначе
+        # привязка не совпала бы с записью графика.
+        name = name.strip() if isinstance(name, str) else ""
+        if not name or "\x00" in name:
+            raise ValueError("Имя участника обязательно.")
         username = username.strip().lstrip("@")
         with self._connection() as connection:
             self._require_super_admin(connection, actor_id)
@@ -3267,7 +3271,8 @@ def _validate_positive_id(value: int, field: str) -> None:
 
 
 def normalize_member_name(name) -> str:
-    """Имя участника служения: пробелы схлопываются, 1–60 символов."""
+    """Имя нового участника, введённое вручную: пробелы схлопываются,
+    1–60 символов. Имена из графика и «Списков» хранятся как записаны."""
     name = " ".join(name.split()) if isinstance(name, str) else ""
     if not name or len(name) > 60 or "\x00" in name:
         raise ValueError("Имя участника: от 1 до 60 символов.")

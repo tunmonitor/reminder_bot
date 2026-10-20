@@ -519,6 +519,12 @@ async def _load_service_task_assignments(
         xlsx_path.unlink(missing_ok=True)
 
 
+# Проблемы листа «Списки» в целом (неизвестное служение) — не одного
+# служения: админ получает их с первым отправленным уведомлением дня.
+SHEET_ISSUE_PREFIX = "«Списки»:"
+_REPORTED_SHEET_ISSUES: dict[str, date] = {}
+
+
 def _sync_rosters_and_contacts(
     registry: ServiceRegistry,
     xlsx_path: Path,
@@ -539,12 +545,10 @@ def _sync_rosters_and_contacts(
         debug_logger.exception("Не удалось обновить состав служений из «Списков»")
     else:
         service = registry.get_service(service_id)
-        prefixes = (f"«Списки», {service['name']}:",) if service else ()
-        if service_id == "assembly":
-            # Проблемы листа в целом (неизвестное служение) — один раз,
-            # вместе с Собранием, а не в каждом служении.
-            prefixes += ("«Списки»:",)
-        if issues is not None and prefixes:
+        prefixes = (SHEET_ISSUE_PREFIX,) + (
+            (f"«Списки», {service['name']}:",) if service else ()
+        )
+        if issues is not None:
             issues.extend(
                 issue for issue in roster_issues if issue.startswith(prefixes)
             )
@@ -790,6 +794,17 @@ async def _process_service_reminder(
         )
         return
     issues_recipient = "admin:schedule-issues"
+    today = datetime.now(tz).date()
+    for reported, reported_on in list(_REPORTED_SHEET_ISSUES.items()):
+        if reported_on != today:
+            _REPORTED_SHEET_ISSUES.pop(reported, None)
+    schedule_issues = [
+        issue for issue in schedule_issues
+        if not (
+            issue.startswith(SHEET_ISSUE_PREFIX)
+            and issue in _REPORTED_SHEET_ISSUES
+        )
+    ]
     if schedule_issues and not registry.is_group_reminder_delivered(
         reminder["id"], event_date.isoformat(), issues_recipient
     ):
@@ -806,6 +821,9 @@ async def _process_service_reminder(
             registry.mark_group_reminder_delivered(
                 reminder["id"], event_date.isoformat(), issues_recipient
             )
+            for issue in unique_issues:
+                if issue.startswith(SHEET_ISSUE_PREFIX):
+                    _REPORTED_SHEET_ISSUES[issue] = today
 
     try:
         contacts = registry.list_responsible_contacts(

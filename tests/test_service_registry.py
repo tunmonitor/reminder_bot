@@ -489,12 +489,13 @@ class ServiceRegistryTest(unittest.TestCase):
                 ("спевка", 5005, "maria_x"),
             ],
         )
-        self.registry.bind_service_member(1001, "sound", "  Новый   Человек ", 7007)
+        long_name = "Иван  " + "Очень" * 15
+        self.registry.bind_service_member(1001, "sound", f" {long_name} ", 7007)
         self.assertIn(
-            "Новый Человек",
+            long_name,
             [m["name"] for m in self.registry.list_service_members("sound")],
         )
-        with self.assertRaisesRegex(ValueError, "от 1 до 60"):
+        with self.assertRaisesRegex(ValueError, "обязательно"):
             self.registry.bind_service_member(1001, "sound", "  ", 7007)
         with self.assertRaises(PermissionError):
             self.registry.bind_service_member(2002, "sound", "Мария", 6006)
