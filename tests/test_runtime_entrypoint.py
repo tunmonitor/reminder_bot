@@ -199,7 +199,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
         today = datetime.now(ZoneInfo("UTC")).date()
         parsed_months = []
 
-        def parse(path, month, logger):
+        def parse(path, month, logger, services=None):
             parsed_months.append(month)
             if month != today.replace(day=1):
                 raise SheetNotFoundError("Лист расписания не найден")
@@ -234,7 +234,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
 
         today = datetime.now(ZoneInfo("UTC")).date()
 
-        def parse(path, month, logger):
+        def parse(path, month, logger, services=None):
             if month != today.replace(day=1):
                 raise RuntimeError("Лист расписания пуст")
             return {}
@@ -409,6 +409,47 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                         duplicate_id, event_date, "group:-10001"
                     )
                 )
+
+        asyncio.run(process())
+
+    def test_schedule_issues_are_sent_to_admin_once_per_event(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def load(*args, issues=None, **kwargs):
+            issues.append("«Собрание», 11.10.2026: строка без задачи")
+            return {"Ведущий": ["Анна"]}, True
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                reminder = registry.list_group_reminders("assembly")[0]
+                bot = SimpleNamespace(send_message=AsyncMock())
+                credentials = SimpleNamespace(admin_tg_id=1001)
+                logger = MagicMock()
+                run_date = date(2026, 10, 11) - timedelta(
+                    days=reminder["reminder_days"]
+                )
+                with patch.object(
+                    app, "_load_service_task_assignments",
+                    new=AsyncMock(side_effect=load),
+                ):
+                    for _ in range(2):
+                        await app._process_service_reminder(
+                            bot, credentials, Path(tmp_dir), ZoneInfo("UTC"),
+                            registry, "assembly", reminder["id"],
+                            logger, logger, run_date=run_date,
+                        )
+
+                admin_messages = [
+                    call.args[1]
+                    for call in bot.send_message.await_args_list
+                    if call.args[0] == 1001
+                ]
+                self.assertEqual(len(admin_messages), 1)
+                self.assertIn("строка без задачи", admin_messages[0])
+                self.assertIn("Проверьте график «Собрание»", admin_messages[0])
 
         asyncio.run(process())
 

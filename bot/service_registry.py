@@ -11,10 +11,16 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from string import Formatter
+from dataclasses import replace
 from typing import Callable
 
 from .secure_fs import open_private_directory
-from .services import SERVICES
+from .services import (
+    SERVICES,
+    ServiceDefinition,
+    ServiceTask,
+    normalized_name,
+)
 
 
 GROUP_TEMPLATE_FIELDS = frozenset(
@@ -229,6 +235,23 @@ class ServiceRegistry:
                     name TEXT PRIMARY KEY
                 );
 
+                CREATE TABLE IF NOT EXISTS service_tasks (
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1
+                        CHECK (enabled IN (0, 1)),
+                    aliases_json TEXT NOT NULL DEFAULT '[]',
+                    source TEXT NOT NULL
+                        CHECK (source IN ('catalog', 'admin')),
+                    PRIMARY KEY (service_id, name)
+                );
+
+                CREATE TABLE IF NOT EXISTS catalog_migrations (
+                    name TEXT PRIMARY KEY
+                );
+
                 CREATE TABLE IF NOT EXISTS group_reminder_legacy_ids (
                     legacy_id INTEGER PRIMARY KEY,
                     reminder_id INTEGER NOT NULL
@@ -242,6 +265,7 @@ class ServiceRegistry:
             if any(row["unique"] for row in reminder_indexes):
                 connection.executescript(
                     """
+                    BEGIN IMMEDIATE;
                     CREATE TABLE service_reminders_v2 (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         service_id TEXT NOT NULL REFERENCES services(id)
@@ -416,24 +440,7 @@ class ServiceRegistry:
                 (secrets.randbelow(2**30) + 2**30,),
             )
             now = _utc_now()
-            for service in SERVICES:
-                is_assembly = service.id == "assembly"
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO services (
-                        id, name, aliases_json, assignment_layout,
-                        group_chat_id, enabled
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        service.id,
-                        service.name,
-                        json.dumps(service.aliases, ensure_ascii=False),
-                        service.assignment_layout,
-                        assembly_group_chat_id if is_assembly else None,
-                        int(is_assembly),
-                    ),
-                )
+            self._sync_service_catalog(connection, assembly_group_chat_id)
             has_super_admin = connection.execute(
                 "SELECT 1 FROM super_admins LIMIT 1"
             ).fetchone()
@@ -466,7 +473,219 @@ class ServiceRegistry:
                     "INSERT INTO service_reminder_migrations (name) "
                     "VALUES ('legacy-reminders')"
                 )
+            self._migrate_to_service_catalog(connection)
             self._migrate_service_reminders(connection)
+
+    @staticmethod
+    def _sync_service_catalog(
+        connection: sqlite3.Connection, assembly_group_chat_id: int
+    ) -> None:
+        """Переносит каталог служений и задач из файла в БД.
+
+        Названия, синонимы и колонки задаёт файл; включение задач и задачи,
+        добавленные суперадмином, хранятся в БД и файлом не перезаписываются.
+        Служения, которых нет в каталоге, уходят в архив без удаления данных.
+        """
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(services)")
+        }
+        if "archived" not in columns:
+            connection.execute(
+                "ALTER TABLE services ADD COLUMN archived INTEGER NOT NULL "
+                "DEFAULT 0 CHECK (archived IN (0, 1))"
+            )
+        for service in SERVICES:
+            is_assembly = service.id == "assembly"
+            connection.execute(
+                """
+                INSERT INTO services (
+                    id, name, aliases_json, assignment_layout,
+                    group_chat_id, enabled
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    aliases_json = excluded.aliases_json,
+                    assignment_layout = excluded.assignment_layout,
+                    archived = 0
+                """,
+                (
+                    service.id,
+                    service.name,
+                    json.dumps(service.aliases, ensure_ascii=False),
+                    service.assignment_layout,
+                    assembly_group_chat_id if is_assembly else None,
+                    int(is_assembly),
+                ),
+            )
+            for position, task in enumerate(service.tasks):
+                connection.execute(
+                    """
+                    INSERT INTO service_tasks (
+                        service_id, name, position, enabled, aliases_json,
+                        source
+                    ) VALUES (?, ?, ?, ?, ?, 'catalog')
+                    ON CONFLICT(service_id, name) DO UPDATE SET
+                        position = excluded.position,
+                        aliases_json = excluded.aliases_json,
+                        source = 'catalog'
+                    """,
+                    (
+                        service.id,
+                        task.name,
+                        position,
+                        int(task.enabled),
+                        json.dumps(task.aliases, ensure_ascii=False),
+                    ),
+                )
+            # Задачи, добавленные суперадмином, идут после задач каталога;
+            # позиции уникальны и служат идентификатором кнопок.
+            admin_tasks = connection.execute(
+                "SELECT name FROM service_tasks "
+                "WHERE service_id = ? AND source = 'admin' "
+                "ORDER BY position, name",
+                (service.id,),
+            ).fetchall()
+            for offset, row in enumerate(admin_tasks):
+                connection.execute(
+                    "UPDATE service_tasks SET position = ? "
+                    "WHERE service_id = ? AND name = ?",
+                    (len(service.tasks) + offset, service.id, row["name"]),
+                )
+        catalog_ids = [service.id for service in SERVICES]
+        connection.execute(
+            "UPDATE services SET archived = 1, enabled = 0 "
+            f"WHERE id NOT IN ({', '.join('?' for _ in catalog_ids)})",
+            catalog_ids,
+        )
+
+    @staticmethod
+    def _migrate_to_service_catalog(connection: sqlite3.Connection) -> None:
+        """Однократно переводит данные на каталог служений и задач.
+
+        Администраторы «Слайдов» становятся администраторами «Трансляции и
+        слайдов»; задачи привязок, личных текстов и шаблонов переименовываются
+        в названия каталога по синонимам. Выполняется в общей транзакции
+        initialize() и отмечается в catalog_migrations.
+        """
+        if connection.execute(
+            "SELECT 1 FROM catalog_migrations WHERE name = 'catalog-v1'"
+        ).fetchone():
+            return
+        # Упразднённые служения стали задачами других служений: их
+        # администраторы, привязки, личные тексты и настройки переносятся.
+        merged_services = {
+            "slides": ("broadcast", "Слайды"),
+            "rehearsal": ("sound", "спевка"),
+            "coffee": ("kitchen", "кофе"),
+        }
+        existing = {
+            row["id"] for row in connection.execute("SELECT id FROM services")
+        }
+        for old_id, (new_id, new_task) in merged_services.items():
+            if old_id not in existing or new_id not in existing:
+                continue
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO service_admins (
+                    service_id, telegram_id, username, created_by, created_at
+                )
+                SELECT ?, telegram_id, username, created_by, created_at
+                FROM service_admins WHERE service_id = ?
+                """,
+                (new_id, old_id),
+            )
+            for row in connection.execute(
+                "SELECT * FROM responsible_contacts WHERE service_id = ?",
+                (old_id,),
+            ).fetchall():
+                _move_contact(connection, row, new_id, new_task)
+            for row in connection.execute(
+                "SELECT id FROM user_reminder_texts WHERE service_id = ?",
+                (old_id,),
+            ).fetchall():
+                _move_user_text(connection, row["id"], new_id, new_task)
+            connection.execute(
+                """
+                INSERT INTO user_notification_prefs (service_id, actor_id, enabled)
+                SELECT ?, actor_id, enabled FROM user_notification_prefs
+                WHERE service_id = ?
+                ON CONFLICT(actor_id, service_id) DO UPDATE SET
+                    enabled = MAX(enabled, excluded.enabled)
+                """,
+                (new_id, old_id),
+            )
+        # Строки без задачи раньше получали название служения; в этих
+        # служениях так записывались участники «в смене».
+        legacy_tasks = {
+            ("kitchen", "кухня"): "в смене",
+            ("order", "орг. порядка"): "в смене",
+        }
+        renames: dict[tuple[str, str], str | None] = {}
+
+        def canonical(service_id: str, task: str) -> str | None:
+            key = (service_id, task)
+            if key not in renames:
+                normalized = normalized_name(task)
+                target = legacy_tasks.get((service_id, normalized))
+                if target is None:
+                    target = next(
+                        (
+                            row["name"]
+                            for row in connection.execute(
+                                "SELECT name, aliases_json FROM service_tasks "
+                                "WHERE service_id = ?",
+                                (service_id,),
+                            )
+                            if normalized in {
+                                normalized_name(name)
+                                for name in (
+                                    row["name"],
+                                    *json.loads(row["aliases_json"]),
+                                )
+                            }
+                        ),
+                        None,
+                    )
+                renames[key] = target
+            target = renames[key]
+            return target if target and target != task else None
+
+        for row in connection.execute(
+            "SELECT * FROM responsible_contacts"
+        ).fetchall():
+            target = canonical(row["service_id"], row["task"])
+            if target is not None:
+                _move_contact(connection, row, row["service_id"], target)
+        for row in connection.execute(
+            "SELECT id, service_id, task FROM user_reminder_texts"
+        ).fetchall():
+            target = canonical(row["service_id"], row["task"])
+            if target is not None:
+                _move_user_text(connection, row["id"], row["service_id"], target)
+        for row in connection.execute(
+            "SELECT id, personal_templates_json FROM services "
+            "WHERE personal_templates_json IS NOT NULL"
+        ).fetchall():
+            templates = json.loads(row["personal_templates_json"])
+            renamed = {}
+            for task, template in templates.items():
+                target = canonical(row["id"], task) or task
+                # Шаблон под каноническим названием главнее; шаблон под
+                # синонимом при конфликте остаётся под своим ключом.
+                if target != task and target in templates:
+                    renamed[task] = template
+                else:
+                    renamed[target] = template
+            if renamed != templates:
+                connection.execute(
+                    "UPDATE services SET personal_templates_json = ? "
+                    "WHERE id = ?",
+                    (json.dumps(renamed, ensure_ascii=False), row["id"]),
+                )
+        connection.execute(
+            "INSERT INTO catalog_migrations (name) VALUES ('catalog-v1')"
+        )
 
     @staticmethod
     def _migrate_service_reminders(
@@ -623,7 +842,7 @@ class ServiceRegistry:
                 "SELECT id, name, aliases_json, assignment_layout, "
                 "group_chat_id, enabled, reminder_days, reminder_time, "
                 "group_template, personal_templates_json "
-                "FROM services ORDER BY id"
+                "FROM services WHERE archived = 0 ORDER BY id"
             ).fetchall()
             reminders = connection.execute(
                 "SELECT id, service_id, body, reminder_days, reminder_time, "
@@ -670,6 +889,107 @@ class ServiceRegistry:
             ),
             None,
         )
+
+    def list_service_tasks(self, service_id: str) -> list[dict]:
+        """Задачи служения в порядке каталога, включая выключенные."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT name, position, enabled, aliases_json, source "
+                "FROM service_tasks WHERE service_id = ? "
+                "ORDER BY position, name",
+                (service_id,),
+            ).fetchall()
+        return [
+            {
+                "name": row["name"],
+                "position": row["position"],
+                "enabled": bool(row["enabled"]),
+                "aliases": json.loads(row["aliases_json"]),
+                "source": row["source"],
+            }
+            for row in rows
+        ]
+
+    def service_catalog(self) -> tuple[ServiceDefinition, ...]:
+        """Каталог из файла с задачами в состоянии из БД (для парсера)."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT service_id, name, enabled, aliases_json "
+                "FROM service_tasks ORDER BY service_id, position, name"
+            ).fetchall()
+        tasks: dict[str, list[ServiceTask]] = {}
+        for row in rows:
+            tasks.setdefault(row["service_id"], []).append(
+                ServiceTask(
+                    row["name"],
+                    tuple(json.loads(row["aliases_json"])),
+                    bool(row["enabled"]),
+                )
+            )
+        return tuple(
+            replace(service, tasks=tuple(tasks.get(service.id, ())))
+            for service in SERVICES
+        )
+
+    def set_service_task_enabled(
+        self, actor_id: int, service_id: str, task: str, enabled: bool
+    ) -> None:
+        _validate_positive_id(actor_id, "actor_id")
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled должен быть логическим значением")
+        with self._connection() as connection:
+            self._require_super_admin(connection, actor_id)
+            self._require_service(connection, service_id)
+            cursor = connection.execute(
+                "UPDATE service_tasks SET enabled = ? "
+                "WHERE service_id = ? AND name = ?",
+                (int(enabled), service_id, task),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(f"Задача «{task}» не найдена.")
+            self._audit(
+                connection, actor_id, "service_task_updated", service_id,
+                {"task": task, "enabled": enabled},
+            )
+
+    def add_service_task(
+        self, actor_id: int, service_id: str, name: str
+    ) -> None:
+        _validate_positive_id(actor_id, "actor_id")
+        name = " ".join(name.split()) if isinstance(name, str) else ""
+        if not name or len(name) > 60 or "\x00" in name:
+            raise ValueError("Название задачи: от 1 до 60 символов.")
+        with self._connection() as connection:
+            self._require_super_admin(connection, actor_id)
+            self._require_service(connection, service_id)
+            existing = connection.execute(
+                "SELECT name, aliases_json, position FROM service_tasks "
+                "WHERE service_id = ?",
+                (service_id,),
+            ).fetchall()
+            key = normalized_name(name)
+            for row in existing:
+                if key in {
+                    normalized_name(value)
+                    for value in (row["name"], *json.loads(row["aliases_json"]))
+                }:
+                    raise ValueError(
+                        f"Задача «{name}» уже есть: «{row['name']}»."
+                    )
+            connection.execute(
+                "INSERT INTO service_tasks "
+                "(service_id, name, position, enabled, source) "
+                "VALUES (?, ?, ?, 1, 'admin')",
+                (
+                    service_id,
+                    name,
+                    max((row["position"] for row in existing), default=-1) + 1,
+                ),
+            )
+            self._audit(
+                connection, actor_id, "service_task_added", service_id,
+                {"task": name},
+            )
 
     def is_super_admin(self, telegram_id: int) -> bool:
         with self._connection() as connection:
@@ -991,6 +1311,99 @@ class ServiceRegistry:
                 "group_reminder_deleted",
                 row["service_id"],
                 {"reminder_id": reminder_id},
+            )
+
+    def merge_group_reminder(
+        self,
+        actor_id: int,
+        target_id: int,
+        body=_UNSET,
+        *,
+        expected_slot: tuple[int, str],
+        source_id: int | None = None,
+        source_slot: tuple[int, str] | None = None,
+    ) -> None:
+        """Объединяет напоминания с одинаковым расписанием в target_id.
+
+        body — итоговый текст target (по умолчанию не меняется); source_id —
+        напоминание, которое удаляется в той же транзакции. expected_slot и
+        source_slot — расписания, показанные пользователю: если их успели
+        изменить, объединение отклоняется. Отметки доставки source
+        переносятся на target, чтобы уже отправленное не ушло повторно.
+        """
+        _validate_positive_id(actor_id, "actor_id")
+        _validate_positive_id(target_id, "target_id")
+        if source_id is not None:
+            _validate_positive_id(source_id, "source_id")
+            if source_id == target_id:
+                raise ValueError("Нельзя объединить напоминание с самим собой.")
+            if source_slot is None:
+                raise ValueError("Не указано расписание объединяемого напоминания.")
+        stale = ValueError(
+            "Напоминания изменились. Откройте список напоминаний заново."
+        )
+        with self._connection() as connection:
+            target = connection.execute(
+                "SELECT * FROM group_reminders WHERE id = ?", (target_id,)
+            ).fetchone()
+            if target is None:
+                raise ValueError("Групповое напоминание больше не существует.")
+            self._require_service_editor(
+                connection, actor_id, target["service_id"]
+            )
+            if (
+                (target["reminder_days"], target["reminder_time"])
+                != tuple(expected_slot)
+                or not target["enabled"]
+            ):
+                raise stale
+            if source_id is not None:
+                source = connection.execute(
+                    "SELECT service_id, reminder_days, reminder_time "
+                    "FROM group_reminders WHERE id = ?",
+                    (source_id,),
+                ).fetchone()
+                if source is None or source["service_id"] != target["service_id"]:
+                    raise ValueError(
+                        "Объединяемое напоминание больше не существует."
+                    )
+                if (
+                    (source["reminder_days"], source["reminder_time"])
+                    != tuple(source_slot)
+                ):
+                    raise stale
+            new_body = target["body"] if body is _UNSET else body
+            self._validate_group_reminder_values(
+                target["reminder_days"], target["reminder_time"], new_body
+            )
+            connection.execute(
+                "UPDATE group_reminders SET body = ? WHERE id = ?",
+                (new_body.strip() if new_body else None, target_id),
+            )
+            if source_id is not None:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO group_reminder_deliveries (
+                        reminder_id, event_date, recipient_key, delivered_at
+                    )
+                    SELECT ?, event_date, recipient_key, delivered_at
+                    FROM group_reminder_deliveries WHERE reminder_id = ?
+                    """,
+                    (target_id, source_id),
+                )
+                connection.execute(
+                    "DELETE FROM group_reminders WHERE id = ?", (source_id,)
+                )
+            self._audit(
+                connection,
+                actor_id,
+                "group_reminder_merged",
+                target["service_id"],
+                {
+                    "reminder_id": target_id,
+                    "merged_reminder_id": source_id,
+                    "has_custom_body": new_body is not None,
+                },
             )
 
     def resolve_group_text(self, reminder: dict, service: dict) -> str:
@@ -1702,7 +2115,8 @@ class ServiceRegistry:
         with self._connection() as connection:
             services = connection.execute(
                 "SELECT DISTINCT service_id FROM responsible_contacts "
-                "WHERE telegram_id = ? ORDER BY service_id",
+                "WHERE telegram_id = ? AND service_id IN (SELECT id FROM services WHERE archived = 0) "
+                "ORDER BY service_id",
                 (actor_id,),
             ).fetchall()
             for row in services:
@@ -1757,7 +2171,8 @@ class ServiceRegistry:
         with self._connection() as connection:
             rows = connection.execute(
                 "SELECT DISTINCT service_id FROM responsible_contacts "
-                "WHERE telegram_id = ? ORDER BY service_id",
+                "WHERE telegram_id = ? AND service_id IN (SELECT id FROM services WHERE archived = 0) "
+                "ORDER BY service_id",
                 (actor_id,),
             ).fetchall()
         return [row["service_id"] for row in rows]
@@ -1780,7 +2195,8 @@ class ServiceRegistry:
         with self._connection() as connection:
             rows = connection.execute(
                 "SELECT service_id, task, name FROM responsible_contacts "
-                "WHERE telegram_id = ? ORDER BY service_id, task, name",
+                "WHERE telegram_id = ? AND service_id IN (SELECT id FROM services WHERE archived = 0) "
+                "ORDER BY service_id, task, name",
                 (actor_id,),
             ).fetchall()
         return [dict(row) for row in rows]
@@ -1804,7 +2220,7 @@ class ServiceRegistry:
                  AND texts.service_id = contacts.service_id
                 LEFT JOIN user_reminder_schedules AS schedules
                   ON schedules.text_id = texts.id
-                WHERE contacts.telegram_id = ?
+                WHERE contacts.telegram_id = ? AND services.archived = 0
                 GROUP BY services.id, preferences.enabled
                 ORDER BY services.id
                 """,
@@ -2334,7 +2750,8 @@ class ServiceRegistry:
         connection: sqlite3.Connection, service_id: str
     ) -> None:
         if connection.execute(
-            "SELECT 1 FROM services WHERE id = ?", (service_id,)
+            "SELECT 1 FROM services WHERE id = ? AND archived = 0",
+            (service_id,),
         ).fetchone() is None:
             raise ValueError(f"Неизвестное служение: {service_id}")
 
@@ -2374,6 +2791,89 @@ class ServiceRegistry:
                 _utc_now(),
             ),
         )
+
+
+def _move_contact(
+    connection: sqlite3.Connection, row, service_id: str, task: str
+) -> None:
+    """Переносит привязку под (service_id, task), не теряя людей.
+
+    Если та же привязка (тот же человек с тем же именем) уже есть — старая
+    строка удаляется как дубль. Если под целевой задачей то же имя
+    принадлежит другому человеку или этот человек записан под другим
+    именем, старая строка остаётся как есть: ничья привязка не удаляется.
+    """
+    conflict = connection.execute(
+        "SELECT telegram_id, name FROM responsible_contacts "
+        "WHERE service_id = ? AND task = ? "
+        "AND (telegram_id = ? OR name = ?)",
+        (service_id, task, row["telegram_id"], row["name"]),
+    ).fetchall()
+    if any(
+        (item["telegram_id"], item["name"])
+        != (row["telegram_id"], row["name"])
+        for item in conflict
+    ):
+        return
+    if conflict:
+        connection.execute(
+            "DELETE FROM responsible_contacts WHERE service_id = ? "
+            "AND task = ? AND telegram_id = ?",
+            (row["service_id"], row["task"], row["telegram_id"]),
+        )
+        return
+    connection.execute(
+        "UPDATE responsible_contacts SET service_id = ?, task = ? "
+        "WHERE service_id = ? AND task = ? AND telegram_id = ?",
+        (service_id, task, row["service_id"], row["task"], row["telegram_id"]),
+    )
+
+
+def _move_user_text(
+    connection: sqlite3.Connection, text_id: int, service_id: str, task: str
+) -> None:
+    """Переносит личный текст под (service_id, task) вместе с правилами.
+
+    Текст переезжает только вслед за привязкой пользователя к целевой
+    задаче (_move_contact выполняется раньше): иначе текст и правила
+    остаются рядом со своей привязкой под старым названием. Если у
+    пользователя уже есть текст под целевой задачей, правила переходят к
+    нему (свой текст сохраняется, если у цели его нет), а старая запись
+    удаляется.
+    """
+    row = connection.execute(
+        "SELECT * FROM user_reminder_texts WHERE id = ?", (text_id,)
+    ).fetchone()
+    if connection.execute(
+        "SELECT 1 FROM responsible_contacts "
+        "WHERE service_id = ? AND task = ? AND telegram_id = ?",
+        (service_id, task, row["actor_id"]),
+    ).fetchone() is None:
+        return
+    target = connection.execute(
+        "SELECT id, body FROM user_reminder_texts "
+        "WHERE actor_id = ? AND service_id = ? AND task = ? AND id != ?",
+        (row["actor_id"], service_id, task, text_id),
+    ).fetchone()
+    if target is None:
+        connection.execute(
+            "UPDATE user_reminder_texts SET service_id = ?, task = ? "
+            "WHERE id = ?",
+            (service_id, task, text_id),
+        )
+        return
+    connection.execute(
+        "UPDATE user_reminder_schedules SET text_id = ? WHERE text_id = ?",
+        (target["id"], text_id),
+    )
+    if target["body"] is None and row["body"] is not None:
+        connection.execute(
+            "UPDATE user_reminder_texts SET body = ? WHERE id = ?",
+            (row["body"], target["id"]),
+        )
+    connection.execute(
+        "DELETE FROM user_reminder_texts WHERE id = ?", (text_id,)
+    )
 
 
 def _validate_positive_id(value: int, field: str) -> None:

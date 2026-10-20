@@ -1251,12 +1251,15 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 67890, "sound", "Микшер", "Алексей", actor_id
             )
             self.registry.set_responsible_contact(
-                67890, "slides", "Слайды", "Алексей", actor_id
+                67890, "books", "Слайды", "Алексей", actor_id
             )
             text_id = self.registry.upsert_user_text(
                 actor_id, "sound", "Микшер", None
             )
             schedule = self.registry.add_schedule(text_id, 1, "09:00")
+            self.context.load_service_task_assignments = AsyncMock(
+                return_value={"Микшер": ["Алексей"], "Слайды": ["Алексей"]}
+            )
             next_message_id = 20
 
             def message(text=""):
@@ -1310,7 +1313,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 self.registry.get_user_notifications_enabled(actor_id, "sound")
             )
             self.assertTrue(
-                self.registry.get_user_notifications_enabled(actor_id, "slides")
+                self.registry.get_user_notifications_enabled(actor_id, "books")
             )
             self.assertEqual(
                 self.registry.list_schedules(text_id), [schedule]
@@ -1372,9 +1375,11 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     for row in markup.inline_keyboard
                 ],
                 [
-                    ["assembly", "broadcast", "slides"],
-                    ["order", "kitchen", "coffee"],
-                    ["sound", "rehearsal"],
+                    ["assembly"],
+                    ["broadcast"],
+                    ["kitchen", "sound"],
+                    ["order", "office_cleaning"],
+                    ["books", "children"],
                 ],
             )
             self.assertEqual(sum(map(len, markup.inline_keyboard)), 8)
@@ -2358,142 +2363,422 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    async def _click(self, message, predicate, actor_id=12345):
+        markup = message.answer.await_args.kwargs["reply_markup"]
+        button = next(
+            button
+            for row in markup.inline_keyboard
+            for button in row
+            if predicate(button)
+        )
+        callback = SimpleNamespace(
+            data=button.callback_data,
+            from_user=SimpleNamespace(id=actor_id),
+            message=SimpleNamespace(
+                chat=SimpleNamespace(type="private", id=actor_id),
+                answer=AsyncMock(),
+            ),
+            answer=AsyncMock(),
+        )
+        if button.callback_data.startswith("notify_back:"):
+            handler_name = "on_notification_edit_back"
+        elif button.callback_data.startswith("svc_tasks:"):
+            handler_name = "on_service_tasks"
+        else:
+            handler_name = "on_group_reminder_action"
+        await self.callback_handler(handler_name)(callback)
+        return callback
+
+    async def _type(self, text, actor_id=12345):
+        parameter_handler = next(
+            item.callback
+            for item in self.admin_router.message.handlers
+            if item.callback.__name__ == "on_service_parameter"
+        )
+        message = self.message(actor_id, text)
+        await parameter_handler(message)
+        return message
+
+    async def _open_sound_reminders(self, actor_id=12345):
+        self.registry.add_service_admin(67890, "sound", actor_id)
+        command = self.message(actor_id, "/service_notify")
+        await self.admin_router.message.handlers[6].callback(command)
+        selection = SimpleNamespace(
+            data="service:service_notify:sound",
+            from_user=SimpleNamespace(id=actor_id),
+            message=SimpleNamespace(
+                chat=SimpleNamespace(type="private"),
+                answer=AsyncMock(),
+            ),
+            answer=AsyncMock(),
+        )
+        await self.callback_handler("on_service_selected")(selection)
+        return await self._click(
+            selection.message,
+            lambda button: button.text.startswith("⏰ Напоминания"),
+            actor_id,
+        )
+
+    def _sound_slots(self):
+        return sorted(
+            (
+                (item["reminder_days"], item["reminder_time"], item["body"])
+                for item in self.registry.list_group_reminders("sound")
+            ),
+            key=lambda slot: (slot[0], slot[1], slot[2] or ""),
+        )
+
     def test_guided_notification_setup_adds_independent_reminder(self):
         async def run():
-            self.registry.add_service_admin(67890, "sound", 12345)
-            command = self.message(12345, "/service_notify")
-            await self.admin_router.message.handlers[6].callback(command)
-            selection = SimpleNamespace(
-                data="service:service_notify:sound",
-                from_user=SimpleNamespace(id=12345),
-                message=SimpleNamespace(
-                    chat=SimpleNamespace(type="private"),
-                    answer=AsyncMock(),
+            menu = await self._open_sound_reminders()
+            add = await self._click(
+                menu.message,
+                lambda button: button.text == "➕ Добавить напоминание",
+            )
+            # An existing «1 дн. 18:00» reminder must not trigger a warning
+            # before the new reminder's schedule is entered.
+            self.assertIn(
+                "шаг 1 из 3", add.message.answer.await_args.args[0]
+            )
+            self.assertNotIn(
+                "уже есть", add.message.answer.await_args.args[0]
+            )
+            await self._type("3")
+            time_step = await self._type("10:30")
+            self.assertIn(
+                "шаг 3 из 3", time_step.answer.await_args.args[0]
+            )
+            card = await self._click(
+                time_step,
+                lambda button: button.text == "📝 Шаблон по умолчанию",
+            )
+
+            self.assertEqual(
+                self._sound_slots(),
+                [(1, "18:00", None), (3, "10:30", None)],
+            )
+            self.assertIn(
+                "📝 Напоминание",
+                card.message.answer.await_args.args[0],
+            )
+
+        asyncio.run(run())
+
+    def test_cancelled_add_wizard_creates_nothing(self):
+        async def run():
+            menu = await self._open_sound_reminders()
+            add = await self._click(
+                menu.message,
+                lambda button: button.text == "➕ Добавить напоминание",
+            )
+            await self._type("2")
+            time_step = await self._type("09:00")
+            back = await self._click(
+                time_step,
+                lambda button: button.callback_data.startswith("notify_back:"),
+            )
+
+            self.assertEqual(self._sound_slots(), [(1, "18:00", None)])
+            self.assertIn(
+                "напоминания", back.message.answer.await_args.args[0]
+            )
+            del add
+
+        asyncio.run(run())
+
+    def test_add_wizard_rejects_invalid_days_and_time(self):
+        async def run():
+            menu = await self._open_sound_reminders()
+            await self._click(
+                menu.message,
+                lambda button: button.text == "➕ Добавить напоминание",
+            )
+            wrong_days = await self._type("9")
+            self.assertIn(
+                "от 0 до 6", wrong_days.answer.await_args.args[0]
+            )
+            await self._type("2")
+            wrong_time = await self._type("25:00")
+            self.assertIn("HH:MM", wrong_time.answer.await_args.args[0])
+            self.assertEqual(self._sound_slots(), [(1, "18:00", None)])
+
+        asyncio.run(run())
+
+    def test_same_slot_offers_merge_with_rendered_preview(self):
+        async def run():
+            self.context.get_group_reminder_preview = AsyncMock(
+                return_value={
+                    "date": "25.10.2026",
+                    "send_date": "24.10.2026",
+                    "time": "18:00",
+                    "text": "Итоговый текст для группы",
+                    "has_data": True,
+                    "error": None,
+                }
+            )
+            existing_id = self.registry.list_group_reminders("sound")[0]["id"]
+            menu = await self._open_sound_reminders()
+            await self._click(
+                menu.message,
+                lambda button: button.text == "➕ Добавить напоминание",
+            )
+            await self._type("1")
+            await self._type("18:00")
+            merge_screen = await self._type("Не забудьте ноты! {sunday_date}")
+
+            screen_text = merge_screen.answer.await_args.args[0]
+            self.assertIn("уже есть напоминание", screen_text)
+            self.assertIn("Итоговый текст для группы", screen_text)
+            self.assertIn("25.10.2026", screen_text)
+            loader_args = self.context.get_group_reminder_preview.await_args
+            self.assertEqual(loader_args.args[0], existing_id)
+            merged_body = loader_args.args[1]
+            self.assertTrue(
+                merged_body.endswith("\n\nНе забудьте ноты! {sunday_date}")
+            )
+            self.assertIn("{task_assignments}", merged_body)
+
+            await self._click(
+                merge_screen, lambda button: button.text == "🔗 Объединить"
+            )
+            self.assertEqual(
+                self._sound_slots(), [(1, "18:00", merged_body)]
+            )
+
+        asyncio.run(run())
+
+    def test_same_slot_can_still_be_saved_separately(self):
+        async def run():
+            menu = await self._open_sound_reminders()
+            await self._click(
+                menu.message,
+                lambda button: button.text == "➕ Добавить напоминание",
+            )
+            await self._type("1")
+            await self._type("18:00")
+            merge_screen = await self._type("Отдельный текст")
+            # Without a preview loader the merged template is shown instead.
+            self.assertIn(
+                "Отдельный текст", merge_screen.answer.await_args.args[0]
+            )
+            await self._click(
+                merge_screen,
+                lambda button: button.text == "➕ Отдельным сообщением",
+            )
+            self.assertEqual(
+                self._sound_slots(),
+                [(1, "18:00", None), (1, "18:00", "Отдельный текст")],
+            )
+
+        asyncio.run(run())
+
+    def test_same_slot_and_same_text_keeps_one_reminder(self):
+        async def run():
+            menu = await self._open_sound_reminders()
+            await self._click(
+                menu.message,
+                lambda button: button.text == "➕ Добавить напоминание",
+            )
+            await self._type("1")
+            text_step = await self._type("18:00")
+            same = await self._click(
+                text_step,
+                lambda button: button.text == "📝 Шаблон по умолчанию",
+            )
+            self.assertIn(
+                "с таким же текстом", same.message.answer.await_args.args[0]
+            )
+            await self._click(
+                same.message,
+                lambda button: button.text == "🔗 Оставить одно",
+            )
+            self.assertEqual(self._sound_slots(), [(1, "18:00", None)])
+
+        asyncio.run(run())
+
+    def test_merge_cancel_keeps_reminders_unchanged(self):
+        async def run():
+            menu = await self._open_sound_reminders()
+            await self._click(
+                menu.message,
+                lambda button: button.text == "➕ Добавить напоминание",
+            )
+            await self._type("1")
+            await self._type("18:00")
+            merge_screen = await self._type("Другой текст")
+            await self._click(
+                merge_screen, lambda button: button.text == "✖️ Отмена"
+            )
+            self.assertEqual(self._sound_slots(), [(1, "18:00", None)])
+
+        asyncio.run(run())
+
+    def _preview_with_data(self):
+        async def preview(reminder_id, body=None):
+            return {
+                "date": "25.10.2026",
+                "send_date": "24.10.2026",
+                "time": "18:00",
+                "text": body or "Текст",
+                "has_data": True,
+                "error": None,
+            }
+
+        self.context.get_group_reminder_preview = AsyncMock(side_effect=preview)
+
+    def test_changing_schedule_onto_taken_slot_merges_into_existing(self):
+        async def run():
+            self._preview_with_data()
+            existing_id = self.registry.list_group_reminders("sound")[0]["id"]
+            self.registry.update_group_reminder(
+                67890, existing_id, body="Первый текст"
+            )
+            other_id = self.registry.add_group_reminder(
+                67890, "sound", 2, "18:00", "Второй текст"
+            )
+            menu = await self._open_sound_reminders()
+            card = await self._click(
+                menu.message,
+                lambda button: button.callback_data.startswith(
+                    f"group_reminder:open:sound:{other_id}:"
                 ),
-                answer=AsyncMock(),
             )
-            await self.callback_handler("on_service_selected")(selection)
-            main_menu = selection.message.answer.await_args.kwargs["reply_markup"]
-            reminder_button = next(
-                button
-                for row in main_menu.inline_keyboard
-                for button in row
-                if button.text.startswith("⏰ Напоминания")
+            await self._click(
+                card.message, lambda button: button.text == "📅 Срок"
             )
-            reminder_menu_callback = SimpleNamespace(
-                data=reminder_button.callback_data,
-                from_user=SimpleNamespace(id=12345),
-                message=SimpleNamespace(
-                    chat=SimpleNamespace(type="private"),
-                    answer=AsyncMock(),
-                ),
-                answer=AsyncMock(),
+            merge_screen = await self._type("1")
+            self.assertIn(
+                "Первый текст\n\nВторой текст",
+                merge_screen.answer.await_args.args[0],
             )
-            await self.callback_handler("on_group_reminder_action")(
-                reminder_menu_callback
+            merged = await self._click(
+                merge_screen, lambda button: button.text == "🔗 Объединить"
             )
-            rules_menu = reminder_menu_callback.message.answer.await_args.kwargs[
-                "reply_markup"
-            ]
-            add_button = next(
-                button
-                for row in rules_menu.inline_keyboard
-                for button in row
-                if button.text == "➕ Добавить напоминание"
+
+            self.assertEqual(
+                self._sound_slots(),
+                [(1, "18:00", "Первый текст\n\nВторой текст")],
             )
-            add_callback = SimpleNamespace(
-                data=add_button.callback_data,
-                from_user=SimpleNamespace(id=12345),
-                message=SimpleNamespace(
-                    chat=SimpleNamespace(type="private"),
-                    answer=AsyncMock(),
-                ),
-                answer=AsyncMock(),
+            self.assertIsNone(self.registry.get_group_reminder(other_id))
+            self.assertIn(
+                "Первый текст", merged.message.answer.await_args.args[0]
             )
-            await self.callback_handler("on_group_reminder_action")(
-                add_callback
+
+        asyncio.run(run())
+
+    def test_merge_is_not_offered_without_schedule_preview(self):
+        async def run():
+            self.context.get_group_reminder_preview = AsyncMock(
+                return_value={
+                    "date": "25.10.2026", "send_date": "24.10.2026",
+                    "time": "18:00", "text": "", "has_data": False,
+                    "error": "Не удалось загрузить график. Попробуйте позже.",
+                }
             )
-            confirm_add_button = next(
-                button
-                for row in add_callback.message.answer.await_args.kwargs[
+            menu = await self._open_sound_reminders()
+            await self._click(
+                menu.message,
+                lambda button: button.text == "➕ Добавить напоминание",
+            )
+            await self._type("1")
+            await self._type("18:00")
+            screen = await self._type("Другой текст")
+
+            labels = [
+                button.text
+                for row in screen.answer.await_args.kwargs[
                     "reply_markup"
                 ].inline_keyboard
                 for button in row
-                if button.callback_data.startswith(
-                    "group_reminder:confirm_add:"
+            ]
+            self.assertNotIn("🔗 Объединить", labels)
+            self.assertIn("➕ Отдельным сообщением", labels)
+            self.assertIn(
+                "нельзя проверить длину", screen.answer.await_args.args[0]
+            )
+
+        asyncio.run(run())
+
+    def test_disabled_reminder_is_not_a_merge_target(self):
+        async def run():
+            existing_id = self.registry.list_group_reminders("sound")[0]["id"]
+            self.registry.update_group_reminder(
+                67890, existing_id, enabled=False
+            )
+            menu = await self._open_sound_reminders()
+            await self._click(
+                menu.message,
+                lambda button: button.text == "➕ Добавить напоминание",
+            )
+            await self._type("1")
+            text_step = await self._type("18:00")
+            await self._click(
+                text_step,
+                lambda button: button.text == "📝 Шаблон по умолчанию",
+            )
+
+            self.assertEqual(
+                self._sound_slots(),
+                [(1, "18:00", None), (1, "18:00", None)],
+            )
+
+        asyncio.run(run())
+
+    def test_old_merge_button_cannot_confirm_newer_offer(self):
+        async def run():
+            self._preview_with_data()
+            menu = await self._open_sound_reminders()
+            await self._click(
+                menu.message,
+                lambda button: button.text == "➕ Добавить напоминание",
+            )
+            await self._type("1")
+            await self._type("18:00")
+            first_offer = await self._type("Первый")
+            old_merge = next(
+                button.callback_data
+                for row in first_offer.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.text == "🔗 Объединить"
+            )
+            await self._click(
+                first_offer, lambda button: button.text == "✖️ Отмена"
+            )
+            rules = self.registry.list_group_reminders("sound")
+            session_id = old_merge.rsplit(":", 1)[1]
+            await self.callback_handler("on_group_reminder_action")(
+                SimpleNamespace(
+                    data=f"group_reminder:add:sound:{session_id}",
+                    from_user=SimpleNamespace(id=12345),
+                    message=SimpleNamespace(
+                        chat=SimpleNamespace(type="private", id=12345),
+                        answer=AsyncMock(),
+                    ),
+                    answer=AsyncMock(),
                 )
             )
-            confirm_add_callback = SimpleNamespace(
-                data=confirm_add_button.callback_data,
+            await self._type("1")
+            await self._type("18:00")
+            await self._type("Второй")
+            stale = SimpleNamespace(
+                data=old_merge,
                 from_user=SimpleNamespace(id=12345),
                 message=SimpleNamespace(
-                    chat=SimpleNamespace(type="private"),
+                    chat=SimpleNamespace(type="private", id=12345),
                     answer=AsyncMock(),
                 ),
                 answer=AsyncMock(),
             )
-            await self.callback_handler("on_group_reminder_action")(
-                confirm_add_callback
-            )
-            parameter_handler = next(
-                item.callback
-                for item in self.admin_router.message.handlers
-                if item.callback.__name__ == "on_service_parameter"
-            )
-            card_markup = confirm_add_callback.message.answer.await_args.kwargs[
-                "reply_markup"
-            ]
-            edit_days = next(
-                button
-                for row in card_markup.inline_keyboard
-                for button in row
-                if button.text == "📅 Срок"
-            )
-            edit_days_callback = SimpleNamespace(
-                data=edit_days.callback_data,
-                from_user=SimpleNamespace(id=12345),
-                message=SimpleNamespace(
-                    chat=SimpleNamespace(type="private"),
-                    answer=AsyncMock(),
-                ),
-                answer=AsyncMock(),
-            )
-            await self.callback_handler("on_group_reminder_action")(
-                edit_days_callback
-            )
-            updated_days = self.message(12345, "3")
-            await parameter_handler(updated_days)
-            card_markup = updated_days.answer.await_args.kwargs[
-                "reply_markup"
-            ]
-            edit_time = next(
-                button
-                for row in card_markup.inline_keyboard
-                for button in row
-                if button.text == "🕒 Время"
-            )
-            edit_time_callback = SimpleNamespace(
-                data=edit_time.callback_data,
-                from_user=SimpleNamespace(id=12345),
-                message=SimpleNamespace(
-                    chat=SimpleNamespace(type="private"),
-                    answer=AsyncMock(),
-                ),
-                answer=AsyncMock(),
-            )
-            await self.callback_handler("on_group_reminder_action")(
-                edit_time_callback
-            )
-            saved_time_input = self.message(12345, "10:30")
-            await parameter_handler(saved_time_input)
+            await self.callback_handler("on_group_reminder_action")(stale)
 
-            reminders = self.registry.list_group_reminders("sound")
+            self.assertIn("устарел", stale.answer.await_args.args[0])
             self.assertEqual(
-                sorted(
-                    (item["reminder_days"], item["reminder_time"])
-                    for item in reminders
-                ),
-                [(1, "18:00"), (3, "10:30")],
+                [item["body"] for item in self.registry.list_group_reminders(
+                    "sound"
+                )],
+                [rules[0]["body"]],
             )
 
         asyncio.run(run())
@@ -3949,7 +4234,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 67890,
             )
             self.assertTrue(assembly.text.endswith("СОБРАНИЕ"))
-            self.assertTrue(broadcast.text.endswith("ТРАНСЛЯЦИЯ"))
+            self.assertTrue(broadcast.text.endswith("ТРАНСЛЯЦИЯ И СЛАЙДЫ"))
 
         asyncio.run(run())
 
@@ -3999,9 +4284,11 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 for item in self.admin_router.message.handlers
             }
             expected_ids = [
-                ["assembly", "broadcast", "slides"],
-                ["order", "kitchen", "coffee"],
-                ["sound", "rehearsal"],
+                ["assembly"],
+                ["broadcast"],
+                ["kitchen", "sound"],
+                ["order", "office_cleaning"],
+                ["books", "children"],
             ]
             for command_name, operation in (
                 ("/service_settings", "service_settings"),
@@ -4204,7 +4491,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
     def test_services_listing_separates_services_and_shows_admin_usernames(self):
         async def run():
             self.registry.add_service_admin(67890, "sound", 12345, "sound_admin")
-            self.registry.add_service_admin(67890, "slides", 12345, "sound_admin")
+            self.registry.add_service_admin(67890, "books", 12345, "sound_admin")
             message = self.message(67890, "/services")
 
             await self.admin_router.message.handlers[0].callback(message)
@@ -4222,13 +4509,13 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             slides_button = await self.dialog_button(
                 message,
                 lambda button: button.callback_data
-                == "service:service_settings:slides",
+                == "service:service_settings:books",
                 67890,
             )
             self.assertTrue(sound_button.text.endswith("ЗВУК"))
-            self.assertTrue(slides_button.text.endswith("СЛАЙДЫ"))
+            self.assertTrue(slides_button.text.endswith("КНИГИ"))
             self.assertTrue(self.registry.is_service_admin(12345, "sound"))
-            self.assertTrue(self.registry.is_service_admin(12345, "slides"))
+            self.assertTrue(self.registry.is_service_admin(12345, "books"))
 
         asyncio.run(run())
 
@@ -4456,7 +4743,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             new_admin_router = (
                 new_dispatcher.include_router.call_args_list[0].args[0]
             )
-            new_command = self.message(67890, "/service_chat coffee")
+            new_command = self.message(67890, "/service_chat children")
             await new_admin_router.message.handlers[4].callback(new_command)
             new_request_id = (
                 new_command.answer.await_args.kwargs["reply_markup"]
@@ -4475,7 +4762,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
             self.assertIn("не соответствует активному запросу", stale_response.answer.await_args.args[0])
             self.assertIsNone(self.registry.get_service("sound")["group_chat_id"])
-            self.assertIsNone(self.registry.get_service("coffee")["group_chat_id"])
+            self.assertIsNone(self.registry.get_service("children")["group_chat_id"])
 
         asyncio.run(run())
 
@@ -5045,6 +5332,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 answer=AsyncMock(),
             )
             await handler(result)
+            press.last_callback = result
             return result.message
 
         return message, press
@@ -5120,7 +5408,19 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_enable_keeps_existing_rules_instead_of_default(self):
+    def personal_toggle(self, actor_id):
+        async def run():
+            message, press = self.personal_flow(actor_id)
+            command = message("/my_notifications")
+            await self.message_handler("on_my_notifications")(command)
+            screen = await press(command, lambda b: "ЗВУК" in b.text)
+            await press(screen, lambda b: b.text == "🔔 Включить")
+            args = press.last_callback.answer.await_args.args
+            return args[0] if args else None
+
+        return run()
+
+    def test_enable_keeps_existing_enabled_rule_instead_of_default(self):
         async def run():
             actor_id = 4603
             self.registry.set_responsible_contact(
@@ -5129,15 +5429,156 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             text_id = self.registry.upsert_user_text(
                 actor_id, "sound", "Микшер", None
             )
+            self.registry.add_schedule(text_id, 3, "09:00")
+            await self.personal_toggle(actor_id)
+
+            self.assertEqual(self.rules(actor_id), [(3, "09:00", True)])
+            self.assertTrue(
+                self.registry.get_user_notifications_enabled(actor_id, "sound")
+            )
+
+        asyncio.run(run())
+
+    def test_enable_is_refused_when_all_current_rules_are_disabled(self):
+        async def run():
+            actor_id = 4609
+            self.registry.set_responsible_contact(
+                67890, "sound", "Микшер", "Имя из расписания", actor_id
+            )
+            text_id = self.registry.upsert_user_text(
+                actor_id, "sound", "Микшер", None
+            )
             rule = self.registry.add_schedule(text_id, 3, "09:00")
             self.registry.update_schedule(rule["id"], enabled=False)
+            toast = await self.personal_toggle(actor_id)
+
+            self.assertEqual(self.rules(actor_id), [(3, "09:00", False)])
+            self.assertFalse(
+                self.registry.get_user_notifications_enabled(actor_id, "sound")
+            )
+            self.assertIn("выключены", toast)
+
+        asyncio.run(run())
+
+    def test_enable_ignores_rules_of_tasks_missing_from_schedule(self):
+        async def run():
+            actor_id = 4610
+            for task in ("Микшер", "Пульт"):
+                self.registry.set_responsible_contact(
+                    67890, "sound", task, "Имя из расписания", actor_id
+                )
+            stale = self.registry.upsert_user_text(
+                actor_id, "sound", "Пульт", None
+            )
+            self.registry.add_schedule(stale, 2, "10:00")
+            await self.personal_toggle(actor_id)
+
+            self.assertEqual(self.rules(actor_id), [(1, "18:00", True)])
+            self.assertEqual(
+                self.rules(actor_id, "Пульт"), [(2, "10:00", True)]
+            )
+            self.assertTrue(
+                self.registry.get_user_notifications_enabled(actor_id, "sound")
+            )
+
+        asyncio.run(run())
+
+    def test_enable_is_refused_when_only_stale_rules_exist(self):
+        async def run():
+            actor_id = 4611
+            self.registry.set_responsible_contact(
+                67890, "sound", "Пульт", "Имя из расписания", actor_id
+            )
+            stale = self.registry.upsert_user_text(
+                actor_id, "sound", "Пульт", None
+            )
+            self.registry.add_schedule(stale, 2, "10:00")
+            toast = await self.personal_toggle(actor_id)
+
+            self.assertFalse(
+                self.registry.get_user_notifications_enabled(actor_id, "sound")
+            )
+            self.assertIn("нет ваших задач", toast)
+
+        asyncio.run(run())
+
+    def _two_current_tasks(self, actor_id):
+        for task in ("Микшер", "Пульт"):
+            self.registry.set_responsible_contact(
+                67890, "sound", task, "Имя из расписания", actor_id
+            )
+        self.context.load_service_task_assignments = AsyncMock(
+            return_value={
+                "Микшер": ["Имя из расписания"],
+                "Пульт": ["Имя из расписания"],
+            }
+        )
+        return self.registry.upsert_user_text(
+            actor_id, "sound", "Микшер", None
+        )
+
+    def test_enable_adds_default_rule_for_uncovered_task(self):
+        async def run():
+            actor_id = 4612
+            text_id = self._two_current_tasks(actor_id)
+            self.registry.add_schedule(text_id, 3, "09:00")
+            await self.personal_toggle(actor_id)
+
+            self.assertEqual(self.rules(actor_id), [(3, "09:00", True)])
+            self.assertEqual(
+                self.rules(actor_id, "Пульт"), [(1, "18:00", True)]
+            )
+            self.assertTrue(
+                self.registry.get_user_notifications_enabled(actor_id, "sound")
+            )
+
+        asyncio.run(run())
+
+    def test_enable_with_disabled_rule_still_covers_other_task(self):
+        async def run():
+            actor_id = 4613
+            text_id = self._two_current_tasks(actor_id)
+            rule = self.registry.add_schedule(text_id, 3, "09:00")
+            self.registry.update_schedule(rule["id"], enabled=False)
+            await self.personal_toggle(actor_id)
+
+            self.assertEqual(self.rules(actor_id), [(3, "09:00", False)])
+            self.assertEqual(
+                self.rules(actor_id, "Пульт"), [(1, "18:00", True)]
+            )
+            self.assertTrue(
+                self.registry.get_user_notifications_enabled(actor_id, "sound")
+            )
+
+        asyncio.run(run())
+
+    def test_enable_with_stored_rule_is_refused_when_schedule_unavailable(self):
+        async def run():
+            actor_id = 4614
+            self.registry.set_responsible_contact(
+                67890, "sound", "Микшер", "Имя из расписания", actor_id
+            )
+            text_id = self.registry.upsert_user_text(
+                actor_id, "sound", "Микшер", None
+            )
+            self.registry.add_schedule(text_id, 3, "09:00")
             message, press = self.personal_flow(actor_id)
             command = message("/my_notifications")
             await self.message_handler("on_my_notifications")(command)
             screen = await press(command, lambda b: "ЗВУК" in b.text)
-            await press(screen, lambda b: b.text == "🔔 Включить")
+            self.context.load_service_task_assignments = AsyncMock(
+                side_effect=RuntimeError("offline")
+            )
+            with patch("bot.handlers.PERSONAL_TASK_CACHE_TTL_SECONDS", -1):
+                await press(screen, lambda b: b.text == "🔔 Включить")
 
-            self.assertEqual(self.rules(actor_id), [(3, "09:00", False)])
+            self.assertFalse(
+                self.registry.get_user_notifications_enabled(actor_id, "sound")
+            )
+            self.assertIn(
+                "не загрузился",
+                press.last_callback.answer.await_args.args[0],
+            )
 
         asyncio.run(run())
 
@@ -5180,12 +5621,12 @@ class ServiceManagementHandlerTest(unittest.TestCase):
     def test_bulk_enable_reports_services_that_could_not_get_a_rule(self):
         async def run():
             actor_id = 4606
-            for service_id, task in (("sound", "Микшер"), ("slides", "Слайды")):
+            for service_id, task in (("sound", "Микшер"), ("books", "Слайды")):
                 self.registry.set_responsible_contact(
                     67890, service_id, task, "Имя из расписания", actor_id
                 )
             slides_text = self.registry.upsert_user_text(
-                actor_id, "slides", "Слайды", None
+                actor_id, "books", "Слайды", None
             )
             self.registry.add_schedule(slides_text, 2, "10:00")
             self.context.load_service_task_assignments = AsyncMock(
@@ -5212,15 +5653,17 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 callback
             )
 
+            # Без графика сохранённое правило не проверить: оба служения
+            # остаются выключенными, а не только то, где правил нет.
             self.assertFalse(
                 self.registry.get_user_notifications_enabled(actor_id, "sound")
             )
-            self.assertTrue(
-                self.registry.get_user_notifications_enabled(actor_id, "slides")
+            self.assertFalse(
+                self.registry.get_user_notifications_enabled(actor_id, "books")
             )
             toast = callback.answer.await_args.args[0]
             self.assertIn("ЗВУК", toast)
-            self.assertNotIn("ПРЕЗЕНТАЦИЯ", toast)
+            self.assertIn("график не загрузился", toast)
 
         asyncio.run(run())
 
@@ -5260,6 +5703,46 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 self.registry.get_user_notifications_enabled(actor_id, "sound")
             )
             self.assertIn("не загрузился", callback.answer.await_args.args[0])
+
+        asyncio.run(run())
+
+    def test_enable_is_refused_when_user_has_no_current_tasks(self):
+        async def run():
+            actor_id = 4608
+            self.registry.set_responsible_contact(
+                67890, "sound", "Микшер", "Имя из расписания", actor_id
+            )
+            self.context.load_service_task_assignments = AsyncMock(
+                return_value={"Пульт": ["Иван"]}
+            )
+            message, press = self.personal_flow(actor_id)
+            command = message("/my_notifications")
+            await self.message_handler("on_my_notifications")(command)
+            button = next(
+                button
+                for row in command.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.text == "✅ Включить все"
+            )
+            callback = SimpleNamespace(
+                data=button.callback_data,
+                from_user=SimpleNamespace(id=actor_id),
+                message=message(),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_personal_notifications_callback")(
+                callback
+            )
+
+            self.assertFalse(
+                self.registry.get_user_notifications_enabled(actor_id, "sound")
+            )
+            self.assertEqual(self.rules(actor_id), [])
+            self.assertIn(
+                "нет ваших задач в графике", callback.answer.await_args.args[0]
+            )
 
         asyncio.run(run())
 
@@ -5372,6 +5855,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "service:service_admin_add:sound",
                     "service:service_admin_remove:sound",
                     "service:test_notify:sound",
+                    "svc_tasks:open:sound",
                     "service:back_to_services:list",
                 ],
             )
@@ -5379,6 +5863,65 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 "👤 Администраторы · ⚪ не назначены",
                 message.answer.await_args.args[0],
             )
+
+        asyncio.run(run())
+
+    def test_super_admin_toggles_and_adds_service_tasks(self):
+        async def run():
+            card = self.message(67890, "/service_settings sound")
+            await self.message_handler("on_service_settings")(card)
+            opened = SimpleNamespace(
+                data="svc_tasks:open:sound",
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_tasks")(opened)
+            screen = opened.message.answer.await_args.args[0]
+            self.assertIn("ЗВУК · задачи", screen)
+            self.assertIn("🔴 🎶 спевка · выключена", screen)
+
+            toggle = await self._click(
+                opened.message,
+                lambda button: button.text == "🔴 спевка",
+                actor_id=67890,
+            )
+            self.assertTrue(
+                next(
+                    task for task in self.registry.list_service_tasks("sound")
+                    if task["name"] == "спевка"
+                )["enabled"]
+            )
+            await self._click(
+                toggle.message,
+                lambda button: button.text == "➕ Добавить задачу",
+                actor_id=67890,
+            )
+            added = await self._type("Перевозка", actor_id=67890)
+            self.assertIn(
+                "✅ Задача «Перевозка» добавлена",
+                added.answer.await_args.args[0],
+            )
+            self.assertIn(
+                "Перевозка",
+                [task["name"] for task in self.registry.list_service_tasks("sound")],
+            )
+
+        asyncio.run(run())
+
+    def test_service_admin_cannot_open_service_tasks(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 24680)
+            callback = SimpleNamespace(
+                data="svc_tasks:open:sound",
+                from_user=SimpleNamespace(id=24680),
+                message=self.message(24680, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_tasks")(callback)
+
+            self.assertIn("Недостаточно прав", callback.answer.await_args.args[0])
+            callback.message.answer.assert_not_awaited()
 
         asyncio.run(run())
 
@@ -5436,7 +5979,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 ),
             ),
             ServiceEvent(
-                "slides", date(2026, 10, 25), (ServiceAssignment("Слайды", "Ольга"),)
+                "books", date(2026, 10, 25), (ServiceAssignment("Слайды", "Ольга"),)
             ),
             ServiceEvent(
                 "sound", date(2026, 11, 1), (ServiceAssignment("Микшер", "Олег"),)

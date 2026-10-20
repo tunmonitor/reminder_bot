@@ -94,8 +94,38 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   `ОКТЯБРЬ26`. Schedule dates are in column A; task names and assignees are in
   columns A and B. The `Списки` sheet contains task headers in A and contact
   name, username, and Telegram ID in A, B, and C.
-- Task aliases are case-insensitive: `ХКЦ` → `Ответственный`; `Ведущий` or
-  `Ведет` → `Ведущий`; `Проповедует` or `Проповедет` → `Проповедник`.
+- Services, tasks, and month-sheet columns come from
+  `reminder_bot_services.json` (`bot/services.py` validates it at import).
+  `parse_service_events(..., services)` maps column headers to services,
+  merges several columns of one service into one event per date, renames
+  tasks to catalog names via aliases (`normalized_name`), silently drops
+  disabled tasks (and columns whose fixed task is disabled), and reports
+  unknown tasks in `ServiceEvent.issues`. Pass
+  `registry.service_catalog()` so super-admin task toggles apply.
+- `ServiceRegistry.initialize` syncs the catalog into `services` /
+  `service_tasks`; services missing from the file are archived, never
+  deleted, and `list_services` hides them. Task enable state and
+  admin-added tasks live only in SQLite; admin tasks are renumbered after
+  catalog tasks so `position` stays a unique button id. Migration
+  `catalog-v1` runs once: it moves admins, contacts, personal texts (with
+  rules) and prefs of slides/rehearsal/coffee into broadcast/sound/kitchen
+  and renames stored task names via `_move_contact` / `_move_user_text`,
+  which never drop another person's binding or a user's rules. User-facing
+  lists (`list_user_services`, notification state, bulk toggle) skip
+  archived services.
+- The legacy assembly role flow (`parse_schedule`/`parse_people`) keeps its
+  own aliases: `ХКЦ` → `Ответственный`; `Ведущий`/`Ведет` → `Ведущий`;
+  `Проповедует`/`Проповедет` → `Проповедник`.
+- Rows without a task continue the previous task until an empty name cell,
+  another task, a marker, or a date; before the first task they belong to
+  the column task or the service. A row starting with `КОММЕНТАРИИ` and the
+  first Sunday of another month end the sheet. A column `task` applies to
+  every untasked row (also after markers); `default_task` covers untasked
+  rows at the start of a date block (kitchen/order → «в смене»).
+- Contacts are matched by exact (task, name); do not add name-only
+  fallbacks across tasks — namesakes in one service would get each other's
+  mentions and personal reminders. `_move_user_text` moves a text only
+  when the user's binding moved to the target task.
 - Informational tasks may be marked with a leading `*`, `[...]`, or `[*]`.
   They remain available to group templates as `{informational_notes}`, but
   are excluded from responsible-contact selection, personal reminders, and
@@ -175,8 +205,24 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - Personal service-level time uses `set_user_service_schedule`: it updates
   the first rule in place, deletes extras after copying their delivery
   records, and creates rules for tasks without one. Enabling a service with
-  no rules installs `DEFAULT_PERSONAL_RULE`; if tasks cannot be loaded the
-  service stays disabled with a visible notice.
+  no rules installs `DEFAULT_PERSONAL_RULE`. `ensure_default_personal_rule`
+  returns `None` on success or the reason text. Success requires an enabled
+  rule on a task the user has in the current schedule; rules of tasks absent
+  from the schedule do not count. Every current task without any rule gets
+  the default rule, even when other tasks already have rules; disabled rules
+  are never re-enabled automatically. Reasons:
+  `PERSONAL_SCHEDULE_UNAVAILABLE` (schedule failed to load — stored rules
+  alone are never trusted), `PERSONAL_NO_TASKS`, `PERSONAL_RULES_DISABLED`
+  (every current task has rules and all are disabled). Bulk enable
+  uses the short forms in `PERSONAL_PROBLEM_SHORT` because callback toasts
+  are cut at 200 characters. Never mark a service enabled without a usable
+  rule.
+- `current_personal_tasks` caches only the Excel assignments; it re-reads
+  bindings from SQLite on every call on purpose so admin changes apply
+  immediately.
+- Build contact-navigation callback data with
+  `contact_navigation_callback`; use `contact_navigation_button` only when
+  the labeled button itself is needed.
 - Personal screens paginate only item rows; actions, page buttons, and
   back/close stay as separate bottom rows (`_dialog_keep_rows`).
 
@@ -204,6 +250,10 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - Use `ServiceRegistry` methods for persistent state; avoid ad hoc SQL except
   in migrations or focused tests. Migrations must be safe to rerun and
   preserve legacy data/IDs where compatibility requires it.
+- `executescript` commits any pending transaction before it runs. A
+  migration script that rebuilds a table (`CREATE … _v2` / `DROP` /
+  `RENAME`) must start with `BEGIN IMMEDIATE;` so it stays atomic; the
+  enclosing `with connection` commits it.
 - Snapshots are environment-specific and must be fully written, validated
   (manifest/checksums and SQLite integrity), then atomically published.
   Credentials, tokens, logs, and temporary files do not belong in a snapshot.

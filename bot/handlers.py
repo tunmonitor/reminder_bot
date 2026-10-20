@@ -33,7 +33,7 @@ from .commands import (
     sync_user_commands,
     user_role,
 )
-from .notifier import CONFIRM_PREFIX, _notify_admin
+from .notifier import CONFIRM_PREFIX, TELEGRAM_TEXT_LIMIT, _notify_admin
 from .presentation import (
     format_task_assignments,
     task_assignment_names,
@@ -47,6 +47,7 @@ from .service_registry import (
     validate_notification_template,
 )
 from .scheduler import next_reminder_occurrence
+from .services import SERVICES
 from .ui import (
     callback_text,
     clean_previous_menu,
@@ -56,6 +57,7 @@ from .ui import (
     plain_text,
     render_screen_chunks,
     validate_inline_keyboard,
+    visible_units,
 )
 
 router = Router()
@@ -98,9 +100,23 @@ def _telegram_text_chunks(text: str, limit: int = 4000) -> list[str]:
 PERSONAL_ITEM_BUTTONS_PER_PAGE = 6
 DEFAULT_PERSONAL_RULE = (1, "18:00")
 PERSONAL_SCHEDULE_UNAVAILABLE = (
-    "График сейчас не загрузился, поэтому время напоминания не задано. "
-    "Попробуйте позже."
+    "График сейчас не загрузился, поэтому нельзя проверить ваши задачи "
+    "и включить напоминания. Попробуйте позже."
 )
+PERSONAL_NO_TASKS = (
+    "В текущем графике нет ваших задач в этом служении, "
+    "поэтому напоминать пока не о чем."
+)
+PERSONAL_RULES_DISABLED = (
+    "Все ваши правила напоминаний в этом служении выключены. "
+    "Выберите время в «⏰ Изменить время» или включите правило "
+    "в «⚙️ Тексты и правила по задачам»."
+)
+PERSONAL_PROBLEM_SHORT = {
+    PERSONAL_SCHEDULE_UNAVAILABLE: "график не загрузился",
+    PERSONAL_NO_TASKS: "нет ваших задач в графике",
+    PERSONAL_RULES_DISABLED: "все правила выключены",
+}
 PERSONAL_RULE_PRESETS = (
     (1, "18:00"),
     (1, "20:00"),
@@ -118,6 +134,27 @@ CONTACT_NAVIGATION_STEPS = {
     "card": {"overview"},
 }
 _WEEKDAYS = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
+GROUP_REMINDER_NEW_STEPS = frozenset({
+    "group_reminder_new_days",
+    "group_reminder_new_time",
+    "group_reminder_new_text",
+})
+
+
+def _parse_reminder_days(text: str) -> int:
+    try:
+        days = int(text)
+    except ValueError as exc:
+        raise ValueError("Введите целое число от 0 до 6.") from exc
+    if not 0 <= days <= 6:
+        raise ValueError("Число дней должно быть от 0 до 6.")
+    return days
+
+
+def _parse_reminder_time(text: str) -> str:
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", text):
+        raise ValueError("Укажите время в формате HH:MM, например 17:15.")
+    return text
 
 
 def _rule_label(days: int, reminder_time: str) -> str:
@@ -546,13 +583,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         services: list[dict],
         operation: str,
     ) -> InlineKeyboardMarkup:
-        service_order = (
-            "assembly", "broadcast", "slides", "order",
-            "kitchen", "coffee", "sound", "rehearsal",
-        )
+        # Порядок служений — как в каталоге reminder_bot_services.json.
         service_rank = {
-            service_id: index
-            for index, service_id in enumerate(service_order)
+            service.id: index for index, service in enumerate(SERVICES)
         }
         ordered_services = sorted(
             services,
@@ -852,6 +885,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ]
             for label, operation in items
         ]
+        if is_super_admin:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text="📋 Задачи служения",
+                        callback_data=f"svc_tasks:open:{service_id}",
+                    )
+                ]
+            )
         rows.append(
             [
                 InlineKeyboardButton(
@@ -902,11 +944,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             callback_data=f"task:{operation}:{token}",
         )
 
+    def contact_navigation_callback(
+        actor_id: int, service_id: str, action: str
+    ) -> str:
+        token = secrets.token_urlsafe(8)
+        pending_contact_navigation[token] = (actor_id, service_id, action)
+        return f"contact_nav:{token}"
+
     def contact_navigation_button(
         actor_id: int, service_id: str, action: str
     ) -> InlineKeyboardButton:
-        token = secrets.token_urlsafe(8)
-        pending_contact_navigation[token] = (actor_id, service_id, action)
         labels = {
             "tasks": "⬅️ К задачам",
             "services": "⬅️ К служениям",
@@ -919,7 +966,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         label = labels.get(action) or labels[action.partition(":")[0]]
         return InlineKeyboardButton(
             text=label,
-            callback_data=f"contact_nav:{token}",
+            callback_data=contact_navigation_callback(
+                actor_id, service_id, action
+            ),
         )
 
     async def send_task_choices_page(
@@ -1365,18 +1414,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             dates.append(
                 InlineKeyboardButton(
                     text=f"⬅️ {events[index - 1].event_date:%d.%m}",
-                    callback_data=contact_navigation_button(
+                    callback_data=contact_navigation_callback(
                         actor_id, service_id, f"overview:{index - 1}"
-                    ).callback_data,
+                    ),
                 )
             )
         if events and index + 1 < len(events):
             dates.append(
                 InlineKeyboardButton(
                     text=f"➡️ {events[index + 1].event_date:%d.%m}",
-                    callback_data=contact_navigation_button(
+                    callback_data=contact_navigation_callback(
                         actor_id, service_id, f"overview:{index + 1}"
-                    ).callback_data,
+                    ),
                 )
             )
         if dates:
@@ -1791,6 +1840,433 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ]]
         )
 
+    async def show_service_tasks(
+        message: Message, actor_id: int, service_id: str,
+        notice: str | None = None,
+    ) -> None:
+        """Super-admin screen: catalog tasks of a service with on/off toggles."""
+        registry = service_registry()
+        service = service_by_id(registry, service_id) if registry else None
+        if service is None:
+            await _send_dialog(message, "Служение не найдено.", parse_mode=None)
+            return
+        await clean_and_clear_pending_actor(actor_id)
+        session_id = secrets.token_urlsafe(9)
+        pending_inputs[actor_id] = {
+            "operation": "service_tasks",
+            "service_id": service_id,
+            "session_id": session_id,
+            "step": "tasks",
+        }
+        tasks = registry.list_service_tasks(service_id)
+        lines = [f"📋 {service_label(service)} · задачи", ""]
+        if tasks:
+            for task in tasks:
+                status = "🟢" if task["enabled"] else "🔴"
+                aliases = (
+                    f" · также: {', '.join(task['aliases'])}"
+                    if task["aliases"] else ""
+                )
+                off = "" if task["enabled"] else " · выключена"
+                lines.append(
+                    f"{status} {task_emoji(task['name'])} {task['name']}"
+                    f"{off}{aliases}"
+                )
+            lines += [
+                "",
+                "ℹ️ Нажмите задачу, чтобы включить или выключить. "
+                "Выключенные задачи не читаются из графика.",
+            ]
+        else:
+            lines.append(
+                "⚪ задачи не заданы · в графике и напоминаниях служение "
+                "без деления на задачи"
+            )
+        if notice:
+            lines = [notice, ""] + lines
+        buttons = [
+            InlineKeyboardButton(
+                text=f"{'🟢' if task['enabled'] else '🔴'} {task['name']}"[:60],
+                callback_data=(
+                    f"svc_tasks:tog:{service_id}:{task['position']}:"
+                    f"{session_id}"
+                ),
+            )
+            for task in tasks
+        ]
+        rows = layout_buttons(buttons) if buttons else []
+        rows.append([
+            InlineKeyboardButton(
+                text="➕ Добавить задачу",
+                callback_data=f"svc_tasks:add:{service_id}:{session_id}",
+            )
+        ])
+        rows.append([
+            InlineKeyboardButton(
+                text="⬅️ К карточке служения",
+                callback_data=f"service:service_settings:{service_id}",
+            )
+        ])
+        await _send_dialog(
+            message,
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
+            parse_mode=None,
+        )
+
+    @admin_router.callback_query(F.data.startswith("svc_tasks:"))
+    async def on_service_tasks(callback: CallbackQuery) -> None:
+        if (
+            not callback.from_user
+            or not callback.message
+            or callback.message.chat.type != ChatType.PRIVATE
+        ):
+            await _answer_callback(callback)
+            return
+        actor_id = callback.from_user.id
+        registry = service_registry()
+        parts = callback.data.split(":")
+        action, service_id = (parts[1], parts[2]) if len(parts) >= 3 else ("", "")
+        try:
+            if registry is None or not registry.is_super_admin(actor_id):
+                await _answer_callback(callback, "❌ Недостаточно прав.")
+                return
+            if action == "open" and len(parts) == 3:
+                await show_service_tasks(callback.message, actor_id, service_id)
+                await _answer_callback(callback)
+                return
+            pending = pending_inputs.get(actor_id)
+            session_id = parts[-1]
+            if (
+                pending is None
+                or pending.get("operation") != "service_tasks"
+                or pending.get("service_id") != service_id
+                or pending.get("session_id") != session_id
+            ):
+                await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
+                return
+            if action == "tog" and len(parts) == 5:
+                position = int(parts[3])
+                task = next(
+                    (
+                        item for item in registry.list_service_tasks(service_id)
+                        if item["position"] == position
+                    ),
+                    None,
+                )
+                if task is None:
+                    raise ValueError("Задача больше не существует.")
+                registry.set_service_task_enabled(
+                    actor_id, service_id, task["name"], not task["enabled"]
+                )
+                await show_service_tasks(
+                    callback.message, actor_id, service_id,
+                    f"✅ «{task['name']}» "
+                    f"{'выключена' if task['enabled'] else 'включена'}",
+                )
+            elif action == "add" and len(parts) == 4:
+                pending["step"] = "add_task"
+                await _send_dialog(
+                    callback.message,
+                    "ℹ️ Введите название новой задачи (до 60 символов).",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(
+                            text="⬅️ Назад без изменения",
+                            callback_data=f"svc_tasks:open:{service_id}",
+                        )
+                    ]]),
+                    parse_mode=None,
+                )
+            else:
+                await _answer_callback(callback, "⚠️ Неизвестное действие.")
+                return
+        except (PermissionError, ValueError) as exc:
+            await _answer_callback(callback, _status_text(str(exc), "⚠️"))
+            return
+        except sqlite3.Error:
+            debug.exception("Не удалось изменить задачи служения")
+            await _answer_callback(callback, "❌ Ошибка базы данных.")
+            return
+        await _answer_callback(callback)
+
+    async def refresh_group_reminder_jobs() -> None:
+        refresh = getattr(context, "refresh_service_reminder_jobs", None)
+        if callable(refresh):
+            await refresh()
+
+    async def ask_new_group_reminder_step(
+        message: Message, pending: dict, step: str
+    ) -> None:
+        """Show the next step of adding a group reminder."""
+        service_id = pending["service_id"]
+        session_id = pending["session_id"]
+        pending["step"] = step
+        draft = pending["group_reminder_draft"]
+        if step == "group_reminder_new_days":
+            text = (
+                "➕ Новое напоминание · шаг 1 из 3\n\n"
+                "📅 За сколько дней до воскресенья отправить?\n"
+                "ℹ️ Введите число от 0 до 6 (0 — в день служения)."
+            )
+            markup = notification_edit_controls(service_id, session_id)
+        elif step == "group_reminder_new_time":
+            text = (
+                "➕ Новое напоминание · шаг 2 из 3\n\n"
+                "📅 Срок: "
+                + (
+                    "в день служения" if draft["days"] == 0
+                    else f"за {draft['days']} дн."
+                )
+                + "\n"
+                "🕒 Введите время отправки в формате ЧЧ:ММ (например, 18:00)."
+            )
+            markup = notification_edit_controls(service_id, session_id)
+        else:
+            text = (
+                "➕ Новое напоминание · шаг 3 из 3\n\n"
+                f"📅 Отправка: {_rule_label(draft['days'], draft['time'])}\n"
+                "📝 Введите текст напоминания или используйте шаблон "
+                "по умолчанию.\n"
+                "Поля: {service_name}, {sunday_date}, {task_assignments}, "
+                "{informational_notes}."
+            )
+            markup = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="📝 Шаблон по умолчанию",
+                            callback_data=(
+                                f"group_reminder:new_default:{service_id}:"
+                                f"{session_id}"
+                            ),
+                        )
+                    ],
+                    *notification_edit_controls(
+                        service_id, session_id
+                    ).inline_keyboard,
+                ]
+            )
+        await _send_dialog(message, text, reply_markup=markup, parse_mode=None)
+
+    def enabled_group_reminder_at(
+        registry: Any,
+        service_id: str,
+        days: int,
+        reminder_time: str,
+        *,
+        excluding_id: int | None = None,
+    ) -> dict | None:
+        """Включённое напоминание служения с тем же сроком и временем."""
+        return next(
+            (
+                item
+                for item in registry.list_group_reminders(service_id)
+                if item["enabled"]
+                and item["id"] != excluding_id
+                and item["reminder_days"] == days
+                and item["reminder_time"] == reminder_time
+            ),
+            None,
+        )
+
+    async def finish_new_group_reminder(
+        message: Message, actor_id: int, service_id: str
+    ) -> None:
+        """Save the drafted reminder or offer merging with a same-time one."""
+        pending = pending_inputs.get(actor_id)
+        registry = service_registry()
+        if pending is None or registry is None:
+            await _send_dialog(message, "Настройка устарела.", parse_mode=None)
+            return
+        draft = pending["group_reminder_draft"]
+        target = enabled_group_reminder_at(
+            registry, service_id, draft["days"], draft["time"]
+        )
+        if target is not None:
+            await offer_group_reminder_merge(
+                message,
+                actor_id,
+                service_id,
+                target,
+                days=draft["days"],
+                time=draft["time"],
+                body=draft["body"],
+                source_id=None,
+            )
+            return
+        # Совпадение только с выключенным напоминанием не дублирует отправку.
+        reminder_id = registry.add_group_reminder(
+            actor_id, service_id, draft["days"], draft["time"], draft["body"],
+            allow_duplicate=True,
+        )
+        pending.pop("group_reminder_draft", None)
+        await refresh_group_reminder_jobs()
+        await enter_group_reminder_card(
+            message, actor_id, service_id, reminder_id
+        )
+
+    async def offer_group_reminder_merge(
+        message: Message,
+        actor_id: int,
+        service_id: str,
+        target: dict,
+        *,
+        days: int,
+        time: str,
+        body: str | None,
+        source_id: int | None,
+        source_slot: tuple[int, str] | None = None,
+    ) -> None:
+        """Offer to merge a reminder into an existing one with the same slot.
+
+        source_id is None for a reminder that is being added and the id of an
+        existing reminder whose schedule is being changed otherwise.
+        """
+        pending = pending_inputs.get(actor_id)
+        registry = service_registry()
+        service = registry.get_service(service_id) if registry else None
+        if pending is None or service is None:
+            await _send_dialog(message, "Настройка устарела.", parse_mode=None)
+            return
+        existing_text = registry.resolve_group_text(target, service)
+        new_text = registry.resolve_group_text({"body": body}, service)
+        same_text = existing_text.strip() == new_text.strip()
+        merged_body = (
+            None if same_text
+            else existing_text.rstrip() + "\n\n" + new_text.strip()
+        )
+        request_id = secrets.token_urlsafe(6)
+        session_id = pending["session_id"]
+        pending["step"] = "group_reminder_merge"
+        pending["group_reminder_merge"] = {
+            "target_id": target["id"],
+            "target_slot": (target["reminder_days"], target["reminder_time"]),
+            "source_id": source_id,
+            "source_slot": source_slot,
+            "days": days,
+            "time": time,
+            "body": body,
+            "merged_body": merged_body,
+            "request_id": request_id,
+        }
+
+        def merge_is_current() -> bool:
+            active = pending_inputs.get(actor_id)
+            return (
+                active is pending
+                and active.get("session_id") == session_id
+                and active.get("step") == "group_reminder_merge"
+                and (active.get("group_reminder_merge") or {}).get(
+                    "request_id"
+                ) == request_id
+            )
+
+        def merge_button(text: str, action: str) -> InlineKeyboardButton:
+            return InlineKeyboardButton(
+                text=text,
+                callback_data=(
+                    f"group_reminder:{action}:{service_id}:{request_id}:"
+                    f"{session_id}"
+                ),
+            )
+
+        slot = _rule_label(days, time)
+        cancel_row = [merge_button("✖️ Отмена", "mrg_no")]
+        if same_text:
+            await _send_dialog(
+                message,
+                f"ℹ️ Напоминание «{slot}» с таким же текстом уже есть.\n\n"
+                "Можно оставить одно напоминание или отправлять этот текст "
+                "дважды отдельными сообщениями.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        merge_button("🔗 Оставить одно", "mrg_ok"),
+                        merge_button("➕ Отдельно", "mrg_sep"),
+                    ],
+                    cancel_row,
+                ]),
+                parse_mode=None,
+            )
+            return
+
+        await _send_dialog(
+            message,
+            "⏳ Готовлю предпросмотр объединённого сообщения...",
+            parse_mode=None,
+        )
+        result = None
+        preview_loader = getattr(context, "get_group_reminder_preview", None)
+        if callable(preview_loader):
+            try:
+                result = await preview_loader(target["id"], merged_body)
+            except Exception:
+                debug.exception(
+                    "Не удалось подготовить предпросмотр объединения "
+                    "групповых напоминаний"
+                )
+        if not merge_is_current():
+            return
+
+        header = (
+            f"⚠️ На «{slot}» уже есть напоминание.\n"
+            "Их можно объединить в одно сообщение"
+        )
+        too_long = False
+        if result and result.get("has_data"):
+            preview_text = result.get("text") or "⚪ Текст напоминания пуст."
+            too_long = visible_units(preview_text) > TELEGRAM_TEXT_LIMIT
+            preview_chunks = _telegram_text_chunks(preview_text, limit=3000)
+            if len(preview_chunks) > 1:
+                preview_text = preview_chunks[0] + "\n... (текст обрезан)"
+            text = (
+                f"{header}. Так оно будет выглядеть на {result['date']}:\n\n"
+                "──────────────────\n\n"
+                f"{preview_text}"
+            )
+        else:
+            # Без графика итоговую длину не проверить — объединение
+            # не предлагается, чтобы не сохранить неотправляемый текст.
+            too_long = True
+            reason = (
+                result.get("error") if result and result.get("error")
+                else "Не удалось загрузить график."
+            )
+            template_chunks = _telegram_text_chunks(merged_body, limit=3000)
+            template_text = template_chunks[0] + (
+                "\n... (текст обрезан)" if len(template_chunks) > 1 else ""
+            )
+            text = (
+                f"{header}. Текст объединённого сообщения "
+                "(поля в скобках заполнятся из графика):\n\n"
+                "──────────────────\n\n"
+                f"{template_text}\n\n"
+                f"ℹ️ {reason}"
+            )
+        rows = []
+        if too_long and result and result.get("has_data"):
+            text += (
+                "\n\n⚠️ Объединённое сообщение длиннее лимита Telegram "
+                "и не будет отправлено. Сохраните напоминания отдельно."
+            )
+        elif too_long:
+            text += (
+                "\n\n⚠️ Без графика нельзя проверить длину итогового "
+                "сообщения, поэтому объединение сейчас недоступно. "
+                "Попробуйте позже или сохраните отдельно."
+            )
+        else:
+            rows.append([merge_button("🔗 Объединить", "mrg_ok")])
+        rows.append([merge_button("➕ Отдельным сообщением", "mrg_sep")])
+        rows.append(cancel_row)
+        await _send_dialog(
+            message,
+            text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_text_limit=4096,
+            parse_mode=None,
+        )
+
     @admin_router.callback_query(F.data.startswith("group_reminder:"))
     async def on_group_reminder_action(callback: CallbackQuery) -> None:
         if (
@@ -1806,8 +2282,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         _, action, service_id, *tail = parts
         reminder_id = None
+        merge_token = None
         is_preview = action == "preview"
-        if is_preview:
+        if action in {"mrg_ok", "mrg_sep", "mrg_no"}:
+            if len(tail) != 2:
+                await _answer_callback(callback, "⚠️ Настройка устарела.")
+                return
+            merge_token, session_id = tail
+        elif is_preview:
             if len(tail) != 2:
                 await _answer_callback(callback, "⚠️ Настройка устарела.")
                 return
@@ -2094,64 +2576,84 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 if pending.get("step") != "reminder_menu":
                     await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
                     return
-                if any(
-                    item["reminder_days"] == 1
-                    and item["reminder_time"] == "18:00"
-                    for item in registry.list_group_reminders(service_id)
+                pending["group_reminder_draft"] = {}
+                await ask_new_group_reminder_step(
+                    callback.message, pending, "group_reminder_new_days"
+                )
+            elif action == "new_default":
+                if (
+                    pending.get("step") != "group_reminder_new_text"
+                    or pending.get("group_reminder_draft") is None
                 ):
-                    pending["step"] = "group_reminder_duplicate_add"
-                    confirm = InlineKeyboardMarkup(
-                        inline_keyboard=[[
-                            InlineKeyboardButton(
-                                text="✅ Создать повторное",
-                                callback_data=(
-                                    f"group_reminder:confirm_add:{service_id}:"
-                                    f"{session_id}"
-                                ),
-                            ),
-                            InlineKeyboardButton(
-                                text="⬅️ Отмена",
-                                callback_data=(
-                                    f"group_reminder:cancel_add:{service_id}:"
-                                    f"{session_id}"
-                                ),
-                            ),
-                        ]]
-                    )
-                    await _send_dialog(
-                        callback.message,
-                        "Уже есть напоминание за 1 день в 18:00. "
-                        "Создать ещё одно? Оно будет отправляться отдельным "
-                        "сообщением со своим текстом.",
-                        reply_markup=confirm,
-                        parse_mode=None,
-                    )
-                else:
-                    reminder_id = registry.add_group_reminder(
-                        actor_id, service_id, 1, "18:00"
-                    )
-                    await refresh_jobs()
-                    await enter_group_reminder_card(
-                        callback.message, actor_id, service_id, reminder_id
-                    )
-            elif action == "confirm_add":
-                if pending.get("step") != "group_reminder_duplicate_add":
-                    await _answer_callback(callback, "⚠️ Подтверждение устарело.")
+                    await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
                     return
-                reminder_id = registry.add_group_reminder(
-                    actor_id, service_id, 1, "18:00", allow_duplicate=True
-                )
-                await refresh_jobs()
-                await enter_group_reminder_card(
-                    callback.message, actor_id, service_id, reminder_id
-                )
-            elif action == "cancel_add":
-                if pending.get("step") != "group_reminder_duplicate_add":
-                    await _answer_callback(callback, "⚠️ Подтверждение устарело.")
-                    return
-                await show_reminder_rules_menu(
+                pending["group_reminder_draft"]["body"] = None
+                await finish_new_group_reminder(
                     callback.message, actor_id, service_id
                 )
+            elif action in {"mrg_ok", "mrg_sep", "mrg_no"}:
+                merge = pending.get("group_reminder_merge")
+                if (
+                    pending.get("step") != "group_reminder_merge"
+                    or merge is None
+                    or merge["request_id"] != merge_token
+                ):
+                    await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
+                    return
+                pending.pop("group_reminder_merge", None)
+                pending.pop("group_reminder_draft", None)
+                source_id = merge["source_id"]
+                if action == "mrg_ok":
+                    if source_id is not None or merge["merged_body"] is not None:
+                        merge_changes = (
+                            {"body": merge["merged_body"]}
+                            if merge["merged_body"] is not None
+                            else {}
+                        )
+                        registry.merge_group_reminder(
+                            actor_id,
+                            merge["target_id"],
+                            expected_slot=merge["target_slot"],
+                            source_id=source_id,
+                            source_slot=merge["source_slot"],
+                            **merge_changes,
+                        )
+                        await refresh_jobs()
+                    await enter_group_reminder_card(
+                        callback.message, actor_id, service_id,
+                        merge["target_id"],
+                    )
+                elif action == "mrg_sep":
+                    if source_id is None:
+                        opened_id = registry.add_group_reminder(
+                            actor_id,
+                            service_id,
+                            merge["days"],
+                            merge["time"],
+                            merge["body"],
+                            allow_duplicate=True,
+                        )
+                    else:
+                        registry.update_group_reminder(
+                            actor_id,
+                            source_id,
+                            days=merge["days"],
+                            time=merge["time"],
+                            allow_duplicate=True,
+                        )
+                        opened_id = source_id
+                    await refresh_jobs()
+                    await enter_group_reminder_card(
+                        callback.message, actor_id, service_id, opened_id
+                    )
+                elif source_id is None:
+                    await show_reminder_rules_menu(
+                        callback.message, actor_id, service_id
+                    )
+                else:
+                    await enter_group_reminder_card(
+                        callback.message, actor_id, service_id, source_id
+                    )
             elif action == "back":
                 if pending.get("step") not in {
                     "group_reminder_card",
@@ -2269,26 +2771,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await show_reminder_rules_menu(
                     callback.message, actor_id, service_id
                 )
-            elif action == "confirm_update":
-                if pending.get("step") != "group_reminder_duplicate_update":
-                    await _answer_callback(callback, "⚠️ Подтверждение устарело.")
-                    return
-                change = pending.pop("group_reminder_change")
-                registry.update_group_reminder(
-                    actor_id, change["reminder_id"],
-                    days=change["days"],
-                    time=change["time"],
-                    allow_duplicate=True,
-                )
-                pending.pop("group_reminder_input", None)
-                await refresh_jobs()
-                await enter_group_reminder_card(
-                    callback.message, actor_id, service_id,
-                    change["reminder_id"],
-                )
             elif action == "cancel_input":
                 input_info = pending.pop("group_reminder_input", None)
-                pending.pop("group_reminder_change", None)
                 if input_info is None:
                     await _answer_callback(callback, "⚠️ Действие устарело.")
                     return
@@ -3869,7 +4353,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
 
         step = pending.get("step")
-        if step in {
+        if step in GROUP_REMINDER_NEW_STEPS:
+            pending.pop("group_reminder_draft", None)
+            await show_reminder_rules_menu(
+                callback.message, actor_id, service_id
+            )
+        elif step in {
             "group_reminder_days",
             "group_reminder_time",
             "group_reminder_text",
@@ -3879,7 +4368,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await _answer_callback(callback, "⚠️ Нет активного шага для отмены.")
                 return
             pending.pop("group_reminder_input", None)
-            pending.pop("group_reminder_change", None)
             await enter_group_reminder_card(
                 callback.message,
                 actor_id,
@@ -4652,31 +5140,43 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     async def ensure_default_personal_rule(
         registry: Any, actor_id: int, service_id: str, state: dict[str, Any]
-    ) -> bool:
-        """Give a service without personal rules the default rule.
+    ) -> str | None:
+        """Make sure enabling the service will actually send something.
 
-        Returns False when the service has no rules and the schedule could
-        not be loaded, so enabling it would silently send nothing.
+        Returns the reason it cannot: an enabled rule must cover a task the
+        user has in the current schedule. Current tasks without any rule get
+        the default rule; disabled rules are left as the user set them.
         """
-        if any(
-            registry.list_schedules(entry["id"])
+        rules_by_task = {
+            entry["task"]: registry.list_schedules(entry["id"])
             for entry in registry.list_user_texts(actor_id, service_id)
-        ):
-            return True
+        }
         try:
             tasks = await current_personal_tasks(
                 registry, actor_id, service_id, state
             )
         except (OSError, RuntimeError, ValueError):
+            # Без графика нельзя проверить, что сохранённые правила
+            # относятся к текущим задачам, поэтому включение откладывается.
             debug.exception(
                 "Не удалось загрузить задачи для правила по умолчанию"
             )
-            return False
-        if tasks:
+            return PERSONAL_SCHEDULE_UNAVAILABLE
+        if not tasks:
+            return PERSONAL_NO_TASKS
+        uncovered = [task for task in tasks if not rules_by_task.get(task)]
+        if uncovered:
             registry.set_user_service_schedule(
-                actor_id, service_id, tasks, *DEFAULT_PERSONAL_RULE
+                actor_id, service_id, uncovered, *DEFAULT_PERSONAL_RULE
             )
-        return True
+            return None
+        if any(
+            rule["enabled"]
+            for task in tasks
+            for rule in rules_by_task[task]
+        ):
+            return None
+        return PERSONAL_RULES_DISABLED
 
     async def apply_personal_service_rule(
         registry: Any,
@@ -5208,10 +5708,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 if service_id not in registry.list_user_services(actor_id):
                     raise ValueError("Вы не привязаны к этому служению.")
                 enabled = registry.get_user_notifications_enabled(actor_id, service_id)
-                if not enabled and not await ensure_default_personal_rule(
-                    registry, actor_id, service_id, state
-                ):
-                    raise ValueError(PERSONAL_SCHEDULE_UNAVAILABLE)
+                if not enabled:
+                    problem = await ensure_default_personal_rule(
+                        registry, actor_id, service_id, state
+                    )
+                    if problem:
+                        raise ValueError(problem)
                 registry.set_user_notifications_enabled(
                     actor_id, service_id, not enabled
                 )
@@ -5219,24 +5721,26 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 if not payload["enabled"]:
                     registry.set_user_notifications_all(actor_id, False)
                 else:
-                    failed = []
+                    failed: dict[str, list[str]] = {}
                     for service_id in registry.list_user_services(actor_id):
-                        if await ensure_default_personal_rule(
+                        problem = await ensure_default_personal_rule(
                             registry, actor_id, service_id, state
-                        ):
+                        )
+                        if problem is None:
                             registry.set_user_notifications_enabled(
                                 actor_id, service_id, True
                             )
                         else:
                             service = service_by_id(registry, service_id)
-                            failed.append(
+                            failed.setdefault(problem, []).append(
                                 service_label(service) if service else service_id
                             )
                     if failed:
-                        notice = (
-                            f"⚠️ Не включено: {', '.join(failed)}. "
-                            + PERSONAL_SCHEDULE_UNAVAILABLE
-                        )
+                        notice = "⚠️ Не включено: " + "; ".join(
+                            f"{', '.join(labels)} — "
+                            f"{PERSONAL_PROBLEM_SHORT.get(problem, problem)}"
+                            for problem, labels in failed.items()
+                        ) + "."
             elif action_name == "open_service_time":
                 service_id = payload["service_id"]
                 if service_id not in registry.list_user_services(actor_id):
@@ -5568,6 +6072,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         text = message.text.strip()
         try:
+            if operation == "service_tasks":
+                if pending.get("step") != "add_task":
+                    raise ValueError(
+                        "Чтобы добавить задачу, нажмите «➕ Добавить задачу»."
+                    )
+                registry.add_service_task(message.from_user.id, service_id, text)
+                await show_service_tasks(
+                    message, message.from_user.id, service_id,
+                    f"✅ Задача «{' '.join(text.split())}» добавлена",
+                )
+                return
             if operation == "service_admin_add":
                 if pending.get("step") != "await_user":
                     raise ValueError(
@@ -5632,6 +6147,38 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 return
             elif operation == "service_notify":
                 step = pending["step"]
+                if step in GROUP_REMINDER_NEW_STEPS:
+                    draft = pending.get("group_reminder_draft")
+                    if draft is None:
+                        raise ValueError(
+                            "Ввод устарел. Нажмите «Добавить напоминание» "
+                            "заново."
+                        )
+                    if step == "group_reminder_new_days":
+                        draft["days"] = _parse_reminder_days(text)
+                        await ask_new_group_reminder_step(
+                            message, pending, "group_reminder_new_time"
+                        )
+                    elif step == "group_reminder_new_time":
+                        draft["time"] = _parse_reminder_time(text)
+                        await ask_new_group_reminder_step(
+                            message, pending, "group_reminder_new_text"
+                        )
+                    else:
+                        if not text:
+                            raise ValueError(
+                                "Текст группового напоминания не может быть пустым."
+                            )
+                        validate_notification_template(
+                            text,
+                            GROUP_TEMPLATE_FIELDS,
+                            "Текст группового напоминания",
+                        )
+                        draft["body"] = text
+                        await finish_new_group_reminder(
+                            message, message.from_user.id, service_id
+                        )
+                    return
                 if step in {
                     "group_reminder_days",
                     "group_reminder_time",
@@ -5654,25 +6201,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         )
                     changes = {}
                     if step == "group_reminder_days":
-                        try:
-                            days = int(text)
-                        except ValueError as exc:
-                            raise ValueError(
-                                "Введите целое число от 0 до 6."
-                            ) from exc
-                        if not 0 <= days <= 6:
-                            raise ValueError(
-                                "Число дней должно быть от 0 до 6."
-                            )
-                        changes["days"] = days
+                        changes["days"] = _parse_reminder_days(text)
                     elif step == "group_reminder_time":
-                        if not re.fullmatch(
-                            r"(?:[01]\d|2[0-3]):[0-5]\d", text
-                        ):
-                            raise ValueError(
-                                "Укажите время в формате HH:MM, например 17:15."
-                            )
-                        changes["time"] = text
+                        changes["time"] = _parse_reminder_time(text)
                     else:
                         if not text:
                             raise ValueError(
@@ -5703,43 +6234,43 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         updated_time = changes.get(
                             "time", reminder["reminder_time"]
                         )
-                        pending["group_reminder_change"] = {
-                            "reminder_id": input_info["reminder_id"],
-                            "days": updated_days,
-                            "time": updated_time,
-                        }
-                        pending["step"] = "group_reminder_duplicate_update"
-                        keyboard = InlineKeyboardMarkup(
-                            inline_keyboard=[[
-                                InlineKeyboardButton(
-                                    text="✅ Сохранить всё равно",
-                                    callback_data=(
-                                        f"group_reminder:confirm_update:"
-                                        f"{service_id}:"
-                                        f"{input_info['reminder_id']}:"
-                                        f"{pending['session_id']}"
-                                    ),
-                                ),
-                                InlineKeyboardButton(
-                                    text="⬅️ Отмена",
-                                    callback_data=(
-                                        f"group_reminder:cancel_input:"
-                                        f"{service_id}:"
-                                        f"{input_info['reminder_id']}:"
-                                        f"{pending['session_id']}"
-                                    ),
-                                ),
-                            ]]
+                        target = (
+                            enabled_group_reminder_at(
+                                registry,
+                                service_id,
+                                updated_days,
+                                updated_time,
+                                excluding_id=reminder["id"],
+                            )
+                            if reminder["enabled"]
+                            else None
                         )
-                        await _send_dialog(
-                            message,
-                            "Уже есть напоминание с таким сроком и временем. "
-                            "При совпадении расписания оба напоминания будут "
-                            "отправлены отдельными сообщениями. Сохранить?",
-                            reply_markup=keyboard,
-                            parse_mode=None,
-                        )
-                        return
+                        if target is None:
+                            # Совпадение с выключенным напоминанием (или
+                            # изменение выключенного) не даёт двойной отправки.
+                            registry.update_group_reminder(
+                                message.from_user.id,
+                                input_info["reminder_id"],
+                                allow_duplicate=True,
+                                **changes,
+                            )
+                        else:
+                            pending.pop("group_reminder_input", None)
+                            await offer_group_reminder_merge(
+                                message,
+                                message.from_user.id,
+                                service_id,
+                                target,
+                                days=updated_days,
+                                time=updated_time,
+                                body=reminder["body"],
+                                source_id=reminder["id"],
+                                source_slot=(
+                                    reminder["reminder_days"],
+                                    reminder["reminder_time"],
+                                ),
+                            )
+                            return
                     has_schedule_change = bool(
                         {"days", "time"} & changes.keys()
                     )

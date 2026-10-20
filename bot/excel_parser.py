@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import re
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from datetime import date, datetime
 from pathlib import Path
@@ -13,7 +13,12 @@ from xml.etree import ElementTree
 from openpyxl import load_workbook
 from openpyxl.styles.borders import Side
 
-from .services import SERVICES, ServiceDefinition
+from .services import (
+    SERVICES,
+    ScheduleColumn,
+    ServiceDefinition,
+    normalized_name,
+)
 
 ROLES = ("Ответственный", "Ведущий", "Проповедник")
 
@@ -34,6 +39,7 @@ class ServiceEvent:
     service_id: str
     event_date: date
     assignments: tuple[ServiceAssignment, ...]
+    issues: tuple[str, ...] = ()
 
 _MONTH_SHEETS = (
     "ЯНВАРЬ", "ФЕВРАЛЬ", "МАРТ", "АПРЕЛЬ", "МАЙ", "ИЮНЬ",
@@ -62,6 +68,7 @@ _ROLE_ALIASES = {
     "проповедет": "Проповедник",
     "проповедник": "Проповедник",
 }
+_COMMENTS_MARKER = "комментарии"
 _MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 
 
@@ -153,6 +160,43 @@ def is_informational_name(raw: str) -> tuple[bool, str]:
 
 def _normalized(value: str) -> str:
     return " ".join(value.casefold().replace("ё", "е").split())
+
+
+def _rows_before_comments(rows: list) -> list:
+    """Обрезает строки листа, начиная со строки «КОММЕНТАРИИ…»."""
+    for index, row in enumerate(rows):
+        if any(
+            isinstance(value, str)
+            and _normalized(value).startswith(_COMMENTS_MARKER)
+            for value in row or ()
+        ):
+            return rows[:index]
+    return rows
+
+
+def _rows_before_other_month(
+    rows: list, date_columns, month: date
+) -> list:
+    """Обрезает лист на первом воскресенье другого месяца после дат месяца.
+
+    Даты предыдущего месяца в начале листа пропускаются, а воскресенье
+    следующего месяца завершает чтение: его блок и все строки ниже не
+    учитываются. Будние даты (например, спевка в среду после последнего
+    воскресенья) лист не обрезают.
+    """
+    seen_month = False
+    for index, row in enumerate(rows):
+        for column in date_columns:
+            if len(row) <= column:
+                continue
+            event_date = _cell_date(row[column], month.year)
+            if event_date is None:
+                continue
+            if (event_date.year, event_date.month) == (month.year, month.month):
+                seen_month = True
+            elif seen_month and event_date.weekday() == 6:
+                return rows[:index]
+    return rows
 
 
 def _canonical_role(value: str) -> str | None:
@@ -283,7 +327,9 @@ def parse_schedule(path: Path, target: date,
             raise RuntimeError(f"Лист расписания '{expected_sheet}' не найден")
 
         worksheet.reset_dimensions()
-        rows = list(worksheet.iter_rows(values_only=True))
+        rows = _rows_before_comments(
+            list(worksheet.iter_rows(values_only=True))
+        )
         target_row = next(
             (
                 index for index, row in enumerate(rows)
@@ -326,12 +372,159 @@ def parse_schedule(path: Path, target: date,
         workbook.close()
 
 
+def _column_assignments(
+    rows: list,
+    row_index: int,
+    next_row: int,
+    start_column: int,
+    column: ScheduleColumn,
+    service: ServiceDefinition,
+    event_date: date,
+    month: date,
+    debug_logger: logging.Logger,
+) -> tuple[list[ServiceAssignment], list[str]]:
+    """Читает назначения одной колонки служения в блоке одной даты."""
+    default_task = column.task or service.name
+    assignments: list[ServiceAssignment] = []
+    issues: list[str] = []
+    # Строки без задачи продолжают последнюю задачу блока, пока не встретится
+    # пустая ячейка имени, новая задача или пометка. Иначе они относятся к
+    # задаче колонки или к служению без задач; в начале блока — к задаче
+    # default_task колонки; в остальных случаях это «строка без задачи».
+    current_task: str | None = None
+    block_has_task = False
+    for row in rows[row_index + 1:next_row]:
+        if column.layout == "single":
+            name = _clean(row[start_column]) if len(row) > start_column else ""
+            is_informational, task = is_informational_name(name)
+            if is_informational and task:
+                assignments.append(
+                    ServiceAssignment(task=task, name="", is_informational=True)
+                )
+            elif name and _cell_date(name, month.year) is None:
+                assignments.append(ServiceAssignment(task=default_task, name=name))
+            continue
+
+        raw_task_text = (
+            _clean(row[start_column]) if len(row) > start_column else ""
+        )
+        is_informational, task_text = is_informational_name(raw_task_text)
+        name = (
+            _clean(row[start_column + 1]) if len(row) > start_column + 1 else ""
+        )
+        task_label, separator, inline_name = task_text.partition(";")
+        if not name and separator:
+            name = inline_name.strip()
+        task_label = task_label.strip()
+        if is_informational:
+            current_task = None
+            block_has_task = True
+            task = task_label
+        elif task_label:
+            task = _canonical_role(task_label) or task_label
+            current_task = task
+            block_has_task = True
+        elif not name:
+            current_task = None
+            continue
+        elif current_task is not None:
+            task = current_task
+        elif column.task or not service.tasks:
+            # Задача колонки («кофе») или служение без задач (Книги)
+            # относятся ко всем строкам без своей задачи, и после пометок.
+            task = default_task
+        elif not block_has_task and column.default_task:
+            task = column.default_task
+        else:
+            issues.append(
+                f"«{service.name}», {event_date:%d.%m.%Y}: строка без задачи"
+            )
+            debug_logger.warning(
+                "Пропущена строка без задачи: служение=%s, дата=%s",
+                service.name, event_date,
+            )
+            continue
+        if not name and not is_informational:
+            continue
+        if not task:
+            continue
+        assignments.append(
+            ServiceAssignment(
+                task=task, name=name, is_informational=is_informational
+            )
+        )
+    return assignments, issues
+
+
+def _task_enabled(service: ServiceDefinition, task_name: str) -> bool:
+    key = normalized_name(task_name)
+    return any(
+        task.enabled
+        for task in service.tasks
+        if key in {normalized_name(name) for name in (task.name, *task.aliases)}
+    )
+
+
+def _catalog_assignments(
+    service: ServiceDefinition,
+    assignments,
+    issues: list[str],
+    event_date: date,
+    debug_logger: logging.Logger,
+) -> tuple[ServiceAssignment, ...]:
+    """Приводит задачи к названиям каталога и отбрасывает лишние.
+
+    Выключенные задачи пропускаются молча, задачи не из каталога — с
+    предупреждением. У служения без задач все назначения относятся к нему.
+    """
+    tasks = {
+        normalized_name(key): task
+        for task in service.tasks
+        for key in (task.name, *task.aliases)
+    }
+    result = []
+    for assignment in assignments:
+        if assignment.is_informational:
+            result.append(assignment)
+            continue
+        if not service.tasks:
+            result.append(replace(assignment, task=service.name))
+            continue
+        task = tasks.get(normalized_name(assignment.task))
+        if task is None:
+            issue = (
+                f"«{service.name}», {event_date:%d.%m.%Y}: "
+                f"задача «{assignment.task}» не из списка"
+            )
+            if issue not in issues:
+                issues.append(issue)
+            debug_logger.warning(
+                "Задача не из каталога: служение=%s, дата=%s, задача=%s",
+                service.name, event_date, assignment.task,
+            )
+            continue
+        if not task.enabled:
+            debug_logger.debug(
+                "Выключенная задача пропущена: служение=%s, задача=%s",
+                service.name, task.name,
+            )
+            continue
+        result.append(replace(assignment, task=task.name))
+    return tuple(result)
+
+
 def parse_service_events(
     path: Path,
     month: date,
     debug_logger: logging.Logger,
+    services: tuple[ServiceDefinition, ...] | None = None,
 ) -> dict[str, list[ServiceEvent]]:
-    """Читает события и назначения включённых служений с месячного листа."""
+    """Читает события и назначения служений с месячного листа.
+
+    services — каталог с актуальными задачами (по умолчанию из файла).
+    """
+    services = SERVICES if services is None else services
+    services_by_id = {service.id: service for service in services}
     workbook = _load_workbook(path, debug_logger)
     try:
         expected_sheet = _schedule_sheet_name(month)
@@ -348,11 +541,16 @@ def parse_service_events(
         if not rows:
             raise RuntimeError(f"Лист расписания '{sheet_name}' пуст")
         sheet_width = max(len(row) for row in rows)
+        rows = _rows_before_comments(rows)
 
         result: dict[str, list[ServiceEvent]] = {
-            service.id: [] for service in SERVICES
+            service.id: [] for service in services
         }
         if _normalized(sheet_name) == "график":
+            assembly = services_by_id.get("assembly")
+            if assembly is None:
+                return result
+            rows = _rows_before_other_month(rows, (0,), month)
             event_rows = [
                 (row_index, event_date)
                 for row_index, row in enumerate(rows)
@@ -366,16 +564,24 @@ def parse_service_events(
                     if event_index + 1 < len(event_rows)
                     else len(rows)
                 )
-                assignments = tuple(
-                    assignment
-                    for row in rows[row_index + 1:next_row]
-                    for assignment in _parse_legacy_event_row(row)
+                issues: list[str] = []
+                assignments = _catalog_assignments(
+                    assembly,
+                    [
+                        assignment
+                        for row in rows[row_index + 1:next_row]
+                        for assignment in _parse_legacy_event_row(row)
+                    ],
+                    issues,
+                    event_date,
+                    debug_logger,
                 )
                 result["assembly"].append(
                     ServiceEvent(
                         service_id="assembly",
                         event_date=event_date,
                         assignments=assignments,
+                        issues=tuple(issues),
                     )
                 )
             debug_logger.debug(
@@ -386,46 +592,67 @@ def parse_service_events(
             _log_informational_tasks(result, debug_logger)
             return result
 
-        aliases = {
-            _normalized(alias): service
-            for service in SERVICES
-            for alias in service.aliases
+        columns_by_header = {
+            normalized_name(header): (service, column)
+            for service in services
+            for column in service.columns
+            for header in column.headers
         }
         headers = []
-        service_columns: dict[str, int] = {}
-        for column, value in enumerate(rows[0]):
+        found_columns: list[tuple[ServiceDefinition, ScheduleColumn, int]] = []
+        seen_columns: set[tuple[str, tuple[str, ...]]] = set()
+        for column_index, value in enumerate(rows[0]):
             header = _clean(value)
             if not header:
                 continue
-            headers.append(column)
-            service = aliases.get(_normalized(header))
-            if service is None:
+            headers.append(column_index)
+            match = columns_by_header.get(normalized_name(header))
+            if match is None:
+                debug_logger.debug(
+                    "Колонка '%s' листа '%s' не относится к служениям",
+                    header, sheet_name,
+                )
                 continue
-            if service.id in service_columns:
+            service, column = match
+            if column.task and not _task_enabled(service, column.task):
+                debug_logger.debug(
+                    "Колонка '%s' пропущена: задача «%s» выключена",
+                    header, column.task,
+                )
+                continue
+            key = (service.id, column.headers)
+            if key in seen_columns:
                 raise RuntimeError(
-                    f"Заголовок служения «{service.name}» указан несколько раз "
+                    f"Заголовок «{header}» указан несколько раз "
                     f"на листе '{sheet_name}'"
                 )
-            service_columns[service.id] = column
+            seen_columns.add(key)
+            found_columns.append((service, column, column_index))
 
-        for service in SERVICES:
-            start_column = service_columns.get(service.id)
-            if start_column is None:
+        rows = _rows_before_other_month(
+            rows, tuple(index for _, _, index in found_columns), month
+        )
+        found_ids = {service.id for service, _, _ in found_columns}
+        for service in services:
+            if service.columns and service.id not in found_ids:
                 debug_logger.warning(
                     "На листе '%s' не найдено служение '%s'",
                     sheet_name, service.name,
                 )
-                continue
-            next_headers = [column for column in headers if column > start_column]
+
+        # Несколько колонок одного служения (Трансляция + Слайды) дают одно
+        # событие на дату; назначения идут в порядке колонок листа.
+        collected: dict[str, dict[date, tuple[list, list]]] = {}
+        for service, column, start_column in found_columns:
+            next_headers = [index for index in headers if index > start_column]
             end_column = (
                 min(next_headers) - 1 if next_headers else sheet_width - 1
             )
-            if service.assignment_layout == "pairs" and end_column < start_column + 1:
+            if column.layout == "pairs" and end_column < start_column + 1:
                 raise RuntimeError(
                     f"Для служения «{service.name}» на листе '{sheet_name}' "
                     "не хватает столбца ответственного"
                 )
-
             event_rows = [
                 (row_index, event_date)
                 for row_index, row in enumerate(rows)
@@ -441,68 +668,34 @@ def parse_service_events(
                 )
                 if (event_date.year, event_date.month) != (month.year, month.month):
                     continue
-                assignments = []
-                for row in rows[row_index + 1:next_row]:
-                    if service.assignment_layout == "single":
-                        name = _clean(row[start_column]) if len(row) > start_column else ""
-                        is_informational, task = is_informational_name(name)
-                        if is_informational and task:
-                            assignments.append(
-                                ServiceAssignment(
-                                    task=task,
-                                    name="",
-                                    is_informational=True,
-                                )
-                            )
-                        elif name and _cell_date(name, month.year) is None:
-                            assignments.append(
-                                ServiceAssignment(task=service.name, name=name)
-                            )
-                        continue
+                assignments, issues = _column_assignments(
+                    rows, row_index, next_row, start_column, column,
+                    service, event_date, month, debug_logger,
+                )
+                event_assignments, event_issues = collected.setdefault(
+                    service.id, {}
+                ).setdefault(event_date, ([], []))
+                event_assignments.extend(assignments)
+                event_issues.extend(issues)
 
-                    raw_task_text = (
-                        _clean(row[start_column])
-                        if len(row) > start_column
-                        else ""
-                    )
-                    is_informational, task_text = is_informational_name(
-                        raw_task_text
-                    )
-                    name = (
-                        _clean(row[start_column + 1])
-                        if len(row) > start_column + 1
-                        else ""
-                    )
-                    task_label, separator, inline_name = task_text.partition(";")
-                    if not name and separator:
-                        name = inline_name.strip()
-                    task = (
-                        _canonical_role(task_label.strip())
-                        or task_label.strip()
-                        or service.name
-                    )
-                    if not name and not is_informational:
-                        continue
-                    if not task:
-                        continue
-                    assignments.append(
-                        ServiceAssignment(
-                            task=task,
-                            name=name,
-                            is_informational=is_informational,
-                        )
-                    )
-
+        for service in services:
+            for event_date, (assignments, issues) in sorted(
+                collected.get(service.id, {}).items()
+            ):
+                normalized = _catalog_assignments(
+                    service, assignments, issues, event_date, debug_logger
+                )
                 result[service.id].append(
                     ServiceEvent(
                         service_id=service.id,
                         event_date=event_date,
-                        assignments=tuple(assignments),
+                        assignments=normalized,
+                        issues=tuple(issues),
                     )
                 )
                 debug_logger.debug(
                     "Прочитано служение '%s' на %s: назначений=%s",
-                    service.name, event_date, len(assignments),
+                    service.name, event_date, len(normalized),
                 )
 
         _log_informational_tasks(result, debug_logger)
