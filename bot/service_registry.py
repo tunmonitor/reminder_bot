@@ -538,6 +538,15 @@ class ServiceRegistry:
                         json.dumps(task.aliases, ensure_ascii=False),
                     ),
                 )
+            # Задачи, убранные из каталога, удаляются, чтобы не занимать
+            # позиции текущих задач (позиция — идентификатор кнопки).
+            catalog_names = [task.name for task in service.tasks]
+            connection.execute(
+                "DELETE FROM service_tasks WHERE service_id = ? "
+                "AND source = 'catalog' AND name NOT IN "
+                f"({', '.join('?' for _ in catalog_names) or "''"})",
+                (service.id, *catalog_names),
+            )
             # Задачи, добавленные суперадмином, идут после задач каталога;
             # позиции уникальны и служат идентификатором кнопок.
             admin_tasks = connection.execute(
@@ -1256,14 +1265,19 @@ class ServiceRegistry:
             )
             if not isinstance(new_enabled, bool):
                 raise ValueError("enabled должен быть логическим значением")
-            self._ensure_group_schedule_unique(
-                connection,
-                row["service_id"],
-                new_days,
-                new_time,
-                allow_duplicate,
-                excluding_id=reminder_id,
-            )
+            # Слот проверяется только при переносе: текст и включение можно
+            # менять и у напоминания, которое уже делит слот с другим.
+            if (new_days, new_time) != (
+                row["reminder_days"], row["reminder_time"]
+            ):
+                self._ensure_group_schedule_unique(
+                    connection,
+                    row["service_id"],
+                    new_days,
+                    new_time,
+                    allow_duplicate,
+                    excluding_id=reminder_id,
+                )
             connection.execute(
                 "UPDATE group_reminders SET body = ?, reminder_days = ?, "
                 "reminder_time = ?, enabled = ? WHERE id = ?",

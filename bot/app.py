@@ -36,6 +36,7 @@ if __package__:
         ROLES,
         parse_people,
         parse_schedule,
+        SheetEmptyError,
         SheetNotFoundError,
         parse_service_events,
         resolve_assignments,
@@ -91,6 +92,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         ROLES,
         parse_people,
         parse_schedule,
+        SheetEmptyError,
         SheetNotFoundError,
         parse_service_events,
         resolve_assignments,
@@ -546,7 +548,8 @@ async def _load_upcoming_service_events(
                 events_by_service = parse_service_events(
                     xlsx_path, month, debug_logger, services
                 )
-            except SheetNotFoundError:
+            except (SheetNotFoundError, SheetEmptyError):
+                # Лист следующего месяца может быть ещё не создан или пуст.
                 if month == months[0]:
                     raise
                 debug_logger.info(

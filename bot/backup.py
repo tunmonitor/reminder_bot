@@ -316,7 +316,8 @@ class BackupManager:
             return snapshot
 
     async def _run_background_backup(self, reason: str) -> None:
-        self._debounce_handle = None
+        # Отложенный таймер не сбрасывается здесь: create_snapshot отменяет
+        # его под блокировкой, иначе он запустил бы второй снимок.
         try:
             await self.create_snapshot(reason)
         except Exception as exc:
@@ -833,7 +834,7 @@ class BackupManager:
             raise ValueError("Снимок должен находиться в каталоге своего окружения")
         self._validate_snapshot(snapshot, self.environment)
         self._require_external_mount()
-        for suffix in ("-wal", "-shm"):
+        for suffix in ("-wal", "-shm", "-journal"):
             sidecar = Path(f"{self.registry_path}{suffix}")
             if sidecar.exists() or sidecar.is_symlink():
                 raise RuntimeError(

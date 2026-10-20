@@ -27,6 +27,10 @@ class SheetNotFoundError(RuntimeError):
     """The workbook has no sheet for the requested month."""
 
 
+class SheetEmptyError(RuntimeError):
+    """The month sheet exists but has no rows yet."""
+
+
 @dataclass(frozen=True)
 class ServiceAssignment:
     task: str
@@ -175,7 +179,7 @@ def _rows_before_comments(rows: list) -> list:
 
 
 def _rows_before_other_month(
-    rows: list, date_columns, month: date
+    rows: list, date_columns, month: date, row_date=None
 ) -> list:
     """Обрезает лист на первом воскресенье другого месяца после дат месяца.
 
@@ -189,7 +193,7 @@ def _rows_before_other_month(
         for column in date_columns:
             if len(row) <= column:
                 continue
-            event_date = _cell_date(row[column], month.year)
+            event_date = (row_date or _cell_date)(row[column], month.year)
             if event_date is None:
                 continue
             if (event_date.year, event_date.month) == (month.year, month.month):
@@ -262,9 +266,38 @@ def _legacy_role_cell(value) -> tuple[str, str] | None:
     if not separator:
         role_text, separator, inline_name = task.partition(":")
     role = _canonical_role(role_text if separator else task)
-    if role is None:
+    if role is not None:
+        return role, inline_name.strip() if separator else ""
+    if separator:
         return None
-    return role, inline_name.strip() if separator else ""
+    # «Ведущий Павел»: роль и имя через пробел, как в прежнем формате.
+    words = task.split()
+    for size in range(len(words) - 1, 0, -1):
+        role = _canonical_role(" ".join(words[:size]))
+        if role is not None:
+            return role, " ".join(words[size:])
+    return None
+
+
+# Перед датой допускается только день недели: «Воскресенье, 11.10.2026».
+_LEGACY_DATE_RE = re.compile(
+    r"^[а-яё]+\.?,?\s+(\d{1,2})[./](\d{1,2})[./](\d{4})(?!\d)",
+    re.IGNORECASE,
+)
+
+
+def _legacy_row_date(value, target_year: int) -> date | None:
+    """Дата строки листа «График»; допускает текст перед датой."""
+    parsed = _cell_date(value, target_year)
+    if parsed is not None:
+        return parsed
+    match = _LEGACY_DATE_RE.match(_clean(value))
+    if match is None:
+        return None
+    try:
+        return date(int(match[3]), int(match[2]), int(match[1]))
+    except ValueError:
+        return None
 
 
 def _parse_legacy_task_row(row) -> list[tuple[str, str]]:
@@ -330,10 +363,11 @@ def parse_schedule(path: Path, target: date,
         rows = _rows_before_comments(
             list(worksheet.iter_rows(values_only=True))
         )
+        row_date = _legacy_row_date if is_legacy_sheet else _cell_date
         target_row = next(
             (
                 index for index, row in enumerate(rows)
-                if row and _cell_date(row[0], target.year) == target
+                if row and row_date(row[0], target.year) == target
             ),
             None,
         )
@@ -344,7 +378,7 @@ def parse_schedule(path: Path, target: date,
 
         found: dict[str, str] = {}
         for row in rows[target_row + 1:]:
-            if row and _cell_date(row[0], target.year) is not None:
+            if row and row_date(row[0], target.year) is not None:
                 break
             if is_legacy_sheet:
                 task_rows = _parse_legacy_task_row(row)
@@ -539,7 +573,7 @@ def parse_service_events(
         worksheet.reset_dimensions()
         rows = list(worksheet.iter_rows(values_only=True))
         if not rows:
-            raise RuntimeError(f"Лист расписания '{sheet_name}' пуст")
+            raise SheetEmptyError(f"Лист расписания '{sheet_name}' пуст")
         sheet_width = max(len(row) for row in rows)
         rows = _rows_before_comments(rows)
 
@@ -550,11 +584,14 @@ def parse_service_events(
             assembly = services_by_id.get("assembly")
             if assembly is None:
                 return result
-            rows = _rows_before_other_month(rows, (0,), month)
+            rows = _rows_before_other_month(
+                rows, (0,), month, _legacy_row_date
+            )
             event_rows = [
                 (row_index, event_date)
                 for row_index, row in enumerate(rows)
-                if row and (event_date := _cell_date(row[0], month.year)) is not None
+                if row
+                and (event_date := _legacy_row_date(row[0], month.year)) is not None
             ]
             for event_index, (row_index, event_date) in enumerate(event_rows):
                 if (event_date.year, event_date.month) != (month.year, month.month):

@@ -6056,7 +6056,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
             return
         operation = pending["operation"]
-        service_id = pending["service_id"]
+        service_id = pending.get("service_id")
+        if service_id is None:
+            # Меню без текстового ввода (например, «Мои уведомления»).
+            await message.answer(
+                "Выберите действие кнопками меню.", parse_mode=None
+            )
+            return
         registry = service_registry()
         if registry is None:
             await clean_previous_menu_by_id(
@@ -6656,7 +6662,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         ):
             await _answer_callback(callback,)
             return
-        _, action, service_id = callback.data.split(":", 2)
+        parts = callback.data.split(":", 2)
+        if len(parts) != 3:
+            await _answer_callback(callback, "⚠️ Кнопка устарела.")
+            return
+        _, action, service_id = parts
         await clean_previous_menu(callback.message, debug)
         registry = service_registry()
         if registry is None:
