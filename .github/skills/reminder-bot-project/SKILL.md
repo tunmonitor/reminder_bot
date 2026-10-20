@@ -107,6 +107,10 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   on every schedule read; roster failures are logged and never block
   reminders. Binding UI is person-centric (`bind_service_member` covers all
   the person's tasks); `members-v1` migrates old contacts once.
+- Chat topics: `/here [service]` in a group topic stores
+  `services.group_thread_id` (`set_group_thread`, service editor, chat must
+  be the bound one; `set_group_chat` to another chat resets it). Every send
+  to a service group passes `**thread_kwargs(service)`.
 - Services, tasks, and month-sheet columns come from
   `reminder_bot_services.json` (`bot/services.py` validates it at import).
   `parse_service_events(..., services)` maps column headers to services,

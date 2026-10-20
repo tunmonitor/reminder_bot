@@ -2503,6 +2503,84 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_reminder_card_navigates_between_service_reminders(self):
+        async def run():
+            self.registry.add_group_reminder(67890, "sound", 3, "10:30")
+            menu = await self._open_sound_reminders()
+            first = await self._click(
+                menu.message, lambda button: button.text.startswith("📝 1 дн.")
+            )
+            text = first.message.answer.await_args.args[0]
+            self.assertIn("📋 Напоминание 1 из 2", text)
+            labels = [
+                button.text
+                for row in first.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+            ]
+            self.assertIn("➡️ Следующее", labels)
+            self.assertNotIn("⬅️ Предыдущее", labels)
+
+            second = await self._click(
+                first.message, lambda button: button.text == "➡️ Следующее"
+            )
+            text = second.message.answer.await_args.args[0]
+            self.assertIn("за 3 дн.", text)
+            self.assertIn("📋 Напоминание 2 из 2", text)
+            back = await self._click(
+                second.message, lambda button: button.text == "⬅️ Предыдущее"
+            )
+            self.assertIn("за 1 дн.", back.message.answer.await_args.args[0])
+
+            stale = await self._click(
+                first.message, lambda button: button.text == "➡️ Следующее"
+            )
+            self.assertIsNotNone(stale.answer.await_args)
+
+        asyncio.run(run())
+
+    def test_here_command_stores_chat_topic_for_service_admin(self):
+        async def run():
+            handler = self.message_handler("on_here_command")
+            private = self.message(67890, "/here")
+            await handler(private)
+            self.assertIn("в нужной теме", private.answer.await_args.args[0])
+
+            self.registry.set_group_chat(67890, "sound", -100777, enabled=True)
+            self.registry.set_group_chat(67890, "broadcast", -100777, enabled=True)
+            group = self.message(67890, "/here", chat_type="supergroup")
+            group.chat.id = -100777
+            group.message_thread_id = 42
+            group.is_topic_message = True
+            await handler(group)
+            self.assertIn("/here sound", group.answer.await_args.args[0])
+
+            group.text = "/here Звук"
+            await handler(group)
+            self.assertIn("в эту тему", group.answer.await_args.args[0])
+            self.assertEqual(
+                self.registry.get_service("sound")["group_thread_id"], 42
+            )
+            self.assertIsNone(
+                self.registry.get_service("broadcast")["group_thread_id"]
+            )
+
+            stranger = self.message(55555, "/here sound", chat_type="supergroup")
+            stranger.chat.id = -100777
+            await handler(stranger)
+            self.assertIn("только администратор", stranger.answer.await_args.args[0])
+
+            general = self.message(67890, "/here sound", chat_type="supergroup")
+            general.chat.id = -100777
+            await handler(general)
+            self.assertIn("в общую тему", general.answer.await_args.args[0])
+            self.assertIsNone(
+                self.registry.get_service("sound")["group_thread_id"]
+            )
+
+        asyncio.run(run())
+
     def test_cancelled_add_wizard_creates_nothing(self):
         async def run():
             menu = await self._open_sound_reminders()

@@ -42,7 +42,7 @@ if __package__:
         parse_service_rosters,
         resolve_assignments,
     )
-    from .handlers import register
+    from .handlers import register, send_to_service_group
     from .logger import setup_loggers
     from .notifier import (
         TELEGRAM_TEXT_LIMIT,
@@ -99,7 +99,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         parse_service_rosters,
         resolve_assignments,
     )
-    from bot.handlers import register
+    from bot.handlers import register, send_to_service_group
     from bot.logger import setup_loggers
     from bot.notifier import (
         TELEGRAM_TEXT_LIMIT,
@@ -919,11 +919,16 @@ async def _process_service_reminder(
             )
         else:
             try:
-                await send_telegram_screen(
-                    bot.send_message,
+                await send_to_service_group(
+                    lambda chat_id, text, **kwargs: send_telegram_screen(
+                        bot.send_message, chat_id, text,
+                        limit=TELEGRAM_TEXT_LIMIT, **kwargs,
+                    ),
                     group_chat_id,
                     group_text,
-                    limit=TELEGRAM_TEXT_LIMIT,
+                    service,
+                    registry=registry,
+                    logger=debug_logger,
                 )
             except Exception as exc:
                 debug_logger.exception(

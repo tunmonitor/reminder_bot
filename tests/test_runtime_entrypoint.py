@@ -590,6 +590,85 @@ class ReminderBotEntrypointTest(unittest.TestCase):
 
         asyncio.run(process())
 
+    def test_group_reminder_is_sent_to_chosen_topic(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                registry.set_group_thread(1001, "assembly", -10001, 9)
+                reminder = registry.list_group_reminders("assembly")[0]
+                bot = SimpleNamespace(send_message=AsyncMock())
+                logger = MagicMock()
+                with patch.object(
+                    app, "_load_service_task_assignments",
+                    new=AsyncMock(return_value=({"Ведущий": ["Анна"]}, True)),
+                ):
+                    await app._process_service_reminder(
+                        bot, SimpleNamespace(admin_tg_id=1001), Path(tmp_dir),
+                        ZoneInfo("UTC"), registry, "assembly", reminder["id"],
+                        logger, logger,
+                        run_date=date(2026, 10, 11) - timedelta(
+                            days=reminder["reminder_days"]
+                        ),
+                    )
+                group_calls = [
+                    call for call in bot.send_message.await_args_list
+                    if call.args[0] == -10001
+                ]
+                self.assertEqual(len(group_calls), 1)
+                self.assertEqual(
+                    group_calls[0].kwargs.get("message_thread_id"), 9
+                )
+
+        asyncio.run(process())
+
+    def test_deleted_topic_falls_back_to_general_and_is_reset(self):
+        from aiogram.exceptions import TelegramBadRequest
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def send(chat_id, text, **kwargs):
+            if kwargs.get("message_thread_id"):
+                raise TelegramBadRequest(
+                    method=MagicMock(), message="Bad Request: message thread not found"
+                )
+            return SimpleNamespace(message_id=1)
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                registry.set_group_thread(1001, "assembly", -10001, 9)
+                reminder = registry.list_group_reminders("assembly")[0]
+                bot = SimpleNamespace(send_message=AsyncMock(side_effect=send))
+                logger = MagicMock()
+                event_date = date(2026, 10, 11)
+                with patch.object(
+                    app, "_load_service_task_assignments",
+                    new=AsyncMock(return_value=({"Ведущий": ["Анна"]}, True)),
+                ):
+                    await app._process_service_reminder(
+                        bot, SimpleNamespace(admin_tg_id=1001), Path(tmp_dir),
+                        ZoneInfo("UTC"), registry, "assembly", reminder["id"],
+                        logger, logger,
+                        run_date=event_date - timedelta(
+                            days=reminder["reminder_days"]
+                        ),
+                    )
+                self.assertIsNone(
+                    registry.get_service("assembly")["group_thread_id"]
+                )
+                self.assertTrue(
+                    registry.is_group_reminder_delivered(
+                        reminder["id"], event_date.isoformat(), "group:-10001"
+                    )
+                )
+
+        asyncio.run(process())
+
     def test_informational_only_service_reminder_is_not_sent_or_recorded(self):
         from bot import app
         from bot.service_registry import ServiceRegistry

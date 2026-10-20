@@ -48,7 +48,7 @@ from .service_registry import (
     validate_notification_template,
 )
 from .scheduler import next_reminder_occurrence
-from .services import SERVICES
+from .services import SERVICES, normalized_name
 from .ui import (
     callback_text,
     clean_previous_menu,
@@ -73,6 +73,44 @@ async def _answer_callback(
         await callback.answer(**kwargs)
     else:
         await callback.answer(normalized, **kwargs)
+
+
+def thread_kwargs(service: dict | None) -> dict:
+    """message_thread_id темы чата служения, если тема выбрана (/here)."""
+    thread_id = (service or {}).get("group_thread_id")
+    return {"message_thread_id": thread_id} if thread_id else {}
+
+
+async def send_to_service_group(
+    send, chat_id: int, text: str, service: dict | None,
+    registry=None, logger=None, **kwargs,
+):
+    """Отправка в чат служения с учётом темы.
+
+    Если тема удалена или закрыта, сообщение уходит в общую тему, а
+    сохранённая тема сбрасывается — иначе служение перестало бы получать
+    напоминания.
+    """
+    thread = thread_kwargs(service)
+    try:
+        return await send(chat_id, text, **kwargs, **thread)
+    except TelegramAPIError as exc:
+        if not thread or "thread" not in str(exc).lower():
+            raise
+        if logger is not None:
+            logger.warning(
+                "Тема %s чата служения %s недоступна (%s); отправка в общую тему",
+                thread["message_thread_id"], service["id"], exc,
+            )
+    if registry is not None:
+        try:
+            registry.reset_group_thread(
+                service["id"], thread["message_thread_id"]
+            )
+        except Exception:  # noqa: BLE001
+            if logger is not None:
+                logger.exception("Не удалось сбросить тему чата служения")
+    return await send(chat_id, text, **kwargs)
 
 
 def _status_text(text: str, icon: str) -> str:
@@ -537,8 +575,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             f"⚙️ {service_label(service)} · {enabled_status}",
             "",
             f"📡 Групповой чат · {chat_status}",
-            f"⏰ Напоминания групп · {reminders_status}",
         ]
+        if chat_id is not None:
+            thread_id = service.get("group_thread_id")
+            lines.append(
+                f"🧵 Тема · {ui_code(thread_id)}"
+                if thread_id
+                else "🧵 Тема · общая (/here в нужной теме — сменить)"
+            )
+        lines.append(f"⏰ Напоминания групп · {reminders_status}")
         if enabled_reminders:
             now = datetime.now(context.timezone)
             event_date, send_date, reminder = min(
@@ -1946,6 +1991,37 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     )
                 ],
             )
+        # Переход к соседним напоминаниям служения в порядке списка.
+        reminder_ids = [
+            item["id"] for item in registry.list_group_reminders(service_id)
+        ]
+        position = (
+            reminder_ids.index(reminder_id) if reminder_id in reminder_ids else -1
+        )
+        neighbours = []
+        if position > 0:
+            neighbours.append(
+                InlineKeyboardButton(
+                    text="⬅️ Предыдущее",
+                    callback_data=(
+                        f"group_reminder:nav:{service_id}:"
+                        f"{reminder_ids[position - 1]}:{pending['session_id']}"
+                    ),
+                )
+            )
+        if 0 <= position < len(reminder_ids) - 1:
+            neighbours.append(
+                InlineKeyboardButton(
+                    text="➡️ Следующее",
+                    callback_data=(
+                        f"group_reminder:nav:{service_id}:"
+                        f"{reminder_ids[position + 1]}:{pending['session_id']}"
+                    ),
+                )
+            )
+        if neighbours:
+            buttons.append(neighbours)
+            text += f"\n\n📋 Напоминание {position + 1} из {len(reminder_ids)}"
         buttons.append(
             [
                 InlineKeyboardButton(
@@ -1961,7 +2037,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             message,
             text,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-            _dialog_keyboard_limit=8,
+            _dialog_keyboard_limit=10,
+            _dialog_keep_rows=True,
             parse_mode=None,
         )
 
@@ -2872,8 +2949,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     await show_reminder_rules_menu(
                         callback.message, actor_id, service_id
                     )
-            elif action == "open":
-                if pending.get("step") != "reminder_menu":
+            elif action in {"open", "nav"}:
+                expected_step = (
+                    "reminder_menu" if action == "open" else "group_reminder_card"
+                )
+                if pending.get("step") != expected_step:
                     await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
                     return
                 await enter_group_reminder_card(
@@ -5917,6 +5997,86 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             text = "⚠️ Не удалось загрузить график. Попробуйте позже."
         await _send_dialog(message, text, reply_markup=keyboard)
 
+    @admin_router.message(Command("here"))
+    async def on_here_command(message: Message) -> None:
+        """Выбор темы чата служения: /here [служение] в нужной теме группы."""
+        if not message.from_user:
+            return
+        if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+            await message.answer(
+                "Отправьте /here в нужной теме группы служения: туда будут "
+                "приходить напоминания.",
+                parse_mode=None,
+            )
+            return
+        registry = service_registry()
+        if registry is None:
+            return
+        bound = [
+            service for service in registry.list_services()
+            if service["group_chat_id"] == message.chat.id
+        ]
+        if not bound:
+            await message.answer(
+                "К этому чату не привязано ни одно служение.", parse_mode=None
+            )
+            return
+        argument = normalized_name(
+            (message.text or "").partition(" ")[2]
+        )
+        if argument:
+            bound = [
+                service for service in bound
+                if argument in {
+                    normalized_name(service["id"]),
+                    normalized_name(service["name"]),
+                    *(normalized_name(alias) for alias in service["aliases"]),
+                }
+            ]
+        if len(bound) != 1:
+            choices = ", ".join(
+                f"/here {service['id']} ({service['name']})"
+                for service in registry.list_services()
+                if service["group_chat_id"] == message.chat.id
+            )
+            await message.answer(
+                (
+                    "Служение не найдено в этом чате. "
+                    if argument
+                    else "К чату привязано несколько служений. "
+                )
+                + f"Укажите служение: {choices}",
+                parse_mode=None,
+            )
+            return
+        service = bound[0]
+        thread_id = (
+            message.message_thread_id
+            if getattr(message, "is_topic_message", False)
+            else None
+        )
+        try:
+            registry.set_group_thread(
+                message.from_user.id, service["id"], message.chat.id, thread_id
+            )
+        except PermissionError:
+            await message.answer(
+                "Тему может выбрать только администратор служения.",
+                parse_mode=None,
+            )
+            return
+        except (ValueError, sqlite3.Error) as exc:
+            debug.warning("Не удалось сохранить тему чата: %s", exc)
+            await message.answer(
+                "Не удалось сохранить тему чата.", parse_mode=None
+            )
+            return
+        await message.answer(
+            f"✅ Напоминания «{service['name']}» будут приходить "
+            + ("в эту тему." if thread_id else "в общую тему чата."),
+            parse_mode=None,
+        )
+
     @admin_router.message(Command("my_schedule"))
     async def on_my_schedule(message: Message) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
@@ -6861,10 +7021,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
                 return
             try:
-                await context.bot.send_message(
+                await send_to_service_group(
+                    context.bot.send_message,
                     group_chat_id,
                     f"🔧 ТЕСТ службы «{service['name']}»: проверка доставки. "
                     "Обычная рассылка не запускалась.",
+                    service,
+                    registry=service_registry(),
+                    logger=debug,
                     parse_mode=None,
                 )
             except TelegramAPIError as exc:
@@ -7158,12 +7322,29 @@ async def _confirm_locked(
                 state.get("group_chat_id", context.group_chat_id),
             )
         )
+        participant_service = None
+        if registry is not None:
+            try:
+                participant_service = registry.get_service(
+                    participant.get("service_id") or "assembly"
+                )
+            except Exception:  # noqa: BLE001
+                debug.exception("Не удалось прочитать тему чата служения")
+        if (
+            participant_service is None
+            or participant_service.get("group_chat_id") != group_chat_id
+        ):
+            participant_service = None
         try:
-            await context.bot.send_message(
+            await send_to_service_group(
+                context.bot.send_message,
                 group_chat_id,
                 f"🔔 Участник {participant['name']} подтвердил "
                 f"{'задачу' if participant.get('task') else 'роль'} "
                 f"«{participant.get('task', role)}»",
+                participant_service,
+                registry=registry,
+                logger=debug,
                 parse_mode=None,
             )
         except Exception:  # noqa: BLE001
