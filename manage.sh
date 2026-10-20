@@ -440,19 +440,6 @@ cmd_start() {
     chmod 700 "$LOG_DIR" || exit 1
     ensure_backup_dir || exit 1
 
-    if [ -e "$NOHUP_LOG" ] || [ -L "$NOHUP_LOG" ]; then
-        if ! secure_private_file "$NOHUP_LOG"; then
-            echo "❌ Файл системного лога небезопасен: $NOHUP_LOG" >&2
-            exit 1
-        fi
-        : > "$NOHUP_LOG" || exit 1
-    else
-        (umask 077; set -o noclobber; : > "$NOHUP_LOG") || {
-            echo "❌ Не удалось безопасно создать системный лог: $NOHUP_LOG" >&2
-            exit 1
-        }
-    fi
-
     # Проверка активного PID-файла
     if [ -f "$PID_FILE" ] || [ -L "$PID_FILE" ]; then
         local saved_pid saved_starttime
@@ -477,6 +464,21 @@ cmd_start() {
     if [ ! -f "$BOT_SCRIPT" ]; then
         echo "❌ Не найден основной файл бота: $BOT_SCRIPT"
         exit 1
+    fi
+
+    # Системный лог очищается только перед реальным запуском, чтобы
+    # повторный start при работающем боте не стирал трейсбеки.
+    if [ -e "$NOHUP_LOG" ] || [ -L "$NOHUP_LOG" ]; then
+        if ! secure_private_file "$NOHUP_LOG"; then
+            echo "❌ Файл системного лога небезопасен: $NOHUP_LOG" >&2
+            exit 1
+        fi
+        : > "$NOHUP_LOG" || exit 1
+    else
+        (umask 077; set -o noclobber; : > "$NOHUP_LOG") || {
+            echo "❌ Не удалось безопасно создать системный лог: $NOHUP_LOG" >&2
+            exit 1
+        }
     fi
 
     cd "$PROJECT_DIR" || exit 1

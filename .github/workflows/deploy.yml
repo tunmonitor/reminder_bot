@@ -152,6 +152,8 @@ jobs:
             --exclude='/reminder_bot_templates.json' \
             --exclude='/schedule_config.json' \
             --exclude='/reminder_bot_schedule_config.json' \
+            --exclude='/webapp_config.json' \
+            --exclude='/reminder_bot_webapp_config.json' \
             --exclude='/.runtime/' \
             --exclude='/logs_backup/' \
             --exclude='/reminder_bot_logs_backup/' \
@@ -169,7 +171,20 @@ jobs:
           echo "Запуск бота..."
           SHM_DIR="$SHM_DIR" LOG_DIR="$LOG_DIR" RUNNER_TRACKING_ID=0 ./manage.sh start
 
+          # PID-файл пишется до загрузки напоминаний и запуска polling:
+          # бот должен проработать стабилизационный интервал.
           echo "Проверка состояния бота..."
+          for _ in $(seq 15); do
+            sleep 1
+            if ! SHM_DIR="$SHM_DIR" LOG_DIR="$LOG_DIR" ./manage.sh status >/dev/null; then
+              echo "❌ Бот остановился вскоре после запуска"
+              # Повторный start при откате очистит sys_nohup.log.
+              cp -p "$LOG_DIR/sys_nohup.log" \
+                "$LOG_DIR/sys_nohup.failed-deploy.log" || true
+              echo "Трейсбек сохранён в $LOG_DIR/sys_nohup.failed-deploy.log"
+              exit 1
+            fi
+          done
           SHM_DIR="$SHM_DIR" LOG_DIR="$LOG_DIR" ./manage.sh status
           bot_stopped=0
           deploy_succeeded=1

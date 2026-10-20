@@ -10,7 +10,7 @@ import unittest
 from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
 
 from openpyxl import Workbook
@@ -290,6 +290,16 @@ class BackupManagerTest(unittest.TestCase):
         self.assertEqual(json.loads(self.cache.read_text("utf-8"))["sunday_date"], "2030-01-06")
         self.assertTrue(self.xlsx.read_bytes().startswith(b"PK"))
 
+    def test_restore_refuses_leftover_rollback_journal(self):
+        snapshot = asyncio.run(self.manager.create_snapshot("test"))
+        journal = Path(f"{self.database}-journal")
+        journal.write_bytes(b"hot journal")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "sidecar"):
+                self.manager.restore_snapshot(snapshot)
+        finally:
+            journal.unlink()
+
     def test_restore_cannot_overlap_a_running_instance(self):
         snapshot = asyncio.run(self.manager.create_snapshot("test"))
 
@@ -373,6 +383,58 @@ class BackupDebounceTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(handle.cancelled())
             manager._run_background_backup.assert_awaited_once_with("active")
             self.assertTrue(task.done())
+
+
+    async def test_background_backup_cancels_pending_debounce(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = BackupManager(
+                "test",
+                Path(tmp) / "shm",
+                ZoneInfo("Europe/Moscow"),
+                logging.getLogger("test.backup.nightly"),
+                backup_base=Path(tmp) / "backups",
+                mount_point=Path(tmp),
+                require_mount=False,
+                debounce_seconds=60,
+            )
+            manager._create_snapshot = MagicMock(return_value=Path(tmp))
+            manager.mark_dirty()
+            handle = manager._debounce_handle
+
+            await manager._run_background_backup("ночное")
+
+            self.assertTrue(handle.cancelled())
+            self.assertIsNone(manager._debounce_handle)
+            manager._create_snapshot.assert_called_once_with()
+
+    async def test_failed_background_backup_rearms_debounce(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = BackupManager(
+                "test",
+                Path(tmp) / "shm",
+                ZoneInfo("Europe/Moscow"),
+                logging.getLogger("test.backup.retry"),
+                backup_base=Path(tmp) / "backups",
+                mount_point=Path(tmp),
+                require_mount=False,
+                debounce_seconds=60,
+            )
+            manager._create_snapshot = MagicMock(side_effect=OSError("disk"))
+            manager.mark_dirty()
+            handle = manager._debounce_handle
+
+            await manager._run_background_backup("ночное")
+
+            self.assertTrue(handle.cancelled())
+            retry = manager._debounce_handle
+            self.assertIsNotNone(retry)
+            self.assertIsNot(retry, handle)
+
+            await manager._run_background_backup("повтор")
+
+            self.assertTrue(retry.cancelled())
+            self.assertIsNone(manager._debounce_handle)
+            await manager.close()
 
 
 class RestoreProcessGuardTest(unittest.TestCase):

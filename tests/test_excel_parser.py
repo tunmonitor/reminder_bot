@@ -661,6 +661,37 @@ class ExcelParserTest(unittest.TestCase):
             "Проповедник": "Иван",
         })
 
+    def test_parses_legacy_prefixed_dates_and_space_separated_roles(self):
+        workbook = Workbook()
+        schedule = workbook.active
+        schedule.title = "График"
+        schedule.append(["Воскресенье, 04.10.2026"])
+        schedule.append(["Ведущий Пётр"])
+        schedule.append(["Воскресенье, 11.10.2026"])
+        schedule.append(["Ведущий Павел"])
+        schedule.append(["Ответственный Алексей"])
+        schedule.append(["Ведет собрание"])
+        schedule.append(["Перенос 18.10.2026"])
+        schedule.append(["Воскресенье, 18.10.2026"])
+        schedule.append(["Проповедник Иван"])
+        workbook.save(self.path)
+
+        assignments = parse_schedule(
+            self.path, date(2026, 10, 11), self.debug_logger
+        )
+
+        self.assertEqual(assignments, {
+            "Ведущий": "Павел",
+            "Ответственный": "Алексей",
+        })
+        events = parse_service_events(
+            self.path, date(2026, 10, 1), self.debug_logger
+        )["assembly"]
+        self.assertEqual(
+            [event.event_date for event in events],
+            [date(2026, 10, 4), date(2026, 10, 11), date(2026, 10, 18)],
+        )
+
     def test_parses_multiple_legacy_assignments_from_one_row(self):
         workbook = Workbook()
         schedule = workbook.active

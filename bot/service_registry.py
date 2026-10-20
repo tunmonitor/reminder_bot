@@ -538,6 +538,15 @@ class ServiceRegistry:
                         json.dumps(task.aliases, ensure_ascii=False),
                     ),
                 )
+            # Задачи, убранные из каталога, удаляются, чтобы не занимать
+            # позиции текущих задач (позиция — идентификатор кнопки).
+            catalog_names = [task.name for task in service.tasks]
+            placeholders = ", ".join("?" for _ in catalog_names) or "''"
+            connection.execute(
+                "DELETE FROM service_tasks WHERE service_id = ? "
+                f"AND source = 'catalog' AND name NOT IN ({placeholders})",
+                (service.id, *catalog_names),
+            )
             # Задачи, добавленные суперадмином, идут после задач каталога;
             # позиции уникальны и служат идентификатором кнопок.
             admin_tasks = connection.execute(
@@ -1256,14 +1265,31 @@ class ServiceRegistry:
             )
             if not isinstance(new_enabled, bool):
                 raise ValueError("enabled должен быть логическим значением")
-            self._ensure_group_schedule_unique(
-                connection,
-                row["service_id"],
-                new_days,
-                new_time,
-                allow_duplicate,
-                excluding_id=reminder_id,
+            # При переносе слот проверяется целиком. Без переноса текст и
+            # выключение не проверяются, а повторное включение запрещено,
+            # только если в слоте уже есть включённое напоминание.
+            slot_changed = (new_days, new_time) != (
+                row["reminder_days"], row["reminder_time"]
             )
+            if slot_changed:
+                self._ensure_group_schedule_unique(
+                    connection,
+                    row["service_id"],
+                    new_days,
+                    new_time,
+                    allow_duplicate,
+                    excluding_id=reminder_id,
+                )
+            elif new_enabled and not row["enabled"]:
+                self._ensure_group_schedule_unique(
+                    connection,
+                    row["service_id"],
+                    new_days,
+                    new_time,
+                    allow_duplicate,
+                    excluding_id=reminder_id,
+                    enabled_only=True,
+                )
             connection.execute(
                 "UPDATE group_reminders SET body = ?, reminder_days = ?, "
                 "reminder_time = ?, enabled = ? WHERE id = ?",
@@ -1490,12 +1516,15 @@ class ServiceRegistry:
         allow_duplicate: bool,
         *,
         excluding_id: int | None = None,
+        enabled_only: bool = False,
     ) -> None:
         query = (
             "SELECT 1 FROM group_reminders WHERE service_id = ? "
             "AND reminder_days = ? AND reminder_time = ?"
         )
         parameters: tuple = (service_id, days, time)
+        if enabled_only:
+            query += " AND enabled = 1"
         if excluding_id is not None:
             query += " AND id != ?"
             parameters += (excluding_id,)

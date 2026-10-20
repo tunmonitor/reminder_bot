@@ -385,6 +385,25 @@ class ServiceRegistryTest(unittest.TestCase):
             [("звук", 0), ("сборка", 1), ("спевка", 2), ("Перевозка", 3)],
         )
 
+    def test_catalog_sync_removes_tasks_dropped_from_catalog(self):
+        self.registry.add_service_task(1001, "sound", "Перевозка")
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "INSERT INTO service_tasks "
+                "(service_id, name, position, enabled, aliases_json, source) "
+                "VALUES ('sound', 'старая', 1, 1, '[]', 'catalog')"
+            )
+        self.registry.initialize(1001, -10001)
+
+        positions = [
+            (task["name"], task["position"])
+            for task in self.registry.list_service_tasks("sound")
+        ]
+        self.assertEqual(
+            positions,
+            [("звук", 0), ("сборка", 1), ("спевка", 2), ("Перевозка", 3)],
+        )
+
     def test_bootstrap_is_idempotent_and_does_not_promote_new_env_admin(self):
         self.registry.set_group_chat(1001, "sound", -10002, enabled=True)
 
@@ -900,6 +919,31 @@ class ServiceRegistryTest(unittest.TestCase):
                 "SELECT action FROM configuration_audit ORDER BY id DESC"
             ).fetchone()[0]
         self.assertEqual(action, "group_reminder_merged")
+
+    def test_reminder_sharing_slot_keeps_text_and_toggle_editable(self):
+        target_id = self.registry.list_group_reminders("sound")[0]["id"]
+        self.registry.update_group_reminder(1001, target_id, enabled=False)
+        live_id = self.registry.add_group_reminder(
+            1001, "sound", 1, "18:00", allow_duplicate=True
+        )
+
+        self.registry.update_group_reminder(1001, live_id, body="Новый")
+        self.registry.update_group_reminder(1001, live_id, body=None)
+        self.registry.update_group_reminder(1001, live_id, enabled=False)
+
+        reminder = self.registry.get_group_reminder(live_id)
+        self.assertIsNone(reminder["body"])
+        self.assertFalse(reminder["enabled"])
+        self.registry.update_group_reminder(1001, target_id, enabled=True)
+        with self.assertRaisesRegex(ValueError, "уже задано"):
+            self.registry.update_group_reminder(1001, live_id, enabled=True)
+        with self.assertRaisesRegex(ValueError, "уже задано"):
+            self.registry.update_group_reminder(
+                1001,
+                self.registry.add_group_reminder(1001, "sound", 2, "09:00"),
+                days=1,
+                time="18:00",
+            )
 
     def test_merge_group_reminder_without_body_keeps_target_text(self):
         target_id = self.registry.list_group_reminders("sound")[0]["id"]

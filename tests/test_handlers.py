@@ -234,6 +234,16 @@ class ConfirmationHandlerTest(unittest.TestCase):
             )
             context.prepare_service_test_previews.assert_not_awaited()
 
+            malformed = SimpleNamespace(
+                data="test_action:group",
+                from_user=SimpleNamespace(id=67890),
+                message=callback.message,
+                answer=AsyncMock(),
+            )
+            await handler(malformed)
+            malformed.answer.assert_awaited_once()
+            self.assertIn("устарела", malformed.answer.await_args.args[0])
+
         asyncio.run(run())
 
     def test_confirmation_uses_current_registry_group_after_chat_change(self):
@@ -931,6 +941,35 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.context.bot.delete_message.assert_awaited()
             self.context.load_service_task_assignments.assert_awaited_once_with(
                 "sound"
+            )
+
+        asyncio.run(run())
+
+    def test_text_in_personal_notifications_menu_gets_hint(self):
+        async def run():
+            actor_id = 4406
+            self.registry.set_responsible_contact(
+                67890, "sound", "Микшер", "Алексей", actor_id
+            )
+            command = self.message(actor_id, "/my_notifications")
+            command_handler = next(
+                item.callback
+                for item in self.admin_router.message.handlers
+                if item.callback.__name__ == "on_my_notifications"
+            )
+            await command_handler(command)
+            text_handler = next(
+                item.callback
+                for item in self.admin_router.message.handlers
+                if item.callback.__name__ == "on_service_parameter"
+            )
+            text = self.message(actor_id, "привет")
+
+            await text_handler(text)
+
+            self.assertEqual(
+                text.answer.await_args.args[0],
+                "Выберите действие кнопками меню.",
             )
 
         asyncio.run(run())

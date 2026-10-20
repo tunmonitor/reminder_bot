@@ -229,6 +229,31 @@ class ReminderBotEntrypointTest(unittest.TestCase):
         self.assertGreaterEqual(len(parsed_months), 2)
         self.assertEqual(leftovers, [])
 
+    def test_upcoming_events_skip_empty_later_sheet(self):
+        from bot import app
+        from bot.excel_parser import ServiceEvent, SheetEmptyError
+
+        today = datetime.now(ZoneInfo("UTC")).date()
+
+        def parse(path, month, logger, services=None):
+            if month != today.replace(day=1):
+                raise SheetEmptyError("Лист расписания пуст")
+            return {"sound": [ServiceEvent("sound", today, ())]}
+
+        async def load():
+            with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+                app, "download_public", new=AsyncMock()
+            ), patch.object(app, "parse_service_events", side_effect=parse):
+                return await app._load_upcoming_service_events(
+                    SimpleNamespace(yandex_public_url="https://example.invalid"),
+                    Path(tmp_dir),
+                    ZoneInfo("UTC"),
+                    MagicMock(),
+                )
+
+        events = asyncio.run(load())
+        self.assertEqual([event.event_date for event in events], [today])
+
     def test_upcoming_events_propagate_broken_later_sheet(self):
         from bot import app
 
