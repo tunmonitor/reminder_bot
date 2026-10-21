@@ -269,6 +269,14 @@ def _cell_date(
         day, month, short_year = (
             short.group(1, 2, 3) if short[1] else short.group(4, 5, 6)
         )
+        # «09.10» может быть временем: без года принимается только месяц
+        # листа или соседний.
+        if (
+            not short_year
+            and target_month is not None
+            and (int(month) - target_month) % 12 not in {0, 1, 11}
+        ):
+            return None
         year = (
             2000 + int(short_year) if short_year
             else _year_near_sheet(target_year, target_month, int(month))

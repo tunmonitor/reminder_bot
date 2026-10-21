@@ -193,7 +193,9 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   «2я часть нет» (value from the neighbour cell); `_cell_date(value, year, month)` also
   accepts text `dd.mm` / `dd.mm.yy` (two-digit day and month) or `d.mm HH:MM`
   and month abbreviations, infers the year around the sheet month
-  (December→January), and never treats numbers as dates.
+  (December→January), never treats numbers as dates, and accepts a year-less
+  `dd.mm` only for the sheet month ±1. `_process_service_reminder` re-checks
+  the slot (`_same_reminder_slot`) before sending and before marking delivery.
 - Preserve idempotent delivery records and per-service/event locking. A
   failed delivery must not be recorded as success.
 - Personal reminders carry `build_personal_answer_kb` buttons

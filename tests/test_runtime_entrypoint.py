@@ -877,6 +877,43 @@ class ReminderBotEntrypointTest(unittest.TestCase):
 
         asyncio.run(process())
 
+    def test_reminder_moved_during_download_is_not_marked(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                reminder = registry.get_service("assembly")["reminders"][0]
+                bot = SimpleNamespace(
+                    send_message=AsyncMock(return_value=SimpleNamespace(message_id=1)),
+                    edit_message_text=AsyncMock(),
+                )
+
+                async def load(*args, **kwargs):
+                    # Админ меняет время, пока скачивается график.
+                    registry.update_group_reminder(1001, reminder["id"], time="23:58")
+                    return {"Камеры": ["Анна"]}, True
+
+                with patch.object(app, "_load_service_task_assignments", new=load):
+                    await app._process_service_reminder(
+                        bot, SimpleNamespace(admin_tg_id=1001), Path(tmp_dir),
+                        ZoneInfo("UTC"), registry, "assembly", reminder["id"],
+                        MagicMock(), MagicMock(),
+                        run_date=(
+                            date(2026, 10, 11)
+                            - timedelta(days=reminder["reminder_days"])
+                        ),
+                        state_cache=SimpleNamespace(state={}, save=MagicMock()),
+                    )
+                self.assertEqual(group_sends(bot), [])
+                self.assertFalse(registry.is_group_reminder_delivered(
+                    reminder["id"], "2026-10-11", "group:-10001"
+                ))
+
+        asyncio.run(process())
+
     def test_failed_admin_report_is_retried_without_repeating_group(self):
         from bot import app
         from bot.service_registry import ServiceRegistry

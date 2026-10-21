@@ -829,6 +829,14 @@ def _render_group_reminder(
     )
 
 
+def _same_reminder_slot(registry: ServiceRegistry, reminder: dict) -> bool:
+    """Срок и время напоминания не менялись с начала обработки."""
+    current = registry.get_group_reminder(reminder["id"])
+    return current is not None and (
+        current["reminder_days"], current["reminder_time"]
+    ) == (reminder["reminder_days"], reminder["reminder_time"])
+
+
 async def _process_service_reminder(
     bot: Bot,
     credentials,
@@ -1017,6 +1025,14 @@ async def _process_service_reminder(
             f"Для служения «{service['name']}» не задан групповой чат.",
             debug_logger,
         )
+    elif not _same_reminder_slot(registry, reminder):
+        # Пока скачивался график, срок или время напоминания изменили:
+        # отправит задача нового расписания, эта не ставит отметку.
+        debug_logger.info(
+            "Напоминание %s перенесено во время подготовки — отправка "
+            "отменена", reminder["id"],
+        )
+        return
     elif not registry.is_group_reminder_delivered(
         reminder["id"], event_date.isoformat(), group_recipient
     ):
@@ -1056,11 +1072,12 @@ async def _process_service_reminder(
                     debug_logger,
                 )
             else:
-                registry.mark_group_reminder_delivered(
-                    reminder["id"],
-                    event_date.isoformat(),
-                    group_recipient,
-                )
+                if _same_reminder_slot(registry, reminder):
+                    registry.mark_group_reminder_delivered(
+                        reminder["id"],
+                        event_date.isoformat(),
+                        group_recipient,
+                    )
                 interaction_logger.info(
                     "Групповое уведомление служения %s отправлено на %s",
                     service_id,

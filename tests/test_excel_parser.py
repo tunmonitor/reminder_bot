@@ -562,6 +562,9 @@ class ExcelParserTest(unittest.TestCase):
         self.assertEqual(_cell_date("3 января", 2026, 12), date(2027, 1, 3))
         self.assertEqual(_cell_date("28.12", 2027, 1), date(2026, 12, 28))
         self.assertEqual(_cell_date("01.11", 2026, 10), date(2026, 11, 1))
+        for time_like in ("09.05", "10.05", "11.02"):
+            with self.subTest(time_like=time_like):
+                self.assertIsNone(_cell_date(time_like, 2026, 10))
 
     def test_informational_value_from_next_cell(self):
         workbook = Workbook()
