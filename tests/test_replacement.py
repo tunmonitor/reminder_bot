@@ -114,12 +114,34 @@ class PureRulesTest(unittest.TestCase):
         )
         self.assertEqual(moved["звук"], ["Вера", "Борис"])
 
+    def test_already_replaced_follows_chain(self):
+        from bot.replacement import _already_replaced
+
+        chain = [
+            {"task": "звук", "old_name": "А", "new_name": "Б"},
+            {"task": "звук", "old_name": "Б", "new_name": "А"},
+        ]
+        self.assertFalse(_already_replaced(chain, "звук", "А"))
+        self.assertTrue(_already_replaced(chain[:1], "звук", "А"))
+        self.assertFalse(_already_replaced(chain[:1], "сборка", "А"))
+
     def test_parsers(self):
-        self.assertEqual(parse_change_args("звук @alex"), ("звук", "alex"))
+        today = date(2026, 10, 21)
         self.assertEqual(
-            parse_change_args("свет и сцена @alex"), ("свет и сцена", "alex")
+            parse_change_args("звук @alex", today), ("звук", "alex", None)
         )
-        for wrong in ("", "звук", "@alex", "звук alex", "звук @"):
+        self.assertEqual(
+            parse_change_args("свет и сцена @alex 25.10", today),
+            ("свет и сцена", "alex", date(2026, 10, 25)),
+        )
+        self.assertEqual(
+            parse_change_args("звук @alex 04.01", today)[2], date(2027, 1, 4)
+        )
+        self.assertEqual(
+            parse_change_args("звук @alex 04.01.27", today)[2], date(2027, 1, 4)
+        )
+        for wrong in ("", "звук", "@alex", "звук alex", "звук @",
+                      "звук @alex 32.10", "звук @alex 1.1 x"):
             with self.assertRaises(ValueError):
                 parse_change_args(wrong)
         self.assertTrue(poll_answer_choice([0]))
@@ -311,10 +333,12 @@ class HandlersTest(Base):
             interaction_logger=MagicMock(), debug_logger=MagicMock(),
             admin_id=SUPER, group_chat_id=-100, timezone=TZ,
             service_registry=self.registry, bot=self.bot,
+            load_upcoming_service_events=AsyncMock(return_value=[]),
         )
         dispatcher = SimpleNamespace(include_router=MagicMock())
         register(dispatcher, self.context)
         routers = [call.args[0] for call in dispatcher.include_router.call_args_list]
+        self.routers = routers
         self.change = next(
             item.callback for item in routers[0].message.handlers
             if item.callback.__name__ == "on_change_command"
@@ -363,7 +387,7 @@ class HandlersTest(Base):
     def test_change_command(self):
         none = self.message(ADMIN, "/change звук @boris_b")
         asyncio.run(self.change(none))
-        self.assertIn("Нет запроса замены", none.answer.await_args.args[0])
+        self.assertIn("нет задачи «звук»", none.answer.await_args.args[0])
 
         poll = self.start()
         stranger = self.message(OUTSIDER, "/change звук @boris_b")
@@ -392,6 +416,127 @@ class HandlersTest(Base):
         again = self.message(ADMIN, "/change звук @boris_b", -1005, reply)
         asyncio.run(self.change(again))
         self.assertIn("уже завершён", again.answer.await_args.args[0])
+
+
+class DirectChangeTest(HandlersTest):
+    """/change и экран «🔁 Замена» без отказа участника (этап 3.4)."""
+
+    def setUp(self):
+        super().setUp()
+        from bot.excel_parser import ServiceAssignment, ServiceEvent
+
+        today = datetime.now(TZ).date()
+        self.day = today + timedelta(days=3)
+        self.events = [
+            ServiceEvent("sound", self.day, (
+                ServiceAssignment("звук", "Алексей"),
+                ServiceAssignment("сборка", "Алексей"),
+                ServiceAssignment("спевка", "Вера"),
+                ServiceAssignment("спевка", "Глеб"),
+            )),
+        ]
+        self.context.load_upcoming_service_events.return_value = self.events
+        self.registry.set_responsible_contact(
+            SUPER, "sound", "сборка", "Борис", MEMBER, "boris_b"
+        )
+
+    def test_change_command(self):
+        self.skipTest("сценарий без графика проверяется в HandlersTest")
+
+    def test_change_without_decline(self):
+        done = self.message(ADMIN, f"/change звук @boris_b {self.day:%d.%m}")
+        asyncio.run(self.change(done))
+        self.assertIn("✅ Замена назначена", done.answer.await_args.args[0])
+        row = self.registry.list_replacements("sound", self.day.isoformat())[0]
+        self.assertEqual((row["old_name"], row["new_name"]), ("Алексей", "Борис"))
+        self.assertIn("Борис (@boris_b) вместо Алексей", self.sent_to(-1005)[0])
+
+        many = self.message(ADMIN, "/change спевка @boris_b")
+        asyncio.run(self.change(many))
+        self.assertIn("несколько человек", many.answer.await_args.args[0])
+
+        stranger = self.message(OUTSIDER, "/change звук @boris_b")
+        asyncio.run(self.change(stranger))
+        self.assertIn("только админ служения", stranger.answer.await_args.args[0])
+
+    def _callback(self, button):
+        return SimpleNamespace(
+            data=button.callback_data,
+            from_user=SimpleNamespace(id=ADMIN),
+            message=SimpleNamespace(
+                chat=SimpleNamespace(type="private", id=ADMIN),
+                answer=AsyncMock(return_value=SimpleNamespace(message_id=1)),
+            ),
+            answer=AsyncMock(),
+        )
+
+    def _handler(self, name):
+        return next(
+            item.callback for item in self.routers[0].callback_query.handlers
+            if item.callback.__name__ == name
+        )
+
+    async def _press(self, message, label):
+        markup = message.answer.await_args.kwargs["reply_markup"]
+        button = next(
+            item for row in markup.inline_keyboard for item in row
+            if label in item.text
+        )
+        callback = self._callback(button)
+        await self._handler("on_replace_action")(callback)
+        return callback.message
+
+    def test_replace_screen_flow(self):
+        async def run():
+            card = self._callback(SimpleNamespace(
+                callback_data="service:service_replace:sound"
+            ))
+            await self._handler("on_service_selected")(card)
+            dates = card.message
+            self.assertIn("Выберите дату", dates.answer.await_args.args[0])
+            people = await self._press(dates, f"{self.day:%d.%m}")
+            self.assertIn("Кого нужно заменить", people.answer.await_args.args[0])
+            tasks = await self._press(people, "Алексей · 2 задачи")
+            self.assertIn("несколько задач", tasks.answer.await_args.args[0])
+            candidates = await self._press(tasks, "сборка")
+            labels = [
+                item.text for row in
+                candidates.answer.await_args.kwargs["reply_markup"].inline_keyboard
+                for item in row
+            ]
+            self.assertIn("✅ Борис", labels)
+            self.assertIn("👤 Выбрать пользователя Telegram", labels)
+            confirm = await self._press(candidates, "Борис")
+            self.assertIn("Алексей → Борис", confirm.answer.await_args.args[0])
+            result = await self._press(confirm, "Назначить")
+            self.assertIn("✅ Замена назначена", result.answer.await_args.args[0])
+            row = self.registry.list_replacements("sound", self.day.isoformat())[0]
+            self.assertEqual((row["task"], row["new_name"]), ("сборка", "Борис"))
+
+        asyncio.run(run())
+
+    def test_replace_screen_closes_open_request(self):
+        async def run():
+            await self.context.on_assignment_declined(
+                "sound", self.day, "звук", "Алексей", telegram_id=OLD
+            )
+            self.assertEqual(len(self.registry.list_open_replacement_polls()), 1)
+            done = self.message(ADMIN, "/change звук @boris_b")
+            await self.change(done)
+            self.assertEqual(self.registry.list_open_replacement_polls(), [])
+            self.bot.stop_poll.assert_awaited_once()
+
+        asyncio.run(run())
+
+    def test_repeat_decline_after_replacement_starts_nothing(self):
+        self.registry.set_replacement(
+            "sound", self.day.isoformat(), "звук", "Алексей", "Борис", MEMBER,
+            "", "admin", ADMIN,
+        )
+        asyncio.run(self.context.on_assignment_declined(
+            "sound", self.day, "звук", "Алексей", telegram_id=OLD
+        ))
+        self.bot.send_poll.assert_not_awaited()
 
 
 class MigrationTest(unittest.TestCase):
