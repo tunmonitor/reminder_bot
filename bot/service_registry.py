@@ -33,6 +33,9 @@ GROUP_TEMPLATE_FIELDS = frozenset(
         "task_responsibles",
     }
 )
+# Поля задачи есть только у напоминания задачи (этап 3.1): в общем
+# напоминании и шаблоне служения они были бы пустыми.
+GENERAL_GROUP_TEMPLATE_FIELDS = GROUP_TEMPLATE_FIELDS - {"task", "task_responsibles"}
 PERSONAL_TEMPLATE_FIELDS = frozenset(
     {"name", "task", "service_name", "sunday_date", "telegram_id", "username"}
 )
@@ -1441,8 +1444,11 @@ class ServiceRegistry:
             new_time = row["reminder_time"] if time is None else time
             new_body = row["body"] if body is _UNSET else body
             new_enabled = bool(row["enabled"]) if enabled is None else enabled
+            # Поля текста проверяются, только когда текст меняют: старый
+            # текст не должен мешать выключить или перенести напоминание.
             self._validate_group_reminder_values(
-                new_days, new_time, new_body
+                new_days, new_time,
+                new_body if body is not _UNSET else None, row["task"],
             )
             if not isinstance(new_enabled, bool):
                 raise ValueError("enabled должен быть логическим значением")
@@ -1585,7 +1591,8 @@ class ServiceRegistry:
                     raise stale
             new_body = target["body"] if body is _UNSET else body
             self._validate_group_reminder_values(
-                target["reminder_days"], target["reminder_time"], new_body
+                target["reminder_days"], target["reminder_time"],
+                new_body if body is not _UNSET else None, target["task"],
             )
             connection.execute(
                 "UPDATE group_reminders SET body = ? WHERE id = ?",
@@ -1650,6 +1657,15 @@ class ServiceRegistry:
                 }
                 if task not in enabled_tasks:
                     raise ValueError(f"Задача «{task}» не из списка служения.")
+            if task is None:
+                body = connection.execute(
+                    "SELECT body FROM group_reminders WHERE id = ?",
+                    (reminder_id,),
+                ).fetchone()["body"]
+                if body is not None:
+                    self._validate_group_reminder_values(
+                        row["reminder_days"], row["reminder_time"], body
+                    )
             if row["enabled"]:
                 # Иначе в один слот попали бы два включённых напоминания
                 # одной задачи (или два общих).
@@ -1681,7 +1697,7 @@ class ServiceRegistry:
                 raise ValueError("Текст группового шаблона не может быть пустым")
             validate_notification_template(
                 template,
-                GROUP_TEMPLATE_FIELDS,
+                GENERAL_GROUP_TEMPLATE_FIELDS,
                 "Шаблон группового уведомления",
             )
             template = template.strip()
@@ -1725,7 +1741,7 @@ class ServiceRegistry:
 
     @staticmethod
     def _validate_group_reminder_values(
-        days: int, time: str, body: str | None
+        days: int, time: str, body: str | None, task: str | None = None
     ) -> None:
         if isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 6:
             raise ValueError("Число дней должно быть от 0 до 6.")
@@ -1738,7 +1754,7 @@ class ServiceRegistry:
                 raise ValueError("Текст группового напоминания не может быть пустым.")
             validate_notification_template(
                 body,
-                GROUP_TEMPLATE_FIELDS,
+                GROUP_TEMPLATE_FIELDS if task else GENERAL_GROUP_TEMPLATE_FIELDS,
                 "Текст группового напоминания",
             )
 
@@ -1813,7 +1829,7 @@ class ServiceRegistry:
                 raise ValueError("Текст группового уведомления не может быть пустым")
             validate_notification_template(
                 group_template,
-                GROUP_TEMPLATE_FIELDS,
+                GENERAL_GROUP_TEMPLATE_FIELDS,
                 "Шаблон группового уведомления",
             )
         self._validate_personal_templates(personal_templates)

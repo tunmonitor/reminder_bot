@@ -2570,6 +2570,39 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_chat_screens_have_way_back(self):
+        async def run():
+            menu = SimpleNamespace(
+                data="service:service_chat:sound",
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_selected")(menu)
+            labels = [
+                button.text
+                for row in menu.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+            ]
+            self.assertIn("⬅️ К карточке служения", labels)
+
+            picker = SimpleNamespace(
+                data="service:service_chat_set:sound",
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_selected")(picker)
+            keyboard = picker.message.answer.await_args.kwargs["reply_markup"]
+            self.assertEqual(keyboard.keyboard[1][0].text, "⬅️ Назад")
+            back = self.message(67890, "⬅️ Назад")
+            await self.message_handler("on_service_parameter")(back)
+            self.assertIn("выберите действие", back.answer.await_args.args[0])
+
+        asyncio.run(run())
+
     def test_here_command_stores_chat_topic_for_service_admin(self):
         async def run():
             handler = self.message_handler("on_here_command")

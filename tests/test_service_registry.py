@@ -632,6 +632,24 @@ class ServiceRegistryTest(unittest.TestCase):
                 source_id=reminder["id"],
                 source_slot=(reminder["reminder_days"], reminder["reminder_time"]),
             )
+        with self.assertRaisesRegex(ValueError, "не поддерживается"):
+            self.registry.add_group_reminder(1001, "sound", 5, "07:00", "{task}")
+        with self.assertRaisesRegex(ValueError, "не поддерживается"):
+            self.registry.set_service_default_template(
+                1001, "sound", "{task_responsibles}"
+            )
+        self.registry.update_group_reminder(
+            1001, reminder["id"], body="{task}: {task_responsibles}"
+        )
+        with self.assertRaisesRegex(ValueError, "не поддерживается"):
+            self.registry.set_group_reminder_task(1001, other["id"], None)
+            self.registry.update_group_reminder(1001, other["id"], body="{task}")
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "UPDATE group_reminders SET body = '{task}' WHERE id = ?",
+                (other["id"],),
+            )
+        self.registry.update_group_reminder(1001, other["id"], enabled=False)
         self.registry.set_service_task_enabled(1001, "sound", "звук", False)
         detached = self.registry.get_group_reminder(reminder["id"])
         self.assertIsNone(detached["task"])

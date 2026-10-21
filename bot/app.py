@@ -921,19 +921,6 @@ async def _process_service_reminder(
         )
         return
 
-    if not any(
-        not task_is_informational(task_info)
-        for task_info in assignments.values()
-    ):
-        await _notify_admin(
-            bot,
-            credentials.admin_tg_id,
-            f"В графике найдено служение «{service['name']}» на "
-            f"{date_text}, но задачи не назначены.",
-            debug_logger,
-        )
-        return
-
     if _reminder_task_names(reminder, assignments) == []:
         # Напоминание задачи без ответственных на дату не отправляется.
         missing_recipient = "admin:no-task-responsibles"
@@ -950,6 +937,19 @@ async def _process_service_reminder(
             registry.mark_group_reminder_delivered(
                 reminder["id"], event_date.isoformat(), missing_recipient
             )
+        return
+
+    if not any(
+        not task_is_informational(task_info)
+        for task_info in assignments.values()
+    ):
+        await _notify_admin(
+            bot,
+            credentials.admin_tg_id,
+            f"В графике найдено служение «{service['name']}» на "
+            f"{date_text}, но задачи не назначены.",
+            debug_logger,
+        )
         return
 
     group_chat_id = service["group_chat_id"]

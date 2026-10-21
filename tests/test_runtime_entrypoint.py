@@ -724,9 +724,13 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 other_date = date(2026, 10, 18) - timedelta(
                     days=reminder["reminder_days"]
                 )
+                info_only = {"Праздник": {"names": [], "is_informational": True}}
                 with patch.object(
                     app, "_load_service_task_assignments",
-                    new=AsyncMock(return_value=({"Проповедь": ["Иван"]}, True)),
+                    new=AsyncMock(side_effect=[
+                        ({"Проповедь": ["Иван"]}, True),
+                        (info_only, True),
+                    ]),
                 ), patch.object(
                     app, "_notify_admin", new=AsyncMock(return_value=True)
                 ) as notify_admin:

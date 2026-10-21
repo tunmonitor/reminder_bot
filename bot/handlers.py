@@ -42,6 +42,7 @@ from .presentation import (
 )
 from .ui import code as ui_code
 from .service_registry import (
+    GENERAL_GROUP_TEMPLATE_FIELDS,
     GROUP_TEMPLATE_FIELDS,
     PERSONAL_TEMPLATE_FIELDS,
     normalize_member_name,
@@ -797,13 +798,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                                 request_username=True,
                             ),
                         )
-                    ]
+                    ],
+                    [KeyboardButton(text=CONTACT_BACK_TEXT)],
                 ],
                 resize_keyboard=True,
                 one_time_keyboard=True,
             )
             await _send_dialog(message, f"ℹ️ {label}: нажмите кнопку и выберите группу, в которой "
-                "бот уже состоит. После выбора служение будет включено.",
+                "бот уже состоит. После выбора служение будет включено. "
+                f"«{CONTACT_BACK_TEXT}» — вернуться к настройке чата.",
                 reply_markup=keyboard,
                 parse_mode=None,
             )
@@ -2482,7 +2485,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await _send_dialog(message, "Настройка устарела.", parse_mode=None)
             return
         existing_text = registry.resolve_group_text(target, service)
-        new_text = registry.resolve_group_text({"body": body}, service)
+        # Объединяются только напоминания одной задачи: текст источника
+        # без своего тела — шаблон этой задачи (или служения для общих).
+        new_text = registry.resolve_group_text(
+            {"body": body, "task": target.get("task")}, service
+        )
         same_text = existing_text.strip() == new_text.strip()
         merged_body = (
             None if same_text
@@ -3424,7 +3431,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 try:
                     validate_notification_template(
                         current_template,
-                        GROUP_TEMPLATE_FIELDS,
+                        GENERAL_GROUP_TEMPLATE_FIELDS,
                         "Шаблон группового уведомления",
                     )
                 except ValueError:
@@ -3463,6 +3470,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     InlineKeyboardButton(
                         text="🔴 Отключить служение",
                         callback_data=f"service:service_chat_disable:{service_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ К карточке служения",
+                        callback_data=f"service:service_settings:{service_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ К списку служений",
+                        callback_data="service:back_to_services:list",
                     )
                 ],
             ]
@@ -6702,6 +6721,23 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await refresh_user_commands(int(text))
                 response = "Администратор служения снят."
             elif operation == "service_chat":
+                if text == CONTACT_BACK_TEXT:
+                    for request_id, share in list(pending_shares.items()):
+                        if share[0] == message.from_user.id:
+                            pending_shares.pop(request_id, None)
+                    await clean_and_clear_pending_actor(message.from_user.id)
+                    service = service_by_id(registry, service_id)
+                    await _send_dialog(
+                        message, "↩️ Выбор чата отменён.", parse_mode=None,
+                        reply_markup=ReplyKeyboardRemove(),
+                    )
+                    await _send_dialog(
+                        message,
+                        f"{service_label(service)}: выберите действие.",
+                        reply_markup=service_chat_keyboard(service_id),
+                        parse_mode=None,
+                    )
+                    return
                 parts = text.split()
                 if len(parts) != 2 or parts[1] not in {"on", "off"}:
                     raise ValueError(
@@ -6783,7 +6819,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             )
                         validate_notification_template(
                             text,
-                            GROUP_TEMPLATE_FIELDS,
+                            GENERAL_GROUP_TEMPLATE_FIELDS,
                             "Текст группового напоминания",
                         )
                         draft["body"] = text
@@ -6823,7 +6859,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             )
                         validate_notification_template(
                             text,
-                            GROUP_TEMPLATE_FIELDS,
+                            (
+                                GROUP_TEMPLATE_FIELDS
+                                if reminder.get("task")
+                                else GENERAL_GROUP_TEMPLATE_FIELDS
+                            ),
                             "Текст группового напоминания",
                         )
                         changes["body"] = text
@@ -6909,7 +6949,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         )
                     validate_notification_template(
                         text,
-                        GROUP_TEMPLATE_FIELDS,
+                        GENERAL_GROUP_TEMPLATE_FIELDS,
                         "Шаблон группового уведомления",
                     )
                     pending["group_template"] = text
@@ -7034,7 +7074,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         raise ValueError("Текст для группы не может быть пустым.")
                     validate_notification_template(
                         text,
-                        GROUP_TEMPLATE_FIELDS,
+                        GENERAL_GROUP_TEMPLATE_FIELDS,
                         "Шаблон группового уведомления",
                     )
                     pending["group_template"] = text
