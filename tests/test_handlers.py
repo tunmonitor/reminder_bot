@@ -2619,9 +2619,27 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             await handler(group)
             self.assertIn("/here sound", group.answer.await_args.args[0])
 
+            card = SimpleNamespace(
+                data="service:service_settings:sound",
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            card.message.answer.return_value = SimpleNamespace(message_id=77)
+            await self.callback_handler("on_service_selected")(card)
+            self.context.bot.send_message.reset_mock()
+            self.context.bot.delete_message.reset_mock()
             group.text = "/here Звук"
             await handler(group)
             self.assertIn("в эту тему", group.answer.await_args.args[0])
+            private_texts = [
+                call.args[1]
+                for call in self.context.bot.send_message.await_args_list
+                if call.args[0] == 67890
+            ]
+            self.assertIn("✅ Тема чата сохранена", private_texts[0])
+            self.assertIn("🧵 Тема", private_texts[-1])
+            self.context.bot.delete_message.assert_awaited()
             self.assertEqual(
                 self.registry.get_service("sound")["group_thread_id"], 42
             )

@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 import time
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any
 
 from aiogram import F, Dispatcher, Router
@@ -471,6 +472,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         for key in list(pending_notify_task_choices):
             if pending_notify_task_choices[key][0] == actor_id:
                 pending_notify_task_choices.pop(key, None)
+
+    last_service_cards: dict[int, tuple[int, int, str]] = {}
 
     async def clean_and_clear_pending_actor(actor_id: int) -> None:
         pending = pending_inputs.get(actor_id)
@@ -976,11 +979,19 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         )
         chunks = _telegram_text_chunks(response)
         keyboard = settings_keyboard(service["id"], actor_id)
+        sent = None
         for index, chunk in enumerate(chunks):
-            await _send_dialog(message, chunk,
+            sent = await _send_dialog(message, chunk,
                 parse_mode=None,
                 reply_markup=keyboard if index == len(chunks) - 1 else None,
                 _dialog_keyboard_limit=keyboard_size(keyboard),
+            )
+        if sent is not None:
+            # Последняя карточка служения: её заменяет обновлённая после
+            # /here в группе.
+            last_service_cards[actor_id] = (
+                getattr(message.chat, "id", actor_id), sent.message_id,
+                service["id"],
             )
 
     def _task_button(
@@ -6207,6 +6218,45 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             + ("в эту тему." if thread_id else "в общую тему чата."),
             parse_mode=None,
         )
+        await refresh_card_after_here(message.from_user.id, service["id"])
+
+    async def refresh_card_after_here(actor_id: int, service_id: str) -> None:
+        """В личном чате: подтверждение и свежая карточка вместо старой."""
+        registry = service_registry()
+        service = service_by_id(registry, service_id) if registry else None
+        if service is None:
+            return
+        # Тип чата не «private»: _send_dialog не трогает меню и состояние
+        # других сценариев админа, открытых в личном чате.
+        private = SimpleNamespace(
+            chat=SimpleNamespace(id=actor_id, type="service_card"),
+            answer=lambda text, **kwargs: context.bot.send_message(
+                actor_id, text, **kwargs
+            ),
+        )
+        previous = last_service_cards.pop(actor_id, None)
+        thread_id = service.get("group_thread_id")
+        try:
+            await context.bot.send_message(
+                actor_id,
+                f"✅ Тема чата сохранена · {service['name']}\n"
+                + (
+                    "Напоминания и подтверждения будут приходить в выбранную "
+                    "тему."
+                    if thread_id
+                    else "Напоминания будут приходить в общую тему чата."
+                ),
+                parse_mode=None,
+            )
+            await send_service_card(private, actor_id, service)
+        except Exception:  # noqa: BLE001
+            # Например, личный чат с ботом не начат — хватит ответа в группе.
+            debug.info("Не удалось обновить карточку служения в личном чате")
+            return
+        if previous is not None and previous[2] == service_id:
+            await clean_previous_menu_by_id(
+                context.bot, previous[0], previous[1], debug
+            )
 
     @admin_router.message(Command("my_schedule"))
     async def on_my_schedule(message: Message) -> None:
