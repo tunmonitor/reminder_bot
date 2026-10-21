@@ -2619,9 +2619,47 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             await handler(group)
             self.assertIn("/here sound", group.answer.await_args.args[0])
 
+            card = SimpleNamespace(
+                data="service:service_settings:sound",
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            card.message.answer.return_value = SimpleNamespace(message_id=77)
+            await self.callback_handler("on_service_selected")(card)
+            other = SimpleNamespace(
+                data="service:service_settings:broadcast",
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            other.message.answer.return_value = SimpleNamespace(message_id=88)
+            await self.callback_handler("on_service_selected")(other)
             group.text = "/here Звук"
+            # Личный чат недоступен: ссылка на старую карточку сохраняется.
+            self.context.bot.send_message.side_effect = RuntimeError("blocked")
             await handler(group)
+            self.context.bot.send_message.side_effect = None
+            self.context.bot.send_message.return_value = SimpleNamespace(
+                message_id=99
+            )
+            self.context.bot.send_message.reset_mock()
+            self.context.bot.delete_message.reset_mock()
+            await handler(group)
+            deleted = [
+                call.kwargs["message_id"]
+                for call in self.context.bot.delete_message.await_args_list
+            ]
+            self.assertEqual(deleted, [77])
             self.assertIn("в эту тему", group.answer.await_args.args[0])
+            private_texts = [
+                call.args[1]
+                for call in self.context.bot.send_message.await_args_list
+                if call.args[0] == 67890
+            ]
+            self.assertIn("✅ Тема чата сохранена", private_texts[0])
+            self.assertIn("🧵 Тема", private_texts[-1])
+            self.context.bot.delete_message.assert_awaited()
             self.assertEqual(
                 self.registry.get_service("sound")["group_thread_id"], 42
             )

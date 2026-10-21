@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 import time
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any
 
 from aiogram import F, Dispatcher, Router
@@ -181,6 +182,8 @@ CONTACT_NAVIGATION_STEPS = {
 }
 # Кнопка reply-клавиатуры на шаге выбора Telegram-пользователя.
 CONTACT_BACK_TEXT = "⬅️ Назад"
+# Тип служебной обёртки для карточки, отправляемой после /here.
+SERVICE_CARD_CHAT_TYPE = "service_card"
 MEMBER_PAGE_SIZE = 5
 _WEEKDAYS = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
 GROUP_REMINDER_NEW_STEPS = frozenset({
@@ -281,16 +284,19 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         keep_rows = kwargs.pop("_dialog_keep_rows", False)
         text_limit = kwargs.pop("_dialog_text_limit", 500)
         markup = kwargs.pop("reply_markup", None)
+        sent_ids = kwargs.pop("_dialog_sent_ids", None)
         actor_id = getattr(getattr(target, "chat", None), "id", None)
+        chat_type = getattr(getattr(target, "chat", None), "type", None)
         pending = (
             pending_inputs.get(actor_id)
-            if getattr(getattr(target, "chat", None), "type", None)
-            == ChatType.PRIVATE
+            if chat_type == ChatType.PRIVATE
             else None
         )
-        for token, page_state in list(pending_dialog_pages.items()):
-            if page_state[0] == actor_id:
-                pending_dialog_pages.pop(token, None)
+        # Карточка после /here не сбрасывает листание других меню админа.
+        if chat_type != SERVICE_CARD_CHAT_TYPE:
+            for token, page_state in list(pending_dialog_pages.items()):
+                if page_state[0] == actor_id:
+                    pending_dialog_pages.pop(token, None)
         if (
             clean_previous
             and pending is not None
@@ -406,6 +412,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 ),
                 **kwargs,
             )
+            if sent_ids is not None:
+                sent_ids.append(sent_message.message_id)
         if sent_message is not None and pending is not None:
             pending["menu_message_id"] = sent_message.message_id
             pending["menu_chat_id"] = target.chat.id
@@ -471,6 +479,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         for key in list(pending_notify_task_choices):
             if pending_notify_task_choices[key][0] == actor_id:
                 pending_notify_task_choices.pop(key, None)
+
+    # (админ, служение) -> (чат, ID всех сообщений карточки).
+    last_service_cards: dict[tuple[int, str], tuple[int, list[int]]] = {}
 
     async def clean_and_clear_pending_actor(actor_id: int) -> None:
         pending = pending_inputs.get(actor_id)
@@ -976,12 +987,30 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         )
         chunks = _telegram_text_chunks(response)
         keyboard = settings_keyboard(service["id"], actor_id)
-        for index, chunk in enumerate(chunks):
-            await _send_dialog(message, chunk,
-                parse_mode=None,
-                reply_markup=keyboard if index == len(chunks) - 1 else None,
-                _dialog_keyboard_limit=keyboard_size(keyboard),
-            )
+        sent_ids: list[int] = []
+        key = (actor_id, service["id"])
+        chat_id = getattr(message.chat, "id", actor_id)
+        try:
+            for index, chunk in enumerate(chunks):
+                await _send_dialog(message, chunk,
+                    parse_mode=None,
+                    reply_markup=(
+                        keyboard if index == len(chunks) - 1 else None
+                    ),
+                    _dialog_keyboard_limit=keyboard_size(keyboard),
+                    _dialog_sent_ids=sent_ids,
+                )
+        except Exception:
+            # Недосланные куски удалятся вместе со старой карточкой.
+            previous = last_service_cards.get(key)
+            if sent_ids and previous is not None and previous[0] == chat_id:
+                previous[1].extend(sent_ids)
+            elif sent_ids:
+                last_service_cards[key] = (chat_id, sent_ids)
+            raise
+        # Последняя карточка служения: её заменяет обновлённая после /here
+        # в группе.
+        last_service_cards[key] = (chat_id, sent_ids)
 
     def _task_button(
         actor_id: int,
@@ -6207,6 +6236,50 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             + ("в эту тему." if thread_id else "в общую тему чата."),
             parse_mode=None,
         )
+        await refresh_card_after_here(message.from_user.id, service["id"])
+
+    async def refresh_card_after_here(actor_id: int, service_id: str) -> None:
+        """В личном чате: подтверждение и свежая карточка вместо старой."""
+        registry = service_registry()
+        service = service_by_id(registry, service_id) if registry else None
+        if service is None:
+            return
+        # Тип чата не «private»: _send_dialog не трогает меню и состояние
+        # других сценариев админа, открытых в личном чате.
+        private = SimpleNamespace(
+            chat=SimpleNamespace(id=actor_id, type=SERVICE_CARD_CHAT_TYPE),
+            answer=lambda text, **kwargs: context.bot.send_message(
+                actor_id, text, **kwargs
+            ),
+        )
+        previous = last_service_cards.get((actor_id, service_id))
+        thread_id = service.get("group_thread_id")
+        try:
+            await context.bot.send_message(
+                actor_id,
+                f"✅ Тема чата сохранена · {service['name']}\n"
+                + (
+                    "Напоминания и подтверждения будут приходить в выбранную "
+                    "тему."
+                    if thread_id
+                    else "Напоминания будут приходить в общую тему чата."
+                ),
+                parse_mode=None,
+            )
+            await send_service_card(private, actor_id, service)
+        except Exception:  # noqa: BLE001
+            # Например, личный чат с ботом не начат — хватит ответа в группе.
+            debug.warning(
+                "Не удалось обновить карточку служения в личном чате",
+                exc_info=True,
+            )
+            return
+        if previous is not None:
+            chat_id, message_ids = previous
+            for message_id in message_ids:
+                await clean_previous_menu_by_id(
+                    context.bot, chat_id, message_id, debug
+                )
 
     @admin_router.message(Command("my_schedule"))
     async def on_my_schedule(message: Message) -> None:
