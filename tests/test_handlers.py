@@ -2627,10 +2627,30 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             card.message.answer.return_value = SimpleNamespace(message_id=77)
             await self.callback_handler("on_service_selected")(card)
+            other = SimpleNamespace(
+                data="service:service_settings:broadcast",
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            other.message.answer.return_value = SimpleNamespace(message_id=88)
+            await self.callback_handler("on_service_selected")(other)
+            group.text = "/here Звук"
+            # Личный чат недоступен: ссылка на старую карточку сохраняется.
+            self.context.bot.send_message.side_effect = RuntimeError("blocked")
+            await handler(group)
+            self.context.bot.send_message.side_effect = None
+            self.context.bot.send_message.return_value = SimpleNamespace(
+                message_id=99
+            )
             self.context.bot.send_message.reset_mock()
             self.context.bot.delete_message.reset_mock()
-            group.text = "/here Звук"
             await handler(group)
+            deleted = [
+                call.kwargs["message_id"]
+                for call in self.context.bot.delete_message.await_args_list
+            ]
+            self.assertEqual(deleted, [77])
             self.assertIn("в эту тему", group.answer.await_args.args[0])
             private_texts = [
                 call.args[1]
