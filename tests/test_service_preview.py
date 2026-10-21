@@ -106,7 +106,7 @@ class ServicePreviewTest(unittest.TestCase):
             self.assertEqual(result["time"], reminder["reminder_time"])
             self.assertIn("Звук · 25.10.2026", result["text"])
             self.assertIn("Алексей (@alex)", plain_text(result["text"]))
-            self.assertIn("📌 2-я часть — нет", result["text"])
+            self.assertIn("📌 2-я часть нет", result["text"])
 
     def test_group_reminder_preview_falls_back_to_builtin_template(self):
         with tempfile.TemporaryDirectory() as temp_dir:

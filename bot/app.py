@@ -1677,12 +1677,14 @@ async def _run_locked(args: CliArgs) -> None:
         }
         upcoming_lock = asyncio.Lock()
 
-        async def load_upcoming_service_events(until: date | None = None) -> list:
+        async def load_upcoming_service_events(
+            force: bool = False, until: date | None = None
+        ) -> list:
             # Один общий скачанный график на несколько минут для всех
             # пользователей: повторные нажатия не обращаются к Яндекс.Диску.
-            # В кэше — график до конца следующего месяца (для «🔁 Замена»);
-            # по умолчанию возвращаются ближайшие 6 недель, until — до этой
-            # даты.
+            # force — «🔄 Сверить график»: скачать заново. В кэше — график до
+            # конца следующего месяца (для «🔁 Замена»); по умолчанию
+            # возвращаются ближайшие 6 недель, until — до этой даты.
             today = datetime.now(tz).date()
             limit = until or today + timedelta(days=UPCOMING_WEEKS_DEFAULT * 7)
 
@@ -1695,7 +1697,8 @@ async def _run_locked(args: CliArgs) -> None:
             async with upcoming_lock:
                 loaded_at = upcoming_cache["loaded_at"]
                 if (
-                    loaded_at is not None
+                    not force
+                    and loaded_at is not None
                     and time.monotonic() - loaded_at
                     < UPCOMING_EVENTS_CACHE_SECONDS
                     # После смены месяца кэш может не покрывать окно.

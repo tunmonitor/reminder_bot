@@ -44,3 +44,18 @@ class FormatTaskAssignmentsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InformationalLabelTest(unittest.TestCase):
+    def test_label_and_notes(self):
+        from bot.presentation import format_informational_notes, informational_label
+
+        self.assertEqual(informational_label("2я часть", ["нет"]), "2я часть нет")
+        self.assertEqual(informational_label("Праздник", [""]), "Праздник")
+        self.assertEqual(
+            format_informational_notes({
+                "Причастие": {"names": ["В.П."], "is_informational": True},
+                "звук": {"names": ["Алексей"], "is_informational": False},
+            }),
+            "📌 Причастие В.П.",
+        )

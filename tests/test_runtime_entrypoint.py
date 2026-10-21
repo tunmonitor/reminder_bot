@@ -191,7 +191,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     group_sends(bot)[0].args[0], -10001
                 )
                 self.assertIn(
-                    "📌 2-я часть — нет",
+                    "📌 2-я часть нет",
                     group_sends(bot)[0].args[1],
                 )
                 state_cache.save.assert_not_called()
