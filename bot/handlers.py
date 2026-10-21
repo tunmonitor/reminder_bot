@@ -60,6 +60,7 @@ from .service_registry import (
     GENERAL_GROUP_TEMPLATE_FIELDS,
     GROUP_TEMPLATE_FIELDS,
     PERSONAL_TEMPLATE_FIELDS,
+    USER_REMINDER_BODY_LIMIT,
     USER_REMINDERS_PER_SERVICE,
     normalize_member_name,
     validate_notification_template,
@@ -2094,12 +2095,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         )
 
     def send_now_snapshot(reminder: dict | None):
-        """Что должно не измениться между предпросмотром и отправкой."""
+        """Что должно не измениться между предпросмотром и отправкой:
+        напоминание и чат (тема) служения."""
         if reminder is None:
             return None
+        service = service_registry().get_service(reminder["service_id"]) or {}
         return (
             reminder["service_id"], reminder["body"], reminder.get("task"),
             reminder["reminder_days"], reminder["reminder_time"],
+            service.get("group_chat_id"), service.get("group_thread_id"),
         )
 
     async def show_send_now_confirm(
@@ -6017,6 +6021,24 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             raise ValueError("Напоминание больше не существует.")
         return rule
 
+    def shortened_user_body(body: str | None) -> str | None:
+        """Прежние тексты могли быть длиннее нынешнего лимита: копия
+        сокращается по границе слова так, чтобы шаблон остался верным."""
+        if not body or len(body.encode("utf-16-le")) // 2 <= USER_REMINDER_BODY_LIMIT:
+            return body
+        while body and len(body.encode("utf-16-le")) // 2 > USER_REMINDER_BODY_LIMIT:
+            body = body[:-100]
+        while body:
+            body = body.rsplit(maxsplit=1)[0] if " " in body.strip() else ""
+            try:
+                validate_notification_template(
+                    body, PERSONAL_TEMPLATE_FIELDS, "Текст личного напоминания"
+                )
+                return body.rstrip() or None
+            except ValueError:
+                continue
+        return None
+
     async def add_own_personal_rule(
         registry: Any, actor_id: int, service_id: str, task: str,
         days: int, reminder_time: str, state: dict[str, Any],
@@ -7434,9 +7456,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     raise ValueError("Вы больше не привязаны к этой задаче.")
                 # Копия выключена: два одинаковых напоминания не придут, пока
                 # у копии не изменят время и не включат её.
+                body = shortened_user_body(rule["body"])
                 copy = registry.add_schedule(
                     rule["text_id"], rule["reminder_days"],
-                    rule["reminder_time"], origin="user", body=rule["body"],
+                    rule["reminder_time"], origin="user", body=body or None,
                     enabled=False,
                 )
                 pop_personal_level(state)

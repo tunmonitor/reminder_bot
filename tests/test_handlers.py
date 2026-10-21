@@ -1877,6 +1877,16 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 self.context.bot.send_message.await_args.args[0], -100555
             )
             self.assertIn("Отправлено", sent.answer.await_args.args[0])
+            # Смена чата после предпросмотра — нужен новый предпросмотр.
+            again = await self._click(
+                card.message, lambda button: button.text == "📤 Отправить сейчас"
+            )
+            self.registry.set_group_chat(67890, "sound", -100777, enabled=True)
+            self.context.bot.send_message.reset_mock()
+            await self._click(
+                again.message, lambda button: button.text == "✅ Отправить"
+            )
+            self.context.bot.send_message.assert_not_awaited()
             # Повторное нажатие той же кнопки ничего не отправляет.
             self.context.bot.send_message.reset_mock()
             await self._click(
@@ -4954,6 +4964,36 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             service = await press(confirm, lambda b: b.text == "🗑 Да, удалить")
             self.assertEqual(self.rules(actor_id), [(0, "07:30", True)])
             self.assertIn("Напоминаний: 1 (своих — до 10)", service.answer.await_args.args[0])
+
+        asyncio.run(run())
+
+    def test_copy_of_legacy_long_text_is_shortened(self):
+        async def run():
+            import sqlite3 as _sqlite3
+
+            actor_id = 4604
+            self.registry.set_responsible_contact(
+                67890, "sound", "Микшер", "Имя из расписания", actor_id
+            )
+            text_id = self.registry.ensure_user_text(actor_id, "sound", "Микшер")
+            rule = self.registry.add_schedule(text_id, 2, "10:00", origin="user")
+            with _sqlite3.connect(self.registry.path) as connection:
+                connection.execute(
+                    "UPDATE user_reminder_schedules SET body = ? WHERE id = ?",
+                    ("длинно {name} " * 400 + "{name}", rule["id"]),
+                )
+            message, press = self.personal_flow(actor_id)
+            command = message("/my_notifications")
+            await self.message_handler("on_my_notifications")(command)
+            screen = await press(command, lambda b: "ЗВУК" in b.text)
+            card = await press(screen, lambda b: "✏️ Микшер" in b.text)
+            await press(card, lambda b: b.text == "📋 Копировать как своё")
+            bodies = [
+                item["body"] for item in
+                self.registry.list_user_service_schedules(actor_id, "sound")
+            ]
+            self.assertEqual(len(bodies), 2)
+            self.assertLessEqual(min(len(body) for body in bodies), 3000)
 
         asyncio.run(run())
 
