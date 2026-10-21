@@ -581,6 +581,50 @@ class DirectChangeTest(HandlersTest):
         self.assertEqual(len(warnings), 1)
         self.assertIn("чат служения", warnings[0])
 
+    def test_change_rejects_busy_substitute_and_mismatched_reply(self):
+        self.registry.set_responsible_contact(
+            SUPER, "sound", "спевка", "Глеб", OUTSIDER, "gleb_g"
+        )
+        busy = self.message(ADMIN, f"/change спевка @gleb_g {self.day:%d.%m}")
+        asyncio.run(self.change(busy))
+        # В задаче двое — сначала выбор в «🔁 Замена».
+        self.assertIn("несколько человек", busy.answer.await_args.args[0])
+        self.registry.set_responsible_contact(
+            SUPER, "sound", "звук", "Глеб", OUTSIDER, "gleb_g"
+        )
+        from bot.excel_parser import ServiceAssignment, ServiceEvent
+
+        self.events[0] = ServiceEvent("sound", self.day, (
+            ServiceAssignment("звук", "Алексей"),
+            ServiceAssignment("звук", "Глеб"),
+        ))
+        asyncio.run(self.context.on_assignment_declined(
+            "sound", self.day, "звук", "Алексей", telegram_id=OLD
+        ))
+        poll = self.registry.list_open_replacement_polls()[0]
+        other = self.day + timedelta(days=7)
+        mismatch = self.message(
+            ADMIN, f"/change звук @boris_b {other:%d.%m}", -1005,
+            SimpleNamespace(message_id=poll["message_id"]),
+        )
+        asyncio.run(self.change(mismatch))
+        self.assertIn("Этот опрос — на", mismatch.answer.await_args.args[0])
+        taken = self.message(
+            ADMIN, "/change звук @gleb_g", -1005,
+            SimpleNamespace(message_id=poll["message_id"]),
+        )
+        asyncio.run(self.change(taken))
+        self.assertIn("уже в задаче", taken.answer.await_args.args[0])
+
+    def test_foreign_request_does_not_block_own_service(self):
+        self.registry.create_replacement_poll(
+            "foreign", "broadcast", self.day.isoformat(), "звук", "Кто-то",
+            None, 0, 0, None, "2099-01-01T00:00:00+00:00", status="closed",
+        )
+        done = self.message(ADMIN, "/change звук @boris_b")
+        asyncio.run(self.change(done))
+        self.assertIn("✅ Замена назначена", done.answer.await_args.args[0])
+
     def test_repeat_decline_after_replacement_starts_nothing(self):
         self.registry.set_replacement(
             "sound", self.day.isoformat(), "звук", "Алексей", "Борис", MEMBER,

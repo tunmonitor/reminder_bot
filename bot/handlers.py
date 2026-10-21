@@ -6656,9 +6656,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         name = (known or {}).get("name") or full_name or (
             f"@{user.username}" if user.username else "Участник"
         )
-        if name == pending["old_name"]:
+        busy = {
+            item.name for item in pending["event"].assignments
+            if item.task == pending["task"]
+        }
+        if name in busy:
             await _send_dialog(
-                message, "❌ Это тот же человек, которого нужно заменить.",
+                message,
+                "❌ Это тот же человек, которого нужно заменить."
+                if name == pending["old_name"]
+                else f"❌ {name} уже в задаче «{pending['task']}» на эту дату.",
                 parse_mode=None, reply_markup=ReplyKeyboardRemove(),
             )
             await show_replace_candidates(message, actor_id, pending)
@@ -6780,6 +6787,20 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         await _answer_callback(callback)
 
+    async def task_names_on_date(service_id: str, event_date, task: str) -> list:
+        """Кто стоит в задаче на дату (график с заменами)."""
+        loader = getattr(context, "load_upcoming_service_events", None)
+        if loader is None:
+            return []
+        events = await loader(until=max(event_date, replace_window_end()))
+        return [
+            item.name
+            for event in events
+            if event.service_id == service_id and event.event_date == event_date
+            for item in event.assignments
+            if item.task == task and item.name
+        ]
+
     @admin_router.message(Command("change"))
     async def on_change_command(message: Message) -> None:
         """/change {задача} @username [дд.мм] — замена от админа.
@@ -6819,6 +6840,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             if poll is not None and poll["filled"]:
                 await reply("ℹ️ Этот поиск замены уже завершён.")
                 return
+            if (
+                poll is not None and event_date is not None
+                and poll["event_date"] != event_date.isoformat()
+            ):
+                await reply(
+                    f"ℹ️ Этот опрос — на {date.fromisoformat(poll['event_date']):%d.%m}, "
+                    f"а в команде указано {event_date:%d.%m}. Уберите дату или "
+                    "отправьте команду без ответа на опрос."
+                )
+                return
             if poll is not None:
                 polls = [poll]
         if not polls:
@@ -6831,6 +6862,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 and (event_date is None or poll["event_date"] == event_date.isoformat())
                 and in_this_chat(poll["service_id"], poll["chat_id"])
             ]
+        # Запросы чужих служений не мешают замене в своих.
+        foreign_polls = [
+            poll for poll in polls
+            if not is_service_admin(message.from_user.id, poll["service_id"])
+        ]
+        polls = [poll for poll in polls if poll not in foreign_polls]
         # 2. Без запроса — задача служения на дату по графику.
         targets = [
             (poll["service_id"], date.fromisoformat(poll["event_date"]),
@@ -6869,6 +6906,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 if len(target[3]) == 1 and event.service_id not in nearest:
                     nearest[event.service_id] = target
             targets = list({**first_any, **nearest}.values())
+        if not targets and foreign_polls:
+            await reply(
+                "❌ Назначить замену может только админ служения: "
+                + service_admins_text(registry, foreign_polls[0]["service_id"])
+            )
+            return
         if not targets:
             when = f" на {event_date:%d.%m.%Y}" if event_date else ""
             await reply(
@@ -6914,6 +6957,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         if substitute["name"] == names[0]:
             await reply("❌ Это тот же человек, которого нужно заменить.")
+            return
+        try:
+            busy = await task_names_on_date(service_id, target_date, task)
+        except (OSError, RuntimeError, ValueError, sqlite3.Error):
+            debug.exception("Не удалось проверить назначения для /change")
+            busy = []
+        if substitute["name"] in busy:
+            await reply(
+                f"❌ {substitute['name']} уже в задаче «{task}» на "
+                f"{target_date:%d.%m} — выберите другого человека."
+            )
             return
         try:
             done = await admin_assign_replacement(

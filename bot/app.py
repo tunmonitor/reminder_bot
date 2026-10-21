@@ -1672,7 +1672,9 @@ async def _run_locked(args: CliArgs) -> None:
         context.prepare_test_previews = prepare_test_previews
         context.load_service_task_assignments = load_service_task_assignments
 
-        upcoming_cache: dict[str, Any] = {"loaded_at": None, "events": []}
+        upcoming_cache: dict[str, Any] = {
+            "loaded_at": None, "events": [], "until": None,
+        }
         upcoming_lock = asyncio.Lock()
 
         async def load_upcoming_service_events(until: date | None = None) -> list:
@@ -1696,6 +1698,9 @@ async def _run_locked(args: CliArgs) -> None:
                     loaded_at is not None
                     and time.monotonic() - loaded_at
                     < UPCOMING_EVENTS_CACHE_SECONDS
+                    # После смены месяца кэш может не покрывать окно.
+                    and upcoming_cache["until"] is not None
+                    and upcoming_cache["until"] >= limit
                 ):
                     # Замены — из базы при каждом чтении: кэш хранит график.
                     return window(upcoming_cache["events"])
@@ -1714,7 +1719,8 @@ async def _run_locked(args: CliArgs) -> None:
                     until=max(end_of_next_month, limit),
                 )
                 upcoming_cache.update(
-                    loaded_at=time.monotonic(), events=events
+                    loaded_at=time.monotonic(), events=events,
+                    until=max(end_of_next_month, limit),
                 )
                 return window(events)
 
