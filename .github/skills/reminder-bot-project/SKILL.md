@@ -186,6 +186,28 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   a newer menu.
 - Preserve idempotent delivery records and per-service/event locking. A
   failed delivery must not be recorded as success.
+- Personal reminders carry `build_personal_answer_kb` buttons
+  (`pcf:{c|d}:{service}:{YYYYMMDD}:{task_token(task)}`, handler
+  `on_personal_answer`; the token is a name hash because task positions get
+  renumbered, resolved by `linked_task_by_token` among the caller's linked
+  tasks). Answers live in `service_confirmations` (`set_confirmation`
+  returns `(name, changed)`; only the contact linked to that task may
+  answer). An answered task/date gets no more personal reminders. A new
+  "declined" sends `notify_admins_declined` and calls the optional
+  `context.on_assignment_declined` hook (replacement search, stage 3.3).
+- `bot/admin_report.py`: after a group reminder `send_admin_reports` sends
+  one report per service admin and date (fallback: super admin) and stores it
+  in `admin_report_messages`; later reminders and answers edit it
+  (`refresh_admin_reports` delegates to `send_admin_reports`, which targets
+  only current recipients, drops rows of removed admins, and resends a report
+  whose edit fails). `_process_service_reminder` calls it whenever the group
+  reminder of that date is delivered, so a failed report is retried without
+  resending the group. `build_report_text(limit=...)` keeps
+  `{confirmation_status}` visible by collapsing delivery, then assignments;
+  confirmations are keyed by `(task, telegram_id)`. The template is written on
+  finish only if this session edited it (`admin_report_template_edited`). Template `services.admin_report_template`
+  (`ADMIN_REPORT_FIELDS`), edited under «📋 Отчёт админам» in
+  `/service_notify` and saved on «Завершить и сохранить».
 
 ### Rich text, mentions, and message length
 
@@ -309,6 +331,7 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - Snapshot creation, retention, and restore: `tests/test_backup.py`
 - Web App static server/config: `tests/test_webapp_server.py`,
   `tests/test_config_service_registry.py`
+- Answers to personal reminders and admin reports: `tests/test_admin_report.py`
 - Runtime/CLI setup and dry-run: `tests/test_runtime_entrypoint.py`,
   `tests/test_debug_schedule.py`
 

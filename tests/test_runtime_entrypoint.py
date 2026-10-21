@@ -13,6 +13,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 
+def group_sends(bot):
+    """Отправки в группы (отрицательный chat_id), без отчётов админам."""
+    return [
+        call for call in bot.send_message.await_args_list
+        if isinstance(call.args[0], int) and call.args[0] < 0
+    ]
+
+
 class ReminderBotEntrypointTest(unittest.TestCase):
     def test_webapp_menu_button_uses_configured_https_url(self):
         from bot.app import _configure_webapp_menu
@@ -178,13 +186,13 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                         state_cache=state_cache,
                     )
 
-                self.assertEqual(bot.send_message.await_count, 1)
+                self.assertEqual(len(group_sends(bot)), 1)
                 self.assertEqual(
-                    bot.send_message.await_args_list[0].args[0], -10001
+                    group_sends(bot)[0].args[0], -10001
                 )
                 self.assertIn(
                     "📌 2-я часть — нет",
-                    bot.send_message.await_args_list[0].args[1],
+                    group_sends(bot)[0].args[1],
                 )
                 state_cache.save.assert_not_called()
                 notify_admin.assert_not_awaited()
@@ -423,8 +431,8 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     len(raw_text.encode("utf-16-le")) // 2, TELEGRAM_TEXT_LIMIT
                 )
                 notify_admin.assert_not_awaited()
-                self.assertEqual(bot.send_message.await_count, 1)
-                sent = bot.send_message.await_args.args[1]
+                self.assertEqual(len(group_sends(bot)), 1)
+                sent = group_sends(bot)[-1].args[1]
                 self.assertIn('<a href="tg://user?id=3049">', sent)
                 self.assertNotIn("\x00", sent)
 
@@ -475,10 +483,10 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                             run_date=run_date,
                         )
 
-                self.assertEqual(bot.send_message.await_count, 2)
+                self.assertEqual(len(group_sends(bot)), 2)
                 sent_texts = [
                     call.args[1]
-                    for call in bot.send_message.await_args_list
+                    for call in group_sends(bot)
                 ]
                 self.assertTrue(
                     any("Отдельный текст Собрание" in text for text in sent_texts)
@@ -534,6 +542,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     call.args[1]
                     for call in bot.send_message.await_args_list
                     if call.args[0] == 1001
+                    and "Проверьте график" in call.args[1]
                 ]
                 self.assertEqual(len(admin_messages), 1)
                 self.assertIn("строка без задачи", admin_messages[0])
@@ -846,9 +855,9 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                         state_cache=state_cache,
                     )
 
-                self.assertEqual(bot.send_message.await_count, 1)
+                self.assertEqual(len(group_sends(bot)), 1)
                 self.assertEqual(
-                    bot.send_message.await_args.args[0], -10001
+                    group_sends(bot)[-1].args[0], -10001
                 )
                 self.assertTrue(
                     registry.is_group_reminder_delivered(
@@ -865,6 +874,59 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     )
                 )
                 logger.info.assert_called()
+
+        asyncio.run(process())
+
+    def test_failed_admin_report_is_retried_without_repeating_group(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                reminder = registry.get_service("assembly")["reminders"][0]
+                admin_fails = {"value": True}
+
+                async def send_message(chat_id, text, **kwargs):
+                    if chat_id == 1001 and admin_fails["value"]:
+                        raise RuntimeError("blocked")
+                    return SimpleNamespace(message_id=70)
+
+                bot = SimpleNamespace(
+                    send_message=AsyncMock(side_effect=send_message),
+                    edit_message_text=AsyncMock(),
+                )
+                logger = MagicMock()
+
+                async def run_reminder():
+                    await app._process_service_reminder(
+                        bot, SimpleNamespace(admin_tg_id=1001), Path(tmp_dir),
+                        ZoneInfo("UTC"), registry, "assembly", reminder["id"],
+                        logger, logger,
+                        run_date=(
+                            date(2026, 10, 11)
+                            - timedelta(days=reminder["reminder_days"])
+                        ),
+                        state_cache=SimpleNamespace(state={}, save=MagicMock()),
+                    )
+
+                with patch.object(
+                    app,
+                    "_load_service_task_assignments",
+                    new=AsyncMock(return_value=({"Камеры": ["Анна"]}, True)),
+                ):
+                    await run_reminder()
+                    self.assertEqual(
+                        registry.list_admin_reports("assembly", "2026-10-11"), []
+                    )
+                    admin_fails["value"] = False
+                    await run_reminder()
+
+                self.assertEqual(len(group_sends(bot)), 1)
+                self.assertEqual(
+                    len(registry.list_admin_reports("assembly", "2026-10-11")), 1
+                )
 
         asyncio.run(process())
 
@@ -947,6 +1009,60 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     "<b>🔔 Личное: Алексей, Микшер, Звук, 18.10.2026</b>",
                 )
                 self.assertEqual(load_assignments.await_count, 3)
+
+        asyncio.run(process())
+
+    def test_user_reminder_has_answer_buttons_and_stops_after_answer(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                registry.set_group_chat(1001, "sound", -10055, enabled=True)
+                registry.set_responsible_contact(
+                    1001, "sound", "звук", "Алексей", 2002, "alex"
+                )
+                registry.set_user_notifications_enabled(2002, "sound", True)
+                text_id = registry.upsert_user_text(
+                    2002, "sound", "звук", "Личное: {name}"
+                )
+                first = registry.add_schedule(text_id, 3, "09:00")
+                second = registry.add_schedule(text_id, 1, "18:00")
+                bot = SimpleNamespace(
+                    send_message=AsyncMock(
+                        return_value=SimpleNamespace(message_id=55)
+                    )
+                )
+                logger = MagicMock()
+
+                async def remind(schedule):
+                    await app._process_user_reminder_schedule(
+                        bot, SimpleNamespace(admin_tg_id=1001), Path(tmp_dir),
+                        ZoneInfo("UTC"), registry, schedule["id"], logger,
+                        logger,
+                        run_date=(
+                            date(2026, 10, 18)
+                            - timedelta(days=schedule["reminder_days"])
+                        ),
+                    )
+
+                with patch.object(
+                    app,
+                    "_load_service_task_assignments",
+                    new=AsyncMock(return_value=({"звук": ["Алексей"]}, True)),
+                ):
+                    await remind(first)
+                    markup = bot.send_message.await_args.kwargs["reply_markup"]
+                    labels = [b.text for b in markup.inline_keyboard[0]]
+                    self.assertEqual(labels, ["✅ Принял", "🚫 Не смогу"])
+                    registry.set_confirmation(
+                        "sound", "2026-10-18", "звук", 2002, "declined"
+                    )
+                    await remind(second)
+
+                self.assertEqual(bot.send_message.await_count, 1)
 
         asyncio.run(process())
 

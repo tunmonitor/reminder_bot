@@ -9,6 +9,7 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from .service_registry import task_token
 from .ui import render_edit_screen, send_telegram_screen
 
 RATE_LIMIT_DELAY = 0.05         # согласно ТЗ — защита от HTTP 429
@@ -33,6 +34,17 @@ def build_service_confirm_kb(token: str, event_date_iso: str) -> InlineKeyboardM
             text="✅ Принял, буду",
             callback_data=f"scf:{event_date_iso}:{token}",
         ),
+    ]])
+
+
+def build_personal_answer_kb(
+    service_id: str, event_date, task: str
+) -> InlineKeyboardMarkup:
+    """«Принял» / «Не смогу» в личном напоминании (этап 3.2)."""
+    suffix = f"{service_id}:{event_date:%Y%m%d}:{task_token(task)}"
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Принял", callback_data=f"pcf:c:{suffix}"),
+        InlineKeyboardButton(text="🚫 Не смогу", callback_data=f"pcf:d:{suffix}"),
     ]])
 
 
