@@ -124,6 +124,11 @@ class PureRulesTest(unittest.TestCase):
         self.assertFalse(_already_replaced(chain, "звук", "А"))
         self.assertTrue(_already_replaced(chain[:1], "звук", "А"))
         self.assertFalse(_already_replaced(chain[:1], "сборка", "А"))
+        back = [
+            {"task": "звук", "old_name": "А", "new_name": "Б"},
+            {"task": "звук", "old_name": "В", "new_name": "А"},
+        ]
+        self.assertFalse(_already_replaced(back, "звук", "А"))
 
     def test_parsers(self):
         today = date(2026, 10, 21)
