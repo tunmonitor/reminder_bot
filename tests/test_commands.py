@@ -38,7 +38,7 @@ class CommandsForRoleTest(unittest.TestCase):
         names = command_names(commands_for_role(ROLE_SERVICE_ADMIN))
         self.assertEqual(
             names,
-            ["start", "services", "service_notify", "my_schedule", "my_notifications", "cancel"],
+            ["start", "services", "service_notify", "change", "my_schedule", "my_notifications", "cancel"],
         )
 
     def test_main_super_admin_gets_full_menu_with_delivery_check(self):

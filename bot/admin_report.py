@@ -12,6 +12,7 @@ from collections.abc import Callable
 from datetime import date
 
 from .presentation import (
+    apply_replacements,
     format_task_assignments,
     task_assignment_names,
     task_is_informational,
@@ -135,6 +136,11 @@ def report_recipients(registry, service_id: str, fallback_admin_id: int) -> list
 def _report_text(registry, service: dict, event_date: date, assignments: dict,
                  admin_actor_id: int, limit: int) -> str:
     contacts = registry.list_responsible_contacts(admin_actor_id, service["id"])
+    # Замены на дату (этап 3.3) главнее назначений из графика.
+    assignments = apply_replacements(
+        assignments,
+        registry.list_replacements(service["id"], event_date.isoformat()),
+    )
     return build_report_text(
         service.get("admin_report_template"),
         service["name"],

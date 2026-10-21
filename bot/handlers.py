@@ -36,6 +36,14 @@ from .commands import (
     user_role,
 )
 from .admin_report import notify_admins_declined, refresh_admin_reports
+from .group_send import send_to_service_group, thread_kwargs
+from .replacement import (
+    finish_replacement,
+    parse_change_args,
+    person_label,
+    poll_answer_choice,
+    start_replacement_search,
+)
 from .notifier import CONFIRM_PREFIX, TELEGRAM_TEXT_LIMIT, _notify_admin
 from .presentation import (
     format_task_assignments,
@@ -79,48 +87,6 @@ async def _answer_callback(
         await callback.answer(**kwargs)
     else:
         await callback.answer(normalized, **kwargs)
-
-
-def thread_kwargs(service: dict | None) -> dict:
-    """message_thread_id темы чата служения, если тема выбрана (/here)."""
-    thread_id = (service or {}).get("group_thread_id")
-    return {"message_thread_id": thread_id} if thread_id else {}
-
-
-async def send_to_service_group(
-    send, chat_id: int, text: str, service: dict | None,
-    registry=None, logger=None, **kwargs,
-):
-    """Отправка в чат служения с учётом темы.
-
-    Если тема удалена или закрыта, сообщение уходит в общую тему; удалённая
-    тема сбрасывается (иначе служение перестало бы получать напоминания),
-    закрытая остаётся выбранной.
-    """
-    thread = thread_kwargs(service)
-    try:
-        return await send(chat_id, text, **kwargs, **thread)
-    except TelegramAPIError as exc:
-        error = str(exc).lower()
-        # «message thread not found», TOPIC_CLOSED/TOPIC_DELETED/... —
-        # тема недоступна, сообщение уходит в общую тему.
-        if not thread or ("thread" not in error and "topic" not in error):
-            raise
-        if logger is not None:
-            logger.warning(
-                "Тема %s чата служения %s недоступна (%s); отправка в общую тему",
-                thread["message_thread_id"], service["id"], exc,
-            )
-    # Закрытую тему могут открыть снова — она остаётся выбранной.
-    if registry is not None and "closed" not in error:
-        try:
-            registry.reset_group_thread(
-                service["id"], thread["message_thread_id"]
-            )
-        except Exception:  # noqa: BLE001
-            if logger is not None:
-                logger.exception("Не удалось сбросить тему чата служения")
-    return await send(chat_id, text, **kwargs)
 
 
 def _status_text(text: str, icon: str) -> str:
@@ -6275,6 +6241,187 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             text = "⚠️ Не удалось загрузить график. Попробуйте позже."
         await _send_dialog(message, text, reply_markup=keyboard)
 
+    # --- Замена ответственного (этап 3.3) ---
+
+    async def start_replacement(
+        service_id: str, event_date, task: str, name: str,
+        telegram_id: int | None = None,
+    ) -> None:
+        registry = service_registry()
+        if registry is None:
+            return
+        await start_replacement_search(
+            context.bot, registry, service_id, event_date, task, name,
+            telegram_id, admin_actor_id=context.admin_id,
+            tz=context.timezone, logger=debug,
+            schedule_close=getattr(context, "schedule_replacement_close", None),
+        )
+
+    async def close_replacement_poll(
+        poll_id: str, substitute: dict | None = None,
+        actor_id: int | None = None,
+    ) -> bool:
+        """Итог опроса по сроку (substitute=None) или замена по /change
+        (в том числе для запроса без опроса или с закрытым опросом)."""
+        registry = service_registry()
+        poll = registry.get_replacement_poll(poll_id) if registry else None
+        if poll is None:
+            return False
+        closed = await finish_replacement(
+            context.bot, registry, poll, substitute,
+            source="admin" if substitute else "poll", actor_id=actor_id,
+            admin_actor_id=context.admin_id, tz=context.timezone,
+            logger=debug, report_limit=TELEGRAM_TEXT_LIMIT,
+        )
+        cancel = getattr(context, "cancel_replacement_close", None)
+        if closed and substitute is not None and callable(cancel):
+            cancel(poll_id)
+        return closed
+
+    if not callable(getattr(context, "on_assignment_declined", None)):
+        context.on_assignment_declined = start_replacement
+    context.close_replacement_poll = close_replacement_poll
+
+    @router.poll_answer()
+    async def on_replacement_poll_answer(poll_answer) -> None:
+        user = getattr(poll_answer, "user", None)
+        registry = service_registry()
+        if user is None or registry is None or user.is_bot:
+            return
+        full_name = " ".join(
+            part for part in (user.first_name, user.last_name) if part
+        )
+        try:
+            registry.record_poll_answer(
+                poll_answer.poll_id, user.id, user.username or "", full_name,
+                poll_answer_choice(poll_answer.option_ids),
+            )
+        except (ValueError, sqlite3.Error):
+            debug.exception("Не удалось сохранить ответ в опросе замены")
+
+    def service_admins_text(registry, service_id: str) -> str:
+        people = []
+        for admin in registry.list_service_admin_details(service_id):
+            person = registry.service_person(service_id, admin["telegram_id"])
+            name = person["name"] if person else None
+            username = admin["username"] or (person or {}).get("username")
+            label = " / ".join(
+                part for part in (name, f"@{username}" if username else None)
+                if part
+            )
+            people.append(label or "админ без имени")
+        return ", ".join(people) or "админы не назначены — обратитесь к суперадмину"
+
+    @admin_router.message(Command("change"))
+    async def on_change_command(message: Message) -> None:
+        """/change {задача} @username — замена вместо открытого поиска."""
+        if not message.from_user:
+            return
+        registry = service_registry()
+        if registry is None:
+            return
+        reply = lambda text: message.answer(text, parse_mode=None)  # noqa: E731
+        try:
+            task_text, username = parse_change_args(
+                (message.text or "").partition(" ")[2]
+            )
+        except ValueError as exc:
+            await reply(f"ℹ️ {exc}")
+            return
+        polls = []
+        reply_to = getattr(message, "reply_to_message", None)
+        if message.chat.type != ChatType.PRIVATE and reply_to is not None:
+            poll = registry.replacement_poll_by_message(
+                message.chat.id, reply_to.message_id
+            )
+            if poll is not None and poll["filled"]:
+                await reply("ℹ️ Этот поиск замены уже завершён.")
+                return
+            if poll is not None:
+                polls = [poll]
+        if not polls:
+            today = datetime.now(context.timezone).date().isoformat()
+            polls = [
+                poll
+                for poll in registry.list_unfilled_replacement_requests(today)
+                if normalized_name(poll["task"]) == normalized_name(task_text)
+                and (
+                    message.chat.type == ChatType.PRIVATE
+                    or poll["chat_id"] == message.chat.id
+                    # Запрос без опроса (chat_id=0) — по чату служения.
+                    or (registry.get_service(poll["service_id"]) or {}).get(
+                        "group_chat_id"
+                    ) == message.chat.id
+                )
+            ]
+        if not polls:
+            await reply(
+                f"ℹ️ Нет запроса замены для задачи «{task_text}»: замена "
+                "назначается после «🚫 Не смогу» участника."
+            )
+            return
+        allowed = [
+            poll for poll in polls
+            if is_service_admin(message.from_user.id, poll["service_id"])
+        ]
+        if not allowed:
+            await reply(
+                "❌ Назначить замену может только админ служения: "
+                + service_admins_text(registry, polls[0]["service_id"])
+            )
+            return
+        if len(allowed) > 1:
+            choices = "; ".join(
+                f"{poll['task']} · {poll['event_date']} вместо {poll['old_name']}"
+                for poll in allowed
+            )
+            await reply(
+                "ℹ️ Ждут замены несколько запросов: " + choices
+                + ". Ответьте командой на нужный опрос в чате служения."
+            )
+            return
+        poll = allowed[0]
+        person = registry.find_service_person_by_username(
+            poll["service_id"], username
+        )
+        if person is None or not person.get("telegram_id"):
+            await reply(
+                f"❌ @{username} не найден в составе служения. Сначала "
+                "привяжите человека к Telegram (/service_contact)."
+            )
+            return
+        named = registry.service_person(
+            poll["service_id"], person["telegram_id"], poll["task"]
+        ) or person
+        substitute = {
+            "name": named["name"],
+            "telegram_id": person["telegram_id"],
+            "username": named.get("username") or person.get("username") or "",
+        }
+        if substitute["name"] == poll["old_name"]:
+            await reply("❌ Это тот же человек, которого нужно заменить.")
+            return
+        try:
+            closed = await close_replacement_poll(
+                poll["poll_id"], substitute, message.from_user.id
+            )
+        except Exception:  # noqa: BLE001
+            debug.exception("Не удалось назначить замену")
+            await reply("❌ Не удалось назначить замену. Подробности в журнале.")
+            return
+        if not closed:
+            await reply("ℹ️ Поиск замены уже завершён.")
+            return
+        interaction.info(
+            "Замена назначена админом: service=%s task=%s date=%s actor=%s",
+            poll["service_id"], poll["task"], poll["event_date"],
+            message.from_user.id,
+        )
+        await reply(
+            f"✅ Замена назначена: «{poll['task']}» — "
+            f"{person_label(substitute['name'], substitute['username'])}."
+        )
+
     @admin_router.message(Command("here"))
     async def on_here_command(message: Message) -> None:
         """Выбор темы чата служения: /here [служение] в нужной теме группы."""
@@ -7670,7 +7817,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 on_declined = getattr(context, "on_assignment_declined", None)
                 if callable(on_declined):
                     try:
-                        await on_declined(service_id, event_date, task, name)
+                        await on_declined(
+                            service_id, event_date, task, name,
+                            telegram_id=cb.from_user.id,
+                        )
                     except Exception:  # noqa: BLE001
                         debug.exception("Не удалось запустить поиск замены")
             try:

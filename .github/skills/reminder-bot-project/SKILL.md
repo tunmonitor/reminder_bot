@@ -195,6 +195,31 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   answer). An answered task/date gets no more personal reminders. A new
   "declined" sends `notify_admins_declined` and calls the optional
   `context.on_assignment_declined` hook (replacement search, stage 3.3).
+- Replacement (stage 3.3, `bot/replacement.py`): a new "declined" calls
+  `context.on_assignment_declined` = `start_replacement_search` (notice +
+  non-anonymous poll via `send_to_service_group`, row in `replacement_polls`,
+  `context.schedule_replacement_close` adds APScheduler job
+  `replacement-poll-{poll_id}`; open polls are rescheduled on startup).
+  `poll_deadline`: min(now+12h, event day start−12h), at least 1h. Votes:
+  `on_replacement_poll_answer` → `record_poll_answer`. `finish_replacement`
+  closes once (`close_replacement_poll` returns False on repeat), picks the
+  first "Могу" among `task_member_ids`, else the first "Могу". `/change task
+  @username` (`on_change_command`, admins only) closes the poll with a chosen
+  person. Every decline stores a request row in
+  `replacement_polls` (no group chat or failed poll → `manual-…` row with
+  status `closed`); `filled` marks a request that got a replacement
+  (`claim_replacement_request` / `release_replacement_request`), and `/change`
+  accepts any unfilled request from today (`list_unfilled_replacement_requests`).
+  `service_replacements` override Excel for one date:
+  `presentation.apply_replacements` runs in `_load_service_task_assignments`
+  only with `only_date` (month-wide lists stay raw; roster/contact sync always
+  sees raw names), in the admin report (reports store raw assignments via
+  `raw_out` and apply current replacements on render) and, via
+  `_apply_event_replacements`, on the cached upcoming events. `set_replacement` adds a task contact only for a
+  substitute already known in the service (member or contact). Poll votes use
+  `_connection(notify=False)`, so they do not trigger backups or job
+  refreshes; `/change` removes the pending close job
+  (`context.cancel_replacement_close`). Group sending lives in `bot/group_send.py`.
 - `bot/admin_report.py`: after a group reminder `send_admin_reports` sends
   one report per service admin and date (fallback: super admin) and stores it
   in `admin_report_messages`; later reminders and answers edit it
@@ -332,6 +357,7 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - Web App static server/config: `tests/test_webapp_server.py`,
   `tests/test_config_service_registry.py`
 - Answers to personal reminders and admin reports: `tests/test_admin_report.py`
+- Replacement polls, `/change`, Excel override: `tests/test_replacement.py`
 - Runtime/CLI setup and dry-run: `tests/test_runtime_entrypoint.py`,
   `tests/test_debug_schedule.py`
 

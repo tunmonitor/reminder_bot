@@ -7,6 +7,7 @@ import stat
 import tempfile
 import time
 from contextlib import suppress
+from dataclasses import replace as dataclass_replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import MenuButtonWebApp, WebAppInfo
+from apscheduler.jobstores.base import JobLookupError
 
 if __package__:
     from .cli import CliArgs
@@ -54,6 +56,7 @@ if __package__:
         send_assignments,
     )
     from .presentation import (
+        apply_replacements,
         format_informational_notes,
         format_task_assignments,
         format_task_responsibles,
@@ -113,6 +116,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         send_assignments,
     )
     from bot.presentation import (
+        apply_replacements,
         format_informational_notes,
         format_task_assignments,
         format_task_responsibles,
@@ -452,6 +456,7 @@ async def _load_service_task_assignments(
     services=None,
     issues: list[str] | None = None,
     registry: ServiceRegistry | None = None,
+    raw_out: dict | None = None,
 ) -> dict[str, dict[str, object]] | tuple[dict[str, dict[str, object]], bool]:
     """Назначения служения из графика; issues пополняется предупреждениями.
 
@@ -510,11 +515,24 @@ async def _load_service_task_assignments(
             }
             for task, task_info in sorted(assignments.items())
         }
+        if raw_out is not None:
+            # Назначения из графика без замен: отчёт админам применяет
+            # действующие замены сам при каждом обновлении.
+            raw_out.clear()
+            raw_out.update(result)
         if registry is not None:
+            # Привязки и состав — по графику, без замен.
             _sync_rosters_and_contacts(
                 registry, xlsx_path, service_id, result, services,
                 debug_logger, issues,
             )
+            if only_date is not None:
+                # Замена на одну дату (этап 3.3) главнее графика. Без
+                # only_date здесь имена за весь месяц — замены не применяются.
+                result = apply_replacements(
+                    result,
+                    registry.list_replacements(service_id, only_date.isoformat()),
+                )
         if return_event_found:
             return result, event_found
         return result
@@ -624,6 +642,44 @@ async def _load_upcoming_service_events(
         return sorted(events, key=lambda event: (event.event_date, event.service_id))
     finally:
         xlsx_path.unlink(missing_ok=True)
+
+
+def _apply_event_replacements(events: list, registry) -> list:
+    """События графика с заменами на их даты (этап 3.3): заменённый
+    уходит из задачи, заменяющий появляется."""
+    if registry is None:
+        return events
+    result = []
+    for event in events:
+        replacements = registry.list_replacements(
+            event.service_id, event.event_date.isoformat()
+        )
+        if not replacements:
+            result.append(event)
+            continue
+        assignments = list(event.assignments)
+        for item in replacements:
+            task_rows = [
+                row for row in assignments
+                if row.task == item["task"] and not row.is_informational
+            ]
+            if not task_rows:
+                continue
+            names = [row.name for row in task_rows]
+            if item["old_name"] in names:
+                assignments = [
+                    dataclass_replace(row, name=item["new_name"])
+                    if row in task_rows and row.name == item["old_name"]
+                    else row
+                    for row in assignments
+                ]
+            elif item["new_name"] not in names:
+                assignments.append(
+                    dataclass_replace(task_rows[0], name=item["new_name"])
+                )
+        unique = list(dict.fromkeys(assignments))
+        result.append(dataclass_replace(event, assignments=tuple(unique)))
+    return result
 
 
 async def get_group_reminder_preview(
@@ -797,6 +853,7 @@ async def _process_service_reminder(
         days=reminder["reminder_days"]
     )
     schedule_issues: list[str] = []
+    raw_assignments: dict = {}
     try:
         assignments, event_found = await _load_service_task_assignments(
             credentials,
@@ -809,6 +866,7 @@ async def _process_service_reminder(
             services=registry.service_catalog(),
             issues=schedule_issues,
             registry=registry,
+            raw_out=raw_assignments,
         )
     except Exception as exc:
         debug_logger.exception(
@@ -1011,7 +1069,8 @@ async def _process_service_reminder(
         # отчёт отправится при следующем запуске, не повторяя группу.
         try:
             await send_admin_reports(
-                bot, registry, service, event_date, assignments,
+                bot, registry, service, event_date,
+                raw_assignments or assignments,
                 credentials.admin_tg_id, debug_logger, TELEGRAM_TEXT_LIMIT,
             )
         except Exception:  # noqa: BLE001
@@ -1622,7 +1681,10 @@ async def _run_locked(args: CliArgs) -> None:
                     and time.monotonic() - loaded_at
                     < UPCOMING_EVENTS_CACHE_SECONDS
                 ):
-                    return upcoming_cache["events"]
+                    # Замены — из базы при каждом чтении: кэш хранит график.
+                    return _apply_event_replacements(
+                        upcoming_cache["events"], service_registry
+                    )
                 events = await _load_upcoming_service_events(
                     credentials, shm_dir, tz, debug_logger,
                     services=(
@@ -1633,7 +1695,7 @@ async def _run_locked(args: CliArgs) -> None:
                 upcoming_cache.update(
                     loaded_at=time.monotonic(), events=events
                 )
-                return events
+                return _apply_event_replacements(events, service_registry)
 
         context.load_upcoming_service_events = load_upcoming_service_events
         context.prepare_service_test_previews = prepare_service_test_previews
@@ -1850,6 +1912,45 @@ async def _run_locked(args: CliArgs) -> None:
 
             service_registry.on_change = schedule_user_job_refresh
 
+            async def scheduled_replacement_close(poll_id: str) -> None:
+                task = asyncio.current_task()
+                if task is not None:
+                    active_jobs.add(task)
+                try:
+                    await context.close_replacement_poll(poll_id)
+                except Exception:
+                    debug_logger.exception(
+                        "Ошибка подведения итога опроса замены %s", poll_id
+                    )
+                finally:
+                    if task is not None:
+                        active_jobs.discard(task)
+
+            def schedule_replacement_close(poll_id: str, deadline) -> None:
+                """Итог опроса замены по сроку (этап 3.3)."""
+                if scheduler is None:
+                    return
+                scheduler.add_job(
+                    scheduled_replacement_close,
+                    "date",
+                    run_date=max(deadline, datetime.now(tz)),
+                    args=[poll_id],
+                    id=f"replacement-poll-{poll_id}",
+                    replace_existing=True,
+                    misfire_grace_time=None,
+                )
+
+            def cancel_replacement_close(poll_id: str) -> None:
+                if scheduler is None:
+                    return
+                try:
+                    scheduler.remove_job(f"replacement-poll-{poll_id}")
+                except JobLookupError:
+                    pass
+
+            context.schedule_replacement_close = schedule_replacement_close
+            context.cancel_replacement_close = cancel_replacement_close
+
         try:
             _write_pid(pid_file)
             pid_created = True
@@ -1874,6 +1975,11 @@ async def _run_locked(args: CliArgs) -> None:
         if service_registry is not None:
             await refresh_service_reminders()
             await refresh_user_reminder_jobs()
+            # Открытые опросы замены переживают перезапуск бота.
+            for poll in service_registry.list_open_replacement_polls():
+                schedule_replacement_close(
+                    poll["poll_id"], datetime.fromisoformat(poll["deadline"])
+                )
         scheduler.start()
         await _configure_webapp_menu(bot, PROJECT_DIR, debug_logger)
         if backup_manager is not None:

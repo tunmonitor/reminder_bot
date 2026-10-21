@@ -23,6 +23,9 @@ _SERVICES = BotCommand(command="services", description="Служения и их
 _SERVICE_NOTIFY = BotCommand(
     command="service_notify", description="Напоминания и шаблоны"
 )
+_CHANGE = BotCommand(
+    command="change", description="Назначить замену: задача @username"
+)
 _SUPER_ADMIN_COMMANDS = [
     BotCommand(command="service_contact", description="Привязать ответственных"),
     BotCommand(command="service_sync", description="Сверить график и привязки"),
@@ -37,7 +40,7 @@ def commands_for_role(role: str, *, is_main_admin: bool = False) -> list[BotComm
     """Return menu commands available to a role, most frequent first."""
     commands = [_START]
     if role != ROLE_USER:
-        commands.extend([_SERVICES, _SERVICE_NOTIFY])
+        commands.extend([_SERVICES, _SERVICE_NOTIFY, _CHANGE])
     if role == ROLE_SUPER_ADMIN:
         commands.extend(_SUPER_ADMIN_COMMANDS)
     if is_main_admin:
