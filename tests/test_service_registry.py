@@ -254,7 +254,12 @@ class ServiceRegistryTest(unittest.TestCase):
         texts = self.registry.list_user_texts(4001, "assembly")
         self.assertEqual(
             [(text["id"], text["task"], text["body"]) for text in texts],
-            [(902, "Проповедь", "Свой текст")],
+            [(902, "Проповедь", None)],
+        )
+        # Свой текст задачи перешёл в её правило (личные напоминания v2).
+        self.assertEqual(
+            [rule["body"] for rule in self.registry.list_schedules(902)],
+            ["Свой текст"],
         )
         self.assertEqual(
             [
@@ -1993,6 +1998,8 @@ class ServiceRegistryTest(unittest.TestCase):
                     "reminder_days": 0,
                     "reminder_time": "07:30",
                     "enabled": 1,
+                    "origin": "admin",
+                    "body": None,
                 }
             ],
         )
@@ -2070,4 +2077,80 @@ class RescheduleResetsDeliveryTest(unittest.TestCase):
             )
             self.assertTrue(
                 registry.is_group_reminder_delivered(reminder_id, past, "group:-1")
+            )
+
+
+class UserRuleRulesTest(unittest.TestCase):
+    def test_duplicates_limit_and_length(self):
+        import tempfile
+        from pathlib import Path as _Path
+
+        from bot.service_registry import ServiceRegistry as _Registry
+
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = _Registry(_Path(tmp) / "r.sqlite3")
+            registry.initialize(1001, -100)
+            registry.set_responsible_contact(1001, "sound", "звук", "Алексей", 2002)
+            text_id = registry.ensure_user_text(2002, "sound", "звук")
+            admin = registry.add_schedule(text_id, 1, "18:00")
+            with self.assertRaises(ValueError):
+                registry.add_schedule(text_id, 1, "18:00", origin="user")
+            copy = registry.add_schedule(
+                text_id, 1, "18:00", origin="user", enabled=False
+            )
+            with self.assertRaises(ValueError):
+                registry.update_schedule(copy["id"], enabled=True)
+            registry.update_schedule(copy["id"], days=0, time="08:00")
+            registry.update_schedule(copy["id"], enabled=True)
+            with self.assertRaises(ValueError):
+                registry.update_schedule(copy["id"], days=1, time="18:00")
+            registry.update_schedule(admin["id"], enabled=False)
+            registry.update_schedule(copy["id"], days=1, time="18:00")
+            with self.assertRaises(ValueError):
+                registry.update_schedule(copy["id"], body="x" * 3001)
+            # Лимит — только на свои напоминания.
+            for index in range(9):
+                registry.add_schedule(
+                    text_id, 2, f"0{index}:30", origin="user"
+                )
+            with self.assertRaises(ValueError):
+                registry.add_schedule(text_id, 3, "09:00", origin="user")
+            registry.add_schedule(text_id, 3, "09:00")
+
+
+class PersonalOriginMigrationTest(unittest.TestCase):
+    def test_legacy_rules_and_body_only_texts(self):
+        import sqlite3 as _sqlite3
+        import tempfile
+        from pathlib import Path as _Path
+
+        from bot.service_registry import ServiceRegistry as _Registry
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _Path(tmp) / "r.sqlite3"
+            registry = _Registry(path)
+            registry.initialize(1001, -100)
+            registry.set_responsible_contact(1001, "sound", "звук", "А", 2002)
+            registry.set_responsible_contact(1001, "sound", "сборка", "А", 2002)
+            sound = registry.ensure_user_text(2002, "sound", "звук")
+            build = registry.ensure_user_text(2002, "sound", "сборка")
+            registry.add_schedule(sound, 1, "18:00")
+            registry.add_schedule(sound, 0, "08:00")
+            with _sqlite3.connect(path) as connection:
+                connection.execute(
+                    "UPDATE user_reminder_texts SET body = 'Мой текст' WHERE id = ?",
+                    (build,),
+                )
+                connection.execute(
+                    "DELETE FROM catalog_migrations WHERE name = 'personal-origin-v2'"
+                )
+            _Registry(path).initialize(1001, -100)
+            rules = registry.list_user_service_schedules(2002, "sound")
+            self.assertEqual(
+                sorted((r["task"], r["origin"], r["enabled"], r["body"]) for r in rules),
+                [
+                    ("звук", "user", 1, None),
+                    ("звук", "user", 1, None),
+                    ("сборка", "user", 0, "Мой текст"),
+                ],
             )

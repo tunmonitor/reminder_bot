@@ -1043,7 +1043,8 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     bot.send_message.await_args_list[0].args[1],
-                    "<b>🔔 Личное: Алексей, Микшер, Звук, 18.10.2026</b>",
+                    "<b>🔔 Звук · Микшер · 18.10.2026</b>\n"
+                    "Личное: Алексей, Микшер, Звук, 18.10.2026",
                 )
                 self.assertEqual(load_assignments.await_count, 3)
 
@@ -1100,6 +1101,41 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     await remind(second)
 
                 self.assertEqual(bot.send_message.await_count, 1)
+
+        asyncio.run(process())
+
+    def test_oversized_personal_reminder_is_shortened_not_dropped(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                registry.set_group_chat(1001, "sound", -10055, enabled=True)
+                registry.set_responsible_contact(
+                    1001, "sound", "звук", "Алексей" * 30, 2002
+                )
+                registry.set_user_notifications_enabled(2002, "sound", True)
+                text_id = registry.ensure_user_text(2002, "sound", "звук")
+                schedule = registry.add_schedule(
+                    text_id, 1, "18:00", origin="user", body="{name} " * 300
+                )
+                bot = SimpleNamespace(
+                    send_message=AsyncMock(return_value=SimpleNamespace(message_id=5))
+                )
+                with patch.object(
+                    app, "_load_service_task_assignments",
+                    new=AsyncMock(return_value=({"звук": ["Алексей" * 30]}, True)),
+                ):
+                    await app._process_user_reminder_schedule(
+                        bot, SimpleNamespace(admin_tg_id=1001), Path(tmp_dir),
+                        ZoneInfo("UTC"), registry, schedule["id"], MagicMock(),
+                        MagicMock(), run_date=date(2026, 10, 17),
+                    )
+                sent = [c for c in bot.send_message.await_args_list if c.args[0] == 2002]
+                self.assertEqual(len(sent), 1)
+                self.assertIn("…", sent[0].args[1])
 
         asyncio.run(process())
 

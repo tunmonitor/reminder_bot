@@ -244,6 +244,26 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   `_connection(notify=False)`, so they do not trigger backups or job
   refreshes; `/change` removes the pending close job
   (`context.cancel_replacement_close`). Group sending lives in `bot/group_send.py`.
+- Personal reminders (`user_reminder_schedules.origin`/`body`, migrated:
+  rules of a task that had its own text became `user`): `admin` rules use the
+  admin template and the user may only toggle or copy them; `user` rules have
+  their own time/text (`update_schedule(body=...)`). `add_schedule` enforces
+  `USER_REMINDERS_PER_SERVICE` (10 own `user` rules) per user and service and
+  `_ensure_unique_enabled_rule` (no two enabled rules of a task at the same
+  days/time, also in `update_schedule`); own text ≤ 3000 chars;
+  `set_user_service_schedule` touches only `admin` rules. Screens
+  (`render_current_personal_level`): `service` (rule list), `rule`,
+  `delete_rule`, `add_task`, `add_time`. Sent text is always
+  `🔔 {service} · {task} · {date}` + body (shortened with «…» if it
+  exceeds the limit). Enabling/adding a single rule never flips the service
+  preference. Migration `personal-origin-v2` (catalog_migrations): only a
+  lone default (1, 18:00) rule without body stays `admin`; task bodies move
+  into its rules or into a disabled `user` rule. «📤 Отправить сейчас» keeps a
+  reminder snapshot and refuses to send if the reminder changed.
+- Group reminder card: «📤 Отправить сейчас» (`send_now` → preview →
+  `send_now_ok`, not marked delivered).
+- `_send_dialog` prefixes buttons without a known icon with 📋; add new
+  leading emoji to its list.
 - `bot/admin_report.py`: after a group reminder `send_admin_reports` sends
   one report per service admin and date (fallback: super admin) and stores it
   in `admin_report_messages`; later reminders and answers edit it

@@ -66,6 +66,9 @@ DEFAULT_TASK_TEMPLATE = (
     "{task}: {task_responsibles}"
 )
 _UNSET = object()
+# Своих личных напоминаний человека в одном служении.
+USER_REMINDERS_PER_SERVICE = 10
+USER_REMINDER_BODY_LIMIT = 3000
 
 
 def task_token(task: str) -> str:
@@ -737,6 +740,68 @@ class ServiceRegistry:
                 "AND r.event_date = replacement_polls.event_date "
                 "AND r.task = replacement_polls.task "
                 "AND r.old_name = replacement_polls.old_name)"
+            )
+        schedule_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(user_reminder_schedules)"
+            )
+        }
+        if "origin" not in schedule_columns:
+            # Личные напоминания (отзыв 21.10): «admin» — с текстом админа,
+            # пользователь только включает/выключает; «user» — своё, со
+            # своим временем и текстом. Свой текст задачи переходит в её
+            # правила.
+            connection.execute(
+                "ALTER TABLE user_reminder_schedules ADD COLUMN origin TEXT "
+                "NOT NULL DEFAULT 'admin' CHECK (origin IN ('admin', 'user'))"
+            )
+            connection.execute(
+                "ALTER TABLE user_reminder_schedules ADD COLUMN body TEXT"
+            )
+            connection.execute(
+                "UPDATE user_reminder_schedules SET origin = 'user', body = ("
+                "SELECT body FROM user_reminder_texts t WHERE t.id = text_id) "
+                "WHERE text_id IN (SELECT id FROM user_reminder_texts "
+                "WHERE body IS NOT NULL)"
+            )
+        if connection.execute(
+            "SELECT 1 FROM catalog_migrations WHERE name = 'personal-origin-v2'"
+        ).fetchone() is None:
+            # Напоминанием админа остаётся только правило по умолчанию
+            # («за 1 дн. в 18:00», единственное у задачи, без своего
+            # текста); правила, которые человек задавал сам, — свои.
+            connection.execute(
+                "UPDATE user_reminder_schedules SET origin = 'user' "
+                "WHERE origin = 'admin' AND body IS NULL AND ("
+                "reminder_days != 1 OR reminder_time != '18:00' OR "
+                "(SELECT COUNT(*) FROM user_reminder_schedules other "
+                "WHERE other.text_id = user_reminder_schedules.text_id "
+                "AND other.origin = 'admin') > 1)"
+            )
+            # Свой текст задачи — в её правила (если их ещё не скопировали)
+            # или, если правил нет, в выключенное своё напоминание.
+            connection.execute(
+                "UPDATE user_reminder_schedules SET origin = 'user', body = ("
+                "SELECT body FROM user_reminder_texts t WHERE t.id = text_id) "
+                "WHERE body IS NULL AND text_id IN (SELECT id FROM "
+                "user_reminder_texts WHERE body IS NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO user_reminder_schedules "
+                "(text_id, reminder_days, reminder_time, enabled, origin, body) "
+                "SELECT id, 1, '18:00', 0, 'user', body "
+                "FROM user_reminder_texts t WHERE body IS NOT NULL "
+                "AND NOT EXISTS (SELECT 1 FROM user_reminder_schedules s "
+                "WHERE s.text_id = t.id)"
+            )
+            connection.execute(
+                "UPDATE user_reminder_texts SET body = NULL "
+                "WHERE body IS NOT NULL"
+            )
+            connection.execute(
+                "INSERT INTO catalog_migrations (name) "
+                "VALUES ('personal-origin-v2')"
             )
         for service in SERVICES:
             is_assembly = service.id == "assembly"
@@ -3589,38 +3654,135 @@ class ServiceRegistry:
                 (actor_id, service_id, task.strip()),
             )
 
+    _SCHEDULE_COLUMNS = (
+        "id, text_id, reminder_days, reminder_time, enabled, origin, body"
+    )
+
     def list_schedules(self, text_id: int) -> list[dict]:
         _validate_positive_id(text_id, "text_id")
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT id, text_id, reminder_days, reminder_time, enabled "
+                f"SELECT {self._SCHEDULE_COLUMNS} "
                 "FROM user_reminder_schedules WHERE text_id = ? ORDER BY id",
                 (text_id,),
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def add_schedule(self, text_id: int, days: int, time: str) -> dict:
+    def list_user_service_schedules(
+        self, actor_id: int, service_id: str
+    ) -> list[dict]:
+        """Все личные напоминания человека в служении (с задачей)."""
+        _validate_positive_id(actor_id, "actor_id")
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT s.id, s.text_id, s.reminder_days, s.reminder_time, "
+                "s.enabled, s.origin, s.body, t.task "
+                "FROM user_reminder_schedules s "
+                "JOIN user_reminder_texts t ON t.id = s.text_id "
+                "WHERE t.actor_id = ? AND t.service_id = ? "
+                "ORDER BY t.task, s.origin, s.reminder_days DESC, "
+                "s.reminder_time, s.id",
+                (actor_id, service_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def add_schedule(
+        self,
+        text_id: int,
+        days: int,
+        time: str,
+        *,
+        origin: str = "admin",
+        body: str | None = None,
+        enabled: bool = True,
+    ) -> dict:
         _validate_positive_id(text_id, "text_id")
         self._validate_user_schedule(days, time)
+        if origin not in {"admin", "user"}:
+            raise ValueError("Некорректный вид напоминания")
+        body = self._validated_user_body(body)
         with self._connection() as connection:
-            exists = connection.execute(
-                "SELECT 1 FROM user_reminder_texts WHERE id = ?",
+            text = connection.execute(
+                "SELECT actor_id, service_id FROM user_reminder_texts "
+                "WHERE id = ?",
                 (text_id,),
             ).fetchone()
-            if exists is None:
+            if text is None:
                 raise ValueError("Текст личного уведомления не найден")
+            if origin == "user":
+                self._ensure_user_schedule_limit(
+                    connection, text["actor_id"], text["service_id"]
+                )
+            if enabled:
+                self._ensure_unique_enabled_rule(connection, text_id, days, time)
             cursor = connection.execute(
                 "INSERT INTO user_reminder_schedules "
-                "(text_id, reminder_days, reminder_time) VALUES (?, ?, ?)",
-                (text_id, days, time),
+                "(text_id, reminder_days, reminder_time, enabled, origin, body) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (text_id, days, time, int(enabled), origin, body),
             )
             schedule_id = cursor.lastrowid
             row = connection.execute(
-                "SELECT id, text_id, reminder_days, reminder_time, enabled "
+                f"SELECT {self._SCHEDULE_COLUMNS} "
                 "FROM user_reminder_schedules WHERE id = ?",
                 (schedule_id,),
             ).fetchone()
         return dict(row)
+
+    @staticmethod
+    def _validated_user_body(body: str | None) -> str | None:
+        if body is None:
+            return None
+        if not isinstance(body, str) or not body.strip():
+            raise ValueError("Текст уведомления не может быть пустым")
+        if len(body.encode("utf-16-le")) // 2 > USER_REMINDER_BODY_LIMIT:
+            # Запас под заголовок и подставленные поля: иначе сообщение не
+            # уйдёт из-за лимита Telegram.
+            raise ValueError(
+                f"Текст напоминания — не длиннее {USER_REMINDER_BODY_LIMIT} "
+                "символов."
+            )
+        validate_notification_template(
+            body, PERSONAL_TEMPLATE_FIELDS, "Текст личного напоминания"
+        )
+        return body.strip()
+
+    @staticmethod
+    def _ensure_unique_enabled_rule(
+        connection: sqlite3.Connection, text_id: int, days: int, time: str,
+        excluding_id: int | None = None,
+    ) -> None:
+        """Два включённых напоминания задачи на одно время — два одинаковых
+        сообщения; такое не сохраняется."""
+        duplicate = connection.execute(
+            "SELECT 1 FROM user_reminder_schedules WHERE text_id = ? "
+            "AND reminder_days = ? AND reminder_time = ? AND enabled = 1 "
+            "AND id IS NOT ?",
+            (text_id, days, time, excluding_id),
+        ).fetchone()
+        if duplicate is not None:
+            raise ValueError(
+                "На это время у задачи уже есть включённое напоминание. "
+                "Выберите другое время."
+            )
+
+    @staticmethod
+    def _ensure_user_schedule_limit(
+        connection: sqlite3.Connection, actor_id: int, service_id: str
+    ) -> None:
+        # Считаются свои напоминания: напоминания админа бот создаёт сам
+        # (по одному на задачу).
+        count = connection.execute(
+            "SELECT COUNT(*) FROM user_reminder_schedules s "
+            "JOIN user_reminder_texts t ON t.id = s.text_id "
+            "WHERE t.actor_id = ? AND t.service_id = ? AND s.origin = 'user'",
+            (actor_id, service_id),
+        ).fetchone()[0]
+        if count >= USER_REMINDERS_PER_SERVICE:
+            raise ValueError(
+                f"В одном служении можно не больше "
+                f"{USER_REMINDERS_PER_SERVICE} личных напоминаний."
+            )
 
     def update_schedule(
         self,
@@ -3628,11 +3790,15 @@ class ServiceRegistry:
         days: int | None = None,
         time: str | None = None,
         enabled: bool | None = None,
+        body=_UNSET,
     ) -> None:
+        """body — свой текст напоминания (None — текст админа)."""
         _validate_positive_id(schedule_id, "schedule_id")
+        if body is not _UNSET:
+            body = self._validated_user_body(body)
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT reminder_days, reminder_time, enabled "
+                "SELECT text_id, reminder_days, reminder_time, enabled, body "
                 "FROM user_reminder_schedules WHERE id = ?",
                 (schedule_id,),
             ).fetchone()
@@ -3646,6 +3812,15 @@ class ServiceRegistry:
                 bool(row["enabled"]) if enabled is None else enabled
             )
             self._validate_user_schedule(new_days, new_time)
+            if new_enabled and (
+                not row["enabled"]
+                or (new_days, new_time)
+                != (row["reminder_days"], row["reminder_time"])
+            ):
+                self._ensure_unique_enabled_rule(
+                    connection, row["text_id"], new_days, new_time,
+                    excluding_id=schedule_id,
+                )
             if (
                 new_days != row["reminder_days"]
                 or new_time != row["reminder_time"]
@@ -3657,9 +3832,12 @@ class ServiceRegistry:
                 )
             connection.execute(
                 "UPDATE user_reminder_schedules "
-                "SET reminder_days = ?, reminder_time = ?, enabled = ? "
-                "WHERE id = ?",
-                (new_days, new_time, int(new_enabled), schedule_id),
+                "SET reminder_days = ?, reminder_time = ?, enabled = ?, "
+                "body = ? WHERE id = ?",
+                (
+                    new_days, new_time, int(new_enabled),
+                    row["body"] if body is _UNSET else body, schedule_id,
+                ),
             )
 
     def delete_schedule(self, schedule_id: int) -> None:
@@ -3709,11 +3887,12 @@ class ServiceRegistry:
                     "WHERE actor_id = ? AND service_id = ? AND task = ?",
                     (actor_id, service_id, task),
                 ).fetchone()["id"]
+                # Только напоминания с текстом админа: свои не меняются.
                 schedule_ids = [
                     row["id"]
                     for row in connection.execute(
                         "SELECT id FROM user_reminder_schedules "
-                        "WHERE text_id = ? ORDER BY id",
+                        "WHERE text_id = ? AND origin = 'admin' ORDER BY id",
                         (text_id,),
                     ).fetchall()
                 ]
@@ -3764,7 +3943,8 @@ class ServiceRegistry:
         query = """
             SELECT schedules.id AS schedule_id, schedules.text_id,
                    schedules.reminder_days, schedules.reminder_time,
-                   texts.actor_id, texts.service_id, texts.task, texts.body,
+                   texts.actor_id, texts.service_id, texts.task,
+                   schedules.body AS body, schedules.origin,
                    services.name AS service_name,
                    services.enabled AS service_enabled,
                    preferences.enabled AS notifications_enabled
@@ -3809,7 +3989,8 @@ class ServiceRegistry:
                 """
                 SELECT schedules.id AS schedule_id, schedules.text_id,
                        schedules.reminder_days, schedules.reminder_time,
-                       texts.actor_id, texts.service_id, texts.task, texts.body,
+                       texts.actor_id, texts.service_id, texts.task,
+                       schedules.body AS body, schedules.origin,
                        services.name AS service_name,
                        services.enabled AS service_enabled,
                        preferences.enabled AS notifications_enabled,
@@ -3867,16 +4048,18 @@ class ServiceRegistry:
         service_id: str,
         task: str,
         personal_templates: dict[str, str] | None = None,
+        body: str | None = None,
     ) -> str:
+        """body — свой текст напоминания; иначе текст админа задачи."""
+        if body:
+            return body
         user_text = self.get_user_text(actor_id, service_id, task)
         if user_text is not None and user_text["body"] is not None:
             return user_text["body"]
         if personal_templates and personal_templates.get(task):
             return personal_templates[task]
-        return (
-            "{name}, напоминаем о задаче «{task}» службы "
-            "«{service_name}» на {sunday_date}."
-        )
+        # Служение, задача и дата — уже в заголовке напоминания.
+        return "{name}, напоминаем о вашем служении."
 
     def get_responsible_contact(
         self, service_id: str, task: str, name: str
