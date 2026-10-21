@@ -34,6 +34,7 @@ from .commands import (
     sync_user_commands,
     user_role,
 )
+from .admin_report import notify_admins_declined, refresh_admin_reports
 from .notifier import CONFIRM_PREFIX, TELEGRAM_TEXT_LIMIT, _notify_admin
 from .presentation import (
     format_task_assignments,
@@ -43,6 +44,8 @@ from .presentation import (
 )
 from .ui import code as ui_code
 from .service_registry import (
+    ADMIN_REPORT_FIELDS,
+    DEFAULT_ADMIN_REPORT_TEMPLATE,
     GENERAL_GROUP_TEMPLATE_FIELDS,
     GROUP_TEMPLATE_FIELDS,
     PERSONAL_TEMPLATE_FIELDS,
@@ -857,6 +860,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "reminder_days": service["reminder_days"],
                 "reminder_time": service["reminder_time"],
                 "group_template": service["group_template"],
+                "admin_report_template": service.get("admin_report_template"),
                 "personal_templates": dict(
                     service["personal_templates"] if service else {}
                 ),
@@ -1818,6 +1822,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 ],
                 [
                     InlineKeyboardButton(
+                        text="📋 Отчёт админам",
+                        callback_data=(
+                            f"group_reminder:report:{service_id}:"
+                            f"{pending['session_id']}"
+                        ),
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
                         text="✅ Завершить и сохранить",
                         callback_data=(
                             f"notify_finish:{service_id}:"
@@ -2202,6 +2215,67 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             f"📝 {service_label(service)} · шаблон по умолчанию\n\n"
             "ℹ️ Используется напоминаниями, у которых не задан свой текст.\n\n"
             f"Текущий текст:\n{current_template}",
+            reply_markup=keyboard,
+            parse_mode=None,
+        )
+
+    async def enter_admin_report_template(
+        message: Message, actor_id: int, service_id: str
+    ) -> None:
+        """Шаблон отчёта админам после группового напоминания (этап 3.2)."""
+        pending = pending_inputs.get(actor_id)
+        registry = service_registry()
+        service = registry.get_service(service_id) if registry else None
+        if (
+            pending is None
+            or pending.get("operation") != "service_notify"
+            or pending.get("service_id") != service_id
+            or service is None
+        ):
+            await _send_dialog(message, "Настройка устарела.", parse_mode=None)
+            return
+        pending["step"] = "admin_report"
+        template = pending.get("admin_report_template")
+        current = template or (
+            "Используется встроенный шаблон:\n" + DEFAULT_ADMIN_REPORT_TEMPLATE
+        )
+        session_id = pending["session_id"]
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✏️ Изменить",
+                        callback_data=(
+                            f"group_reminder:edit_report:{service_id}:"
+                            f"{session_id}"
+                        ),
+                    ),
+                    InlineKeyboardButton(
+                        text="🔄 Вернуть встроенный",
+                        callback_data=(
+                            f"group_reminder:reset_report:{service_id}:"
+                            f"{session_id}"
+                        ),
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ К настройкам",
+                        callback_data=(
+                            f"group_reminder:root_back:{service_id}:"
+                            f"{session_id}"
+                        ),
+                    )
+                ],
+            ]
+        )
+        await _send_dialog(
+            message,
+            f"📋 {service_label(service)} · отчёт админам\n\n"
+            "ℹ️ Приходит админам служения в личный чат после группового "
+            "напоминания и обновляется, когда участники отвечают "
+            "«Принял» или «Не смогу».\n\n"
+            f"Текущий текст:\n{current}",
             reply_markup=keyboard,
             parse_mode=None,
         )
@@ -2737,9 +2811,40 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
                     return
                 await enter_default_template(callback.message, actor_id, service_id)
+            elif action == "report":
+                if pending.get("step") != "menu":
+                    await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
+                    return
+                await enter_admin_report_template(
+                    callback.message, actor_id, service_id
+                )
+            elif action == "edit_report":
+                if pending.get("step") != "admin_report":
+                    await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
+                    return
+                pending["step"] = "admin_report_text"
+                await _send_dialog(
+                    callback.message,
+                    "Введите шаблон отчёта админам. Доступные поля: "
+                    "{service_name}, {sunday_date}, {task_assignments}, "
+                    "{delivery_status}, {confirmation_status}.",
+                    reply_markup=notification_edit_controls(
+                        service_id, session_id
+                    ),
+                    parse_mode=None,
+                )
+            elif action == "reset_report":
+                if pending.get("step") != "admin_report":
+                    await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
+                    return
+                pending["admin_report_template"] = None
+                await enter_admin_report_template(
+                    callback.message, actor_id, service_id
+                )
             elif action == "root_back":
                 if pending.get("step") not in {
                     "default_template",
+                    "admin_report",
                     "reminder_menu",
                 }:
                     await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
@@ -3583,6 +3688,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 pending["service_id"],
                 pending["personal_templates"],
             )
+            report_template = pending.get(
+                "admin_report_template", service.get("admin_report_template")
+            )
+            if report_template != service.get("admin_report_template"):
+                registry.set_admin_report_template(
+                    actor_id, pending["service_id"], report_template
+                )
             refresh_reminders = getattr(
                 context, "refresh_service_reminder_jobs", None
             )
@@ -4837,6 +4949,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         elif step == "group_default_text":
             pending["step"] = "default_template"
             await enter_default_template(
+                callback.message, actor_id, service_id
+            )
+        elif step == "admin_report_text":
+            await enter_admin_report_template(
                 callback.message, actor_id, service_id
             )
         elif step in {"reminder_days", "reminder_time"}:
@@ -7031,6 +7147,19 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         message, message.from_user.id, service_id
                     )
                     return
+                if step == "admin_report_text":
+                    if not text:
+                        raise ValueError(
+                            "Шаблон отчёта админам не может быть пустым."
+                        )
+                    validate_notification_template(
+                        text, ADMIN_REPORT_FIELDS, "Шаблон отчёта админам"
+                    )
+                    pending["admin_report_template"] = text
+                    await enter_admin_report_template(
+                        message, message.from_user.id, service_id
+                    )
+                    return
                 if step == "days":
                     try:
                         days = int(text)
@@ -7438,6 +7567,112 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         async with lock:
             await _confirm_locked(cb, context, sunday_iso, role, interaction, debug)
 
+    @router.callback_query(F.data.startswith("pcf:"))
+    async def on_personal_answer(cb: CallbackQuery) -> None:
+        """«✅ Принял» / «🚫 Не смогу» в личном напоминании (этап 3.2)."""
+        if not cb.from_user:
+            await _answer_callback(cb, "❌ Не удалось определить пользователя")
+            return
+        parts = (cb.data or "").split(":")
+        registry = service_registry()
+        try:
+            _, kind, service_id, raw_date, token = parts
+            event_date = datetime.strptime(raw_date, "%Y%m%d").date()
+            if kind not in {"c", "d"}:
+                raise ValueError(kind)
+        except ValueError:
+            await _answer_callback(cb, "❌ Некорректные данные кнопки")
+            return
+        if registry is None:
+            await _answer_callback(cb, "❌ Реестр служений недоступен.")
+            return
+        if event_date < datetime.now(context.timezone).date():
+            await _answer_callback(cb, "⚠️ Это напоминание устарело")
+            return
+        try:
+            task = registry.linked_task_by_token(
+                service_id, cb.from_user.id, token
+            )
+        except sqlite3.Error:
+            debug.exception("Не удалось найти задачу ответа на напоминание")
+            task = None
+        if task is None:
+            await _answer_callback(cb, "❌ Вы не привязаны к этой задаче")
+            return
+        status = "confirmed" if kind == "c" else "declined"
+        try:
+            name, changed = registry.set_confirmation(
+                service_id, event_date.isoformat(), task, cb.from_user.id,
+                status,
+            )
+        except PermissionError:
+            await _answer_callback(cb, "❌ Вы не привязаны к этой задаче")
+            return
+        except (ValueError, sqlite3.Error):
+            debug.exception("Не удалось сохранить ответ на напоминание")
+            await _answer_callback(
+                cb, "❌ Не удалось сохранить ответ. Нажмите кнопку повторно."
+            )
+            return
+        note = (
+            "✅ Подтверждено" if status == "confirmed"
+            else "🚫 Вы отметили, что не сможете. Админы служения "
+            "получили сообщение."
+        )
+        if cb.message and cb.message.text:
+            try:
+                await cb.message.edit_text(
+                    cb.message.text + "\n\n" + note, parse_mode=None
+                )
+            except Exception:  # noqa: BLE001
+                debug.exception("Не удалось отредактировать личное напоминание")
+        if changed:
+            interaction.info(
+                "Ответ на напоминание: service=%s task=%s tg_id=%s date=%s "
+                "status=%s",
+                service_id, task, cb.from_user.id, event_date, status,
+            )
+            service = registry.get_service(service_id)
+            if status == "confirmed" and service_id == "assembly" and service:
+                # Как прежде у Собрания: подтверждение видно в группе.
+                try:
+                    await send_to_service_group(
+                        context.bot.send_message,
+                        service["group_chat_id"],
+                        f"🔔 Участник {name} подтвердил задачу «{task}»",
+                        service,
+                        registry=registry,
+                        logger=debug,
+                        parse_mode=None,
+                    )
+                except Exception:  # noqa: BLE001
+                    debug.exception("Не удалось отправить апдейт в группу")
+            if status == "declined" and service:
+                try:
+                    await notify_admins_declined(
+                        context.bot, registry, service, event_date, task,
+                        name, context.admin_id, debug,
+                    )
+                except Exception:  # noqa: BLE001
+                    debug.exception("Не удалось сообщить админам об отказе")
+                # Поиск замены (этап 3.3).
+                on_declined = getattr(context, "on_assignment_declined", None)
+                if callable(on_declined):
+                    try:
+                        await on_declined(service_id, event_date, task, name)
+                    except Exception:  # noqa: BLE001
+                        debug.exception("Не удалось запустить поиск замены")
+            try:
+                await refresh_admin_reports(
+                    context.bot, registry, service_id, event_date,
+                    context.admin_id, debug, TELEGRAM_TEXT_LIMIT,
+                )
+            except Exception:  # noqa: BLE001
+                debug.exception("Не удалось обновить отчёт админам")
+        await _answer_callback(
+            cb, "✅ Спасибо!" if status == "confirmed" else "Ответ сохранён"
+        )
+
     @router.callback_query(F.data.startswith("scf:"))
     async def on_service_confirm(cb: CallbackQuery) -> None:
         if not cb.from_user:
@@ -7508,6 +7743,17 @@ async def _confirm_locked(
             )
             return
 
+    if newly_persisted and participant.get("service_id") and participant.get("task"):
+        # Кнопка прежнего формата: ответ попадает и в общий учёт (этап 3.2).
+        registry = getattr(context, "service_registry", None)
+        try:
+            if registry is not None:
+                registry.set_confirmation(
+                    participant["service_id"], sunday_iso, participant["task"],
+                    cb.from_user.id, "confirmed",
+                )
+        except Exception:  # noqa: BLE001
+            debug.exception("Не удалось записать подтверждение в реестр")
     if newly_persisted:
         if cb.message and cb.message.text:
             try:

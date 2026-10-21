@@ -1,6 +1,7 @@
 """Persistent configuration for service access and participant contacts."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -8,7 +9,7 @@ import secrets
 import sqlite3
 import stat
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from string import Formatter
 from dataclasses import replace
@@ -43,12 +44,36 @@ DEFAULT_GROUP_TEMPLATE = (
     "Напоминание о служении «{service_name}» в воскресенье "
     "{sunday_date}:\n{task_assignments}"
 )
+ADMIN_REPORT_FIELDS = frozenset(
+    {
+        "service_name",
+        "sunday_date",
+        "task_assignments",
+        "delivery_status",
+        "confirmation_status",
+    }
+)
+DEFAULT_ADMIN_REPORT_TEMPLATE = (
+    "📋 Отчёт · {service_name} · {sunday_date}\n\n"
+    "{task_assignments}\n\n"
+    "📨 Личные уведомления:\n{delivery_status}\n\n"
+    "✅ Подтверждения:\n{confirmation_status}"
+)
 # Шаблон по умолчанию для напоминания одной задачи (этап 3.1).
 DEFAULT_TASK_TEMPLATE = (
     "Напоминание о служении «{service_name}» в воскресенье {sunday_date}.\n"
     "{task}: {task_responsibles}"
 )
 _UNSET = object()
+
+
+def task_token(task: str) -> str:
+    """Короткий устойчивый идентификатор задачи для callback_data.
+
+    Позиции задач перенумеровываются, а название может не поместиться в
+    64 байта, поэтому в кнопку кладём хэш названия.
+    """
+    return hashlib.sha1(task.encode("utf-8")).hexdigest()[:10]
 
 
 def validate_notification_template(
@@ -276,6 +301,34 @@ class ServiceRegistry:
                         CHECK (source IN ('excel', 'manual', 'legacy')),
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (service_id, name)
+                );
+
+                -- Ответы на личные напоминания (этап 3.2): «Принял» или
+                -- «Не смогу» по задаче на дату события.
+                CREATE TABLE IF NOT EXISTS service_confirmations (
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    event_date TEXT NOT NULL,
+                    task TEXT NOT NULL,
+                    telegram_id INTEGER NOT NULL CHECK (telegram_id > 0),
+                    name TEXT NOT NULL,
+                    status TEXT NOT NULL
+                        CHECK (status IN ('confirmed', 'declined')),
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (service_id, event_date, task, telegram_id)
+                );
+
+                -- Отправленные отчёты админам служения: редактируются при
+                -- подтверждениях; assignments_json — назначения на дату.
+                CREATE TABLE IF NOT EXISTS admin_report_messages (
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    event_date TEXT NOT NULL,
+                    admin_id INTEGER NOT NULL CHECK (admin_id > 0),
+                    message_id INTEGER NOT NULL,
+                    assignments_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (service_id, event_date, admin_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS group_reminder_legacy_ids (
@@ -604,6 +657,11 @@ class ServiceRegistry:
             connection.execute(
                 "ALTER TABLE services ADD COLUMN archived INTEGER NOT NULL "
                 "DEFAULT 0 CHECK (archived IN (0, 1))"
+            )
+        if "admin_report_template" not in columns:
+            # Шаблон отчёта админам (этап 3.2); NULL — встроенный.
+            connection.execute(
+                "ALTER TABLE services ADD COLUMN admin_report_template TEXT"
             )
         if "group_thread_id" not in columns:
             # Тема (topic) группового чата; NULL — общая тема.
@@ -969,7 +1027,8 @@ class ServiceRegistry:
             rows = connection.execute(
                 "SELECT id, name, aliases_json, assignment_layout, "
                 "group_chat_id, group_thread_id, enabled, reminder_days, "
-                "reminder_time, group_template, personal_templates_json "
+                "reminder_time, group_template, personal_templates_json, "
+                "admin_report_template "
                 "FROM services WHERE archived = 0 ORDER BY id"
             ).fetchall()
             reminders = connection.execute(
@@ -1630,6 +1689,156 @@ class ServiceRegistry:
         if reminder.get("task"):
             return DEFAULT_TASK_TEMPLATE
         return service.get("group_template") or DEFAULT_GROUP_TEMPLATE
+
+    def set_admin_report_template(
+        self, actor_id: int, service_id: str, template: str | None
+    ) -> None:
+        """Шаблон отчёта админам служения; None — встроенный."""
+        _validate_positive_id(actor_id, "actor_id")
+        if template is not None:
+            if not isinstance(template, str) or not template.strip():
+                raise ValueError("Шаблон отчёта не может быть пустым")
+            validate_notification_template(
+                template, ADMIN_REPORT_FIELDS, "Шаблон отчёта админам"
+            )
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            self._require_service_editor(connection, actor_id, service_id)
+            connection.execute(
+                "UPDATE services SET admin_report_template = ? WHERE id = ?",
+                (template.strip() if template else None, service_id),
+            )
+            self._audit(
+                connection, actor_id, "admin_report_template_updated",
+                service_id, {"has_custom_template": template is not None},
+            )
+
+    def linked_task_by_token(
+        self, service_id: str, telegram_id: int, token: str
+    ) -> str | None:
+        """Задача служения с этим task_token, к которой привязан человек."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT task FROM responsible_contacts "
+                "WHERE service_id = ? AND telegram_id = ?",
+                (service_id, telegram_id),
+            ).fetchall()
+        return next(
+            (row["task"] for row in rows if task_token(row["task"]) == token),
+            None,
+        )
+
+    def set_confirmation(
+        self,
+        service_id: str,
+        event_date: str,
+        task: str,
+        telegram_id: int,
+        status: str,
+    ) -> tuple[str, bool]:
+        """Ответ человека на личное напоминание: (имя, ответ изменился).
+
+        Ответить может только привязанный к задаче пользователь.
+        """
+        _validate_positive_id(telegram_id, "telegram_id")
+        if status not in {"confirmed", "declined"}:
+            raise ValueError("Некорректный ответ")
+        date.fromisoformat(event_date)
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            contact = connection.execute(
+                "SELECT name FROM responsible_contacts "
+                "WHERE service_id = ? AND task = ? AND telegram_id = ?",
+                (service_id, task, telegram_id),
+            ).fetchone()
+            if contact is None:
+                raise PermissionError("Вы не привязаны к этой задаче.")
+            cursor = connection.execute(
+                """
+                INSERT INTO service_confirmations (
+                    service_id, event_date, task, telegram_id, name, status,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(service_id, event_date, task, telegram_id)
+                DO UPDATE SET status = excluded.status,
+                              name = excluded.name,
+                              updated_at = excluded.updated_at
+                WHERE service_confirmations.status != excluded.status
+                """,
+                (
+                    service_id, event_date, task, telegram_id,
+                    contact["name"], status, _utc_now(),
+                ),
+            )
+        return contact["name"], cursor.rowcount > 0
+
+    def get_confirmation(
+        self, service_id: str, event_date: str, task: str, telegram_id: int
+    ) -> str | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT status FROM service_confirmations "
+                "WHERE service_id = ? AND event_date = ? AND task = ? "
+                "AND telegram_id = ?",
+                (service_id, event_date, task, telegram_id),
+            ).fetchone()
+        return row["status"] if row else None
+
+    def list_confirmations(
+        self, service_id: str, event_date: str
+    ) -> dict[tuple[str, str], str]:
+        """{(задача, имя): status} на дату события."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT task, name, status FROM service_confirmations "
+                "WHERE service_id = ? AND event_date = ?",
+                (service_id, event_date),
+            ).fetchall()
+        return {(row["task"], row["name"]): row["status"] for row in rows}
+
+    def save_admin_report(
+        self,
+        service_id: str,
+        event_date: str,
+        admin_id: int,
+        message_id: int,
+        assignments: dict,
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO admin_report_messages (
+                    service_id, event_date, admin_id, message_id,
+                    assignments_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(service_id, event_date, admin_id) DO UPDATE SET
+                    message_id = excluded.message_id,
+                    assignments_json = excluded.assignments_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    service_id, event_date, admin_id, message_id,
+                    json.dumps(assignments, ensure_ascii=False, sort_keys=True),
+                    _utc_now(),
+                ),
+            )
+
+    def list_admin_reports(self, service_id: str, event_date: str) -> list[dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT admin_id, message_id, assignments_json "
+                "FROM admin_report_messages "
+                "WHERE service_id = ? AND event_date = ? ORDER BY admin_id",
+                (service_id, event_date),
+            ).fetchall()
+        return [
+            {
+                "admin_id": row["admin_id"],
+                "message_id": row["message_id"],
+                "assignments": json.loads(row["assignments_json"]),
+            }
+            for row in rows
+        ]
 
     def set_group_reminder_task(
         self, actor_id: int, reminder_id: int, task: str | None
