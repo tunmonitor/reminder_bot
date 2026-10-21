@@ -205,9 +205,17 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   closes once (`close_replacement_poll` returns False on repeat), picks the
   first "Могу" among `task_member_ids`, else the first "Могу". `/change task
   @username` (`on_change_command`, admins only) closes the poll with a chosen
-  person. `service_replacements` override Excel for one date:
+  person. Every decline stores a request row in
+  `replacement_polls` (no group chat or failed poll → `manual-…` row with
+  status `closed`); `filled` marks a request that got a replacement
+  (`claim_replacement_request` / `release_replacement_request`), and `/change`
+  accepts any unfilled request from today (`list_unfilled_replacement_requests`).
+  `service_replacements` override Excel for one date:
   `presentation.apply_replacements` runs in `_load_service_task_assignments`
-  and in the admin report. `set_replacement` adds a task contact only for a
+  only with `only_date` (month-wide lists stay raw; roster/contact sync always
+  sees raw names), in the admin report (reports store raw assignments via
+  `raw_out` and apply current replacements on render) and, via
+  `_apply_event_replacements`, on the cached upcoming events. `set_replacement` adds a task contact only for a
   substitute already known in the service (member or contact). Poll votes use
   `_connection(notify=False)`, so they do not trigger backups or job
   refreshes; `/change` removes the pending close job

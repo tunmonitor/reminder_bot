@@ -717,6 +717,26 @@ class ServiceRegistry:
                 "ALTER TABLE services ADD COLUMN group_thread_id INTEGER "
                 "CHECK (group_thread_id IS NULL OR group_thread_id > 0)"
             )
+        poll_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(replacement_polls)")
+        }
+        if "filled" not in poll_columns:
+            # Запрос замены выполнен (этап 3.3): закрытый опрос без замены
+            # и запрос без опроса остаются доступны для /change.
+            connection.execute(
+                "ALTER TABLE replacement_polls ADD COLUMN filled INTEGER "
+                "NOT NULL DEFAULT 0 CHECK (filled IN (0, 1))"
+            )
+            # Запросы, по которым замену уже назначили, — выполнены.
+            connection.execute(
+                "UPDATE replacement_polls SET filled = 1 WHERE EXISTS ("
+                "SELECT 1 FROM service_replacements r "
+                "WHERE r.service_id = replacement_polls.service_id "
+                "AND r.event_date = replacement_polls.event_date "
+                "AND r.task = replacement_polls.task "
+                "AND r.old_name = replacement_polls.old_name)"
+            )
         for service in SERVICES:
             is_assembly = service.id == "assembly"
             connection.execute(
@@ -1920,9 +1940,14 @@ class ServiceRegistry:
         message_id: int,
         notice_message_id: int | None,
         deadline: str,
+        status: str = "open",
     ) -> None:
+        """status="closed" — запрос без опроса (нет чата служения или опрос
+        не отправился): ждёт /change."""
         date.fromisoformat(event_date)
         datetime.fromisoformat(deadline)
+        if status not in {"open", "closed"}:
+            raise ValueError("Некорректное состояние опроса")
         with self._connection() as connection:
             self._require_service(connection, service_id)
             connection.execute(
@@ -1931,12 +1956,12 @@ class ServiceRegistry:
                     poll_id, service_id, event_date, task, old_name,
                     old_telegram_id, chat_id, message_id, notice_message_id,
                     deadline, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     poll_id, service_id, event_date, task, old_name,
                     old_telegram_id, chat_id, message_id, notice_message_id,
-                    deadline, _utc_now(),
+                    deadline, status, _utc_now(),
                 ),
             )
 
@@ -1947,14 +1972,15 @@ class ServiceRegistry:
                 (poll_id,),
             ).fetchone())
 
-    def find_open_replacement_poll(
+    def find_active_replacement_request(
         self, service_id: str, event_date: str, task: str, old_name: str
     ) -> dict | None:
+        """Невыполненный запрос замены: идёт опрос или ждёт /change."""
         with self._connection() as connection:
             return self._poll_row(connection.execute(
                 "SELECT * FROM replacement_polls WHERE service_id = ? "
                 "AND event_date = ? AND task = ? AND old_name = ? "
-                "AND status = 'open'",
+                "AND filled = 0",
                 (service_id, event_date, task, old_name),
             ).fetchone())
 
@@ -1969,6 +1995,34 @@ class ServiceRegistry:
                 "ORDER BY created_at DESC LIMIT 1",
                 (chat_id, message_id, message_id),
             ).fetchone())
+
+    def list_unfilled_replacement_requests(self, since: str) -> list[dict]:
+        """Запросы без назначенной замены на даты с since — для /change."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM replacement_polls WHERE filled = 0 "
+                "AND event_date >= ? ORDER BY event_date, created_at",
+                (since,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def claim_replacement_request(self, poll_id: str) -> bool:
+        """Отмечает запрос выполненным; False — замену уже назначили."""
+        with self._connection(notify=False) as connection:
+            cursor = connection.execute(
+                "UPDATE replacement_polls SET filled = 1, status = 'closed' "
+                "WHERE poll_id = ? AND filled = 0",
+                (poll_id,),
+            )
+        return cursor.rowcount > 0
+
+    def release_replacement_request(self, poll_id: str) -> None:
+        """Назначение не удалось — запрос снова ждёт /change."""
+        with self._connection(notify=False) as connection:
+            connection.execute(
+                "UPDATE replacement_polls SET filled = 0 WHERE poll_id = ?",
+                (poll_id,),
+            )
 
     def list_open_replacement_polls(self) -> list[dict]:
         with self._connection() as connection:

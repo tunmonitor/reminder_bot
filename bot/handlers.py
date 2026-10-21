@@ -6261,7 +6261,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         poll_id: str, substitute: dict | None = None,
         actor_id: int | None = None,
     ) -> bool:
-        """Итог опроса по сроку (substitute=None) или по /change."""
+        """Итог опроса по сроку (substitute=None) или замена по /change
+        (в том числе для запроса без опроса или с закрытым опросом)."""
         registry = service_registry()
         poll = registry.get_replacement_poll(poll_id) if registry else None
         if poll is None:
@@ -6333,23 +6334,30 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             poll = registry.replacement_poll_by_message(
                 message.chat.id, reply_to.message_id
             )
-            if poll is not None and poll["status"] != "open":
+            if poll is not None and poll["filled"]:
                 await reply("ℹ️ Этот поиск замены уже завершён.")
                 return
             if poll is not None:
                 polls = [poll]
         if not polls:
+            today = datetime.now(context.timezone).date().isoformat()
             polls = [
-                poll for poll in registry.list_open_replacement_polls()
+                poll
+                for poll in registry.list_unfilled_replacement_requests(today)
                 if normalized_name(poll["task"]) == normalized_name(task_text)
                 and (
                     message.chat.type == ChatType.PRIVATE
                     or poll["chat_id"] == message.chat.id
+                    # Запрос без опроса (chat_id=0) — по чату служения.
+                    or (registry.get_service(poll["service_id"]) or {}).get(
+                        "group_chat_id"
+                    ) == message.chat.id
                 )
             ]
         if not polls:
             await reply(
-                f"ℹ️ Нет открытого поиска замены для задачи «{task_text}»."
+                f"ℹ️ Нет запроса замены для задачи «{task_text}»: замена "
+                "назначается после «🚫 Не смогу» участника."
             )
             return
         allowed = [
@@ -6368,7 +6376,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 for poll in allowed
             )
             await reply(
-                "ℹ️ Открыто несколько поисков замены: " + choices
+                "ℹ️ Ждут замены несколько запросов: " + choices
                 + ". Ответьте командой на нужный опрос в чате служения."
             )
             return

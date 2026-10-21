@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import secrets
 from collections.abc import Callable
 from datetime import date, datetime, time, timedelta, timezone
 
@@ -53,10 +54,10 @@ async def _notify(bot, chat_ids, text: str, logger: logging.Logger) -> None:
     for chat_id in chat_ids:
         try:
             await bot.send_message(chat_id, text, parse_mode=None)
-        except Exception as exc:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             logger.warning(
-                "Не удалось отправить сообщение о замене в чат %s: %s",
-                chat_id, type(exc).__name__,
+                "Не удалось отправить сообщение о замене в чат %s",
+                chat_id, exc_info=True,
             )
 
 
@@ -77,28 +78,43 @@ async def start_replacement_search(
 ) -> dict | None:
     """Объявление и опрос в чате служения; админам — как назначить самому.
 
-    Возвращает созданный опрос или None (уже идёт, нет чата, ошибка)."""
+    Запрос замены сохраняется всегда: без опроса (нет чата, опрос не
+    отправился) он сразу ждёт /change. Возвращает запрос или None (уже
+    есть невыполненный запрос на это)."""
     service = registry.get_service(service_id)
     if service is None:
         return None
     event_iso = event_date.isoformat()
-    if registry.find_open_replacement_poll(service_id, event_iso, task, old_name):
+    if registry.find_active_replacement_request(
+        service_id, event_iso, task, old_name
+    ):
         return None
     admins = report_recipients(registry, service_id, admin_actor_id)
     date_text = f"{event_date:%d.%m.%Y}"
     manual = f"Назначить самому: /change {task} @username"
-    chat_id = service.get("group_chat_id")
-    if not chat_id or not service.get("enabled", True):
+    now = now or datetime.now(timezone.utc)
+    deadline = poll_deadline(now.astimezone(tz), event_date, tz)
+
+    async def manual_request(reason: str) -> dict | None:
+        request_id = f"manual-{secrets.token_hex(8)}"
+        registry.create_replacement_poll(
+            request_id, service_id, event_iso, task, old_name,
+            old_telegram_id, 0, 0, None,
+            deadline.astimezone(timezone.utc).isoformat(), status="closed",
+        )
         await _notify(
             bot, admins,
             f"⚠️ Нужна замена: «{task}» · {service['name']} · {date_text} "
-            f"вместо {old_name}. Чат служения не привязан — опрос не "
-            f"запущен.\n{manual}",
+            f"вместо {old_name}. {reason}\n{manual}",
             logger,
         )
-        return None
-    now = now or datetime.now(timezone.utc)
-    deadline = poll_deadline(now.astimezone(tz), event_date, tz)
+        return registry.get_replacement_poll(request_id)
+
+    chat_id = service.get("group_chat_id")
+    if not chat_id or not service.get("enabled", True):
+        return await manual_request(
+            "Чат служения не привязан — опрос не запущен."
+        )
     try:
         notice = await send_to_service_group(
             bot.send_message, chat_id,
@@ -115,23 +131,37 @@ async def start_replacement_search(
         )
     except Exception:  # noqa: BLE001
         logger.exception("Не удалось запустить опрос замены")
+        return await manual_request(
+            "Опрос в чате служения отправить не удалось."
+        )
+    poll_id = poll_message.poll.id
+    try:
+        registry.create_replacement_poll(
+            poll_id, service_id, event_iso, task, old_name, old_telegram_id,
+            chat_id, poll_message.message_id,
+            getattr(notice, "message_id", None),
+            deadline.astimezone(timezone.utc).isoformat(),
+        )
+        if schedule_close is not None:
+            schedule_close(poll_id, deadline)
+    except Exception:  # noqa: BLE001
+        # Опрос без записи нельзя подсчитать — останавливаем его.
+        logger.exception("Не удалось сохранить опрос замены %s", poll_id)
+        try:
+            await bot.stop_poll(chat_id, poll_message.message_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Не удалось остановить опрос замены %s", poll_id,
+                exc_info=True,
+            )
         await _notify(
             bot, admins,
-            f"⚠️ Нужна замена: «{task}» · {service['name']} · {date_text} "
-            f"вместо {old_name}. Опрос в чате служения отправить не "
-            f"удалось.\n{manual}",
+            f"⚠️ Поиск замены не запущен из-за ошибки: «{task}» · "
+            f"{service['name']} · {date_text} вместо {old_name}. Опрос в "
+            f"чате остановлен.\n{manual}",
             logger,
         )
         return None
-    poll_id = poll_message.poll.id
-    registry.create_replacement_poll(
-        poll_id, service_id, event_iso, task, old_name, old_telegram_id,
-        chat_id, poll_message.message_id,
-        getattr(notice, "message_id", None),
-        deadline.astimezone(timezone.utc).isoformat(),
-    )
-    if schedule_close is not None:
-        schedule_close(poll_id, deadline)
     await _notify(
         bot, admins,
         f"🔎 Ищем замену: «{task}» · {service['name']} · {date_text} вместо "
@@ -192,16 +222,19 @@ async def finish_replacement(
 ) -> bool:
     """Закрывает опрос и назначает замену (substitute=None — по ответам).
 
-    False — опрос уже закрыт другим вызовом."""
-    if not registry.close_replacement_poll(poll["poll_id"]):
+    Опрос без подходящего «Могу» закрывается, а запрос ждёт /change.
+    False — итог по сроку уже подведён или замену уже назначили."""
+    was_open = registry.close_replacement_poll(poll["poll_id"])
+    if not was_open and substitute is None:
         return False
-    try:
-        await bot.stop_poll(poll["chat_id"], poll["message_id"])
-    except Exception as exc:  # noqa: BLE001
-        logger.info(
-            "Опрос замены %s не остановлен: %s", poll["poll_id"],
-            type(exc).__name__,
-        )
+    if was_open and poll["message_id"]:
+        try:
+            await bot.stop_poll(poll["chat_id"], poll["message_id"])
+        except Exception:  # noqa: BLE001
+            logger.info(
+                "Опрос замены %s не остановлен", poll["poll_id"],
+                exc_info=True,
+            )
     if substitute is None:
         answer = choose_volunteer(registry, poll)
         substitute = (
@@ -222,6 +255,8 @@ async def finish_replacement(
             logger,
         )
         return True
+    if not registry.claim_replacement_request(poll["poll_id"]):
+        return False
     try:
         await assign_replacement(
             bot, registry, service, event_date, poll["task"], poll["old_name"],
@@ -231,6 +266,7 @@ async def finish_replacement(
         )
     except Exception:  # noqa: BLE001
         logger.exception("Не удалось назначить замену по опросу %s", poll["poll_id"])
+        registry.release_replacement_request(poll["poll_id"])
         await _notify(
             bot, admins,
             f"⚠️ Не удалось назначить замену: «{poll['task']}» · "

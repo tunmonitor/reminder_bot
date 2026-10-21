@@ -190,11 +190,39 @@ class SearchFlowTest(Base):
         self.assertIsNone(self.start())
         self.assertEqual(self.bot.send_poll.await_count, 1)
 
-    def test_without_group_chat_admins_are_told(self):
+    def test_without_group_chat_request_waits_for_change(self):
         self.registry.set_group_chat(SUPER, "sound", None, enabled=False)
-        self.assertIsNone(self.start())
+        request = self.start()
+        self.assertEqual((request["status"], request["filled"]), ("closed", 0))
         self.bot.send_poll.assert_not_awaited()
         self.assertIn("Чат служения не привязан", self.sent_to(ADMIN)[0])
+        self.assertIsNone(self.start())
+        substitute = {"name": "Борис", "telegram_id": MEMBER, "username": ""}
+        self.assertTrue(self.finish(request, substitute))
+        self.bot.stop_poll.assert_not_awaited()
+        self.assertFalse(self.finish(request, substitute))
+        self.assertIsNone(self.registry.find_active_replacement_request(
+            "sound", EVENT.isoformat(), "звук", "Алексей"
+        ))
+        self.assertEqual(
+            self.registry.list_replacements("sound", EVENT.isoformat())[0]["new_name"],
+            "Борис",
+        )
+
+    def test_poll_failure_and_storage_failure(self):
+        self.bot.send_poll.side_effect = RuntimeError("no rights")
+        request = self.start()
+        self.assertTrue(request["poll_id"].startswith("manual-"))
+        self.assertIn("отправить не удалось", self.sent_to(ADMIN)[-1])
+
+    def test_storage_failure_after_poll_sent_stops_poll(self):
+        with patch.object(
+            self.registry, "create_replacement_poll",
+            side_effect=[RuntimeError("disk"), None],
+        ):
+            self.assertIsNone(self.start())
+        self.bot.stop_poll.assert_awaited_once()
+        self.assertIn("не запущен из-за ошибки", self.sent_to(ADMIN)[-1])
 
     def test_task_member_wins_over_earlier_outsider(self):
         poll = self.start()
@@ -240,12 +268,40 @@ class SearchFlowTest(Base):
         self.registry.record_poll_answer(poll["poll_id"], MEMBER, "", "", True)
         self.registry.on_change.assert_not_called()
 
-    def test_no_volunteers_tells_admins(self):
+    def test_no_volunteers_tells_admins_and_change_still_works(self):
         poll = self.start()
         self.bot.send_message.reset_mock()
         self.finish(poll)
+        self.assertFalse(self.finish(poll))
         self.assertEqual(self.registry.list_replacements("sound", EVENT.isoformat()), [])
         self.assertIn("Замена не найдена", self.sent_to(ADMIN)[0])
+        self.assertTrue(self.finish(
+            poll, {"name": "Борис", "telegram_id": MEMBER, "username": ""}
+        ))
+        self.assertEqual(self.bot.stop_poll.await_count, 1)
+
+    def test_report_follows_changed_replacement(self):
+        from bot.admin_report import send_admin_reports
+
+        raw = {"звук": {"names": ["Алексей"], "is_informational": False}}
+        self.registry.set_replacement(
+            "sound", EVENT.isoformat(), "звук", "Алексей", "Борис", MEMBER,
+            "", "admin", ADMIN,
+        )
+        service = self.registry.get_service("sound")
+        asyncio.run(send_admin_reports(
+            self.bot, self.registry, service, EVENT, raw, SUPER, MagicMock(), 4096
+        ))
+        self.registry.set_replacement(
+            "sound", EVENT.isoformat(), "звук", "Алексей", "Глеб", None,
+            "", "admin", ADMIN,
+        )
+        asyncio.run(send_admin_reports(
+            self.bot, self.registry, service, EVENT, raw, SUPER, MagicMock(), 4096
+        ))
+        text = self.bot.edit_message_text.await_args.args[0]
+        self.assertIn("Глеб", text)
+        self.assertNotIn("Борис", text)
 
 
 class HandlersTest(Base):
@@ -297,10 +353,17 @@ class HandlersTest(Base):
         asyncio.run(self.context.close_replacement_poll(poll["poll_id"]))
         self.assertEqual(self.registry.list_open_replacement_polls(), [])
 
+    def test_change_in_group_finds_request_without_poll(self):
+        self.bot.send_poll.side_effect = RuntimeError("no rights")
+        self.start()
+        done = self.message(ADMIN, "/change звук @boris_b", -1005)
+        asyncio.run(self.change(done))
+        self.assertIn("✅ Замена назначена", done.answer.await_args.args[0])
+
     def test_change_command(self):
         none = self.message(ADMIN, "/change звук @boris_b")
         asyncio.run(self.change(none))
-        self.assertIn("Нет открытого поиска", none.answer.await_args.args[0])
+        self.assertIn("Нет запроса замены", none.answer.await_args.args[0])
 
         poll = self.start()
         stranger = self.message(OUTSIDER, "/change звук @boris_b")
@@ -329,6 +392,35 @@ class HandlersTest(Base):
         again = self.message(ADMIN, "/change звук @boris_b", -1005, reply)
         asyncio.run(self.change(again))
         self.assertIn("уже завершён", again.answer.await_args.args[0])
+
+
+class MigrationTest(unittest.TestCase):
+    def test_filled_backfilled_for_existing_replacements(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "r.sqlite3"
+            registry = ServiceRegistry(path)
+            registry.initialize(SUPER, -100)
+            for poll_id in ("done", "waiting"):
+                registry.create_replacement_poll(
+                    poll_id, "sound", EVENT.isoformat(), "звук",
+                    "Алексей" if poll_id == "done" else "Вера", None, -1, 1,
+                    None, "2099-01-01T00:00:00+00:00", status="closed",
+                )
+            registry.set_replacement(
+                "sound", EVENT.isoformat(), "звук", "Алексей", "Борис", None,
+                "", "admin", SUPER,
+            )
+            # База до появления колонки filled.
+            with sqlite3.connect(path) as connection:
+                connection.execute("ALTER TABLE replacement_polls DROP COLUMN filled")
+            ServiceRegistry(path).initialize(SUPER, -100)
+            self.assertEqual(
+                [item["poll_id"] for item in
+                 registry.list_unfilled_replacement_requests("2000-01-01")],
+                ["waiting"],
+            )
 
 
 class LoaderAppliesReplacementTest(Base):
@@ -361,6 +453,42 @@ class LoaderAppliesReplacementTest(Base):
                 )
 
         self.assertEqual(asyncio.run(run())["звук"]["names"], ["Борис"])
+
+    def test_month_wide_loader_and_upcoming_events(self):
+        from bot import app
+        from bot.excel_parser import ServiceAssignment, ServiceEvent
+
+        self.registry.set_replacement(
+            "sound", EVENT.isoformat(), "звук", "Алексей", "Борис", MEMBER,
+            "boris_b", "admin", ADMIN,
+        )
+        events = [
+            ServiceEvent("sound", EVENT, (ServiceAssignment("звук", "Алексей"),)),
+            ServiceEvent(
+                "sound", EVENT + timedelta(days=7),
+                (ServiceAssignment("звук", "Алексей"),),
+            ),
+        ]
+        shown = app._apply_event_replacements(events, self.registry)
+        self.assertEqual(shown[0].assignments[0].name, "Борис")
+        self.assertEqual(shown[1].assignments[0].name, "Алексей")
+        self.assertEqual(events[0].assignments[0].name, "Алексей")
+
+        async def run():
+            with tempfile.TemporaryDirectory() as shm, \
+                    patch.object(app, "download_public", new=AsyncMock()), \
+                    patch.object(
+                        app, "parse_service_events",
+                        return_value={"sound": events},
+                    ), \
+                    patch.object(app, "_sync_rosters_and_contacts"):
+                return await app._load_service_task_assignments(
+                    SimpleNamespace(yandex_public_url="https://example.invalid"),
+                    Path(shm), TZ, "sound", MagicMock(), registry=self.registry,
+                )
+
+        # Без даты — имена за месяц: заменённый не пропадает из списков.
+        self.assertEqual(asyncio.run(run())["звук"]["names"], ["Алексей"])
 
 
 if __name__ == "__main__":
