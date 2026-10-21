@@ -9,7 +9,7 @@ import secrets
 import sqlite3
 import stat
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from string import Formatter
 from dataclasses import replace
@@ -1608,6 +1608,18 @@ class ServiceRegistry:
                     excluding_id=reminder_id,
                     enabled_only=True,
                     task=row["task"],
+                )
+            if slot_changed:
+                # Новый срок или время — новая отправка: отметки доставки
+                # на предстоящие даты сбрасываются, иначе напоминание,
+                # уже ушедшее на это воскресенье, молча не сработает.
+                # Только групповое сообщение: предупреждения админу о
+                # графике не повторяются. День запаса — на часовой пояс.
+                connection.execute(
+                    "DELETE FROM group_reminder_deliveries "
+                    "WHERE reminder_id = ? AND event_date >= ? "
+                    "AND recipient_key LIKE 'group:%'",
+                    (reminder_id, (date.today() - timedelta(days=1)).isoformat()),
                 )
             connection.execute(
                 "UPDATE group_reminders SET body = ?, reminder_days = ?, "

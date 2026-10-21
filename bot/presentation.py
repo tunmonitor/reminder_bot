@@ -113,6 +113,12 @@ def format_task_assignments(
         groups.append("\n".join(lines))
     return "\n\n".join(groups) or "⚪ Ответственные не указаны"
 
+def informational_label(task: str, values) -> str:
+    """«2я часть» + соседняя ячейка «нет» → «2я часть нет»."""
+    values = [value for value in values if value]
+    return " ".join([task, ", ".join(values)]) if values else task
+
+
 def format_informational_notes(
     assignments: dict[str, dict[str, Any] | list[str]],
 ) -> str:
@@ -120,11 +126,7 @@ def format_informational_notes(
     for task, task_info in assignments.items():
         if not task_is_informational(task_info):
             continue
-        values = task_assignment_names(task_info)
-        note = f"📌 {task}"
-        if values:
-            note += f" — {', '.join(values)}"
-        notes.append(note)
+        notes.append(f"📌 {informational_label(task, task_assignment_names(task_info))}")
     return "\n".join(notes)
 
 

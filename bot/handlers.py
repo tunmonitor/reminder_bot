@@ -48,6 +48,7 @@ from .replacement import (
 from .notifier import CONFIRM_PREFIX, TELEGRAM_TEXT_LIMIT, _notify_admin
 from .presentation import (
     format_task_assignments,
+    informational_label,
     task_assignment_names,
     task_emoji,
     task_is_informational,
@@ -852,7 +853,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await _send_dialog(message, f"⏳ {label}: загружаю и проверяю актуальный график...",
                     parse_mode=None,
                 )
-            await offer_contact_overview(message, actor_id, service_id)
+            await offer_contact_overview(
+                message, actor_id, service_id,
+                force_reload=operation == "service_sync",
+            )
             return
         await _send_dialog(message, prompts[operation], parse_mode=None)
 
@@ -1553,7 +1557,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         return True
 
     async def offer_contact_overview(
-        message: Message, actor_id: int, service_id: str
+        message: Message, actor_id: int, service_id: str,
+        force_reload: bool = False,
     ) -> None:
         """Show who serves on each upcoming date and whether Telegram is linked."""
         loader = getattr(context, "load_upcoming_service_events", None)
@@ -1564,7 +1569,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         pending = pending_inputs[actor_id]
         try:
-            events = await loader()
+            events = await (loader(force=True) if force_reload else loader())
         except (OSError, RuntimeError, ValueError, sqlite3.Error):
             debug.exception("Не удалось загрузить график для обзора ответственных")
             events = None
@@ -1605,7 +1610,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         notes = []
         for assignment in event.assignments:
             if assignment.is_informational:
-                notes.append(assignment.task)
+                notes.append(
+                    informational_label(assignment.task, [assignment.name])
+                )
                 continue
             names = names_by_task.setdefault(assignment.task, [])
             if assignment.name and assignment.name not in names:

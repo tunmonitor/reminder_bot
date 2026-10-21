@@ -531,6 +531,61 @@ class ExcelParserTest(unittest.TestCase):
             [["Октябрьские слайды"]],
         )
 
+    def test_short_text_dates_stop_month_sheet(self):
+        """«01.11» без года на листе октября — не продолжение 25.10."""
+        for label in ("01.11", "01.11.26", "1.11 10:00", "1 нояб.", "1 ноя"):
+            with self.subTest(label=label):
+                workbook = Workbook()
+                schedule = workbook.active
+                schedule.title = "ОКТЯБРЬ26"
+                schedule.append(["СОБРАНИЕ"])
+                schedule.append([date(2026, 10, 25)])
+                schedule.append(["ХКЦ", "Октябрьский"])
+                schedule.append([label])
+                schedule.append(["ХКЦ", "Ноябрьский"])
+                workbook.save(self.path)
+                parsed = parse_service_events(
+                    self.path, date(2026, 10, 1), self.debug_logger
+                )
+                self.assertEqual(
+                    [item.name for item in parsed["assembly"][0].assignments],
+                    ["Октябрьский"],
+                )
+
+    def test_ambiguous_numbers_are_not_dates(self):
+        from bot.excel_parser import _cell_date
+
+        for value in ("1.10", "10.10 кг", "5.5", 1.1, 10.3, "10.30"):
+            with self.subTest(value=value):
+                self.assertIsNone(_cell_date(value, 2026, 10))
+        self.assertEqual(_cell_date("03.01", 2026, 12), date(2027, 1, 3))
+        self.assertEqual(_cell_date("3 января", 2026, 12), date(2027, 1, 3))
+        self.assertEqual(_cell_date("28.12", 2027, 1), date(2026, 12, 28))
+        self.assertEqual(_cell_date("01.11", 2026, 10), date(2026, 11, 1))
+        for time_like in ("09.05", "10.05", "11.02"):
+            with self.subTest(time_like=time_like):
+                self.assertIsNone(_cell_date(time_like, 2026, 10))
+
+    def test_informational_value_from_next_cell(self):
+        workbook = Workbook()
+        schedule = workbook.active
+        schedule.title = "ОКТЯБРЬ26"
+        schedule.append(["СОБРАНИЕ"])
+        schedule.append([date(2026, 10, 4)])
+        schedule.append(["ХКЦ", "Ответственный"])
+        schedule.append(["*Причастие", "В.П."])
+        schedule.append(["*2я часть", "нет"])
+        workbook.save(self.path)
+        parsed = parse_service_events(
+            self.path, date(2026, 10, 1), self.debug_logger
+        )
+        notes = [
+            (item.task, item.name)
+            for item in parsed["assembly"][0].assignments
+            if item.is_informational
+        ]
+        self.assertEqual(notes, [("Причастие", "В.П."), ("2я часть", "нет")])
+
     def test_december_sheet_stops_at_january_text_date(self):
         workbook = Workbook()
         schedule = workbook.active

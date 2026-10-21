@@ -62,6 +62,10 @@ _MONTH_NAMES = {
     "октября": 10, "октябрь": 10,
     "ноября": 11, "ноябрь": 11,
     "декабря": 12, "декабрь": 12,
+    # Сокращения: «1 нояб.», «1 ноя».
+    "янв": 1, "фев": 2, "февр": 2, "мар": 3, "апр": 4, "июн": 6,
+    "июл": 7, "авг": 8, "сен": 9, "сент": 9, "окт": 10, "ноя": 11,
+    "нояб": 11, "дек": 12,
 }
 _ROLE_ALIASES = {
     "ответственный": "Ответственный",
@@ -193,7 +197,11 @@ def _rows_before_other_month(
         for column in date_columns:
             if len(row) <= column:
                 continue
-            event_date = (row_date or _cell_date)(row[column], month.year)
+            event_date = (
+                row_date(row[column], month.year)
+                if row_date is not None
+                else _cell_date(row[column], month.year, month.month)
+            )
             if event_date is None:
                 continue
             if (event_date.year, event_date.month) == (month.year, month.month):
@@ -220,7 +228,19 @@ def _find_sheet(workbook, expected: str, legacy_names: tuple[str, ...] = ()):
     return None, None
 
 
-def _cell_date(value, target_year: int) -> date | None:
+def _year_near_sheet(target_year: int, target_month: int | None, month: int) -> int:
+    """Год даты без года: «03.01» на листе декабря — следующий год,
+    «28.12» на листе января — предыдущий."""
+    if target_month == 12 and month == 1:
+        return target_year + 1
+    if target_month == 1 and month == 12:
+        return target_year - 1
+    return target_year
+
+
+def _cell_date(
+    value, target_year: int, target_month: int | None = None
+) -> date | None:
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
@@ -232,13 +252,50 @@ def _cell_date(value, target_year: int) -> date | None:
             return date(*(int(part) for part in (numeric[3], numeric[2], numeric[1])))
         except ValueError:
             return None
+    # «01.11», «01.11.26», «1.11 10:00» — дата без года или с коротким
+    # годом: иначе блок такой даты приклеился бы к предыдущему воскресенью.
+    # Только текст и только в однозначной записи: числа (1.1, 10.3),
+    # время и вес («1.10», «5.5 кг») датой не считаются.
+    short = (
+        re.match(
+            r"^(\d{2})\.(\d{2})(?:\.(\d{2}))?$"
+            r"|^(\d{1,2})\.(\d{1,2})(?:\.(\d{2}))?\s+\d{1,2}:\d{2}(?:\s|$)",
+            text,
+        )
+        if isinstance(value, str)
+        else None
+    )
+    if short:
+        day, month, short_year = (
+            short.group(1, 2, 3) if short[1] else short.group(4, 5, 6)
+        )
+        # «09.10» может быть временем: без года принимается только месяц
+        # листа или соседний.
+        if (
+            not short_year
+            and target_month is not None
+            and (int(month) - target_month) % 12 not in {0, 1, 11}
+        ):
+            return None
+        year = (
+            2000 + int(short_year) if short_year
+            else _year_near_sheet(target_year, target_month, int(month))
+        )
+        try:
+            return date(year, int(month), int(day))
+        except ValueError:
+            return None
     named = re.match(r"^(\d{1,2})\s+([а-я]+)(?:\s+(\d{4}))?(?:\b|$)", text)
     if named:
         month = _MONTH_NAMES.get(named[2])
         if month is None:
             return None
+        year = (
+            int(named[3]) if named[3]
+            else _year_near_sheet(target_year, target_month, month)
+        )
         try:
-            return date(int(named[3] or target_year), month, int(named[1]))
+            return date(year, month, int(named[1]))
         except ValueError:
             return None
     return None
@@ -443,7 +500,7 @@ def _column_assignments(
                 assignments.append(
                     ServiceAssignment(task=task, name="", is_informational=True)
                 )
-            elif name and _cell_date(name, month.year) is None:
+            elif name and _cell_date(name, month.year, month.month) is None:
                 assignments.append(ServiceAssignment(task=default_task, name=name))
             continue
 
@@ -702,7 +759,11 @@ def parse_service_events(
                 (row_index, event_date)
                 for row_index, row in enumerate(rows)
                 if len(row) > start_column
-                and (event_date := _cell_date(row[start_column], month.year))
+                and (
+                    event_date := _cell_date(
+                        row[start_column], month.year, month.month
+                    )
+                )
                 is not None
             ]
             for event_index, (row_index, event_date) in enumerate(event_rows):

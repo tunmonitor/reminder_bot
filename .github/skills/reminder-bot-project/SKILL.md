@@ -184,6 +184,18 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   item ID, and request-specific token before loading and after every relevant
   `await`. New previews invalidate old requests; old results must not replace
   a newer menu.
+- Changing a group reminder's days/time (`update_group_reminder`,
+  `slot_changed`) deletes its `group:%` delivery marks for event dates from yesterday on
+  (admin warning marks stay), so a rescheduled reminder fires again.
+- `context.load_upcoming_service_events(force=True)` bypasses the 5-minute
+  cache; «🔄 Сверить график» uses it.
+- Informational notes render as `informational_label(task, values)` →
+  «2я часть нет» (value from the neighbour cell); `_cell_date(value, year, month)` also
+  accepts text `dd.mm` / `dd.mm.yy` (two-digit day and month) or `d.mm HH:MM`
+  and month abbreviations, infers the year around the sheet month
+  (December→January), never treats numbers as dates, and accepts a year-less
+  `dd.mm` only for the sheet month ±1. `_process_service_reminder` re-checks
+  the slot (`_same_reminder_slot`) before sending and before marking delivery.
 - Preserve idempotent delivery records and per-service/event locking. A
   failed delivery must not be recorded as success.
 - Personal reminders carry `build_personal_answer_kb` buttons

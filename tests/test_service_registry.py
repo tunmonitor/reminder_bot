@@ -2041,3 +2041,33 @@ class ServiceRegistryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RescheduleResetsDeliveryTest(unittest.TestCase):
+    def test_changed_slot_clears_future_delivery_marks(self):
+        import tempfile
+        from datetime import date as _date, timedelta as _timedelta
+        from pathlib import Path as _Path
+
+        from bot.service_registry import ServiceRegistry as _Registry
+
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = _Registry(_Path(tmp) / "r.sqlite3")
+            registry.initialize(1001, -100)
+            reminder = registry.add_group_reminder(1001, "sound", 3, "10:00")
+            reminder_id = reminder["id"] if isinstance(reminder, dict) else reminder
+            future = (_date.today() + _timedelta(days=3)).isoformat()
+            past = (_date.today() - _timedelta(days=7)).isoformat()
+            for event in (future, past):
+                registry.mark_group_reminder_delivered(reminder_id, event, "group:-1")
+            registry.update_group_reminder(1001, reminder_id, body="Новый текст")
+            self.assertTrue(
+                registry.is_group_reminder_delivered(reminder_id, future, "group:-1")
+            )
+            registry.update_group_reminder(1001, reminder_id, days=0, time="23:59")
+            self.assertFalse(
+                registry.is_group_reminder_delivered(reminder_id, future, "group:-1")
+            )
+            self.assertTrue(
+                registry.is_group_reminder_delivered(reminder_id, past, "group:-1")
+            )
