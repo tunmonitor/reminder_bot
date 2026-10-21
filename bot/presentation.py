@@ -1,6 +1,7 @@
 """Formatting helpers for user-facing assignment summaries."""
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping
 from typing import Any
 
@@ -125,3 +126,35 @@ def format_informational_notes(
             note += f" — {', '.join(values)}"
         notes.append(note)
     return "\n".join(notes)
+
+
+def apply_replacements(assignments: dict, replacements: list[dict]) -> dict:
+    """Копия назначений с заменами (по порядку назначения: цепочки
+    «А → Б → В» дают В). Замена главнее графика: если в графике на эту
+    задачу уже нет заменённого, заменяющий всё равно остаётся."""
+    if not replacements:
+        return assignments
+    result = copy.deepcopy(assignments)
+    for item in replacements:
+        task_info = result.get(item["task"])
+        if task_info is None:
+            continue
+        if isinstance(task_info, dict):
+            if task_info.get("is_informational"):
+                continue
+            names = list(task_info.get("names", []))
+        else:
+            names = list(task_info)
+        if item["old_name"] in names:
+            names = [
+                item["new_name"] if name == item["old_name"] else name
+                for name in names
+            ]
+        elif item["new_name"] not in names:
+            names.append(item["new_name"])
+        names = list(dict.fromkeys(names))
+        if isinstance(task_info, dict):
+            task_info["names"] = names
+        else:
+            result[item["task"]] = names
+    return result

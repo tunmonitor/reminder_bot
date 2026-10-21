@@ -310,7 +310,7 @@ class PersonalAnswerHandlerTest(RegistryTestCase):
         self.registry.add_service_admin(SUPER, "sound", ADMIN)
         self._press(self._button("🚫 Не смогу"))
         self.context.on_assignment_declined.assert_awaited_once_with(
-            "sound", FUTURE, "звук", "Алексей"
+            "sound", FUTURE, "звук", "Алексей", telegram_id=MEMBER
         )
         notices = [
             call.args for call in self.context.bot.send_message.await_args_list

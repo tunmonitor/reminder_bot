@@ -18,6 +18,7 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import MenuButtonWebApp, WebAppInfo
+from apscheduler.jobstores.base import JobLookupError
 
 if __package__:
     from .cli import CliArgs
@@ -54,6 +55,7 @@ if __package__:
         send_assignments,
     )
     from .presentation import (
+        apply_replacements,
         format_informational_notes,
         format_task_assignments,
         format_task_responsibles,
@@ -113,6 +115,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         send_assignments,
     )
     from bot.presentation import (
+        apply_replacements,
         format_informational_notes,
         format_task_assignments,
         format_task_responsibles,
@@ -511,6 +514,11 @@ async def _load_service_task_assignments(
             for task, task_info in sorted(assignments.items())
         }
         if registry is not None:
+            # Замена на одну дату (этап 3.3) главнее графика.
+            result = apply_replacements(
+                result,
+                registry.list_replacements(service_id, sunday_date.isoformat()),
+            )
             _sync_rosters_and_contacts(
                 registry, xlsx_path, service_id, result, services,
                 debug_logger, issues,
@@ -1850,6 +1858,45 @@ async def _run_locked(args: CliArgs) -> None:
 
             service_registry.on_change = schedule_user_job_refresh
 
+            async def scheduled_replacement_close(poll_id: str) -> None:
+                task = asyncio.current_task()
+                if task is not None:
+                    active_jobs.add(task)
+                try:
+                    await context.close_replacement_poll(poll_id)
+                except Exception:
+                    debug_logger.exception(
+                        "Ошибка подведения итога опроса замены %s", poll_id
+                    )
+                finally:
+                    if task is not None:
+                        active_jobs.discard(task)
+
+            def schedule_replacement_close(poll_id: str, deadline) -> None:
+                """Итог опроса замены по сроку (этап 3.3)."""
+                if scheduler is None:
+                    return
+                scheduler.add_job(
+                    scheduled_replacement_close,
+                    "date",
+                    run_date=max(deadline, datetime.now(tz)),
+                    args=[poll_id],
+                    id=f"replacement-poll-{poll_id}",
+                    replace_existing=True,
+                    misfire_grace_time=None,
+                )
+
+            def cancel_replacement_close(poll_id: str) -> None:
+                if scheduler is None:
+                    return
+                try:
+                    scheduler.remove_job(f"replacement-poll-{poll_id}")
+                except JobLookupError:
+                    pass
+
+            context.schedule_replacement_close = schedule_replacement_close
+            context.cancel_replacement_close = cancel_replacement_close
+
         try:
             _write_pid(pid_file)
             pid_created = True
@@ -1874,6 +1921,11 @@ async def _run_locked(args: CliArgs) -> None:
         if service_registry is not None:
             await refresh_service_reminders()
             await refresh_user_reminder_jobs()
+            # Открытые опросы замены переживают перезапуск бота.
+            for poll in service_registry.list_open_replacement_polls():
+                schedule_replacement_close(
+                    poll["poll_id"], datetime.fromisoformat(poll["deadline"])
+                )
         scheduler.start()
         await _configure_webapp_menu(bot, PROJECT_DIR, debug_logger)
         if backup_manager is not None:

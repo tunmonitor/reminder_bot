@@ -331,6 +331,54 @@ class ServiceRegistry:
                     PRIMARY KEY (service_id, event_date, admin_id)
                 );
 
+                -- Замена ответственного на одну дату (этап 3.3); главнее
+                -- графика. old_name — кого заменили (из графика или прошлая
+                -- замена), new_name — кто вместо него.
+                CREATE TABLE IF NOT EXISTS service_replacements (
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    event_date TEXT NOT NULL,
+                    task TEXT NOT NULL,
+                    old_name TEXT NOT NULL,
+                    new_name TEXT NOT NULL,
+                    telegram_id INTEGER
+                        CHECK (telegram_id IS NULL OR telegram_id > 0),
+                    username TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL CHECK (source IN ('poll', 'admin')),
+                    created_by INTEGER,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (service_id, event_date, task, old_name)
+                );
+
+                -- Опросы «Кто сможет…» в чате служения (этап 3.3).
+                CREATE TABLE IF NOT EXISTS replacement_polls (
+                    poll_id TEXT PRIMARY KEY,
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    event_date TEXT NOT NULL,
+                    task TEXT NOT NULL,
+                    old_name TEXT NOT NULL,
+                    old_telegram_id INTEGER,
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    notice_message_id INTEGER,
+                    deadline TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open'
+                        CHECK (status IN ('open', 'closed')),
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS replacement_poll_answers (
+                    poll_id TEXT NOT NULL REFERENCES replacement_polls(poll_id)
+                        ON DELETE CASCADE,
+                    telegram_id INTEGER NOT NULL CHECK (telegram_id > 0),
+                    username TEXT NOT NULL DEFAULT '',
+                    full_name TEXT NOT NULL DEFAULT '',
+                    can INTEGER NOT NULL CHECK (can IN (0, 1)),
+                    answered_at TEXT NOT NULL,
+                    PRIMARY KEY (poll_id, telegram_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS group_reminder_legacy_ids (
                     legacy_id INTEGER PRIMARY KEY,
                     reminder_id INTEGER NOT NULL
@@ -1010,7 +1058,9 @@ class ServiceRegistry:
         return connection
 
     @contextmanager
-    def _connection(self):
+    def _connection(self, *, notify: bool = True):
+        """notify=False — запись, от которой не зависят задачи планировщика
+        (голоса в опросе): без резервной копии и пересборки задач."""
         connection = self._connect()
         changed = False
         try:
@@ -1019,7 +1069,7 @@ class ServiceRegistry:
             changed = connection.total_changes > 0
         finally:
             connection.close()
-        if changed and self.on_change is not None:
+        if notify and changed and self.on_change is not None:
             self.on_change()
 
     def list_services(self) -> list[dict]:
@@ -1851,6 +1901,296 @@ class ServiceRegistry:
             }
             for row in rows
         ]
+
+    # --- Замена ответственного (этап 3.3) ---
+
+    @staticmethod
+    def _poll_row(row) -> dict | None:
+        return dict(row) if row is not None else None
+
+    def create_replacement_poll(
+        self,
+        poll_id: str,
+        service_id: str,
+        event_date: str,
+        task: str,
+        old_name: str,
+        old_telegram_id: int | None,
+        chat_id: int,
+        message_id: int,
+        notice_message_id: int | None,
+        deadline: str,
+    ) -> None:
+        date.fromisoformat(event_date)
+        datetime.fromisoformat(deadline)
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            connection.execute(
+                """
+                INSERT INTO replacement_polls (
+                    poll_id, service_id, event_date, task, old_name,
+                    old_telegram_id, chat_id, message_id, notice_message_id,
+                    deadline, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+                """,
+                (
+                    poll_id, service_id, event_date, task, old_name,
+                    old_telegram_id, chat_id, message_id, notice_message_id,
+                    deadline, _utc_now(),
+                ),
+            )
+
+    def get_replacement_poll(self, poll_id: str) -> dict | None:
+        with self._connection() as connection:
+            return self._poll_row(connection.execute(
+                "SELECT * FROM replacement_polls WHERE poll_id = ?",
+                (poll_id,),
+            ).fetchone())
+
+    def find_open_replacement_poll(
+        self, service_id: str, event_date: str, task: str, old_name: str
+    ) -> dict | None:
+        with self._connection() as connection:
+            return self._poll_row(connection.execute(
+                "SELECT * FROM replacement_polls WHERE service_id = ? "
+                "AND event_date = ? AND task = ? AND old_name = ? "
+                "AND status = 'open'",
+                (service_id, event_date, task, old_name),
+            ).fetchone())
+
+    def replacement_poll_by_message(
+        self, chat_id: int, message_id: int
+    ) -> dict | None:
+        """Опрос по сообщению опроса или по объявлению перед ним."""
+        with self._connection() as connection:
+            return self._poll_row(connection.execute(
+                "SELECT * FROM replacement_polls WHERE chat_id = ? "
+                "AND (message_id = ? OR notice_message_id = ?) "
+                "ORDER BY created_at DESC LIMIT 1",
+                (chat_id, message_id, message_id),
+            ).fetchone())
+
+    def list_open_replacement_polls(self) -> list[dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM replacement_polls WHERE status = 'open' "
+                "ORDER BY deadline, poll_id"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def close_replacement_poll(self, poll_id: str) -> bool:
+        """True — опрос закрыт этим вызовом (защита от двойного итога)."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE replacement_polls SET status = 'closed' "
+                "WHERE poll_id = ? AND status = 'open'",
+                (poll_id,),
+            )
+        return cursor.rowcount > 0
+
+    def record_poll_answer(
+        self,
+        poll_id: str,
+        telegram_id: int,
+        username: str,
+        full_name: str,
+        can: bool | None,
+    ) -> bool:
+        """Ответ в опросе; can=None — голос отозван. False — опрос закрыт."""
+        _validate_positive_id(telegram_id, "telegram_id")
+        with self._connection(notify=False) as connection:
+            poll = connection.execute(
+                "SELECT status FROM replacement_polls WHERE poll_id = ?",
+                (poll_id,),
+            ).fetchone()
+            if poll is None or poll["status"] != "open":
+                return False
+            if can is None:
+                connection.execute(
+                    "DELETE FROM replacement_poll_answers "
+                    "WHERE poll_id = ? AND telegram_id = ?",
+                    (poll_id, telegram_id),
+                )
+                return True
+            connection.execute(
+                """
+                INSERT INTO replacement_poll_answers (
+                    poll_id, telegram_id, username, full_name, can,
+                    answered_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(poll_id, telegram_id) DO UPDATE SET
+                    username = excluded.username,
+                    full_name = excluded.full_name,
+                    can = excluded.can,
+                    answered_at = excluded.answered_at
+                """,
+                (
+                    poll_id, telegram_id, (username or "").lstrip("@"),
+                    full_name or "", int(bool(can)), _utc_now(),
+                ),
+            )
+        return True
+
+    def list_poll_answers(self, poll_id: str) -> list[dict]:
+        """Ответы в порядке времени: первый «Могу» — первый в списке."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT telegram_id, username, full_name, can, answered_at "
+                "FROM replacement_poll_answers WHERE poll_id = ? "
+                "ORDER BY answered_at, rowid",
+                (poll_id,),
+            ).fetchall()
+        return [
+            {**dict(row), "can": bool(row["can"])} for row in rows
+        ]
+
+    def task_member_ids(self, service_id: str, task: str) -> set[int]:
+        """Telegram ID людей с этой задачей: «Списки» и привязки задачи."""
+        with self._connection() as connection:
+            members = connection.execute(
+                "SELECT telegram_id, tasks_json FROM service_members "
+                "WHERE service_id = ? AND telegram_id IS NOT NULL",
+                (service_id,),
+            ).fetchall()
+            contacts = connection.execute(
+                "SELECT telegram_id FROM responsible_contacts "
+                "WHERE service_id = ? AND task = ?",
+                (service_id, task),
+            ).fetchall()
+        ids = {
+            row["telegram_id"] for row in members
+            if task in json.loads(row["tasks_json"])
+        }
+        ids.update(row["telegram_id"] for row in contacts)
+        return ids
+
+    def service_person(
+        self, service_id: str, telegram_id: int, task: str | None = None
+    ) -> dict | None:
+        """Человек служения по Telegram ID: имя привязки к задаче, иначе из
+        состава, иначе из любой привязки."""
+        with self._connection() as connection:
+            row = (task is not None and connection.execute(
+                "SELECT name, telegram_id, username FROM responsible_contacts "
+                "WHERE service_id = ? AND task = ? AND telegram_id = ?",
+                (service_id, task, telegram_id),
+            ).fetchone()) or connection.execute(
+                "SELECT name, telegram_id, username FROM service_members "
+                "WHERE service_id = ? AND telegram_id = ? "
+                "ORDER BY in_list DESC, rowid LIMIT 1",
+                (service_id, telegram_id),
+            ).fetchone() or connection.execute(
+                "SELECT name, telegram_id, username FROM responsible_contacts "
+                "WHERE service_id = ? AND telegram_id = ? "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (service_id, telegram_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def find_service_person_by_username(
+        self, service_id: str, username: str
+    ) -> dict | None:
+        """@username в составе служения или его привязках (без учёта регистра)."""
+        username = (username or "").strip().lstrip("@").casefold()
+        if not username:
+            return None
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            row = connection.execute(
+                "SELECT name, telegram_id, username FROM service_members "
+                "WHERE service_id = ? AND telegram_id IS NOT NULL "
+                "AND lower(username) = ? ORDER BY in_list DESC, rowid LIMIT 1",
+                (service_id, username),
+            ).fetchone() or connection.execute(
+                "SELECT name, telegram_id, username FROM responsible_contacts "
+                "WHERE service_id = ? AND lower(username) = ? "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (service_id, username),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def set_replacement(
+        self,
+        service_id: str,
+        event_date: str,
+        task: str,
+        old_name: str,
+        new_name: str,
+        telegram_id: int | None,
+        username: str,
+        source: str,
+        created_by: int | None,
+    ) -> None:
+        """Замена на одну дату. Заменяющий из состава служения (есть в
+        составе или привязках) получает привязку к задаче под этим именем —
+        для упоминаний и личных напоминаний. Участник чата не из состава
+        указывается только по имени."""
+        date.fromisoformat(event_date)
+        if source not in {"poll", "admin"}:
+            raise ValueError("Некорректный источник замены")
+        if not new_name or not old_name or new_name == old_name:
+            raise ValueError("Некорректная замена")
+        if telegram_id is not None:
+            _validate_positive_id(telegram_id, "telegram_id")
+        username = (username or "").strip().lstrip("@")
+        now = _utc_now()
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            connection.execute(
+                """
+                INSERT INTO service_replacements (
+                    service_id, event_date, task, old_name, new_name,
+                    telegram_id, username, source, created_by, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(service_id, event_date, task, old_name)
+                DO UPDATE SET new_name = excluded.new_name,
+                              telegram_id = excluded.telegram_id,
+                              username = excluded.username,
+                              source = excluded.source,
+                              created_by = excluded.created_by,
+                              created_at = excluded.created_at
+                """,
+                (
+                    service_id, event_date, task, old_name, new_name,
+                    telegram_id, username, source, created_by, now,
+                ),
+            )
+            known = telegram_id is not None and connection.execute(
+                "SELECT 1 FROM service_members WHERE service_id = ? "
+                "AND telegram_id = ? UNION SELECT 1 FROM responsible_contacts "
+                "WHERE service_id = ? AND telegram_id = ? LIMIT 1",
+                (service_id, telegram_id, service_id, telegram_id),
+            ).fetchone() is not None
+            if known:
+                actor = created_by or connection.execute(
+                    "SELECT telegram_id FROM super_admins "
+                    "ORDER BY created_at LIMIT 1"
+                ).fetchone()["telegram_id"]
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO responsible_contacts (
+                        service_id, task, name, telegram_id, username,
+                        updated_by, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        service_id, task, new_name, telegram_id, username,
+                        actor, now,
+                    ),
+                )
+
+    def list_replacements(self, service_id: str, event_date: str) -> list[dict]:
+        """Замены на дату в порядке назначения (цепочки применяются по
+        очереди)."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT task, old_name, new_name, telegram_id, username, "
+                "source FROM service_replacements "
+                "WHERE service_id = ? AND event_date = ? "
+                "ORDER BY created_at, rowid",
+                (service_id, event_date),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def set_group_reminder_task(
         self, actor_id: int, reminder_id: int, task: str | None
