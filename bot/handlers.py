@@ -2093,6 +2093,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             parse_mode=None,
         )
 
+    def send_now_snapshot(reminder: dict | None):
+        """Что должно не измениться между предпросмотром и отправкой."""
+        if reminder is None:
+            return None
+        return (
+            reminder["service_id"], reminder["body"], reminder.get("task"),
+            reminder["reminder_days"], reminder["reminder_time"],
+        )
+
     async def show_send_now_confirm(
         message: Message, actor_id: int, service_id: str, reminder_id: int
     ) -> None:
@@ -2114,9 +2123,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 result = await loader(reminder_id)
             except Exception:  # noqa: BLE001
                 debug.exception("Не удалось подготовить отправку сейчас")
-        if pending_inputs.get(actor_id) is not pending:
+        reminder = registry.get_group_reminder(reminder_id) if registry else None
+        if (
+            pending_inputs.get(actor_id) is not pending
+            or pending.get("step") != "group_reminder_card"
+            or pending.get("reminder_id") != reminder_id
+        ):
             return
-        if service is None or not service.get("group_chat_id"):
+        if reminder is None or reminder["service_id"] != service_id:
+            text, rows = "⚠️ Напоминание больше не существует.", [[back]]
+        elif service is None or not service.get("group_chat_id"):
             text, rows = (
                 "⚠️ У служения не привязан групповой чат — отправлять некуда.",
                 [[back]],
@@ -2132,6 +2148,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         else:
             pending["send_now"] = {
                 "reminder_id": reminder_id, "text": result["text"],
+                "snapshot": send_now_snapshot(reminder),
             }
             text = (
                 f"📤 Отправить сейчас в чат служения? Так оно будет "
@@ -2933,6 +2950,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 if (
                     prepared is None
                     or prepared["reminder_id"] != reminder_id
+                    or prepared["snapshot"] != send_now_snapshot(
+                        registry.get_group_reminder(reminder_id)
+                    )
                     or service is None
                     or not service.get("group_chat_id")
                 ):
@@ -6006,11 +6026,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         ):
             raise ValueError("Вы больше не привязаны к этой задаче.")
         text_id = registry.ensure_user_text(actor_id, service_id, task)
-        rule = registry.add_schedule(
+        return registry.add_schedule(
             text_id, days, reminder_time, origin="user"
         )
-        registry.set_user_notifications_enabled(actor_id, service_id, True)
-        return rule
 
     async def render_current_personal_level(
         target: Message,
@@ -6159,6 +6177,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     or "стандартный текст бота"
                 )
                 body = rule["body"] or admin_text
+                if len(body) > 300:
+                    # Карточка — одно сообщение; полный текст придёт в
+                    # самом напоминании.
+                    body = body[:300].rstrip() + "…"
                 text = (
                     f"{'✏️ Своё' if own else '👤 От админа'} напоминание · "
                     f"{rule['task']}\n"
@@ -6168,6 +6190,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     f"{rule['task']} · дата служения\n"
                     f"Текст: {body}"
                 )
+                if not registry.get_user_notifications_enabled(
+                    actor_id, service_id
+                ):
+                    text += (
+                        "\n\n⚠️ Личные уведомления служения выключены — "
+                        "напоминания не придут. Включите их на экране служения."
+                    )
                 if not own:
                     text += (
                         "\n\nℹ️ Напоминание настроил админ — его можно только "
@@ -7386,9 +7415,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     payload["schedule_id"],
                 )
                 registry.update_schedule(rule["id"], enabled=not rule["enabled"])
-                if not rule["enabled"]:
-                    registry.set_user_notifications_enabled(
-                        actor_id, payload["service_id"], True
+                if not rule["enabled"] and not registry.get_user_notifications_enabled(
+                    actor_id, payload["service_id"]
+                ):
+                    # Флаг служения включил бы и все остальные напоминания.
+                    notice = (
+                        "Напоминание включено, но личные уведомления служения "
+                        "выключены — включите их на экране служения"
                     )
             elif action_name == "copy_rule":
                 rule = personal_rule(

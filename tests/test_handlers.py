@@ -4927,8 +4927,13 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             await text_handler(rule)
             self.assertEqual(self.rules(actor_id), [(0, "07:30", True)])
             self.assertIn("✏️ Своё напоминание", rule.answer.await_args.args[0])
-            self.assertTrue(
+            # Своё напоминание не включает всё служение: иначе заработали бы
+            # и остальные напоминания.
+            self.assertFalse(
                 self.registry.get_user_notifications_enabled(actor_id, "sound")
+            )
+            self.assertIn(
+                "уведомления служения выключены", rule.answer.await_args.args[0]
             )
 
             await press(rule, lambda b: b.text == "✏️ Изменить текст")

@@ -254,7 +254,12 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   `set_user_service_schedule` touches only `admin` rules. Screens
   (`render_current_personal_level`): `service` (rule list), `rule`,
   `delete_rule`, `add_task`, `add_time`. Sent text is always
-  `🔔 {service} · {task} · {date}` + body.
+  `🔔 {service} · {task} · {date}` + body (shortened with «…» if it
+  exceeds the limit). Enabling/adding a single rule never flips the service
+  preference. Migration `personal-origin-v2` (catalog_migrations): only a
+  lone default (1, 18:00) rule without body stays `admin`; task bodies move
+  into its rules or into a disabled `user` rule. «📤 Отправить сейчас» keeps a
+  reminder snapshot and refuses to send if the reminder changed.
 - Group reminder card: «📤 Отправить сейчас» (`send_now` → preview →
   `send_now_ok`, not marked delivered).
 - `_send_dialog` prefixes buttons without a known icon with 📋; add new

@@ -765,9 +765,43 @@ class ServiceRegistry:
                 "WHERE text_id IN (SELECT id FROM user_reminder_texts "
                 "WHERE body IS NOT NULL)"
             )
+        if connection.execute(
+            "SELECT 1 FROM catalog_migrations WHERE name = 'personal-origin-v2'"
+        ).fetchone() is None:
+            # Напоминанием админа остаётся только правило по умолчанию
+            # («за 1 дн. в 18:00», единственное у задачи, без своего
+            # текста); правила, которые человек задавал сам, — свои.
+            connection.execute(
+                "UPDATE user_reminder_schedules SET origin = 'user' "
+                "WHERE origin = 'admin' AND body IS NULL AND ("
+                "reminder_days != 1 OR reminder_time != '18:00' OR "
+                "(SELECT COUNT(*) FROM user_reminder_schedules other "
+                "WHERE other.text_id = user_reminder_schedules.text_id "
+                "AND other.origin = 'admin') > 1)"
+            )
+            # Свой текст задачи — в её правила (если их ещё не скопировали)
+            # или, если правил нет, в выключенное своё напоминание.
+            connection.execute(
+                "UPDATE user_reminder_schedules SET origin = 'user', body = ("
+                "SELECT body FROM user_reminder_texts t WHERE t.id = text_id) "
+                "WHERE body IS NULL AND text_id IN (SELECT id FROM "
+                "user_reminder_texts WHERE body IS NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO user_reminder_schedules "
+                "(text_id, reminder_days, reminder_time, enabled, origin, body) "
+                "SELECT id, 1, '18:00', 0, 'user', body "
+                "FROM user_reminder_texts t WHERE body IS NOT NULL "
+                "AND NOT EXISTS (SELECT 1 FROM user_reminder_schedules s "
+                "WHERE s.text_id = t.id)"
+            )
             connection.execute(
                 "UPDATE user_reminder_texts SET body = NULL "
                 "WHERE body IS NOT NULL"
+            )
+            connection.execute(
+                "INSERT INTO catalog_migrations (name) "
+                "VALUES ('personal-origin-v2')"
             )
         for service in SERVICES:
             is_assembly = service.id == "assembly"
@@ -3701,7 +3735,7 @@ class ServiceRegistry:
             return None
         if not isinstance(body, str) or not body.strip():
             raise ValueError("Текст уведомления не может быть пустым")
-        if len(body) > USER_REMINDER_BODY_LIMIT:
+        if len(body.encode("utf-16-le")) // 2 > USER_REMINDER_BODY_LIMIT:
             # Запас под заголовок и подставленные поля: иначе сообщение не
             # уйдёт из-за лимита Telegram.
             raise ValueError(

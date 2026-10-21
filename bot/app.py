@@ -1212,10 +1212,18 @@ async def _process_user_reminder_schedule(
         return
     # Заголовок всегда: к чему относятся «Принял» / «Не смогу», даже если
     # текст напоминания свой.
-    text = (
+    header = (
         f"🔔 {schedule['service_name']} · {schedule['task']} · "
-        f"{event_date:%d.%m.%Y}\n{text.removeprefix('🔔').strip()}"
+        f"{event_date:%d.%m.%Y}"
     )
+    body_text = text.removeprefix("🔔").strip()
+    text = f"{header}\n{body_text}"
+    if _utf16_length(text) > TELEGRAM_TEXT_LIMIT:
+        # Поля шаблона раздули текст: напоминание всё равно уходит,
+        # сокращённым, — иначе человек остался бы без него.
+        while body_text and _utf16_length(f"{header}\n{body_text}…") > TELEGRAM_TEXT_LIMIT:
+            body_text = body_text[: max(len(body_text) - 200, 0)]
+        text = f"{header}\n{body_text}…"
     if _utf16_length(text) > TELEGRAM_TEXT_LIMIT:
         await _notify_admin(
             bot,

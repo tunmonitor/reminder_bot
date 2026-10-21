@@ -1104,6 +1104,41 @@ class ReminderBotEntrypointTest(unittest.TestCase):
 
         asyncio.run(process())
 
+    def test_oversized_personal_reminder_is_shortened_not_dropped(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                registry.set_group_chat(1001, "sound", -10055, enabled=True)
+                registry.set_responsible_contact(
+                    1001, "sound", "звук", "Алексей" * 30, 2002
+                )
+                registry.set_user_notifications_enabled(2002, "sound", True)
+                text_id = registry.ensure_user_text(2002, "sound", "звук")
+                schedule = registry.add_schedule(
+                    text_id, 1, "18:00", origin="user", body="{name} " * 300
+                )
+                bot = SimpleNamespace(
+                    send_message=AsyncMock(return_value=SimpleNamespace(message_id=5))
+                )
+                with patch.object(
+                    app, "_load_service_task_assignments",
+                    new=AsyncMock(return_value=({"звук": ["Алексей" * 30]}, True)),
+                ):
+                    await app._process_user_reminder_schedule(
+                        bot, SimpleNamespace(admin_tg_id=1001), Path(tmp_dir),
+                        ZoneInfo("UTC"), registry, schedule["id"], MagicMock(),
+                        MagicMock(), run_date=date(2026, 10, 17),
+                    )
+                sent = [c for c in bot.send_message.await_args_list if c.args[0] == 2002]
+                self.assertEqual(len(sent), 1)
+                self.assertIn("…", sent[0].args[1])
+
+        asyncio.run(process())
+
     def test_user_reminder_is_skipped_when_task_becomes_informational(self):
         from bot import app
         from bot.service_registry import ServiceRegistry
