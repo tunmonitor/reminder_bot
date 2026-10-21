@@ -58,6 +58,36 @@ def task_is_informational(task_info: Mapping | list[str]) -> bool:
     )
 
 
+def person_label(
+    task: str,
+    name: str,
+    contacts: dict[tuple[str, str], dict] | None = None,
+    *,
+    mark_unlinked: bool = False,
+) -> str:
+    """Имя ответственного: ссылка на Telegram, если человек привязан."""
+    contact = (contacts or {}).get((task, name))
+    username = contact.get("username") if contact else None
+    label = f"{name} (@{username})" if username else name
+    telegram_id = contact.get("telegram_id") if contact else None
+    if telegram_id:
+        return user_link(telegram_id, label)
+    if contact is None and mark_unlinked:
+        return f"{name} · не привязан"
+    return label
+
+
+def format_task_responsibles(
+    task: str,
+    names: list[str],
+    contacts: dict[tuple[str, str], dict] | None = None,
+) -> str:
+    """Поле {task_responsibles}: ответственные одной задачи через запятую."""
+    return ", ".join(
+        person_label(task, name, contacts, mark_unlinked=True) for name in names
+    )
+
+
 def format_task_assignments(
     assignments: dict[str, dict[str, Any] | list[str]],
     contacts: dict[tuple[str, str], dict] | None = None,
@@ -76,17 +106,9 @@ def format_task_assignments(
         if not names:
             lines.append("• Ответственные не указаны")
         for name in names:
-            contact = (contacts or {}).get((task, name))
-            username = contact.get("username") if contact else None
-            label = f"{name} (@{username})" if username else name
-            telegram_id = contact.get("telegram_id") if contact else None
-            if telegram_id:
-                person_str = user_link(telegram_id, label)
-            elif contact is None and mark_unlinked:
-                person_str = f"{name} · не привязан"
-            else:
-                person_str = label
-            lines.append(f"• {person_str}")
+            lines.append(
+                f"• {person_label(task, name, contacts, mark_unlinked=mark_unlinked)}"
+            )
         groups.append("\n".join(lines))
     return "\n\n".join(groups) or "⚪ Ответственные не указаны"
 

@@ -29,14 +29,24 @@ GROUP_TEMPLATE_FIELDS = frozenset(
         "sunday_date",
         "task_assignments",
         "informational_notes",
+        "task",
+        "task_responsibles",
     }
 )
+# Поля задачи есть только у напоминания задачи (этап 3.1): в общем
+# напоминании и шаблоне служения они были бы пустыми.
+GENERAL_GROUP_TEMPLATE_FIELDS = GROUP_TEMPLATE_FIELDS - {"task", "task_responsibles"}
 PERSONAL_TEMPLATE_FIELDS = frozenset(
     {"name", "task", "service_name", "sunday_date", "telegram_id", "username"}
 )
 DEFAULT_GROUP_TEMPLATE = (
     "Напоминание о служении «{service_name}» в воскресенье "
     "{sunday_date}:\n{task_assignments}"
+)
+# Шаблон по умолчанию для напоминания одной задачи (этап 3.1).
+DEFAULT_TASK_TEMPLATE = (
+    "Напоминание о служении «{service_name}» в воскресенье {sunday_date}.\n"
+    "{task}: {task_responsibles}"
 )
 _UNSET = object()
 
@@ -456,6 +466,17 @@ class ServiceRegistry:
                 (secrets.randbelow(2**30) + 2**30,),
             )
             now = _utc_now()
+            reminder_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(group_reminders)"
+                )
+            }
+            if "task" not in reminder_columns:
+                # Задача напоминания (этап 3.1); NULL — все задачи служения.
+                connection.execute(
+                    "ALTER TABLE group_reminders ADD COLUMN task TEXT"
+                )
             self._sync_service_catalog(connection, assembly_group_chat_id)
             has_super_admin = connection.execute(
                 "SELECT 1 FROM super_admins LIMIT 1"
@@ -642,6 +663,9 @@ class ServiceRegistry:
                 f"AND source = 'catalog' AND name NOT IN ({placeholders})",
                 (service.id, *catalog_names),
             )
+            ServiceRegistry._detach_unavailable_reminder_tasks(
+                connection, service.id
+            )
             # Задачи, добавленные суперадмином, идут после задач каталога;
             # позиции уникальны и служат идентификатором кнопок.
             admin_tasks = connection.execute(
@@ -817,7 +841,7 @@ class ServiceRegistry:
             new_ids_by_schedule: dict[tuple[str, int, str], int] = {}
             for row in connection.execute(
                 "SELECT id, service_id, reminder_days, reminder_time "
-                "FROM group_reminders ORDER BY id"
+                "FROM group_reminders WHERE task IS NULL ORDER BY id"
             ):
                 schedule_key = (
                     row["service_id"],
@@ -950,7 +974,7 @@ class ServiceRegistry:
             ).fetchall()
             reminders = connection.execute(
                 "SELECT id, service_id, body, reminder_days, reminder_time, "
-                "enabled, created_at FROM group_reminders "
+                "enabled, created_at, task FROM group_reminders "
                 "ORDER BY service_id, reminder_days, reminder_time, id"
             ).fetchall()
         reminders_by_service: dict[str, list[dict]] = {}
@@ -964,6 +988,7 @@ class ServiceRegistry:
                     "reminder_time": reminder["reminder_time"],
                     "enabled": bool(reminder["enabled"]),
                     "created_at": reminder["created_at"],
+                    "task": reminder["task"],
                 }
             )
         services = []
@@ -1035,6 +1060,21 @@ class ServiceRegistry:
             for service in SERVICES
         )
 
+    @staticmethod
+    def _detach_unavailable_reminder_tasks(
+        connection: sqlite3.Connection, service_id: str
+    ) -> None:
+        """Напоминание задачи, которой больше нет (или она выключена),
+        выключается и становится общим: иначе оно не отправлялось бы, а
+        админ получал бы ⚠️ на каждую дату."""
+        connection.execute(
+            "UPDATE group_reminders SET task = NULL, enabled = 0 "
+            "WHERE service_id = ? AND task IS NOT NULL AND task NOT IN ("
+            "SELECT name FROM service_tasks WHERE service_id = ? "
+            "AND enabled = 1)",
+            (service_id, service_id),
+        )
+
     def set_service_task_enabled(
         self, actor_id: int, service_id: str, task: str, enabled: bool
     ) -> None:
@@ -1051,6 +1091,7 @@ class ServiceRegistry:
             )
             if cursor.rowcount == 0:
                 raise ValueError(f"Задача «{task}» не найдена.")
+            self._detach_unavailable_reminder_tasks(connection, service_id)
             self._audit(
                 connection, actor_id, "service_task_updated", service_id,
                 {"task": task, "enabled": enabled},
@@ -1271,7 +1312,7 @@ class ServiceRegistry:
             self._require_service(connection, service_id)
             rows = connection.execute(
                 "SELECT id, service_id, body, reminder_days, reminder_time, "
-                "enabled, created_at FROM group_reminders "
+                "enabled, created_at, task FROM group_reminders "
                 "WHERE service_id = ? "
                 "ORDER BY reminder_days, reminder_time, id",
                 (service_id,),
@@ -1307,7 +1348,7 @@ class ServiceRegistry:
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT id, service_id, body, reminder_days, reminder_time, "
-                "enabled, created_at FROM group_reminders WHERE id = ?",
+                "enabled, created_at, task FROM group_reminders WHERE id = ?",
                 (reminder_id,),
             ).fetchone()
         return (
@@ -1403,8 +1444,11 @@ class ServiceRegistry:
             new_time = row["reminder_time"] if time is None else time
             new_body = row["body"] if body is _UNSET else body
             new_enabled = bool(row["enabled"]) if enabled is None else enabled
+            # Поля текста проверяются, только когда текст меняют: старый
+            # текст не должен мешать выключить или перенести напоминание.
             self._validate_group_reminder_values(
-                new_days, new_time, new_body
+                new_days, new_time,
+                new_body if body is not _UNSET else None, row["task"],
             )
             if not isinstance(new_enabled, bool):
                 raise ValueError("enabled должен быть логическим значением")
@@ -1422,6 +1466,7 @@ class ServiceRegistry:
                     new_time,
                     allow_duplicate,
                     excluding_id=reminder_id,
+                    task=row["task"],
                 )
             elif new_enabled and not row["enabled"]:
                 self._ensure_group_schedule_unique(
@@ -1432,6 +1477,7 @@ class ServiceRegistry:
                     allow_duplicate,
                     excluding_id=reminder_id,
                     enabled_only=True,
+                    task=row["task"],
                 )
             connection.execute(
                 "UPDATE group_reminders SET body = ?, reminder_days = ?, "
@@ -1528,7 +1574,7 @@ class ServiceRegistry:
                 raise stale
             if source_id is not None:
                 source = connection.execute(
-                    "SELECT service_id, reminder_days, reminder_time "
+                    "SELECT service_id, reminder_days, reminder_time, task "
                     "FROM group_reminders WHERE id = ?",
                     (source_id,),
                 ).fetchone()
@@ -1539,11 +1585,14 @@ class ServiceRegistry:
                 if (
                     (source["reminder_days"], source["reminder_time"])
                     != tuple(source_slot)
+                    # Напоминания разных задач не объединяются.
+                    or source["task"] != target["task"]
                 ):
                     raise stale
             new_body = target["body"] if body is _UNSET else body
             self._validate_group_reminder_values(
-                target["reminder_days"], target["reminder_time"], new_body
+                target["reminder_days"], target["reminder_time"],
+                new_body if body is not _UNSET else None, target["task"],
             )
             connection.execute(
                 "UPDATE group_reminders SET body = ? WHERE id = ?",
@@ -1578,7 +1627,66 @@ class ServiceRegistry:
     def resolve_group_text(self, reminder: dict, service: dict) -> str:
         if reminder.get("body") is not None:
             return reminder["body"]
+        if reminder.get("task"):
+            return DEFAULT_TASK_TEMPLATE
         return service.get("group_template") or DEFAULT_GROUP_TEMPLATE
+
+    def set_group_reminder_task(
+        self, actor_id: int, reminder_id: int, task: str | None
+    ) -> None:
+        """Задача напоминания: только её ответственные; None — все задачи."""
+        _validate_positive_id(actor_id, "actor_id")
+        _validate_positive_id(reminder_id, "reminder_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT service_id, task, enabled, reminder_days, reminder_time "
+                "FROM group_reminders WHERE id = ?",
+                (reminder_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("Групповое напоминание больше не существует.")
+            self._require_service_editor(connection, actor_id, row["service_id"])
+            if task is not None:
+                enabled_tasks = {
+                    item["name"]
+                    for item in connection.execute(
+                        "SELECT name FROM service_tasks "
+                        "WHERE service_id = ? AND enabled = 1",
+                        (row["service_id"],),
+                    )
+                }
+                if task not in enabled_tasks:
+                    raise ValueError(f"Задача «{task}» не из списка служения.")
+            if task is None:
+                body = connection.execute(
+                    "SELECT body FROM group_reminders WHERE id = ?",
+                    (reminder_id,),
+                ).fetchone()["body"]
+                if body is not None:
+                    self._validate_group_reminder_values(
+                        row["reminder_days"], row["reminder_time"], body
+                    )
+            if row["enabled"]:
+                # Иначе в один слот попали бы два включённых напоминания
+                # одной задачи (или два общих).
+                self._ensure_group_schedule_unique(
+                    connection,
+                    row["service_id"],
+                    row["reminder_days"],
+                    row["reminder_time"],
+                    False,
+                    excluding_id=reminder_id,
+                    enabled_only=True,
+                    task=task,
+                )
+            connection.execute(
+                "UPDATE group_reminders SET task = ? WHERE id = ?",
+                (task, reminder_id),
+            )
+            self._audit(
+                connection, actor_id, "group_reminder_task_updated",
+                row["service_id"], {"reminder_id": reminder_id, "task": task},
+            )
 
     def set_service_default_template(
         self, actor_id: int, service_id: str, template: str | None
@@ -1589,7 +1697,7 @@ class ServiceRegistry:
                 raise ValueError("Текст группового шаблона не может быть пустым")
             validate_notification_template(
                 template,
-                GROUP_TEMPLATE_FIELDS,
+                GENERAL_GROUP_TEMPLATE_FIELDS,
                 "Шаблон группового уведомления",
             )
             template = template.strip()
@@ -1633,7 +1741,7 @@ class ServiceRegistry:
 
     @staticmethod
     def _validate_group_reminder_values(
-        days: int, time: str, body: str | None
+        days: int, time: str, body: str | None, task: str | None = None
     ) -> None:
         if isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 6:
             raise ValueError("Число дней должно быть от 0 до 6.")
@@ -1646,7 +1754,7 @@ class ServiceRegistry:
                 raise ValueError("Текст группового напоминания не может быть пустым.")
             validate_notification_template(
                 body,
-                GROUP_TEMPLATE_FIELDS,
+                GROUP_TEMPLATE_FIELDS if task else GENERAL_GROUP_TEMPLATE_FIELDS,
                 "Текст группового напоминания",
             )
 
@@ -1660,12 +1768,14 @@ class ServiceRegistry:
         *,
         excluding_id: int | None = None,
         enabled_only: bool = False,
+        task: str | None = None,
     ) -> None:
+        # Напоминания разных задач в один слот не пересекаются (этап 3.1).
         query = (
             "SELECT 1 FROM group_reminders WHERE service_id = ? "
-            "AND reminder_days = ? AND reminder_time = ?"
+            "AND reminder_days = ? AND reminder_time = ? AND task IS ?"
         )
-        parameters: tuple = (service_id, days, time)
+        parameters: tuple = (service_id, days, time, task)
         if enabled_only:
             query += " AND enabled = 1"
         if excluding_id is not None:
@@ -1719,7 +1829,7 @@ class ServiceRegistry:
                 raise ValueError("Текст группового уведомления не может быть пустым")
             validate_notification_template(
                 group_template,
-                GROUP_TEMPLATE_FIELDS,
+                GENERAL_GROUP_TEMPLATE_FIELDS,
                 "Шаблон группового уведомления",
             )
         self._validate_personal_templates(personal_templates)
@@ -1769,7 +1879,7 @@ class ServiceRegistry:
             if normalized_reminders is None:
                 primary = connection.execute(
                     "SELECT id FROM group_reminders WHERE service_id = ? "
-                    "ORDER BY id LIMIT 1",
+                    "AND task IS NULL ORDER BY id LIMIT 1",
                     (service_id,),
                 ).fetchone()
                 if primary is None:
@@ -1810,11 +1920,12 @@ class ServiceRegistry:
         allow_duplicate: bool,
     ) -> None:
         existing_rows = connection.execute(
-            "SELECT id, reminder_days, reminder_time FROM group_reminders "
+            "SELECT id, reminder_days, reminder_time, task FROM group_reminders "
             "WHERE service_id = ?",
             (service_id,),
         ).fetchall()
         existing = {row["id"] for row in existing_rows}
+        task_by_id = {row["id"]: row["task"] for row in existing_rows}
         final_ids = {
             item["id"] for item in reminders if item["id"] is not None
         }
@@ -1823,7 +1934,11 @@ class ServiceRegistry:
         if not allow_duplicate:
             seen = set()
             for item in reminders:
-                key = (item["reminder_days"], item["reminder_time"])
+                key = (
+                    item["reminder_days"],
+                    item["reminder_time"],
+                    task_by_id.get(item["id"]),
+                )
                 if key in seen:
                     raise ValueError(
                         f"Уведомление за {key[0]} дн. в {key[1]} уже задано."
@@ -1947,7 +2062,7 @@ class ServiceRegistry:
                 }
             current = connection.execute(
                 "SELECT id, service_id, body, reminder_days, reminder_time, "
-                "enabled, created_at FROM group_reminders "
+                "enabled, created_at, task FROM group_reminders "
                 "WHERE id = ? AND service_id = ?",
                 (reminder_id, service_id),
             ).fetchone()
