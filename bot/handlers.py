@@ -6023,20 +6023,25 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     def shortened_user_body(body: str | None) -> str | None:
         """Прежние тексты могли быть длиннее нынешнего лимита: копия
-        сокращается по границе слова так, чтобы шаблон остался верным."""
+        берёт самое длинное начало в пределах лимита, а если обрезка
+        задела поле шаблона «{…}», отрезает только его."""
         if not body or len(body.encode("utf-16-le")) // 2 <= USER_REMINDER_BODY_LIMIT:
             return body
-        while body and len(body.encode("utf-16-le")) // 2 > USER_REMINDER_BODY_LIMIT:
-            body = body[:-100]
+        units = 0
+        for index, character in enumerate(body):
+            units += len(character.encode("utf-16-le")) // 2
+            if units > USER_REMINDER_BODY_LIMIT:
+                body = body[:index]
+                break
         while body:
-            body = body.rsplit(maxsplit=1)[0] if " " in body.strip() else ""
             try:
                 validate_notification_template(
                     body, PERSONAL_TEMPLATE_FIELDS, "Текст личного напоминания"
                 )
                 return body.rstrip() or None
             except ValueError:
-                continue
+                cut = max(body.rfind("{"), body.rfind("}"))
+                body = body[:cut] if cut >= 0 else ""
         return None
 
     async def add_own_personal_rule(

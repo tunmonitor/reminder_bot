@@ -4994,6 +4994,25 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             ]
             self.assertEqual(len(bodies), 2)
             self.assertLessEqual(min(len(body) for body in bodies), 3000)
+            # Длинное слово без пробелов не теряется целиком.
+            with _sqlite3.connect(self.registry.path) as connection:
+                connection.execute(
+                    "UPDATE user_reminder_schedules SET body = ? WHERE id = ?",
+                    ("я" * 2999 + "{name} b\nконец", rule["id"]),
+                )
+            command = message("/my_notifications")
+            await self.message_handler("on_my_notifications")(command)
+            screen = await press(command, lambda b: "ЗВУК" in b.text)
+            original = await press(
+                screen, lambda b: "✏️ Микшер" in b.text and "10:00" in b.text
+            )
+            await press(original, lambda b: b.text == "📋 Копировать как своё")
+            copies = [
+                item["body"] for item in
+                self.registry.list_user_service_schedules(actor_id, "sound")
+                if item["id"] != rule["id"]
+            ]
+            self.assertIn("я" * 2999, copies)
 
         asyncio.run(run())
 
