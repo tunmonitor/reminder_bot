@@ -19,6 +19,12 @@ from .presentation import (
 from .service_registry import DEFAULT_ADMIN_REPORT_TEMPLATE
 from .ui import render_edit_screen, render_screen_chunks, send_telegram_screen
 
+# Ошибки Telegram, после которых отчёт нужно отправить заново.
+_GONE_MESSAGE_ERRORS = (
+    "message to edit not found",
+    "message can't be edited",
+    "message_id_invalid",
+)
 _TRUNCATED_NOTE = "… отчёт сокращён: не помещается в одно сообщение"
 
 _CONFIRMATION_LABELS = {
@@ -41,6 +47,9 @@ def _people(assignments: dict) -> list[tuple[str, str]]:
     ]
 
 
+_SHORTENED = "… сокращено: не помещается в одно сообщение"
+
+
 def build_report_text(
     template: str | None,
     service_name: str,
@@ -48,8 +57,14 @@ def build_report_text(
     assignments: dict,
     contacts_by_name: dict[tuple[str, str], dict],
     notifications_enabled: Callable[[int], bool],
-    confirmations: dict[tuple[str, str], str],
+    confirmations: dict[tuple[str, int], str],
+    limit: int | None = None,
 ) -> str:
+    """confirmations — {(задача, Telegram ID): status}: ответ принадлежит
+    аккаунту, а не имени, поэтому перепривязка имени не переносит чужой
+    ответ. С limit длинный отчёт сокращается так, чтобы ответы
+    участников оставались видны: сначала сворачиваются статусы доставки,
+    затем список назначений."""
     people = _people(assignments)
     delivery = []
     answers = []
@@ -62,26 +77,39 @@ def build_report_text(
             delivery.append(f"🔕 {name} ({task}) — уведомления выключены")
         else:
             delivery.append(f"✅ {name} ({task}) — уведомления включены")
-        answers.append(
-            f"{_CONFIRMATION_LABELS.get(confirmations.get((task, name)), '⏳ нет ответа')}"
-            f" — {name} ({task})"
-        )
-    return (template or DEFAULT_ADMIN_REPORT_TEMPLATE).format_map(
-        _Values(
-            service_name=service_name,
-            sunday_date=f"{event_date:%d.%m.%Y}",
-            task_assignments=format_task_assignments(
-                assignments, contacts_by_name, mark_unlinked=True
-            ),
-            delivery_status="\n".join(delivery) or "⚪ нет назначений",
-            confirmation_status="\n".join(answers) or "⚪ нет назначений",
-        )
-    )
+        status = confirmations.get((task, telegram_id)) if telegram_id else None
+        label = _CONFIRMATION_LABELS.get(status, "⏳ нет ответа")
+        answers.append(f"{label} — {name} ({task})")
+    values = {
+        "service_name": service_name,
+        "sunday_date": f"{event_date:%d.%m.%Y}",
+        "task_assignments": format_task_assignments(
+            assignments, contacts_by_name, mark_unlinked=True
+        ),
+        "delivery_status": "\n".join(delivery) or "⚪ нет назначений",
+        "confirmation_status": "\n".join(answers) or "⚪ нет назначений",
+    }
+    text_template = template or DEFAULT_ADMIN_REPORT_TEMPLATE
+
+    def render() -> str:
+        return text_template.format_map(_Values(values))
+
+    if limit is None:
+        return render()
+    for field in ("delivery_status", "task_assignments"):
+        if _fits(render(), limit):
+            break
+        values[field] = _SHORTENED
+    return fit_one_screen(render(), limit)
+
+
+def _fits(text: str, limit: int) -> bool:
+    return len(render_screen_chunks(text, limit=limit)) == 1
 
 
 def fit_one_screen(text: str, limit: int) -> str:
     """Отчёт редактируется на месте, поэтому должен влезать в один экран."""
-    if len(render_screen_chunks(text, limit=limit)) == 1:
+    if _fits(text, limit):
         return text
     lines = text.splitlines()
 
@@ -92,7 +120,7 @@ def fit_one_screen(text: str, limit: int) -> str:
     low, high = 0, len(lines) - 1
     while low < high:
         middle = (low + high + 1) // 2
-        if len(render_screen_chunks(candidate(middle), limit=limit)) == 1:
+        if _fits(candidate(middle), limit):
             low = middle
         else:
             high = middle - 1
@@ -105,7 +133,7 @@ def report_recipients(registry, service_id: str, fallback_admin_id: int) -> list
 
 
 def _report_text(registry, service: dict, event_date: date, assignments: dict,
-                 admin_actor_id: int) -> str:
+                 admin_actor_id: int, limit: int) -> str:
     contacts = registry.list_responsible_contacts(admin_actor_id, service["id"])
     return build_report_text(
         service.get("admin_report_template"),
@@ -117,6 +145,7 @@ def _report_text(registry, service: dict, event_date: date, assignments: dict,
             telegram_id, service["id"]
         ),
         registry.list_confirmations(service["id"], event_date.isoformat()),
+        limit=limit,
     )
 
 
@@ -130,45 +159,68 @@ async def send_admin_reports(
     logger: logging.Logger,
     limit: int,
 ) -> None:
-    """Отправляет отчёт админам или обновляет уже отправленный на эту дату."""
-    text = fit_one_screen(
-        _report_text(registry, service, event_date, assignments, admin_actor_id),
-        limit,
+    """Отчёт текущим админам служения: отправленный на эту дату
+    редактируется, недоставленный или удалённый — отправляется заново.
+    Снятые с служения админы обновлений больше не получают."""
+    event_iso = event_date.isoformat()
+    text = _report_text(
+        registry, service, event_date, assignments, admin_actor_id, limit
     )
     stored = {
         report["admin_id"]: report
-        for report in registry.list_admin_reports(
-            service["id"], event_date.isoformat()
-        )
+        for report in registry.list_admin_reports(service["id"], event_iso)
     }
-    for admin_id in report_recipients(registry, service["id"], admin_actor_id):
+    recipients = report_recipients(registry, service["id"], admin_actor_id)
+    for admin_id in set(stored) - set(recipients):
+        registry.delete_admin_report(service["id"], event_iso, admin_id)
+    for admin_id in recipients:
         report = stored.get(admin_id)
-        try:
-            if report is not None:
+        if report is not None:
+            try:
                 await bot.edit_message_text(
                     render_edit_screen(text, limit=limit),
                     chat_id=admin_id,
                     message_id=report["message_id"],
                     parse_mode="HTML",
                 )
-                message_id = report["message_id"]
-            else:
-                sent = await send_telegram_screen(
-                    bot.send_message, admin_id, text, limit=limit
-                )
-                message_id = getattr(sent, "message_id", None)
-        except Exception as exc:  # noqa: BLE001
-            if "message is not modified" in str(exc).lower():
+            except Exception as exc:  # noqa: BLE001
+                error = str(exc).lower()
+                if any(mark in error for mark in _GONE_MESSAGE_ERRORS):
+                    # Сообщение удалено или его нельзя изменить — новое.
+                    report = None
+                    logger.info(
+                        "Отчёт админу %s по служению %s не обновлён (%s); "
+                        "отправляется заново",
+                        admin_id, service["id"], type(exc).__name__,
+                    )
+                elif "message is not modified" not in error:
+                    # Временный сбой: без дубля, обновится в следующий раз.
+                    logger.warning(
+                        "Не удалось обновить отчёт админу %s по служению "
+                        "%s: %s", admin_id, service["id"], type(exc).__name__,
+                    )
+                    continue
+            if report is not None:
+                if report["assignments"] != assignments:
+                    registry.save_admin_report(
+                        service["id"], event_iso, admin_id,
+                        report["message_id"], assignments,
+                    )
                 continue
+        try:
+            sent = await send_telegram_screen(
+                bot.send_message, admin_id, text, limit=limit
+            )
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Не удалось отправить отчёт админу %s по служению %s: %s",
                 admin_id, service["id"], type(exc).__name__,
             )
             continue
+        message_id = getattr(sent, "message_id", None)
         if message_id is not None:
             registry.save_admin_report(
-                service["id"], event_date.isoformat(), admin_id, message_id,
-                assignments,
+                service["id"], event_iso, admin_id, message_id, assignments,
             )
 
 
@@ -181,32 +233,16 @@ async def refresh_admin_reports(
     logger: logging.Logger,
     limit: int,
 ) -> None:
-    """Перестраивает отправленные отчёты после ответа участника."""
+    """Перестраивает отчёты после ответа участника (если отчёт на эту дату
+    уже отправлялся — до группового напоминания отчёта нет)."""
     service = registry.get_service(service_id)
     reports = registry.list_admin_reports(service_id, event_date.isoformat())
     if service is None or not reports:
         return
-    for report in reports:
-        text = fit_one_screen(
-            _report_text(
-                registry, service, event_date, report["assignments"],
-                admin_actor_id,
-            ),
-            limit,
-        )
-        try:
-            await bot.edit_message_text(
-                render_edit_screen(text, limit=limit),
-                chat_id=report["admin_id"],
-                message_id=report["message_id"],
-                parse_mode="HTML",
-            )
-        except Exception as exc:  # noqa: BLE001
-            if "message is not modified" not in str(exc).lower():
-                logger.warning(
-                    "Не удалось обновить отчёт админу %s по служению %s: %s",
-                    report["admin_id"], service_id, type(exc).__name__,
-                )
+    await send_admin_reports(
+        bot, registry, service, event_date, reports[0]["assignments"],
+        admin_actor_id, logger, limit,
+    )
 
 
 async def notify_admins_declined(

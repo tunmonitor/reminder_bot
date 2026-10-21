@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import re
 import secrets
 import sqlite3
 import time
-from datetime import datetime
+from datetime import date, datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -2838,6 +2839,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
                     return
                 pending["admin_report_template"] = None
+                pending["admin_report_template_edited"] = True
                 await enter_admin_report_template(
                     callback.message, actor_id, service_id
                 )
@@ -3688,12 +3690,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 pending["service_id"],
                 pending["personal_templates"],
             )
-            report_template = pending.get(
-                "admin_report_template", service.get("admin_report_template")
-            )
-            if report_template != service.get("admin_report_template"):
+            # Только если шаблон меняли в этой настройке: иначе снимок
+            # сессии затёр бы правку другого админа.
+            if pending.get("admin_report_template_edited"):
                 registry.set_admin_report_template(
-                    actor_id, pending["service_id"], report_template
+                    actor_id, pending["service_id"],
+                    pending.get("admin_report_template"),
                 )
             refresh_reminders = getattr(
                 context, "refresh_service_reminder_jobs", None
@@ -7156,6 +7158,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         text, ADMIN_REPORT_FIELDS, "Шаблон отчёта админам"
                     )
                     pending["admin_report_template"] = text
+                    pending["admin_report_template_edited"] = True
                     await enter_admin_report_template(
                         message, message.from_user.id, service_id
                     )
@@ -7614,25 +7617,40 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 cb, "❌ Не удалось сохранить ответ. Нажмите кнопку повторно."
             )
             return
-        note = (
-            "✅ Подтверждено" if status == "confirmed"
-            else "🚫 Вы отметили, что не сможете. Админы служения "
-            "получили сообщение."
-        )
-        if cb.message and cb.message.text:
+        service = registry.get_service(service_id)
+        admins_told = None
+        if changed and status == "declined" and service:
             try:
-                await cb.message.edit_text(
-                    cb.message.text + "\n\n" + note, parse_mode=None
+                admins_told = await notify_admins_declined(
+                    context.bot, registry, service, event_date, task,
+                    name, context.admin_id, debug,
                 )
             except Exception:  # noqa: BLE001
-                debug.exception("Не удалось отредактировать личное напоминание")
+                debug.exception("Не удалось сообщить админам об отказе")
+                admins_told = 0
+            if not admins_told:
+                debug.warning(
+                    "Об отказе %s по служению %s не узнал ни один админ",
+                    task, service_id,
+                )
+        if status == "confirmed":
+            note = "✅ Подтверждено"
+        elif admins_told:
+            note = "🚫 Вы отметили, что не сможете. Админы служения получили сообщение."
+        elif admins_told is None:
+            note = "🚫 Вы отметили, что не сможете."
+        else:
+            note = (
+                "🚫 Ответ сохранён, но сообщить админам не удалось — "
+                "предупредите их сами."
+            )
+        await _mark_answered_reminder(cb, note, debug)
         if changed:
             interaction.info(
                 "Ответ на напоминание: service=%s task=%s tg_id=%s date=%s "
                 "status=%s",
                 service_id, task, cb.from_user.id, event_date, status,
             )
-            service = registry.get_service(service_id)
             if status == "confirmed" and service_id == "assembly" and service:
                 # Как прежде у Собрания: подтверждение видно в группе.
                 try:
@@ -7648,13 +7666,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 except Exception:  # noqa: BLE001
                     debug.exception("Не удалось отправить апдейт в группу")
             if status == "declined" and service:
-                try:
-                    await notify_admins_declined(
-                        context.bot, registry, service, event_date, task,
-                        name, context.admin_id, debug,
-                    )
-                except Exception:  # noqa: BLE001
-                    debug.exception("Не удалось сообщить админам об отказе")
                 # Поиск замены (этап 3.3).
                 on_declined = getattr(context, "on_assignment_declined", None)
                 if callable(on_declined):
@@ -7706,6 +7717,31 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     dispatcher.include_router(router)
 
 
+async def _mark_answered_reminder(
+    cb: CallbackQuery, note: str, debug: logging.Logger
+) -> None:
+    """Дописывает ответ к личному напоминанию с сохранением оформления и
+    убирает кнопки. Если текст уже не помещается — убирает только кнопки."""
+    message = cb.message
+    if message is None:
+        return
+    original = getattr(message, "html_text", None) or html.escape(
+        getattr(message, "text", None) or ""
+    )
+    if original:
+        text = f"{original}\n\n{html.escape(note)}"
+        if len(text) <= TELEGRAM_TEXT_LIMIT:
+            try:
+                await message.edit_text(text, parse_mode="HTML")
+                return
+            except Exception:  # noqa: BLE001
+                debug.exception("Не удалось отредактировать личное напоминание")
+    try:
+        await message.edit_reply_markup(reply_markup=None)
+    except Exception:  # noqa: BLE001
+        debug.exception("Не удалось убрать кнопки личного напоминания")
+
+
 async def _confirm_locked(
     cb: CallbackQuery,
     context: Any,
@@ -7743,26 +7779,27 @@ async def _confirm_locked(
             )
             return
 
-    if newly_persisted and participant.get("service_id") and participant.get("task"):
+    if participant.get("service_id") and participant.get("task"):
         # Кнопка прежнего формата: ответ попадает и в общий учёт (этап 3.2).
+        # Запись идемпотентна, поэтому повторное нажатие повторяет её после
+        # сбоя.
         registry = getattr(context, "service_registry", None)
         try:
             if registry is not None:
-                registry.set_confirmation(
+                _, answer_changed = registry.set_confirmation(
                     participant["service_id"], sunday_iso, participant["task"],
                     cb.from_user.id, "confirmed",
                 )
+                if answer_changed:
+                    await refresh_admin_reports(
+                        context.bot, registry, participant["service_id"],
+                        date.fromisoformat(sunday_iso), context.admin_id,
+                        debug, TELEGRAM_TEXT_LIMIT,
+                    )
         except Exception:  # noqa: BLE001
             debug.exception("Не удалось записать подтверждение в реестр")
     if newly_persisted:
-        if cb.message and cb.message.text:
-            try:
-                await cb.message.edit_text(
-                    cb.message.text + "\n\n✅ Подтверждено",
-                    parse_mode=None,
-                )
-            except Exception:  # noqa: BLE001
-                debug.exception("Не удалось отредактировать ЛС")
+        await _mark_answered_reminder(cb, "✅ Подтверждено", debug)
 
     group_update_blocked_reason = None
     active_group_chat_id = None

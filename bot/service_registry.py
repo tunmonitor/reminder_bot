@@ -1787,14 +1787,16 @@ class ServiceRegistry:
     def list_confirmations(
         self, service_id: str, event_date: str
     ) -> dict[tuple[str, str], str]:
-        """{(задача, имя): status} на дату события."""
+        """{(задача, Telegram ID): status} на дату события."""
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT task, name, status FROM service_confirmations "
+                "SELECT task, telegram_id, status FROM service_confirmations "
                 "WHERE service_id = ? AND event_date = ?",
                 (service_id, event_date),
             ).fetchall()
-        return {(row["task"], row["name"]): row["status"] for row in rows}
+        return {
+            (row["task"], row["telegram_id"]): row["status"] for row in rows
+        }
 
     def save_admin_report(
         self,
@@ -1821,6 +1823,16 @@ class ServiceRegistry:
                     json.dumps(assignments, ensure_ascii=False, sort_keys=True),
                     _utc_now(),
                 ),
+            )
+
+    def delete_admin_report(
+        self, service_id: str, event_date: str, admin_id: int
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "DELETE FROM admin_report_messages WHERE service_id = ? "
+                "AND event_date = ? AND admin_id = ?",
+                (service_id, event_date, admin_id),
             )
 
     def list_admin_reports(self, service_id: str, event_date: str) -> list[dict]:

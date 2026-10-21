@@ -1004,17 +1004,21 @@ async def _process_service_reminder(
                     service_id,
                     event_date,
                 )
-                try:
-                    await send_admin_reports(
-                        bot, registry, service, event_date, assignments,
-                        credentials.admin_tg_id, debug_logger,
-                        TELEGRAM_TEXT_LIMIT,
-                    )
-                except Exception:  # noqa: BLE001
-                    debug_logger.exception(
-                        "Не удалось подготовить отчёт админам служения %s",
-                        service_id,
-                    )
+    if group_chat_id is not None and registry.is_group_reminder_delivered(
+        reminder["id"], event_date.isoformat(), group_recipient
+    ):
+        # Отчёт отдельно от группового сообщения: недоставленный ранее
+        # отчёт отправится при следующем запуске, не повторяя группу.
+        try:
+            await send_admin_reports(
+                bot, registry, service, event_date, assignments,
+                credentials.admin_tg_id, debug_logger, TELEGRAM_TEXT_LIMIT,
+            )
+        except Exception:  # noqa: BLE001
+            debug_logger.exception(
+                "Не удалось подготовить отчёт админам служения %s",
+                service_id,
+            )
 
 
 async def _process_user_reminder_schedule(

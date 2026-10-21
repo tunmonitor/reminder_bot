@@ -198,8 +198,14 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - `bot/admin_report.py`: after a group reminder `send_admin_reports` sends
   one report per service admin and date (fallback: super admin) and stores it
   in `admin_report_messages`; later reminders and answers edit it
-  (`refresh_admin_reports`); `fit_one_screen` cuts the text to one message so
-  it stays editable. Template `services.admin_report_template`
+  (`refresh_admin_reports` delegates to `send_admin_reports`, which targets
+  only current recipients, drops rows of removed admins, and resends a report
+  whose edit fails). `_process_service_reminder` calls it whenever the group
+  reminder of that date is delivered, so a failed report is retried without
+  resending the group. `build_report_text(limit=...)` keeps
+  `{confirmation_status}` visible by collapsing delivery, then assignments;
+  confirmations are keyed by `(task, telegram_id)`. The template is written on
+  finish only if this session edited it (`admin_report_template_edited`). Template `services.admin_report_template`
   (`ADMIN_REPORT_FIELDS`), edited under «📋 Отчёт админам» in
   `/service_notify` and saved on «Завершить и сохранить».
 

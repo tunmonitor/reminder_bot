@@ -54,7 +54,7 @@ class ConfirmationRegistryTest(RegistryTestCase):
         )
         self.assertEqual(
             self.registry.list_confirmations("sound", iso),
-            {("звук", "Алексей"): "declined"},
+            {("звук", MEMBER): "declined"},
         )
 
     def test_only_linked_person_can_answer(self):
@@ -93,7 +93,7 @@ class ReportTextTest(unittest.TestCase):
             None, "Звук", FUTURE, ASSIGNMENTS,
             {("звук", "Алексей"): {"telegram_id": MEMBER}},
             lambda telegram_id: True,
-            {("звук", "Алексей"): "confirmed"},
+            {("звук", MEMBER): "confirmed"},
         )
         self.assertIn("📋 Отчёт · Звук · 04.01.2099", text)
         self.assertIn("✅ Алексей (звук) — уведомления включены", text)
@@ -107,13 +107,42 @@ class ReportTextTest(unittest.TestCase):
             "Звук", FUTURE, {"звук": {"names": ["Алексей"]}},
             {("звук", "Алексей"): {"telegram_id": MEMBER}},
             lambda telegram_id: False,
-            {("звук", "Алексей"): "declined"},
+            {("звук", MEMBER): "declined"},
         )
         self.assertEqual(
             text,
             "Звук: 🚫 не сможет — Алексей (звук) | "
             "🔕 Алексей (звук) — уведомления выключены",
         )
+
+
+class ReportAnswersTest(RegistryTestCase):
+    def test_rebinding_name_does_not_inherit_old_answer(self):
+        iso = FUTURE.isoformat()
+        self.registry.set_confirmation("sound", iso, "звук", MEMBER, "confirmed")
+        self.registry.set_responsible_contact(
+            SUPER, "sound", "звук", "Алексей", 7007, "@other"
+        )
+        text = build_report_text(
+            None, "Звук", FUTURE, {"звук": {"names": ["Алексей"]}},
+            {("звук", "Алексей"): {"telegram_id": 7007}},
+            lambda telegram_id: True,
+            self.registry.list_confirmations("sound", iso),
+        )
+        self.assertIn("⏳ нет ответа — Алексей (звук)", text)
+
+    def test_long_report_keeps_answers_visible(self):
+        names = [f"Участник с длинным именем {index}" for index in range(300)]
+        text = build_report_text(
+            None, "Звук", FUTURE, {"звук": {"names": names}},
+            {("звук", names[-1]): {"telegram_id": MEMBER}},
+            lambda telegram_id: True,
+            {("звук", MEMBER): "confirmed"},
+            limit=4096,
+        )
+        self.assertEqual(len(render_screen_chunks(text, limit=4096)), 1)
+        self.assertIn("✅ Подтверждения:", text)
+        self.assertIn("сокращено", text)
 
 
 class FitOneScreenTest(unittest.TestCase):
@@ -161,6 +190,44 @@ class ReportDeliveryTest(RegistryTestCase):
             self.assertIn(
                 "подтвердил(а) — Алексей",
                 bot.edit_message_text.await_args.args[0],
+            )
+
+        asyncio.run(run())
+
+    def test_removed_admin_stops_getting_updates_and_deleted_report_resent(self):
+        async def run():
+            other = 23456
+            self.registry.add_service_admin(SUPER, "sound", ADMIN)
+            self.registry.add_service_admin(SUPER, "sound", other)
+            bot = SimpleNamespace(
+                send_message=AsyncMock(return_value=SimpleNamespace(message_id=5)),
+                edit_message_text=AsyncMock(),
+            )
+            service = self.registry.get_service("sound")
+            await send_admin_reports(
+                bot, self.registry, service, FUTURE, ASSIGNMENTS, SUPER,
+                MagicMock(), 4096,
+            )
+            self.registry.remove_service_admin(SUPER, "sound", other)
+            # Админ удалил отчёт: правка не удаётся — отчёт отправляется заново.
+            bot.edit_message_text.side_effect = RuntimeError("message to edit not found")
+            bot.send_message.reset_mock()
+            bot.send_message.return_value = SimpleNamespace(message_id=9)
+            await refresh_admin_reports(
+                bot, self.registry, "sound", FUTURE, SUPER, MagicMock(), 4096
+            )
+            edited = [
+                call.kwargs["chat_id"]
+                for call in bot.edit_message_text.await_args_list
+            ]
+            self.assertNotIn(other, edited)
+            self.assertEqual(
+                [call.args[0] for call in bot.send_message.await_args_list],
+                [ADMIN],
+            )
+            self.assertEqual(
+                self.registry.list_admin_reports("sound", FUTURE.isoformat()),
+                [{"admin_id": ADMIN, "message_id": 9, "assignments": ASSIGNMENTS}],
             )
 
         asyncio.run(run())
@@ -256,6 +323,40 @@ class PersonalAnswerHandlerTest(RegistryTestCase):
         self._press(self._button("🚫 Не смогу"))
         self.assertEqual(self.context.on_assignment_declined.await_count, 1)
         self.assertEqual(self.context.bot.send_message.await_count, 1)
+
+    def test_decline_without_reachable_admins_says_so(self):
+        self.context.bot.send_message.side_effect = RuntimeError("blocked")
+        callback = self._press(self._button("🚫 Не смогу"))
+        text = callback.message.edit_text.await_args.args[0]
+        self.assertIn("сообщить админам не удалось", text)
+        self.assertEqual(
+            callback.message.edit_text.await_args.kwargs["parse_mode"], "HTML"
+        )
+
+    def test_answer_keeps_formatting_and_long_text_only_drops_buttons(self):
+        callback = SimpleNamespace(
+            data=self._button("✅ Принял"),
+            from_user=SimpleNamespace(id=MEMBER),
+            message=SimpleNamespace(
+                text="Заголовок", html_text="<b>Заголовок</b>",
+                edit_text=AsyncMock(), edit_reply_markup=AsyncMock(),
+                chat=SimpleNamespace(type="private", id=MEMBER),
+            ),
+            answer=AsyncMock(),
+        )
+        asyncio.run(self.handlers["on_personal_answer"](callback))
+        self.assertEqual(
+            callback.message.edit_text.await_args.args[0],
+            "<b>Заголовок</b>\n\n✅ Подтверждено",
+        )
+        self.registry.set_confirmation(
+            "sound", FUTURE.isoformat(), "звук", MEMBER, "declined"
+        )
+        callback.message.html_text = "x" * 4096
+        callback.message.edit_text.reset_mock()
+        asyncio.run(self.handlers["on_personal_answer"](callback))
+        callback.message.edit_text.assert_not_awaited()
+        callback.message.edit_reply_markup.assert_awaited_with(reply_markup=None)
 
     def test_stranger_and_stale_buttons_rejected(self):
         callback = self._press(self._button("✅ Принял"), user_id=5555)
@@ -358,6 +459,26 @@ class ReportTemplateEditorTest(RegistryTestCase):
             self.assertEqual(
                 self.registry.get_service("sound")["admin_report_template"],
                 "{service_name}: {confirmation_status}",
+            )
+
+        asyncio.run(run())
+
+    def test_untouched_session_keeps_other_admins_template(self):
+        async def run():
+            selection = SimpleNamespace(
+                data="service:service_notify:sound",
+                from_user=SimpleNamespace(id=ADMIN),
+                message=self._message(""),
+                answer=AsyncMock(),
+            )
+            await self._handler("on_service_selected")(selection)
+            self.registry.set_admin_report_template(
+                SUPER, "sound", "{service_name}"
+            )
+            await self._click(selection.message, "Завершить и сохранить")
+            self.assertEqual(
+                self.registry.get_service("sound")["admin_report_template"],
+                "{service_name}",
             )
 
         asyncio.run(run())
