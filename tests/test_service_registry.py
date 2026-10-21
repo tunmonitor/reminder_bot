@@ -1993,6 +1993,8 @@ class ServiceRegistryTest(unittest.TestCase):
                     "reminder_days": 0,
                     "reminder_time": "07:30",
                     "enabled": 1,
+                    "origin": "admin",
+                    "body": None,
                 }
             ],
         )
@@ -2071,3 +2073,41 @@ class RescheduleResetsDeliveryTest(unittest.TestCase):
             self.assertTrue(
                 registry.is_group_reminder_delivered(reminder_id, past, "group:-1")
             )
+
+
+class UserRuleRulesTest(unittest.TestCase):
+    def test_duplicates_limit_and_length(self):
+        import tempfile
+        from pathlib import Path as _Path
+
+        from bot.service_registry import ServiceRegistry as _Registry
+
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = _Registry(_Path(tmp) / "r.sqlite3")
+            registry.initialize(1001, -100)
+            registry.set_responsible_contact(1001, "sound", "звук", "Алексей", 2002)
+            text_id = registry.ensure_user_text(2002, "sound", "звук")
+            admin = registry.add_schedule(text_id, 1, "18:00")
+            with self.assertRaises(ValueError):
+                registry.add_schedule(text_id, 1, "18:00", origin="user")
+            copy = registry.add_schedule(
+                text_id, 1, "18:00", origin="user", enabled=False
+            )
+            with self.assertRaises(ValueError):
+                registry.update_schedule(copy["id"], enabled=True)
+            registry.update_schedule(copy["id"], days=0, time="08:00")
+            registry.update_schedule(copy["id"], enabled=True)
+            with self.assertRaises(ValueError):
+                registry.update_schedule(copy["id"], days=1, time="18:00")
+            registry.update_schedule(admin["id"], enabled=False)
+            registry.update_schedule(copy["id"], days=1, time="18:00")
+            with self.assertRaises(ValueError):
+                registry.update_schedule(copy["id"], body="x" * 3001)
+            # Лимит — только на свои напоминания.
+            for index in range(9):
+                registry.add_schedule(
+                    text_id, 2, f"0{index}:30", origin="user"
+                )
+            with self.assertRaises(ValueError):
+                registry.add_schedule(text_id, 3, "09:00", origin="user")
+            registry.add_schedule(text_id, 3, "09:00")

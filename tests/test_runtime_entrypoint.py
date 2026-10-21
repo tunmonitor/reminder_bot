@@ -1043,7 +1043,8 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     bot.send_message.await_args_list[0].args[1],
-                    "<b>🔔 Личное: Алексей, Микшер, Звук, 18.10.2026</b>",
+                    "<b>🔔 Звук · Микшер · 18.10.2026</b>\n"
+                    "Личное: Алексей, Микшер, Звук, 18.10.2026",
                 )
                 self.assertEqual(load_assignments.await_count, 3)
 

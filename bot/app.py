@@ -1185,6 +1185,7 @@ async def _process_user_reminder_schedule(
         schedule["service_id"],
         schedule["task"],
         service["personal_templates"],
+        body=schedule.get("body"),
     )
     try:
         text = template.format_map(
@@ -1209,8 +1210,12 @@ async def _process_user_reminder_schedule(
             debug_logger,
         )
         return
-    if not text.startswith("🔔"):
-        text = f"🔔 {text}"
+    # Заголовок всегда: к чему относятся «Принял» / «Не смогу», даже если
+    # текст напоминания свой.
+    text = (
+        f"🔔 {schedule['service_name']} · {schedule['task']} · "
+        f"{event_date:%d.%m.%Y}\n{text.removeprefix('🔔').strip()}"
+    )
     if _utf16_length(text) > TELEGRAM_TEXT_LIMIT:
         await _notify_admin(
             bot,
