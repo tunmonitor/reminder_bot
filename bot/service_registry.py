@@ -15,6 +15,7 @@ from string import Formatter
 from dataclasses import replace
 from typing import Callable
 
+from .presentation import is_replaced
 from .secure_fs import open_private_directory
 from .services import (
     SERVICES,
@@ -2174,11 +2175,15 @@ class ServiceRegistry:
         username: str,
         source: str,
         created_by: int | None,
-    ) -> None:
-        """Замена на одну дату. Заменяющий из состава служения (есть в
-        составе или привязках) получает привязку к задаче под этим именем —
-        для упоминаний и личных напоминаний. Участник чата не из состава
-        указывается только по имени."""
+        expect_current: bool = False,
+    ) -> bool:
+        """Замена на одну дату.
+
+        expect_current — заменённый ещё стоит в задаче (его не заменили,
+        пока админ выбирал); иначе возвращается False. Заменяющий из
+        состава служения (есть в составе или привязках) получает привязку к
+        задаче под этим именем — для упоминаний и личных напоминаний.
+        Участник чата не из состава указывается только по имени."""
         date.fromisoformat(event_date)
         if source not in {"poll", "admin"}:
             raise ValueError("Некорректный источник замены")
@@ -2189,7 +2194,19 @@ class ServiceRegistry:
         username = (username or "").strip().lstrip("@")
         now = _utc_now()
         with self._connection() as connection:
+            # Проверка и запись — одной транзакцией: два подтверждения
+            # подряд не назначат замену дважды.
+            connection.execute("BEGIN IMMEDIATE")
             self._require_service(connection, service_id)
+            if expect_current:
+                rows = connection.execute(
+                    "SELECT task, old_name, new_name FROM service_replacements "
+                    "WHERE service_id = ? AND event_date = ? "
+                    "ORDER BY created_at, rowid",
+                    (service_id, event_date),
+                ).fetchall()
+                if is_replaced([dict(row) for row in rows], task, old_name):
+                    return False
             connection.execute(
                 """
                 INSERT INTO service_replacements (
@@ -2232,6 +2249,7 @@ class ServiceRegistry:
                         actor, now,
                     ),
                 )
+        return True
 
     def list_replacements(self, service_id: str, event_date: str) -> list[dict]:
         """Замены на дату в порядке назначения (цепочки применяются по

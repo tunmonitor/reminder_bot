@@ -158,3 +158,14 @@ def apply_replacements(assignments: dict, replacements: list[dict]) -> dict:
         else:
             result[item["task"]] = names
     return result
+
+
+def is_replaced(replacements: list[dict], task: str, name: str) -> bool:
+    """Человек уже заменён на эту дату (отказ из старого напоминания).
+    Если цепочка замен вернула его обратно (А→Б→А), он снова в задаче."""
+    current = {name}
+    for item in replacements:
+        if item["task"] == task and item["old_name"] in current:
+            current.discard(item["old_name"])
+            current.add(item["new_name"])
+    return name not in current

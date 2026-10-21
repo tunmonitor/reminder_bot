@@ -115,7 +115,7 @@ class PureRulesTest(unittest.TestCase):
         self.assertEqual(moved["звук"], ["Вера", "Борис"])
 
     def test_already_replaced_follows_chain(self):
-        from bot.replacement import _already_replaced
+        from bot.presentation import is_replaced as _already_replaced
 
         chain = [
             {"task": "звук", "old_name": "А", "new_name": "Б"},
@@ -527,6 +527,59 @@ class DirectChangeTest(HandlersTest):
             self.bot.stop_poll.assert_awaited_once()
 
         asyncio.run(run())
+
+    def test_undated_change_skips_date_with_several_people(self):
+        from bot.excel_parser import ServiceAssignment, ServiceEvent
+
+        later = self.day + timedelta(days=7)
+        self.events.append(ServiceEvent("sound", later, (
+            ServiceAssignment("спевка", "Вера"),
+        )))
+        done = self.message(ADMIN, "/change спевка @boris_b")
+        asyncio.run(self.change(done))
+        self.assertIn("✅ Замена назначена", done.answer.await_args.args[0])
+        self.assertEqual(
+            self.registry.list_replacements("sound", later.isoformat())[0]["old_name"],
+            "Вера",
+        )
+        kwargs = self.context.load_upcoming_service_events.await_args.kwargs
+        self.assertIn("until", kwargs)
+
+    def test_stale_screen_does_not_override_replacement(self):
+        async def run():
+            card = self._callback(SimpleNamespace(
+                callback_data="service:service_replace:sound"
+            ))
+            await self._handler("on_service_selected")(card)
+            people = await self._press(card.message, f"{self.day:%d.%m}")
+            tasks = await self._press(people, "Алексей · 2 задачи")
+            candidates = await self._press(tasks, "сборка")
+            confirm = await self._press(candidates, "Борис")
+            # Пока экран открыт, замену назначили иначе.
+            self.registry.set_replacement(
+                "sound", self.day.isoformat(), "сборка", "Алексей", "Глеб",
+                None, "", "admin", SUPER,
+            )
+            result = await self._press(confirm, "Назначить")
+            self.assertIn("уже назначили", result.answer.await_args.args[0])
+            rows = self.registry.list_replacements("sound", self.day.isoformat())
+            self.assertEqual([row["new_name"] for row in rows], ["Глеб"])
+
+        asyncio.run(run())
+
+    def test_failed_announcement_warns_acting_admin(self):
+        async def send_message(chat_id, text, **kwargs):
+            if chat_id < 0:
+                raise RuntimeError("chat gone")
+            return SimpleNamespace(message_id=1)
+
+        self.bot.send_message.side_effect = send_message
+        done = self.message(ADMIN, f"/change звук @boris_b {self.day:%d.%m}")
+        asyncio.run(self.change(done))
+        self.assertIn("✅ Замена назначена", done.answer.await_args.args[0])
+        warnings = [text for text in self.sent_to(ADMIN) if "не дошло" in text]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("чат служения", warnings[0])
 
     def test_repeat_decline_after_replacement_starts_nothing(self):
         self.registry.set_replacement(

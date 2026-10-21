@@ -6350,12 +6350,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         service = registry.get_service(service_id)
         if service is None:
             return False
-        await assign_replacement(
+        if not await assign_replacement(
             context.bot, registry, service, event_date, task, old_name,
             substitute, source="admin", actor_id=actor_id,
             admin_actor_id=context.admin_id, logger=debug,
-            report_limit=TELEGRAM_TEXT_LIMIT,
-        )
+            report_limit=TELEGRAM_TEXT_LIMIT, expect_current=True,
+        ):
+            return False
         interaction.info(
             "Замена назначена админом: service=%s task=%s date=%s actor=%s",
             service_id, task, event_date, actor_id,
@@ -6385,15 +6386,20 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             callback_data=f"rpl:{pending['session_id']}:{action}:{arg}",
         )
 
+    def replace_window_end():
+        """Последний день следующего месяца."""
+        today = datetime.now(context.timezone).date()
+        next_month = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
+        return (next_month + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+
     def replace_events_window(events: list, service_id: str) -> list:
         """События служения с сегодня: текущий и следующий месяц."""
         today = datetime.now(context.timezone).date()
-        next_month = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
-        last = (next_month + timedelta(days=32)).replace(day=1)
+        last = replace_window_end()
         return [
             event for event in events
             if event.service_id == service_id
-            and today <= event.event_date < last
+            and today <= event.event_date <= last
             and any(
                 item.name and not item.is_informational
                 for item in event.assignments
@@ -6411,7 +6417,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         await clean_and_clear_pending_actor(actor_id)
         try:
-            events = replace_events_window(await loader(), service_id)
+            events = replace_events_window(
+                await loader(until=replace_window_end()), service_id
+            )
         except (OSError, RuntimeError, ValueError, sqlite3.Error):
             debug.exception("Не удалось загрузить график для замены")
             events = None
@@ -6832,12 +6840,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if not targets:
             loader = getattr(context, "load_upcoming_service_events", None)
             try:
-                events = await loader() if loader else []
+                events = await loader(until=replace_window_end()) if loader else []
             except (OSError, RuntimeError, ValueError, sqlite3.Error):
                 debug.exception("Не удалось загрузить график для /change")
                 await reply("⚠️ Не удалось загрузить график. Попробуйте позже.")
                 return
             nearest: dict[str, tuple] = {}
+            first_any: dict[str, tuple] = {}
             for event in events or []:
                 if not in_this_chat(event.service_id) or event.event_date < today:
                     continue
@@ -6848,13 +6857,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     if normalized_name(assignment.task) == normalized_name(task_text)
                     and assignment.name and not assignment.is_informational
                 ]
-                if not matched or event.service_id in nearest:
+                if not matched:
                     continue
-                nearest[event.service_id] = (
+                target = (
                     event.service_id, event.event_date, matched[0].task,
                     list(dict.fromkeys(item.name for item in matched)),
                 )
-            targets = list(nearest.values())
+                # Без даты — ближайшая дата с одним ответственным; если
+                # таких нет, первая (с подсказкой выбрать в «🔁 Замена»).
+                first_any.setdefault(event.service_id, target)
+                if len(target[3]) == 1 and event.service_id not in nearest:
+                    nearest[event.service_id] = target
+            targets = list({**first_any, **nearest}.values())
         if not targets:
             when = f" на {event_date:%d.%m.%Y}" if event_date else ""
             await reply(

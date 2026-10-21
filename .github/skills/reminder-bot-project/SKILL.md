@@ -210,7 +210,13 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   «🔁 Замена» card screen (`open_replace_dates`, callbacks `rpl:{session}:…`,
   `pending_inputs` operation `service_replace`, Telegram pick via
   `pending_shares` "service_replace") and `/change` both go through
-  `admin_assign_replacement`, which closes an active request for that person.
+  `admin_assign_replacement`, which closes an active request for that person;
+  otherwise it calls `assign_replacement(..., expect_current=True)` →
+  `set_replacement(expect_current=True)` (BEGIN IMMEDIATE + `is_replaced`
+  chain check), so a stale screen returns False. `_notify` returns failed
+  chats; failed announcements warn service admins and the actor.
+  `context.load_upcoming_service_events(until=...)`: the cache holds events
+  through the end of next month, default return is 6 weeks.
   `start_replacement_search` ignores a decline of an already replaced person. Every decline stores a request row in
   `replacement_polls` (no group chat or failed poll → `manual-…` row with
   status `closed`); `filled` marks a request that got a replacement
