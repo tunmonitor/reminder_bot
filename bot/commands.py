@@ -24,7 +24,7 @@ _SERVICE_NOTIFY = BotCommand(
     command="service_notify", description="Напоминания и шаблоны"
 )
 _CHANGE = BotCommand(
-    command="change", description="Назначить замену: задача @username"
+    command="change", description="Замена: задача @username [дд.мм]"
 )
 _SUPER_ADMIN_COMMANDS = [
     BotCommand(command="service_contact", description="Привязать ответственных"),

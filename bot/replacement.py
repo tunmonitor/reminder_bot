@@ -14,7 +14,7 @@ from datetime import date, datetime, time, timedelta, timezone
 
 from .admin_report import refresh_admin_reports, report_recipients
 from .group_send import send_to_service_group
-from .presentation import apply_replacements  # noqa: F401 — реэкспорт
+from .presentation import apply_replacements, is_replaced  # noqa: F401
 
 POLL_COLLECT = timedelta(hours=12)
 # Ответы собираются не позже чем за 12 часов до начала дня события.
@@ -50,15 +50,19 @@ def _local(deadline: str | datetime, tz) -> str:
     return f"{moment.astimezone(tz):%d.%m %H:%M}"
 
 
-async def _notify(bot, chat_ids, text: str, logger: logging.Logger) -> None:
+async def _notify(bot, chat_ids, text: str, logger: logging.Logger) -> list:
+    """Отправляет сообщение; возвращает чаты, куда доставить не удалось."""
+    failed = []
     for chat_id in chat_ids:
         try:
             await bot.send_message(chat_id, text, parse_mode=None)
         except Exception:  # noqa: BLE001
+            failed.append(chat_id)
             logger.warning(
                 "Не удалось отправить сообщение о замене в чат %s",
                 chat_id, exc_info=True,
             )
+    return failed
 
 
 async def start_replacement_search(
@@ -87,6 +91,8 @@ async def start_replacement_search(
     event_iso = event_date.isoformat()
     if registry.find_active_replacement_request(
         service_id, event_iso, task, old_name
+    ) or is_replaced(
+        registry.list_replacements(service_id, event_iso), task, old_name
     ):
         return None
     admins = report_recipients(registry, service_id, admin_actor_id)
@@ -266,7 +272,10 @@ async def finish_replacement(
         )
     except Exception:  # noqa: BLE001
         logger.exception("Не удалось назначить замену по опросу %s", poll["poll_id"])
-        registry.release_replacement_request(poll["poll_id"])
+        try:
+            registry.release_replacement_request(poll["poll_id"])
+        except Exception:  # noqa: BLE001
+            logger.exception("Не удалось вернуть запрос замены %s", poll["poll_id"])
         await _notify(
             bot, admins,
             f"⚠️ Не удалось назначить замену: «{poll['task']}» · "
@@ -292,14 +301,66 @@ async def assign_replacement(
     admin_actor_id: int,
     logger: logging.Logger,
     report_limit: int,
-) -> None:
-    """Сохраняет замену и сообщает о ней чату, админам и заменяющему."""
+    expect_current: bool = False,
+) -> bool:
+    """Сохраняет замену и сообщает о ней чату, админам и заменяющему.
+
+    Исключение — только если не удалось сохранить саму замену; сбои
+    уведомлений после сохранения записываются в журнал. False — с
+    expect_current человека уже заменили (экран устарел)."""
     event_iso = event_date.isoformat()
-    registry.set_replacement(
+    if not registry.set_replacement(
         service["id"], event_iso, task, old_name, substitute["name"],
         substitute.get("telegram_id"), substitute.get("username") or "",
-        source, actor_id,
-    )
+        source, actor_id, expect_current=expect_current,
+    ):
+        return False
+    try:
+        failed = await _announce_replacement(
+            bot, registry, service, event_date, task, old_name, substitute,
+            source=source, admin_actor_id=admin_actor_id, logger=logger,
+            report_limit=report_limit,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Замена сохранена, но оповещение о ней не завершено")
+        failed = ["оповещение прервано"]
+    if failed:
+        try:
+            # Предупреждение — и админам служения, и тому, кто назначил.
+            recipients = list(dict.fromkeys(
+                item for item in (
+                    *report_recipients(registry, service["id"], admin_actor_id),
+                    actor_id,
+                ) if item
+            ))
+            await _notify(
+                bot, recipients,
+                f"⚠️ Замена «{task}» {event_date:%d.%m.%Y} ({substitute['name']} "
+                f"вместо {old_name}) сохранена, но сообщение не дошло: "
+                f"{', '.join(failed)}. Предупредите их сами.",
+                logger,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Не удалось сообщить о сбое оповещения замены")
+    return True
+
+
+async def _announce_replacement(
+    bot,
+    registry,
+    service: dict,
+    event_date: date,
+    task: str,
+    old_name: str,
+    substitute: dict,
+    *,
+    source: str,
+    admin_actor_id: int,
+    logger: logging.Logger,
+    report_limit: int,
+) -> list[str]:
+    """Оповещения о замене; возвращает, кому доставить не удалось."""
+    event_iso = event_date.isoformat()
     if substitute.get("telegram_id"):
         try:
             registry.set_confirmation(
@@ -314,6 +375,7 @@ async def assign_replacement(
         f"✅ Замена: «{task}» {date_text} — {label} вместо {old_name}."
     )
     how = "по опросу" if source == "poll" else "назначил админ"
+    failed: list[str] = []
     if service.get("group_chat_id") and service.get("enabled", True):
         try:
             await send_to_service_group(
@@ -322,17 +384,19 @@ async def assign_replacement(
             )
         except Exception:  # noqa: BLE001
             logger.exception("Не удалось объявить замену в чате служения")
-    await _notify(
+            failed.append("чат служения")
+    if await _notify(
         bot, report_recipients(registry, service["id"], admin_actor_id),
         f"{text} ({service['name']}, {how})", logger,
-    )
-    if substitute.get("telegram_id"):
-        await _notify(
-            bot, [substitute["telegram_id"]],
-            f"✅ Вы назначены: «{task}» · {service['name']} · {date_text} "
-            f"вместо {old_name}. Спасибо!",
-            logger,
-        )
+    ):
+        failed.append("админы")
+    if substitute.get("telegram_id") and await _notify(
+        bot, [substitute["telegram_id"]],
+        f"✅ Вы назначены: «{task}» · {service['name']} · {date_text} "
+        f"вместо {old_name}. Спасибо!",
+        logger,
+    ):
+        failed.append("заменяющий")
     try:
         await refresh_admin_reports(
             bot, registry, service["id"], event_date, admin_actor_id, logger,
@@ -340,6 +404,7 @@ async def assign_replacement(
         )
     except Exception:  # noqa: BLE001
         logger.exception("Не удалось обновить отчёт админам после замены")
+    return failed
 
 
 def poll_answer_choice(option_ids) -> bool | None:
@@ -349,10 +414,42 @@ def poll_answer_choice(option_ids) -> bool | None:
     return option_ids[0] == 0
 
 
-def parse_change_args(args: str | None) -> tuple[str, str]:
-    """«/change звук @alex» → ("звук", "alex")."""
+CHANGE_USAGE = "Формат: /change {задача} @username [дд.мм]"
+
+
+def parse_change_args(
+    args: str | None, today: date | None = None
+) -> tuple[str, str, date | None]:
+    """«/change звук @alex 18.10» → ("звук", "alex", date(…, 10, 18)).
+
+    Дата необязательна; без года — ближайшая такая дата не раньше today."""
     parts = (args or "").split()
-    if len(parts) < 2 or not parts[-1].startswith("@") or len(parts[-1]) < 2:
-        raise ValueError("Формат: /change {задача} @username")
-    return " ".join(parts[:-1]), parts[-1][1:]
+    at = [index for index, part in enumerate(parts) if part.startswith("@")]
+    if not at or at[-1] == 0 or len(parts[at[-1]]) < 2:
+        raise ValueError(CHANGE_USAGE)
+    index = at[-1]
+    rest = parts[index + 1:]
+    if len(rest) > 1:
+        raise ValueError(CHANGE_USAGE)
+    event_date = parse_event_date(rest[0], today) if rest else None
+    return " ".join(parts[:index]), parts[index][1:], event_date
+
+
+def parse_event_date(text: str, today: date | None = None) -> date:
+    today = today or date.today()
+    pieces = text.strip().split(".")
+    try:
+        if len(pieces) == 2:
+            day, month = int(pieces[0]), int(pieces[1])
+            candidate = date(today.year, month, day)
+            if candidate < today:
+                candidate = date(today.year + 1, month, day)
+            return candidate
+        if len(pieces) == 3:
+            year = int(pieces[2])
+            year = year + 2000 if year < 100 else year
+            return date(year, int(pieces[1]), int(pieces[0]))
+    except ValueError:
+        pass
+    raise ValueError("Дата — в формате дд.мм или дд.мм.гггг. " + CHANGE_USAGE)
 

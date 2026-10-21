@@ -6068,6 +6068,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 [
                     "service:edit_notify:sound",
                     "service:service_contact:sound",
+                    "service:service_replace:sound",
                     "service:service_sync:sound",
                     "service:service_chat:sound",
                     "service:service_admin_add:sound",
@@ -6156,7 +6157,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
             self.assertEqual(
                 self.callback_data_list(callback.message),
-                ["service:edit_notify:sound", "service:back_to_services:list"],
+                ["service:edit_notify:sound", "service:service_replace:sound",
+                 "service:back_to_services:list"],
             )
             self.assertIn(
                 "👤 Администраторы · 1",

@@ -144,6 +144,8 @@ else:  # pragma: no cover - поддержка запуска файла нап�
 
 
 UPCOMING_EVENTS_CACHE_SECONDS = 300
+# «Мои служения» и обзор ответственных — ближайшие недели.
+UPCOMING_WEEKS_DEFAULT = 6
 
 
 def _next_sunday_in_tz(tz) -> date:
@@ -586,10 +588,12 @@ async def _load_upcoming_service_events(
     debug_logger,
     weeks: int = 6,
     services=None,
+    until: date | None = None,
 ) -> list:
-    """Read schedule events from today through the given number of weeks."""
+    """Read schedule events from today through the given number of weeks
+    (or through until, if it is later)."""
     today = datetime.now(tz).date()
-    last_day = today + timedelta(days=weeks * 7)
+    last_day = max(today + timedelta(days=weeks * 7), until or today)
     months = []
     month = today.replace(day=1)
     while month <= last_day:
@@ -1668,34 +1672,57 @@ async def _run_locked(args: CliArgs) -> None:
         context.prepare_test_previews = prepare_test_previews
         context.load_service_task_assignments = load_service_task_assignments
 
-        upcoming_cache: dict[str, Any] = {"loaded_at": None, "events": []}
+        upcoming_cache: dict[str, Any] = {
+            "loaded_at": None, "events": [], "until": None,
+        }
         upcoming_lock = asyncio.Lock()
 
-        async def load_upcoming_service_events() -> list:
+        async def load_upcoming_service_events(until: date | None = None) -> list:
             # Один общий скачанный график на несколько минут для всех
             # пользователей: повторные нажатия не обращаются к Яндекс.Диску.
+            # В кэше — график до конца следующего месяца (для «🔁 Замена»);
+            # по умолчанию возвращаются ближайшие 6 недель, until — до этой
+            # даты.
+            today = datetime.now(tz).date()
+            limit = until or today + timedelta(days=UPCOMING_WEEKS_DEFAULT * 7)
+
+            def window(events: list) -> list:
+                return _apply_event_replacements(
+                    [event for event in events if event.event_date <= limit],
+                    service_registry,
+                )
+
             async with upcoming_lock:
                 loaded_at = upcoming_cache["loaded_at"]
                 if (
                     loaded_at is not None
                     and time.monotonic() - loaded_at
                     < UPCOMING_EVENTS_CACHE_SECONDS
+                    # После смены месяца кэш может не покрывать окно.
+                    and upcoming_cache["until"] is not None
+                    and upcoming_cache["until"] >= limit
                 ):
                     # Замены — из базы при каждом чтении: кэш хранит график.
-                    return _apply_event_replacements(
-                        upcoming_cache["events"], service_registry
-                    )
+                    return window(upcoming_cache["events"])
+                next_month = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
+                end_of_next_month = (
+                    (next_month + timedelta(days=32)).replace(day=1)
+                    - timedelta(days=1)
+                )
                 events = await _load_upcoming_service_events(
                     credentials, shm_dir, tz, debug_logger,
+                    weeks=UPCOMING_WEEKS_DEFAULT,
                     services=(
                         service_registry.service_catalog()
                         if service_registry is not None else None
                     ),
+                    until=max(end_of_next_month, limit),
                 )
                 upcoming_cache.update(
-                    loaded_at=time.monotonic(), events=events
+                    loaded_at=time.monotonic(), events=events,
+                    until=max(end_of_next_month, limit),
                 )
-                return _apply_event_replacements(events, service_registry)
+                return window(events)
 
         context.load_upcoming_service_events = load_upcoming_service_events
         context.prepare_service_test_previews = prepare_service_test_previews

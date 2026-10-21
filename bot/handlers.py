@@ -8,7 +8,7 @@ import re
 import secrets
 import sqlite3
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -38,6 +38,7 @@ from .commands import (
 from .admin_report import notify_admins_declined, refresh_admin_reports
 from .group_send import send_to_service_group, thread_kwargs
 from .replacement import (
+    assign_replacement,
     finish_replacement,
     parse_change_args,
     person_label,
@@ -908,12 +909,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             items.extend(
                 [
                     ("👥 Ответственные", "service_contact"),
+                    ("🔁 Замена", "service_replace"),
                     ("🔄 Сверить график", "service_sync"),
                     ("📡 Групповой чат", "service_chat"),
                     ("👤 Назначить админа", "service_admin_add"),
                     ("➖ Снять админа", "service_admin_remove"),
                 ]
             )
+        else:
+            items.append(("🔁 Замена", "service_replace"))
         if actor_id == context.admin_id:
             items.append(("🧪 Проверка доставки", "test_notify"))
         rows = [
@@ -1561,7 +1565,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         pending = pending_inputs[actor_id]
         try:
             events = await loader()
-        except (OSError, RuntimeError, ValueError):
+        except (OSError, RuntimeError, ValueError, sqlite3.Error):
             debug.exception("Не удалось загрузить график для обзора ответственных")
             events = None
         if pending_inputs.get(actor_id) is not pending:
@@ -4525,6 +4529,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "service_contact",
             "service_sync",
             "service_notify",
+            "service_replace",
             "test_notify",
         }:
             await _answer_callback(callback,"❌ Неизвестное действие.")
@@ -4543,6 +4548,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             if operation == "service_settings":
                 await send_service_card(
                     callback.message, callback.from_user.id, service
+                )
+            elif operation == "service_replace":
+                if not is_service_admin(callback.from_user.id, service_id):
+                    raise PermissionError(
+                        "Замена доступна только администратору этого служения."
+                    )
+                await open_replace_dates(
+                    callback.message, callback.from_user.id, service_id
                 )
             elif operation in {"edit_notify", "service_notify"}:
                 if not is_service_admin(
@@ -5529,6 +5542,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         request_id = message.users_shared.request_id
         pending = pending_shares.pop(request_id, None)
         if (
+            pending is not None
+            and pending[0] == message.from_user.id
+            and pending[1] == "service_replace"
+            and len(message.users_shared.users) == 1
+        ):
+            await on_replace_user_shared(message, pending)
+            return
+        if (
             pending is None
             or pending[0] != message.from_user.id
             or pending[1] not in {"service_admin_add", "service_contact"}
@@ -6312,114 +6333,658 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             people.append(label or "админ без имени")
         return ", ".join(people) or "админы не назначены — обратитесь к суперадмину"
 
+    async def admin_assign_replacement(
+        actor_id: int, service_id: str, event_date, task: str,
+        old_name: str, substitute: dict,
+    ) -> bool:
+        """Замена от админа — без отказа участника. Если по этому человеку
+        уже есть запрос (опрос), он закрывается этой заменой."""
+        registry = service_registry()
+        request = registry.find_active_replacement_request(
+            service_id, event_date.isoformat(), task, old_name
+        )
+        if request is not None:
+            return await close_replacement_poll(
+                request["poll_id"], substitute, actor_id
+            )
+        service = registry.get_service(service_id)
+        if service is None:
+            return False
+        if not await assign_replacement(
+            context.bot, registry, service, event_date, task, old_name,
+            substitute, source="admin", actor_id=actor_id,
+            admin_actor_id=context.admin_id, logger=debug,
+            report_limit=TELEGRAM_TEXT_LIMIT, expect_current=True,
+        ):
+            return False
+        interaction.info(
+            "Замена назначена админом: service=%s task=%s date=%s actor=%s",
+            service_id, task, event_date, actor_id,
+        )
+        return True
+
+    def substitute_by_username(
+        registry, service_id: str, task: str, username: str
+    ) -> dict | None:
+        person = registry.find_service_person_by_username(service_id, username)
+        if person is None or not person.get("telegram_id"):
+            return None
+        named = registry.service_person(
+            service_id, person["telegram_id"], task
+        ) or person
+        return {
+            "name": named["name"],
+            "telegram_id": person["telegram_id"],
+            "username": named.get("username") or person.get("username") or "",
+        }
+
+    # --- Экран «🔁 Замена» в карточке служения (этап 3.4) ---
+
+    def replace_button(text: str, pending: dict, action: str, arg="") -> InlineKeyboardButton:
+        return InlineKeyboardButton(
+            text=text,
+            callback_data=f"rpl:{pending['session_id']}:{action}:{arg}",
+        )
+
+    def replace_window_end():
+        """Последний день следующего месяца."""
+        today = datetime.now(context.timezone).date()
+        next_month = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
+        return (next_month + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+
+    def replace_events_window(events: list, service_id: str) -> list:
+        """События служения с сегодня: текущий и следующий месяц."""
+        today = datetime.now(context.timezone).date()
+        last = replace_window_end()
+        return [
+            event for event in events
+            if event.service_id == service_id
+            and today <= event.event_date <= last
+            and any(
+                item.name and not item.is_informational
+                for item in event.assignments
+            )
+        ]
+
+    async def open_replace_dates(
+        message: Message, actor_id: int, service_id: str, notice: str = ""
+    ) -> None:
+        registry = service_registry()
+        service = service_by_id(registry, service_id) if registry else None
+        loader = getattr(context, "load_upcoming_service_events", None)
+        if service is None or loader is None:
+            await _send_dialog(message, "Замена сейчас недоступна.", parse_mode=None)
+            return
+        await clean_and_clear_pending_actor(actor_id)
+        try:
+            events = replace_events_window(
+                await loader(until=replace_window_end()), service_id
+            )
+        except (OSError, RuntimeError, ValueError, sqlite3.Error):
+            debug.exception("Не удалось загрузить график для замены")
+            events = None
+        pending = {
+            "operation": "service_replace",
+            "service_id": service_id,
+            "session_id": secrets.token_urlsafe(9),
+            "step": "replace_date",
+            "events": events or [],
+        }
+        pending_inputs[actor_id] = pending
+        back = [replace_button("⬅️ К карточке служения", pending, "card")]
+        title = f"🔁 Замена · {service_label(service)}"
+        if events is None:
+            text = f"{title}\n⚠️ Не удалось загрузить график. Попробуйте позже."
+        elif not events:
+            text = (
+                f"{title}\n⚪ В этом и следующем месяце событий с "
+                "ответственными в графике нет."
+            )
+        else:
+            text = (
+                f"{title}\n{notice + chr(10) if notice else ''}"
+                "ℹ️ Выберите дату — замена действует только на неё."
+            )
+        rows = [
+            [replace_button(
+                f"🗓 {event.event_date:%d.%m}, "
+                f"{_WEEKDAYS[event.event_date.weekday()]}",
+                pending, "date", index,
+            )]
+            for index, event in enumerate(events or [])
+        ]
+        await _send_dialog(
+            message, text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[*rows, back]),
+            parse_mode=None,
+        )
+
+    def replace_people(event) -> dict[str, list[str]]:
+        """{имя: [задачи]} на дату (без информационных задач)."""
+        people: dict[str, list[str]] = {}
+        for item in event.assignments:
+            if item.name and not item.is_informational:
+                tasks = people.setdefault(item.name, [])
+                if item.task not in tasks:
+                    tasks.append(item.task)
+        return people
+
+    async def show_replace_people(message: Message, pending: dict) -> None:
+        event = pending["event"]
+        people = replace_people(event)
+        pending["people"] = list(people)
+        pending["step"] = "replace_person"
+        rows = [
+            [replace_button(
+                f"👤 {name} · " + (
+                    tasks[0] if len(tasks) == 1 else f"{len(tasks)} задачи"
+                ),
+                pending, "person", index,
+            )]
+            for index, (name, tasks) in enumerate(people.items())
+        ]
+        rows.append([replace_button("⬅️ К датам", pending, "dates")])
+        await _send_dialog(
+            message,
+            f"🔁 Замена · {event.event_date:%d.%m.%Y}\n"
+            "ℹ️ Кого нужно заменить?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            parse_mode=None,
+        )
+
+    async def show_replace_tasks(message: Message, pending: dict) -> None:
+        tasks = replace_people(pending["event"])[pending["old_name"]]
+        pending["tasks"] = tasks
+        pending["step"] = "replace_task"
+        rows = [
+            [replace_button(f"{task_emoji(task)} {task}", pending, "task", index)]
+            for index, task in enumerate(tasks)
+        ]
+        rows.append([replace_button("⬅️ К людям", pending, "people")])
+        await _send_dialog(
+            message,
+            f"🔁 Замена · {pending['event'].event_date:%d.%m.%Y}\n"
+            f"ℹ️ У {pending['old_name']} несколько задач. В какой нужна замена?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            parse_mode=None,
+        )
+
+    def replace_candidates(registry, pending: dict) -> list[dict]:
+        """Люди служения с этой задачей, которых нет в ней на эту дату."""
+        service_id, task = pending["service_id"], pending["task"]
+        busy = {
+            item.name for item in pending["event"].assignments
+            if item.task == task
+        }
+        candidates: dict[str, dict] = {}
+        for member in registry.list_service_members(service_id):
+            if task in member["tasks"] and member["name"] not in busy:
+                candidates.setdefault(member["name"], {
+                    "name": member["name"],
+                    "telegram_id": member["telegram_id"],
+                    "username": member["username"] or "",
+                })
+        for contact in registry.list_responsible_contacts(
+            context.admin_id, service_id
+        ):
+            if contact["task"] == task and contact["name"] not in busy:
+                candidates.setdefault(contact["name"], {
+                    "name": contact["name"],
+                    "telegram_id": contact["telegram_id"],
+                    "username": contact["username"] or "",
+                })
+        return list(candidates.values())
+
+    async def show_replace_candidates(
+        message: Message, actor_id: int, pending: dict
+    ) -> None:
+        registry = service_registry()
+        candidates = replace_candidates(registry, pending)
+        pending["candidates"] = candidates
+        pending["step"] = "replace_candidate"
+        rows = [
+            [replace_button(
+                f"{'✅' if item['telegram_id'] else '⚪'} {item['name']}",
+                pending, "pick", index,
+            )]
+            for index, item in enumerate(candidates)
+        ]
+        rows.append([replace_button("👤 Выбрать пользователя Telegram", pending, "tg")])
+        back_label = (
+            "⬅️ К задачам"
+            if len(replace_people(pending["event"]).get(pending["old_name"], [])) > 1
+            else "⬅️ К людям"
+        )
+        rows.append([replace_button(back_label, pending, "back_person")])
+        text = (
+            f"🔁 Замена · «{pending['task']}» · "
+            f"{pending['event'].event_date:%d.%m.%Y}\n"
+            f"Вместо: {pending['old_name']}\n"
+            + (
+                "ℹ️ Выберите, кто заменит (люди служения с этой задачей; ⚪ — "
+                "без Telegram), или выберите пользователя Telegram."
+                if candidates
+                else "ℹ️ В составе служения нет других людей с этой задачей — "
+                "выберите пользователя Telegram."
+            )
+        )
+        await _send_dialog(
+            message, text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            parse_mode=None,
+        )
+
+    async def show_replace_confirm(message: Message, pending: dict) -> None:
+        pending["step"] = "replace_confirm"
+        substitute = pending["substitute"]
+        rows = [[
+            replace_button("✅ Назначить", pending, "confirm"),
+            replace_button("⬅️ Назад", pending, "candidates"),
+        ]]
+        await _send_dialog(
+            message,
+            f"🔁 Подтвердите замену\n"
+            f"🗓 {pending['event'].event_date:%d.%m.%Y} · "
+            f"«{pending['task']}»\n"
+            f"{pending['old_name']} → "
+            f"{person_label(substitute['name'], substitute.get('username'))}\n"
+            "ℹ️ Замена действует только на эту дату и главнее графика. Чат "
+            "служения, админы и заменяющий получат сообщение.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            parse_mode=None,
+        )
+
+    async def ask_replace_telegram_user(message: Message, actor_id: int, pending: dict) -> None:
+        pending["step"] = "await_user"
+        for request_id, share in list(pending_shares.items()):
+            if share[0] == actor_id and share[1] == "service_replace":
+                pending_shares.pop(request_id, None)
+        request_id = new_share_request_id()
+        pending_shares[request_id] = (
+            actor_id, "service_replace", pending["service_id"],
+            pending["task"], pending["old_name"],
+        )
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(
+                    text="Выбрать пользователя",
+                    request_users=KeyboardButtonRequestUsers(
+                        request_id=request_id, user_is_bot=False,
+                        max_quantity=1, request_name=True,
+                        request_username=True,
+                    ),
+                )],
+                [KeyboardButton(text=CONTACT_BACK_TEXT)],
+            ],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        await _send_dialog(
+            message,
+            f"Нажмите кнопку и выберите, кто заменит {pending['old_name']} "
+            f"(«{pending['task']}»). «{CONTACT_BACK_TEXT}» — вернуться к "
+            "списку.",
+            reply_markup=keyboard,
+            parse_mode=None,
+        )
+
+    async def on_replace_user_shared(message: Message, share: tuple) -> None:
+        actor_id = message.from_user.id
+        pending = pending_inputs.get(actor_id)
+        if (
+            pending is None
+            or pending.get("operation") != "service_replace"
+            or pending.get("step") != "await_user"
+            or pending.get("service_id") != share[2]
+            or pending.get("old_name") != share[4]
+        ):
+            await _send_dialog(
+                message, "Выбор устарел. Откройте «🔁 Замена» заново.",
+                parse_mode=None, reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+        user = message.users_shared.users[0]
+        registry = service_registry()
+        known = registry.service_person(
+            pending["service_id"], user.user_id, pending["task"]
+        )
+        full_name = " ".join(
+            part for part in (
+                user.first_name or "", getattr(user, "last_name", "") or "",
+            ) if part
+        )
+        name = (known or {}).get("name") or full_name or (
+            f"@{user.username}" if user.username else "Участник"
+        )
+        busy = {
+            item.name for item in pending["event"].assignments
+            if item.task == pending["task"]
+        }
+        if name in busy:
+            await _send_dialog(
+                message,
+                "❌ Это тот же человек, которого нужно заменить."
+                if name == pending["old_name"]
+                else f"❌ {name} уже в задаче «{pending['task']}» на эту дату.",
+                parse_mode=None, reply_markup=ReplyKeyboardRemove(),
+            )
+            await show_replace_candidates(message, actor_id, pending)
+            return
+        pending["substitute"] = {
+            "name": name,
+            "telegram_id": user.user_id,
+            "username": (known or {}).get("username") or user.username or "",
+        }
+        await message.answer("Пользователь выбран.", reply_markup=ReplyKeyboardRemove())
+        await show_replace_confirm(message, pending)
+
+    @admin_router.callback_query(F.data.startswith("rpl:"))
+    async def on_replace_action(callback: CallbackQuery) -> None:
+        if not callback.from_user or not callback.message:
+            await _answer_callback(callback)
+            return
+        parts = (callback.data or "").split(":", 3)
+        actor_id = callback.from_user.id
+        pending = pending_inputs.get(actor_id)
+        if (
+            len(parts) != 4
+            or pending is None
+            or pending.get("operation") != "service_replace"
+            or pending.get("session_id") != parts[1]
+        ):
+            await _answer_callback(callback, "⚠️ Экран устарел. Откройте «🔁 Замена» заново.")
+            return
+        _, _, action, arg = parts
+        service_id = pending["service_id"]
+        registry = service_registry()
+        if registry is None or not is_service_admin(actor_id, service_id):
+            await _answer_callback(callback, "❌ Недостаточно прав.")
+            return
+
+        def pick(items: list, raw: str):
+            try:
+                return items[int(raw)]
+            except (ValueError, IndexError):
+                return None
+
+        message = callback.message
+        if action == "card":
+            service = service_by_id(registry, service_id)
+            await clean_and_clear_pending_actor(actor_id)
+            if service is not None:
+                await send_service_card(message, actor_id, service)
+        elif action == "dates":
+            await open_replace_dates(message, actor_id, service_id)
+        elif action == "date":
+            event = pick(pending["events"], arg)
+            if event is None:
+                await _answer_callback(callback, "⚠️ Дата устарела.")
+                return
+            pending["event"] = event
+            await show_replace_people(message, pending)
+        elif action in {"person", "people"} and "event" in pending:
+            if action == "people":
+                await show_replace_people(message, pending)
+            else:
+                name = pick(pending.get("people", []), arg)
+                if name is None:
+                    await _answer_callback(callback, "⚠️ Выбор устарел.")
+                    return
+                pending["old_name"] = name
+                tasks = replace_people(pending["event"])[name]
+                if len(tasks) == 1:
+                    pending["task"] = tasks[0]
+                    await show_replace_candidates(message, actor_id, pending)
+                else:
+                    await show_replace_tasks(message, pending)
+        elif action == "task" and "old_name" in pending:
+            task = pick(pending.get("tasks", []), arg)
+            if task is None:
+                await _answer_callback(callback, "⚠️ Выбор устарел.")
+                return
+            pending["task"] = task
+            await show_replace_candidates(message, actor_id, pending)
+        elif action == "back_person" and "event" in pending:
+            if len(replace_people(pending["event"]).get(pending.get("old_name"), [])) > 1:
+                await show_replace_tasks(message, pending)
+            else:
+                await show_replace_people(message, pending)
+        elif action == "candidates" and "task" in pending:
+            await show_replace_candidates(message, actor_id, pending)
+        elif action == "pick" and "task" in pending:
+            candidate = pick(pending.get("candidates", []), arg)
+            if candidate is None:
+                await _answer_callback(callback, "⚠️ Выбор устарел.")
+                return
+            pending["substitute"] = dict(candidate)
+            await show_replace_confirm(message, pending)
+        elif action == "tg" and "task" in pending:
+            await ask_replace_telegram_user(message, actor_id, pending)
+        elif action == "confirm" and pending.get("step") == "replace_confirm":
+            substitute = pending["substitute"]
+            event = pending["event"]
+            # Повторное нажатие во время назначения не дублирует замену.
+            pending["step"] = "replace_assigning"
+            try:
+                done = await admin_assign_replacement(
+                    actor_id, service_id, event.event_date, pending["task"],
+                    pending["old_name"], substitute,
+                )
+            except Exception:  # noqa: BLE001
+                debug.exception("Не удалось назначить замену с экрана")
+                pending["step"] = "replace_confirm"
+                await _answer_callback(callback, "❌ Не удалось назначить замену.")
+                return
+            notice = (
+                f"✅ Замена назначена: «{pending['task']}» "
+                f"{event.event_date:%d.%m} — {substitute['name']} вместо "
+                f"{pending['old_name']}."
+                if done else "ℹ️ Эту замену уже назначили."
+            )
+            await open_replace_dates(message, actor_id, service_id, notice)
+        else:
+            await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
+            return
+        await _answer_callback(callback)
+
+    async def task_names_on_date(service_id: str, event_date, task: str) -> list:
+        """Кто стоит в задаче на дату (график с заменами)."""
+        loader = getattr(context, "load_upcoming_service_events", None)
+        if loader is None:
+            return []
+        events = await loader(until=max(event_date, replace_window_end()))
+        return [
+            item.name
+            for event in events
+            if event.service_id == service_id and event.event_date == event_date
+            for item in event.assignments
+            if item.task == task and item.name
+        ]
+
     @admin_router.message(Command("change"))
     async def on_change_command(message: Message) -> None:
-        """/change {задача} @username — замена вместо открытого поиска."""
+        """/change {задача} @username [дд.мм] — замена от админа.
+
+        Есть запрос (участник нажал «Не смогу», ответ на опрос) — замена
+        по нему. Иначе — безусловно: на указанную или ближайшую дату, где у
+        задачи один ответственный."""
         if not message.from_user:
             return
         registry = service_registry()
         if registry is None:
             return
         reply = lambda text: message.answer(text, parse_mode=None)  # noqa: E731
+        today = datetime.now(context.timezone).date()
         try:
-            task_text, username = parse_change_args(
-                (message.text or "").partition(" ")[2]
+            task_text, username, event_date = parse_change_args(
+                (message.text or "").partition(" ")[2], today
             )
         except ValueError as exc:
             await reply(f"ℹ️ {exc}")
             return
+        is_private = message.chat.type == ChatType.PRIVATE
+
+        def in_this_chat(service_id: str, chat_id: int | None = None) -> bool:
+            if is_private or chat_id == message.chat.id:
+                return True
+            service = registry.get_service(service_id) or {}
+            return service.get("group_chat_id") == message.chat.id
+
+        # 1. Запрос замены: ответ на опрос или невыполненный запрос задачи.
         polls = []
         reply_to = getattr(message, "reply_to_message", None)
-        if message.chat.type != ChatType.PRIVATE and reply_to is not None:
+        if not is_private and reply_to is not None:
             poll = registry.replacement_poll_by_message(
                 message.chat.id, reply_to.message_id
             )
             if poll is not None and poll["filled"]:
                 await reply("ℹ️ Этот поиск замены уже завершён.")
                 return
+            if (
+                poll is not None and event_date is not None
+                and poll["event_date"] != event_date.isoformat()
+            ):
+                await reply(
+                    f"ℹ️ Этот опрос — на {date.fromisoformat(poll['event_date']):%d.%m}, "
+                    f"а в команде указано {event_date:%d.%m}. Уберите дату или "
+                    "отправьте команду без ответа на опрос."
+                )
+                return
             if poll is not None:
                 polls = [poll]
         if not polls:
-            today = datetime.now(context.timezone).date().isoformat()
             polls = [
                 poll
-                for poll in registry.list_unfilled_replacement_requests(today)
-                if normalized_name(poll["task"]) == normalized_name(task_text)
-                and (
-                    message.chat.type == ChatType.PRIVATE
-                    or poll["chat_id"] == message.chat.id
-                    # Запрос без опроса (chat_id=0) — по чату служения.
-                    or (registry.get_service(poll["service_id"]) or {}).get(
-                        "group_chat_id"
-                    ) == message.chat.id
+                for poll in registry.list_unfilled_replacement_requests(
+                    today.isoformat()
                 )
+                if normalized_name(poll["task"]) == normalized_name(task_text)
+                and (event_date is None or poll["event_date"] == event_date.isoformat())
+                and in_this_chat(poll["service_id"], poll["chat_id"])
             ]
-        if not polls:
+        # Запросы чужих служений не мешают замене в своих.
+        foreign_polls = [
+            poll for poll in polls
+            if not is_service_admin(message.from_user.id, poll["service_id"])
+        ]
+        polls = [poll for poll in polls if poll not in foreign_polls]
+        # 2. Без запроса — задача служения на дату по графику.
+        targets = [
+            (poll["service_id"], date.fromisoformat(poll["event_date"]),
+             poll["task"], [poll["old_name"]])
+            for poll in polls
+        ]
+        if not targets:
+            loader = getattr(context, "load_upcoming_service_events", None)
+            try:
+                events = await loader(until=replace_window_end()) if loader else []
+            except (OSError, RuntimeError, ValueError, sqlite3.Error):
+                debug.exception("Не удалось загрузить график для /change")
+                await reply("⚠️ Не удалось загрузить график. Попробуйте позже.")
+                return
+            nearest: dict[str, tuple] = {}
+            first_any: dict[str, tuple] = {}
+            for event in events or []:
+                if not in_this_chat(event.service_id) or event.event_date < today:
+                    continue
+                if event_date is not None and event.event_date != event_date:
+                    continue
+                matched = [
+                    assignment for assignment in event.assignments
+                    if normalized_name(assignment.task) == normalized_name(task_text)
+                    and assignment.name and not assignment.is_informational
+                ]
+                if not matched:
+                    continue
+                target = (
+                    event.service_id, event.event_date, matched[0].task,
+                    list(dict.fromkeys(item.name for item in matched)),
+                )
+                # Без даты — ближайшая дата с одним ответственным; если
+                # таких нет, первая (с подсказкой выбрать в «🔁 Замена»).
+                first_any.setdefault(event.service_id, target)
+                if len(target[3]) == 1 and event.service_id not in nearest:
+                    nearest[event.service_id] = target
+            targets = list({**first_any, **nearest}.values())
+        if not targets and foreign_polls:
             await reply(
-                f"ℹ️ Нет запроса замены для задачи «{task_text}»: замена "
-                "назначается после «🚫 Не смогу» участника."
+                "❌ Назначить замену может только админ служения: "
+                + service_admins_text(registry, foreign_polls[0]["service_id"])
+            )
+            return
+        if not targets:
+            when = f" на {event_date:%d.%m.%Y}" if event_date else ""
+            await reply(
+                f"ℹ️ В графике{when} нет задачи «{task_text}» с ответственным."
             )
             return
         allowed = [
-            poll for poll in polls
-            if is_service_admin(message.from_user.id, poll["service_id"])
+            target for target in targets
+            if is_service_admin(message.from_user.id, target[0])
         ]
         if not allowed:
             await reply(
                 "❌ Назначить замену может только админ служения: "
-                + service_admins_text(registry, polls[0]["service_id"])
+                + service_admins_text(registry, targets[0][0])
             )
             return
         if len(allowed) > 1:
             choices = "; ".join(
-                f"{poll['task']} · {poll['event_date']} вместо {poll['old_name']}"
-                for poll in allowed
+                f"{(registry.get_service(item[0]) or {}).get('name', item[0])} · "
+                f"{item[1]:%d.%m}" for item in allowed
             )
             await reply(
-                "ℹ️ Ждут замены несколько запросов: " + choices
-                + ". Ответьте командой на нужный опрос в чате служения."
+                f"ℹ️ Задача «{task_text}» есть в нескольких местах: {choices}. "
+                "Ответьте командой на нужный опрос, укажите дату или "
+                "откройте «🔁 Замена» в карточке служения."
             )
             return
-        poll = allowed[0]
-        person = registry.find_service_person_by_username(
-            poll["service_id"], username
-        )
-        if person is None or not person.get("telegram_id"):
+        service_id, target_date, task, names = allowed[0]
+        if len(names) != 1:
+            await reply(
+                f"ℹ️ В задаче «{task}» {target_date:%d.%m} несколько человек: "
+                f"{', '.join(names)}. Выберите, кого заменить, в «🔁 Замена» "
+                "в карточке служения."
+            )
+            return
+        substitute = substitute_by_username(registry, service_id, task, username)
+        if substitute is None:
             await reply(
                 f"❌ @{username} не найден в составе служения. Сначала "
-                "привяжите человека к Telegram (/service_contact)."
+                "привяжите человека к Telegram (/service_contact) или "
+                "выберите его в «🔁 Замена»."
             )
             return
-        named = registry.service_person(
-            poll["service_id"], person["telegram_id"], poll["task"]
-        ) or person
-        substitute = {
-            "name": named["name"],
-            "telegram_id": person["telegram_id"],
-            "username": named.get("username") or person.get("username") or "",
-        }
-        if substitute["name"] == poll["old_name"]:
+        if substitute["name"] == names[0]:
             await reply("❌ Это тот же человек, которого нужно заменить.")
             return
         try:
-            closed = await close_replacement_poll(
-                poll["poll_id"], substitute, message.from_user.id
+            busy = await task_names_on_date(service_id, target_date, task)
+        except (OSError, RuntimeError, ValueError, sqlite3.Error):
+            debug.exception("Не удалось проверить назначения для /change")
+            busy = []
+        if substitute["name"] in busy:
+            await reply(
+                f"❌ {substitute['name']} уже в задаче «{task}» на "
+                f"{target_date:%d.%m} — выберите другого человека."
+            )
+            return
+        try:
+            done = await admin_assign_replacement(
+                message.from_user.id, service_id, target_date, task,
+                names[0], substitute,
             )
         except Exception:  # noqa: BLE001
             debug.exception("Не удалось назначить замену")
             await reply("❌ Не удалось назначить замену. Подробности в журнале.")
             return
-        if not closed:
+        if not done:
             await reply("ℹ️ Поиск замены уже завершён.")
             return
-        interaction.info(
-            "Замена назначена админом: service=%s task=%s date=%s actor=%s",
-            poll["service_id"], poll["task"], poll["event_date"],
-            message.from_user.id,
-        )
         await reply(
-            f"✅ Замена назначена: «{poll['task']}» — "
-            f"{person_label(substitute['name'], substitute['username'])}."
+            f"✅ Замена назначена: «{task}» {target_date:%d.%m.%Y} — "
+            f"{person_label(substitute['name'], substitute['username'])} "
+            f"вместо {names[0]}."
         )
 
     @admin_router.message(Command("here"))
@@ -6893,6 +7458,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         pending = pending_inputs.get(message.from_user.id)
         if pending is None:
+            return
+        if pending.get("operation") == "service_replace":
+            if (
+                message.text == CONTACT_BACK_TEXT
+                and pending.get("step") == "await_user"
+            ):
+                await message.answer(
+                    "Выбор отменён.", reply_markup=ReplyKeyboardRemove()
+                )
+                await show_replace_candidates(
+                    message, message.from_user.id, pending
+                )
             return
         if pending.get("operation") == "my_notifications_input":
             registry = service_registry()
