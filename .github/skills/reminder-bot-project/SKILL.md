@@ -232,10 +232,13 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   `start_replacement_search` ignores a decline of an already replaced person
   and holds a per-(service, date, task, person) asyncio lock across check +
   Telegram sends + insert, so concurrent declines start one poll. If the
-  close timer cannot be scheduled after the insert, the poll is stopped and
-  closed (`filled = 0`), leaving a request for `/change`. `on_personal_answer`
-  rejects a stale button when the schedule (with replacements) has the task
-  on that date but not this Telegram user (`still_assigned`; no data → accept).
+  close timer cannot be scheduled after the insert, poll and row stay open
+  (startup reschedules open polls; `/change` works) and admins are told.
+  `on_personal_answer` rejects a stale button when the schedule (with
+  replacements) has the task on that date but not this Telegram user
+  (`scheduled_name`: contact name among scheduled names, else a replacement
+  row with this `telegram_id`; no data → accept). The scheduled name is stored
+  in the confirmation and used for the replacement search.
   Every decline stores a request row in
   `replacement_polls` (no group chat or failed poll → `manual-…` row with
   status `closed`); `filled` marks a request that got a replacement

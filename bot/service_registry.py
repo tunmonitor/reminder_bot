@@ -1883,10 +1883,13 @@ class ServiceRegistry:
         task: str,
         telegram_id: int,
         status: str,
+        name: str | None = None,
     ) -> tuple[str, bool]:
         """Ответ человека на личное напоминание: (имя, ответ изменился).
 
-        Ответить может только привязанный к задаче пользователь.
+        Ответить может только привязанный к задаче пользователь. name —
+        имя в графике на эту дату (у заменяющего может отличаться от
+        имени контакта); по умолчанию — имя контакта.
         """
         _validate_positive_id(telegram_id, "telegram_id")
         if status not in {"confirmed", "declined"}:
@@ -1915,10 +1918,10 @@ class ServiceRegistry:
                 """,
                 (
                     service_id, event_date, task, telegram_id,
-                    contact["name"], status, _utc_now(),
+                    name or contact["name"], status, _utc_now(),
                 ),
             )
-        return contact["name"], cursor.rowcount > 0
+        return name or contact["name"], cursor.rowcount > 0
 
     def get_confirmation(
         self, service_id: str, event_date: str, task: str, telegram_id: int
@@ -4073,21 +4076,22 @@ class ServiceRegistry:
             ).fetchone()
         return dict(row) if row else None
 
-    def is_contact_of_any(
+    def contact_name_among(
         self, service_id: str, task: str, names, telegram_id: int
-    ) -> bool:
-        """Привязан ли telegram_id к задаче под одним из этих имён."""
+    ) -> str | None:
+        """Под каким из этих имён telegram_id привязан к задаче (или None)."""
         names = [name.strip() for name in names if name and name.strip()]
         if not names:
-            return False
+            return None
         marks = ", ".join("?" for _ in names)
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT 1 FROM responsible_contacts WHERE service_id = ? "
-                f"AND task = ? AND telegram_id = ? AND name IN ({marks}) LIMIT 1",
+                "SELECT name FROM responsible_contacts WHERE service_id = ? "
+                f"AND task = ? AND telegram_id = ? AND name IN ({marks}) "
+                "ORDER BY updated_at DESC LIMIT 1",
                 (service_id, task.strip(), telegram_id, *names),
             ).fetchone()
-        return row is not None
+        return row["name"] if row else None
 
     def list_responsible_contacts(
         self, actor_id: int, service_id: str

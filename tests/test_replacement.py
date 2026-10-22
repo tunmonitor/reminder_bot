@@ -271,39 +271,25 @@ class SearchFlowTest(Base):
         self.assertIsNone(second)
         self.assertEqual(self.bot.send_poll.await_count, 1)
 
-    def test_timer_failure_leaves_request_for_change(self):
+    def test_timer_failure_keeps_poll_open(self):
         self.schedule_close.side_effect = RuntimeError("scheduler")
         request = self.start()
-        self.assertEqual((request["status"], request["filled"]), ("closed", 0))
-        self.bot.stop_poll.assert_awaited_once()
-        self.assertIn("не запущен из-за ошибки", self.sent_to(ADMIN)[-1])
-        self.assertEqual(self.registry.list_open_replacement_polls(), [])
+        self.assertEqual((request["status"], request["filled"]), ("open", 0))
+        self.bot.stop_poll.assert_not_awaited()
+        self.assertIn("Таймер итога не поставлен", self.sent_to(ADMIN)[-1])
+        # При запуске открытый опрос снова ставится на таймер.
+        self.assertEqual(len(self.registry.list_open_replacement_polls()), 1)
         substitute = {"name": "Борис", "telegram_id": MEMBER, "username": ""}
         self.assertTrue(self.finish(request, substitute))
 
-    def test_timer_and_stop_failures_are_reported(self):
-        self.schedule_close.side_effect = RuntimeError("scheduler")
+    def test_failed_stop_after_storage_failure_is_reported(self):
         self.bot.stop_poll.side_effect = RuntimeError("no rights")
         with patch.object(
-            self.registry, "close_replacement_poll",
+            self.registry, "create_replacement_poll",
             side_effect=RuntimeError("disk"),
         ):
-            self.start()
-        text = self.sent_to(ADMIN)[-1]
-        self.assertIn("остановить не удалось", text)
-        self.assertIn("голоса пока учитываются", text)
-        self.assertIn("после перезапуска бота", text)
-        # Открытая запись осталась — при запуске её снова поставят на таймер.
-        self.assertEqual(len(self.registry.list_open_replacement_polls()), 1)
-
-    def test_stop_failure_with_closed_request(self):
-        self.schedule_close.side_effect = RuntimeError("scheduler")
-        self.bot.stop_poll.side_effect = RuntimeError("no rights")
-        request = self.start()
-        self.assertEqual(request["status"], "closed")
-        text = self.sent_to(ADMIN)[-1]
-        self.assertIn("остановите его вручную, голоса в нём не учитываются", text)
-        self.assertNotIn("перезапуска", text)
+            self.assertIsNone(self.start())
+        self.assertIn("остановите его вручную", self.sent_to(ADMIN)[-1])
 
     def test_task_member_wins_over_earlier_outsider(self):
         poll = self.start()
@@ -496,6 +482,15 @@ class HandlersTest(Base):
         )
         asyncio.run(answer(cb))
         self.assertEqual(cb.answer.await_args.args[0], "Спасибо!")
+
+        # Отказ заменяющего ищет замену имени из графика, не имени контакта.
+        self.context.on_assignment_declined = AsyncMock()
+        cb.data = f"pcf:d:sound:{EVENT:%Y%m%d}:{task_token('звук')}"
+        cb.answer = AsyncMock()
+        asyncio.run(answer(cb))
+        self.assertEqual(
+            self.context.on_assignment_declined.await_args.args[3], "Борис Б."
+        )
 
         # Цепочка: заменяющего самого заменили — его кнопка устарела.
         self.registry.set_replacement(

@@ -177,7 +177,6 @@ async def _start_replacement_search_locked(
             "Опрос в чате служения отправить не удалось."
         )
     poll_id = poll_message.poll.id
-    created = False
     try:
         registry.create_replacement_poll(
             poll_id, service_id, event_iso, task, old_name, old_telegram_id,
@@ -185,12 +184,9 @@ async def _start_replacement_search_locked(
             getattr(notice, "message_id", None),
             deadline.astimezone(timezone.utc).isoformat(),
         )
-        created = True
-        if schedule_close is not None:
-            schedule_close(poll_id, deadline)
     except Exception:  # noqa: BLE001
-        # Опрос без записи или без таймера итога не подвести — останавливаем.
-        logger.exception("Не удалось запустить опрос замены %s", poll_id)
+        # Опрос без записи нельзя подсчитать — останавливаем его.
+        logger.exception("Не удалось сохранить опрос замены %s", poll_id)
         stopped = True
         try:
             await bot.stop_poll(chat_id, poll_message.message_id)
@@ -200,47 +196,36 @@ async def _start_replacement_search_locked(
                 "Не удалось остановить опрос замены %s", poll_id,
                 exc_info=True,
             )
-        request = None
-        closed = True
-        if created:
-            # Запись есть: закрываем опрос, запрос остаётся ждать /change.
-            # Голоса в закрытый опрос не записываются, даже если опрос в
-            # чате остановить не удалось.
-            try:
-                # False — запрос уже закрыт другим путём, это не сбой.
-                registry.close_replacement_poll(poll_id)
-                request = registry.get_replacement_poll(poll_id)
-            except Exception:  # noqa: BLE001
-                closed = False
-                logger.exception("Не удалось закрыть опрос замены %s", poll_id)
-        if stopped:
-            state = ["Опрос в чате остановлен."]
-        elif closed:
-            state = [
-                "Опрос в чате остановить не удалось — остановите его "
-                "вручную, голоса в нём не учитываются."
-            ]
-        else:
-            state = ["Опрос в чате остановить не удалось."]
-        if not closed:
-            # Открытую запись при запуске бот снова ставит на таймер итога.
-            state.append(
-                "Запрос не удалось закрыть: голоса пока учитываются, итог "
-                "опроса подведётся после перезапуска бота."
-            )
+        state = (
+            "Опрос в чате остановлен." if stopped else
+            "Опрос в чате остановить не удалось — остановите его вручную, "
+            "голоса в нём не учитываются."
+        )
         await _notify(
             bot, admins,
             f"⚠️ Поиск замены не запущен из-за ошибки: «{task}» · "
             f"{service['name']} · {date_text} вместо {old_name}. "
-            f"{' '.join(state)}\n{manual}",
+            f"{state}\n{manual}",
             logger,
         )
-        return request
+        return None
+    timer_note = ""
+    if schedule_close is not None:
+        try:
+            schedule_close(poll_id, deadline)
+        except Exception:  # noqa: BLE001
+            # Опрос и запись остаются открытыми: при запуске бот снова
+            # ставит открытые опросы на таймер итога, /change работает всегда.
+            logger.exception("Не удалось поставить таймер опроса %s", poll_id)
+            timer_note = (
+                "\n⚠️ Таймер итога не поставлен: итог подведётся после "
+                "перезапуска бота, или назначьте замену сами."
+            )
     await _notify(
         bot, admins,
         f"🔎 Ищем замену: «{task}» · {service['name']} · {date_text} вместо "
         f"{old_name}. Опрос в чате служения до {_local(deadline, tz)}.\n"
-        f"{manual}",
+        f"{manual}{timer_note}",
         logger,
     )
     return registry.get_replacement_poll(poll_id)
