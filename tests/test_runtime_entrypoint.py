@@ -1746,6 +1746,137 @@ class ReminderBotEntrypointTest(unittest.TestCase):
 
         asyncio.run(run_bot())
 
+    def test_wait_for_telegram_retries_until_get_me_succeeds(self):
+        from aiogram.exceptions import TelegramNetworkError, TelegramServerError
+
+        from bot import app
+
+        bot = SimpleNamespace(
+            me=AsyncMock(
+                side_effect=[
+                    TelegramNetworkError(method=MagicMock(), message="DNS"),
+                    TelegramServerError(method=MagicMock(), message="Bad Gateway"),
+                    None,
+                ]
+            )
+        )
+        logger = MagicMock()
+        with patch.object(app, "TELEGRAM_RETRY_FIRST_DELAY", 0.01):
+            self.assertTrue(asyncio.run(app._wait_for_telegram(bot, logger)))
+
+        self.assertEqual(bot.me.await_count, 3)
+        self.assertEqual(logger.warning.call_count, 2)
+
+    def test_wait_for_telegram_stops_on_sigterm(self):
+        """manage.sh stop во время ожидания: выход без getMe и с очисткой."""
+        import signal
+
+        from aiogram.exceptions import TelegramNetworkError
+
+        from bot import app
+
+        bot = SimpleNamespace(
+            me=AsyncMock(side_effect=TelegramNetworkError(method=MagicMock(), message="DNS"))
+        )
+
+        async def scenario():
+            asyncio.get_running_loop().call_later(
+                0.05, os.kill, os.getpid(), signal.SIGTERM
+            )
+            return await asyncio.wait_for(
+                app._wait_for_telegram(bot, MagicMock()), timeout=5
+            )
+
+        self.assertFalse(asyncio.run(scenario()))
+        self.assertEqual(bot.me.await_count, 1)
+        self.assertIs(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+
+    def test_command_menu_sync_does_not_block_startup(self):
+        """Без DNS обновление меню висит, но PID-файл и опрос уже работают."""
+        from bot import app
+
+        async def run_bot():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                shm_dir = Path(tmp_dir) / "shm"
+                log_dir = Path(tmp_dir) / "logs"
+                shm_dir.mkdir(mode=0o700)
+                log_dir.mkdir(mode=0o700)
+                bot = SimpleNamespace(
+                    session=SimpleNamespace(close=AsyncMock()),
+                    set_my_commands=AsyncMock(),
+                )
+                dispatcher = SimpleNamespace()
+                scheduler = SimpleNamespace(
+                    running=True,
+                    start=MagicMock(),
+                    pause=MagicMock(),
+                    shutdown=MagicMock(),
+                )
+                sync_started = asyncio.Event()
+                sync_cancelled = asyncio.Event()
+                pid_seen = []
+
+                async def hanging_sync(*_args):
+                    sync_started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        sync_cancelled.set()
+                        raise
+
+                async def start_polling(_bot, **_kwargs):
+                    pid_seen.append((shm_dir / "reminder_bot_bot.pid").exists())
+                    await sync_started.wait()
+
+                dispatcher.start_polling = AsyncMock(side_effect=start_polling)
+                with ExitStack() as stack:
+                    stack.enter_context(patch.object(
+                        app, "setup_loggers", return_value=(MagicMock(), MagicMock()),
+                    ))
+                    stack.enter_context(patch.object(
+                        app,
+                        "load_credentials",
+                        return_value=SimpleNamespace(
+                            timezone="UTC",
+                            bot_token="token",
+                            group_chat_id=1,
+                            admin_tg_id=2,
+                        ),
+                    ))
+                    stack.enter_context(patch.object(
+                        app,
+                        "service_registry_path",
+                        return_value=Path(tmp_dir) / "service-registry.sqlite3",
+                    ))
+                    stack.enter_context(patch.object(app, "load_templates", return_value={}))
+                    stack.enter_context(patch.object(app, "get_tz", return_value=ZoneInfo("UTC")))
+                    stack.enter_context(patch.object(app, "StateCache"))
+                    stack.enter_context(patch.object(app, "Bot", return_value=bot))
+                    stack.enter_context(patch.object(app, "Dispatcher", return_value=dispatcher))
+                    stack.enter_context(patch.object(app, "register"))
+                    stack.enter_context(patch.object(
+                        app.ServiceRegistry,
+                        "initialize",
+                        side_effect=PermissionError("invalid registry permissions"),
+                    ))
+                    stack.enter_context(patch.object(app, "load_schedule", return_value=[]))
+                    stack.enter_context(patch.object(app, "build_scheduler", return_value=scheduler))
+                    stack.enter_context(patch.object(
+                        app, "sync_admin_commands", side_effect=hanging_sync,
+                    ))
+                    stack.enter_context(patch.object(
+                        app, "_configure_webapp_menu", AsyncMock(),
+                    ))
+                    await asyncio.wait_for(
+                        app.run(SimpleNamespace(shm_dir=str(shm_dir), log_dir=str(log_dir))),
+                        timeout=5,
+                    )
+
+                self.assertEqual(pid_seen, [True])
+                self.assertTrue(sync_cancelled.is_set())
+
+        asyncio.run(run_bot())
+
     def test_write_pid_creates_private_file(self):
         from bot.app import _current_process_starttime, _write_pid
 

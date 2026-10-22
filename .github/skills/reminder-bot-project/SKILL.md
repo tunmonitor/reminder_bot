@@ -384,6 +384,7 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - `manage.sh` controls bot, Web App, logs, backups, and restore in test/prod
   deployments. Test and prod use separate directories/configuration. Avoid
   deployment commands during ordinary code changes.
+- Startup must not block on Telegram before the PID file is written: `manage.sh start` kills the process if the PID file is missing after 30 s. After a reboot DNS may be down for minutes and Telegram may answer 502. Command menus (`sync_admin_commands`, returns False on retryable errors) run as a background task after `_write_pid` and retry with backoff; `_wait_for_telegram` retries `getMe` before `start_polling` (aiogram's own `getMe` there has no retry). Menu writes for one user are serialized by a per-user lock in `bot/commands.py` (role read + request). Cron has an hourly `start` watchdog.
 
 ## Focused test modules
 

@@ -112,6 +112,21 @@ public_url). Test и prod используют разные порты. Публ
 SHM_DIR=/dev/shm/reminder_bot/test LOG_DIR=/dev/shm/reminder_bot/test/logs ./manage.sh start
 ```
 
+### Автозапуск после перезагрузки
+
+После перезагрузки сервера DNS бывает недоступен несколько минут, а Telegram
+иногда отвечает 502. `start` ждёт PID-файл не дольше 30 с, поэтому бот пишет
+его до любых обращений к Telegram, а затем сам ждёт Telegram: повторяет
+`getMe` (5 с, 10 с … до 5 минут) и обновляет меню команд в фоне с теми же
+повторами. Рекомендуемый crontab:
+
+```cron
+@reboot sleep 15 && /home/pi/app/reminder_bot/prod/manage.sh start
+0 * * * * /home/pi/app/reminder_bot/prod/manage.sh start > /dev/null 2>&1
+```
+
+Ежечасный `start` ничего не делает, если бот уже работает.
+
 ## Команды бота
 
 ### Для администратора
