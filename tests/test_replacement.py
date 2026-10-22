@@ -17,7 +17,7 @@ from bot.replacement import (
     start_replacement_search,
 )
 from bot.presentation import apply_replacements
-from bot.service_registry import ServiceRegistry
+from bot.service_registry import ServiceRegistry, task_token
 
 TZ = ZoneInfo("Europe/Moscow")
 SUPER = 67890
@@ -251,6 +251,36 @@ class SearchFlowTest(Base):
         self.bot.stop_poll.assert_awaited_once()
         self.assertIn("не запущен из-за ошибки", self.sent_to(ADMIN)[-1])
 
+    def test_concurrent_declines_start_one_poll(self):
+        async def both():
+            args = (
+                self.bot, self.registry, "sound", EVENT, "звук", "Алексей", OLD,
+            )
+            kwargs = dict(
+                admin_actor_id=SUPER, tz=TZ, logger=MagicMock(),
+                schedule_close=self.schedule_close,
+                now=datetime(2098, 12, 29, 10, 0, tzinfo=timezone.utc),
+            )
+            return await asyncio.gather(
+                start_replacement_search(*args, **kwargs),
+                start_replacement_search(*args, **kwargs),
+            )
+
+        first, second = asyncio.run(both())
+        self.assertEqual(first["status"], "open")
+        self.assertIsNone(second)
+        self.assertEqual(self.bot.send_poll.await_count, 1)
+
+    def test_timer_failure_leaves_request_for_change(self):
+        self.schedule_close.side_effect = RuntimeError("scheduler")
+        request = self.start()
+        self.assertEqual((request["status"], request["filled"]), ("closed", 0))
+        self.bot.stop_poll.assert_awaited_once()
+        self.assertIn("не запущен из-за ошибки", self.sent_to(ADMIN)[-1])
+        self.assertEqual(self.registry.list_open_replacement_polls(), [])
+        substitute = {"name": "Борис", "telegram_id": MEMBER, "username": ""}
+        self.assertTrue(self.finish(request, substitute))
+
     def test_task_member_wins_over_earlier_outsider(self):
         poll = self.start()
         self.registry.record_poll_answer(poll["poll_id"], OLD, "alex_one", "Алексей", True)
@@ -381,6 +411,42 @@ class HandlersTest(Base):
         )
         asyncio.run(self.context.close_replacement_poll(poll["poll_id"]))
         self.assertEqual(self.registry.list_open_replacement_polls(), [])
+
+    def test_stale_decline_button_is_rejected(self):
+        """«Не смогу» в старом напоминании: в графике уже другой человек."""
+        answer = [
+            item.callback for router in self.routers
+            for item in router.callback_query.handlers
+            if item.callback.__name__ == "on_personal_answer"
+        ][-1]
+        self.context.on_assignment_declined = AsyncMock()
+
+        def press():
+            cb = SimpleNamespace(
+                from_user=SimpleNamespace(id=OLD),
+                data=f"pcf:d:sound:{EVENT:%Y%m%d}:{task_token('звук')}",
+                answer=AsyncMock(), message=None,
+            )
+            asyncio.run(answer(cb))
+            return cb.answer.await_args.args[0]
+
+        self.context.load_upcoming_service_events.return_value = [
+            SimpleNamespace(
+                service_id="sound", event_date=EVENT,
+                assignments=[SimpleNamespace(task="звук", name="Борис")],
+            )
+        ]
+        self.assertIn("устарело", press())
+        self.assertEqual(
+            self.registry.list_confirmations("sound", EVENT.isoformat()), {}
+        )
+        self.context.on_assignment_declined.assert_not_awaited()
+
+        self.context.load_upcoming_service_events.return_value[0].assignments = [
+            SimpleNamespace(task="звук", name="Алексей")
+        ]
+        self.assertEqual(press(), "Ответ сохранён")
+        self.context.on_assignment_declined.assert_awaited_once()
 
     def test_change_in_group_finds_request_without_poll(self):
         self.bot.send_poll.side_effect = RuntimeError("no rights")

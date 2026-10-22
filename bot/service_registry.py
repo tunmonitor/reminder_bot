@@ -4073,6 +4073,22 @@ class ServiceRegistry:
             ).fetchone()
         return dict(row) if row else None
 
+    def is_contact_of_any(
+        self, service_id: str, task: str, names, telegram_id: int
+    ) -> bool:
+        """Привязан ли telegram_id к задаче под одним из этих имён."""
+        names = [name.strip() for name in names if name and name.strip()]
+        if not names:
+            return False
+        marks = ", ".join("?" for _ in names)
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM responsible_contacts WHERE service_id = ? "
+                f"AND task = ? AND telegram_id = ? AND name IN ({marks}) LIMIT 1",
+                (service_id, task.strip(), telegram_id, *names),
+            ).fetchone()
+        return row is not None
+
     def list_responsible_contacts(
         self, actor_id: int, service_id: str
     ) -> list[dict]:

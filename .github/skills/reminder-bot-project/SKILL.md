@@ -229,7 +229,14 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   chats; failed announcements warn service admins and the actor.
   `context.load_upcoming_service_events(until=...)`: the cache holds events
   through the end of next month, default return is 6 weeks.
-  `start_replacement_search` ignores a decline of an already replaced person. Every decline stores a request row in
+  `start_replacement_search` ignores a decline of an already replaced person
+  and holds a per-(service, date, task, person) asyncio lock across check +
+  Telegram sends + insert, so concurrent declines start one poll. If the
+  close timer cannot be scheduled after the insert, the poll is stopped and
+  closed (`filled = 0`), leaving a request for `/change`. `on_personal_answer`
+  rejects a stale button when the schedule (with replacements) has the task
+  on that date but not this Telegram user (`still_assigned`; no data → accept).
+  Every decline stores a request row in
   `replacement_polls` (no group chat or failed poll → `manual-…` row with
   status `closed`); `filled` marks a request that got a replacement
   (`claim_replacement_request` / `release_replacement_request`), and `/change`

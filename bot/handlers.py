@@ -8408,6 +8408,21 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         async with lock:
             await _confirm_locked(cb, context, sunday_iso, role, interaction, debug)
 
+    async def still_assigned(
+        registry: Any, service_id: str, event_date, task: str, telegram_id: int
+    ) -> bool:
+        """Человек ещё стоит в задаче на дату (график с заменами).
+
+        Без данных графика проверить нельзя — ответ принимается."""
+        try:
+            names = await task_names_on_date(service_id, event_date, task)
+            return not names or registry.is_contact_of_any(
+                service_id, task, names, telegram_id
+            )
+        except Exception:  # noqa: BLE001
+            debug.exception("Не удалось сверить ответ с графиком")
+            return True
+
     @router.callback_query(F.data.startswith("pcf:"))
     async def on_personal_answer(cb: CallbackQuery) -> None:
         """«✅ Принял» / «🚫 Не смогу» в личном напоминании (этап 3.2)."""
@@ -8439,6 +8454,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             task = None
         if task is None:
             await _answer_callback(cb, "❌ Вы не привязаны к этой задаче")
+            return
+        if not await still_assigned(
+            registry, service_id, event_date, task, cb.from_user.id
+        ):
+            await _answer_callback(
+                cb, "⚠️ Это напоминание устарело: в графике на эту дату "
+                "в задаче уже другой человек."
+            )
             return
         status = "confirmed" if kind == "c" else "declined"
         try:

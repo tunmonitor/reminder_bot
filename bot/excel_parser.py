@@ -285,7 +285,7 @@ def _cell_date(
             return date(year, int(month), int(day))
         except ValueError:
             return None
-    named = re.match(r"^(\d{1,2})\s+([а-я]+)(?:\s+(\d{4}))?(?:\b|$)", text)
+    named = re.match(r"^(\d{1,2})\s+([а-я]+)\.?(?:\s*(\d{4}))?(?![\wа-я])", text)
     if named:
         month = _MONTH_NAMES.get(named[2])
         if month is None:
