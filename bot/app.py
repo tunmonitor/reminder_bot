@@ -1621,6 +1621,7 @@ async def _run_locked(args: CliArgs) -> None:
     bot = None
     scheduler = None
     nightly_backup_task: asyncio.Task | None = None
+    commands_task: asyncio.Task | None = None
     pid_created = False
     active_jobs: set[asyncio.Task[None]] = set()
     service_reminder_locks: dict[tuple[str, date], asyncio.Lock] = {}
@@ -1631,10 +1632,6 @@ async def _run_locked(args: CliArgs) -> None:
             token=credentials.bot_token,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         )
-        if callable(getattr(bot, "set_my_commands", None)):
-            await sync_admin_commands(
-                bot, service_registry, credentials.admin_tg_id, debug_logger
-            )
         dp = Dispatcher(storage=MemoryStorage())
         context = SimpleNamespace(
             bot=bot,
@@ -2032,6 +2029,21 @@ async def _run_locked(args: CliArgs) -> None:
             debug_logger.error(message)
             raise FileExistsError(message) from exc
 
+        # Меню команд обновляется в фоне: после перезагрузки сервера DNS
+        # бывает недоступен минутами, а manage.sh ждёт PID-файл лишь 30 с.
+        if callable(getattr(bot, "set_my_commands", None)):
+            async def sync_commands_in_background() -> None:
+                try:
+                    await sync_admin_commands(
+                        bot, service_registry, credentials.admin_tg_id, debug_logger
+                    )
+                except Exception:
+                    debug_logger.exception("Не удалось обновить меню команд")
+
+            commands_task = asyncio.create_task(
+                sync_commands_in_background(),
+                name="reminder-bot-sync-commands",
+            )
         if service_registry is not None:
             await refresh_service_reminders()
             await refresh_user_reminder_jobs()
@@ -2054,9 +2066,10 @@ async def _run_locked(args: CliArgs) -> None:
             )
         await dp.start_polling(bot, close_bot_session=False)
     finally:
-        if nightly_backup_task is not None:
-            nightly_backup_task.cancel()
-            await asyncio.gather(nightly_backup_task, return_exceptions=True)
+        for background_task in (nightly_backup_task, commands_task):
+            if background_task is not None:
+                background_task.cancel()
+                await asyncio.gather(background_task, return_exceptions=True)
         try:
             if scheduler is not None and scheduler.running:
                 scheduler.pause()

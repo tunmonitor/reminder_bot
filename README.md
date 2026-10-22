@@ -105,12 +105,28 @@ public_url). Test и prod используют разные порты. Публ
 | `LOG_DIR` | Каталог логов | значение `SHM_DIR` |
 | `REMINDER_BOT_DB_PATH` | Путь SQLite-реестра | `<project>/.runtime/reminder_bot.sqlite3` |
 | `TIMEZONE` | Часовой пояс планировщика | `Europe/Moscow` |
+| `NETWORK_WAIT_SECONDS` | Сколько `start` ждёт DNS для `api.telegram.org` | `300` |
 
 Пример:
 
 ```bash
 SHM_DIR=/dev/shm/reminder_bot/test LOG_DIR=/dev/shm/reminder_bot/test/logs ./manage.sh start
 ```
+
+### Автозапуск после перезагрузки
+
+После перезагрузки сервера DNS бывает недоступен несколько минут, хотя сеть
+уже поднята. Поэтому `start` сначала ждёт, пока разрешится `api.telegram.org`
+(до `NETWORK_WAIT_SECONDS`), а бот обновляет меню команд в фоне, уже после
+записи PID-файла: `start` ждёт PID-файл не дольше 30 с и иначе завершает
+процесс. Рекомендуемый crontab:
+
+```cron
+@reboot sleep 15 && /home/pi/app/reminder_bot/prod/manage.sh start
+0 * * * * /home/pi/app/reminder_bot/prod/manage.sh start > /dev/null 2>&1
+```
+
+Ежечасный `start` ничего не делает, если бот уже работает.
 
 ## Команды бота
 

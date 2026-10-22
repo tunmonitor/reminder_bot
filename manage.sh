@@ -415,6 +415,26 @@ restore_latest_log() {
 # --------------------------------------------
 # Команда start
 # --------------------------------------------
+# После перезагрузки сервера DNS бывает недоступен несколько минут, хотя
+# сеть уже поднята (cron @reboot стартует раньше). Ждём, пока разрешится
+# api.telegram.org; по истечении срока всё равно запускаем бота.
+wait_for_telegram_dns() {
+    local limit="${NETWORK_WAIT_SECONDS:-300}"
+    local waited=0
+    command -v getent >/dev/null 2>&1 || return 0
+    while ! getent hosts api.telegram.org >/dev/null 2>&1; do
+        if [ "$waited" -ge "$limit" ]; then
+            echo "⚠️ api.telegram.org не разрешается ${limit} с, запускаем без сети."
+            return 0
+        fi
+        if [ "$waited" -eq 0 ]; then
+            echo "⏳ Ждём DNS для api.telegram.org (до ${limit} с)..."
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
+}
+
 cmd_start() {
     echo "🚀 Запуск бота ($ENV_NAME)..."
 
@@ -457,6 +477,8 @@ cmd_start() {
             rm -f "$PID_FILE"
         fi
     fi
+
+    wait_for_telegram_dns
 
     # Восстанавливаем последний лог из бэкапа, если ОЗУ чистая
     restore_latest_log || exit 1
