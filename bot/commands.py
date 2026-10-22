@@ -1,12 +1,19 @@
 """Telegram command menus filtered by the user's role."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 from typing import Any
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
 
 ROLE_USER = "user"
@@ -35,6 +42,13 @@ _SUPER_ADMIN_COMMANDS = [
 ]
 _TEST_NOTIFY = BotCommand(command="test_notify", description="Проверить доставку")
 
+# Временные сбои сети или Telegram: обновление меню стоит повторить позже.
+RETRYABLE_ERRORS = (TelegramNetworkError, TelegramServerError, TelegramRetryAfter)
+
+# Роль читается и меню отправляется под одной блокировкой, чтобы обновление
+# при запуске не перезаписало меню, уже обновлённое после смены роли.
+_user_menu_locks: dict[int, asyncio.Lock] = {}
+
 
 def commands_for_role(role: str, *, is_main_admin: bool = False) -> list[BotCommand]:
     """Return menu commands available to a role, most frequent first."""
@@ -62,14 +76,21 @@ def user_role(registry: Any, telegram_id: int) -> str:
     return ROLE_USER
 
 
-async def set_default_commands(bot: Bot, debug: logging.Logger) -> None:
-    """Show only participant commands to users without a personal menu."""
+async def set_default_commands(bot: Bot, debug: logging.Logger) -> bool:
+    """Show only participant commands to users without a personal menu.
+
+    Returns False when the failure is temporary and worth retrying.
+    """
     try:
         await bot.set_my_commands(
             commands_for_role(ROLE_USER), scope=BotCommandScopeDefault()
         )
+    except RETRYABLE_ERRORS:
+        debug.exception("Не удалось обновить меню команд Telegram")
+        return False
     except TelegramAPIError:
         debug.exception("Не удалось обновить меню команд Telegram")
+    return True
 
 
 async def sync_user_commands(
@@ -78,13 +99,30 @@ async def sync_user_commands(
     telegram_id: int,
     main_admin_id: int,
     debug: logging.Logger,
-) -> None:
-    """Apply the role-specific command menu to one private chat."""
+) -> bool:
+    """Apply the role-specific command menu to one private chat.
+
+    Returns False when the failure is temporary and worth retrying.
+    """
+    lock = _user_menu_locks.setdefault(telegram_id, asyncio.Lock())
+    async with lock:
+        return await _sync_user_commands_locked(
+            bot, registry, telegram_id, main_admin_id, debug
+        )
+
+
+async def _sync_user_commands_locked(
+    bot: Bot,
+    registry: Any,
+    telegram_id: int,
+    main_admin_id: int,
+    debug: logging.Logger,
+) -> bool:
     try:
         role = user_role(registry, telegram_id)
     except sqlite3.Error:
         debug.exception("Не удалось определить роль для меню команд")
-        return
+        return True
     is_main_admin = telegram_id == main_admin_id
     scope = BotCommandScopeChat(chat_id=telegram_id)
     try:
@@ -98,21 +136,28 @@ async def sync_user_commands(
     except TelegramBadRequest as exc:
         if "chat not found" not in str(exc).lower():
             debug.exception("Не удалось обновить меню команд пользователя")
-            return
+            return True
         # Пользователь ещё не открывал бота: меню появится после его /start.
         debug.info(
             "Меню команд для %s отложено: пользователь ещё не писал боту",
             telegram_id,
         )
+    except RETRYABLE_ERRORS:
+        debug.exception("Не удалось обновить меню команд пользователя")
+        return False
     except TelegramAPIError:
         debug.exception("Не удалось обновить меню команд пользователя")
+    return True
 
 
 async def sync_admin_commands(
     bot: Bot, registry: Any, main_admin_id: int, debug: logging.Logger
-) -> None:
-    """Install the default menu and personal menus for all known admins."""
-    await set_default_commands(bot, debug)
+) -> bool:
+    """Install the default menu and personal menus for all known admins.
+
+    Returns False when some menu hit a temporary failure and should be retried.
+    """
+    done = await set_default_commands(bot, debug)
     admin_ids = {main_admin_id}
     if registry is not None:
         try:
@@ -120,4 +165,8 @@ async def sync_admin_commands(
         except sqlite3.Error:
             debug.exception("Не удалось прочитать администраторов для меню команд")
     for telegram_id in sorted(admin_ids):
-        await sync_user_commands(bot, registry, telegram_id, main_admin_id, debug)
+        if not await sync_user_commands(
+            bot, registry, telegram_id, main_admin_id, debug
+        ):
+            done = False
+    return done

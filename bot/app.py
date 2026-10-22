@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import stat
 import tempfile
 import time
@@ -16,7 +17,12 @@ from typing import Any
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import MenuButtonWebApp, WebAppInfo
 from apscheduler.jobstores.base import JobLookupError
@@ -224,6 +230,65 @@ def _remove_pid_if_owned(path: Path) -> None:
         os.unlink(path.name, dir_fd=directory_fd)
     finally:
         os.close(directory_fd)
+
+
+TELEGRAM_RETRY_FIRST_DELAY = 5
+TELEGRAM_RETRY_MAX_DELAY = 300
+
+
+async def _retry_delays():
+    """Паузы между повторами: 5 с, затем вдвое больше, но не дольше 5 минут."""
+    delay = TELEGRAM_RETRY_FIRST_DELAY
+    while True:
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, TELEGRAM_RETRY_MAX_DELAY)
+        yield
+
+
+async def _wait_for_telegram(bot: Bot, logger) -> bool:
+    """Ждёт, пока Telegram ответит на getMe.
+
+    aiogram вызывает getMe в начале start_polling без повторов: сбой DNS после
+    перезагрузки сервера или 502 от Telegram иначе завершает процесс.
+    Обработчики SIGTERM/SIGINT aiogram ставит только в start_polling, поэтому
+    на время ожидания стоп-сигнал обрабатывается здесь. Возвращает False,
+    если пришёл сигнал остановки.
+    """
+    if not callable(getattr(bot, "me", None)):
+        return True
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    installed = []
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with suppress(NotImplementedError, RuntimeError, ValueError):
+            loop.add_signal_handler(sig, stop.set)
+            installed.append(sig)
+    stop_wait = asyncio.create_task(stop.wait())
+    delay = TELEGRAM_RETRY_FIRST_DELAY
+    try:
+        while True:
+            request = asyncio.create_task(bot.me())
+            await asyncio.wait({request, stop_wait}, return_when=asyncio.FIRST_COMPLETED)
+            if stop.is_set():
+                request.cancel()
+                await asyncio.gather(request, return_exceptions=True)
+                return False
+            try:
+                request.result()
+                return True
+            except (TelegramNetworkError, TelegramServerError, TelegramRetryAfter) as exc:
+                logger.warning("Telegram недоступен при запуске, повторим: %s", exc)
+                pause = delay
+                if isinstance(exc, TelegramRetryAfter):
+                    pause = max(pause, exc.retry_after)
+            await asyncio.wait({stop_wait}, timeout=pause)
+            if stop.is_set():
+                return False
+            delay = min(delay * 2, TELEGRAM_RETRY_MAX_DELAY)
+    finally:
+        stop_wait.cancel()
+        for sig in installed:
+            loop.remove_signal_handler(sig)
 
 
 async def _configure_webapp_menu(bot: Bot, project_dir: Path, logger) -> None:
@@ -2033,12 +2098,17 @@ async def _run_locked(args: CliArgs) -> None:
         # бывает недоступен минутами, а manage.sh ждёт PID-файл лишь 30 с.
         if callable(getattr(bot, "set_my_commands", None)):
             async def sync_commands_in_background() -> None:
-                try:
-                    await sync_admin_commands(
-                        bot, service_registry, credentials.admin_tg_id, debug_logger
-                    )
-                except Exception:
-                    debug_logger.exception("Не удалось обновить меню команд")
+                retries = _retry_delays()
+                while True:
+                    try:
+                        if await sync_admin_commands(
+                            bot, service_registry, credentials.admin_tg_id, debug_logger
+                        ):
+                            return
+                    except Exception:
+                        debug_logger.exception("Не удалось обновить меню команд")
+                        return
+                    await anext(retries)
 
             commands_task = asyncio.create_task(
                 sync_commands_in_background(),
@@ -2053,7 +2123,6 @@ async def _run_locked(args: CliArgs) -> None:
                     poll["poll_id"], datetime.fromisoformat(poll["deadline"])
                 )
         scheduler.start()
-        await _configure_webapp_menu(bot, PROJECT_DIR, debug_logger)
         if backup_manager is not None:
             if create_startup_backup is not None:
                 backup_manager.start_task(
@@ -2064,6 +2133,10 @@ async def _run_locked(args: CliArgs) -> None:
                 backup_manager.run_nightly(),
                 name="reminder-bot-nightly-backup",
             )
+        if not await _wait_for_telegram(bot, debug_logger):
+            debug_logger.info("Остановка до подключения к Telegram")
+            return
+        await _configure_webapp_menu(bot, PROJECT_DIR, debug_logger)
         await dp.start_polling(bot, close_bot_session=False)
     finally:
         for background_task in (nightly_backup_task, commands_task):

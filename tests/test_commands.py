@@ -4,7 +4,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramNetworkError,
+)
 
 from bot.commands import (
     ROLE_SERVICE_ADMIN,
@@ -12,6 +16,7 @@ from bot.commands import (
     ROLE_USER,
     commands_for_role,
     sync_admin_commands,
+    sync_user_commands,
     user_role,
 )
 from bot.service_registry import ServiceRegistry
@@ -128,6 +133,61 @@ class SyncCommandsTest(unittest.TestCase):
 
         self.assertEqual(bot.set_my_commands.await_count, 3)
         debug.exception.assert_called_once()
+
+    def test_reports_only_temporary_failures_for_retry(self):
+        bot = MagicMock(
+            set_my_commands=AsyncMock(
+                side_effect=[None, TelegramAPIError(method=MagicMock(), message="x"), None]
+            ),
+            delete_my_commands=AsyncMock(),
+        )
+        self.assertTrue(
+            asyncio.run(sync_admin_commands(bot, self.registry, 67890, MagicMock()))
+        )
+
+        bot.set_my_commands = AsyncMock(
+            side_effect=[
+                TelegramNetworkError(method=MagicMock(), message="DNS"),
+                None,
+                None,
+            ]
+        )
+        self.assertFalse(
+            asyncio.run(sync_admin_commands(bot, self.registry, 67890, MagicMock()))
+        )
+        self.assertEqual(bot.set_my_commands.await_count, 3)
+
+    def test_menu_updates_for_one_user_run_in_order(self):
+        """Роль читается под блокировкой: второе обновление ждёт первое."""
+        events = []
+        release = asyncio.Event()
+        registry = MagicMock()
+        registry.is_super_admin = MagicMock(
+            side_effect=lambda _tid: events.append("role") or True
+        )
+
+        async def set_commands(*_args, **_kwargs):
+            events.append("send")
+            if len(events) == 2:
+                await release.wait()
+
+        bot = MagicMock(set_my_commands=AsyncMock(side_effect=set_commands))
+
+        async def scenario():
+            first = asyncio.create_task(
+                sync_user_commands(bot, registry, 555, 1, MagicMock())
+            )
+            await asyncio.sleep(0)
+            second = asyncio.create_task(
+                sync_user_commands(bot, registry, 555, 1, MagicMock())
+            )
+            await asyncio.sleep(0)
+            release.set()
+            await asyncio.gather(first, second)
+
+        asyncio.run(scenario())
+
+        self.assertEqual(events, ["role", "send", "role", "send"])
 
 
 if __name__ == "__main__":

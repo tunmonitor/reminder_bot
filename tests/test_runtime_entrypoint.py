@@ -1746,6 +1746,51 @@ class ReminderBotEntrypointTest(unittest.TestCase):
 
         asyncio.run(run_bot())
 
+    def test_wait_for_telegram_retries_until_get_me_succeeds(self):
+        from aiogram.exceptions import TelegramNetworkError, TelegramServerError
+
+        from bot import app
+
+        bot = SimpleNamespace(
+            me=AsyncMock(
+                side_effect=[
+                    TelegramNetworkError(method=MagicMock(), message="DNS"),
+                    TelegramServerError(method=MagicMock(), message="Bad Gateway"),
+                    None,
+                ]
+            )
+        )
+        logger = MagicMock()
+        with patch.object(app, "TELEGRAM_RETRY_FIRST_DELAY", 0.01):
+            self.assertTrue(asyncio.run(app._wait_for_telegram(bot, logger)))
+
+        self.assertEqual(bot.me.await_count, 3)
+        self.assertEqual(logger.warning.call_count, 2)
+
+    def test_wait_for_telegram_stops_on_sigterm(self):
+        """manage.sh stop во время ожидания: выход без getMe и с очисткой."""
+        import signal
+
+        from aiogram.exceptions import TelegramNetworkError
+
+        from bot import app
+
+        bot = SimpleNamespace(
+            me=AsyncMock(side_effect=TelegramNetworkError(method=MagicMock(), message="DNS"))
+        )
+
+        async def scenario():
+            asyncio.get_running_loop().call_later(
+                0.05, os.kill, os.getpid(), signal.SIGTERM
+            )
+            return await asyncio.wait_for(
+                app._wait_for_telegram(bot, MagicMock()), timeout=5
+            )
+
+        self.assertFalse(asyncio.run(scenario()))
+        self.assertEqual(bot.me.await_count, 1)
+        self.assertIs(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+
     def test_command_menu_sync_does_not_block_startup(self):
         """Без DNS обновление меню висит, но PID-файл и опрос уже работают."""
         from bot import app
