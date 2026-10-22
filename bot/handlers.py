@@ -8416,8 +8416,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         Без данных графика проверить нельзя — ответ принимается."""
         try:
             names = await task_names_on_date(service_id, event_date, task)
-            return not names or registry.is_contact_of_any(
+            if not names or registry.is_contact_of_any(
                 service_id, task, names, telegram_id
+            ):
+                return True
+            # Заменяющий по /change мог быть привязан к задаче под другим
+            # именем — его узнаём по Telegram ID в записи замены.
+            return any(
+                item["task"] == task and item["new_name"] in names
+                and item["telegram_id"] == telegram_id
+                for item in registry.list_replacements(
+                    service_id, event_date.isoformat()
+                )
             )
         except Exception:  # noqa: BLE001
             debug.exception("Не удалось сверить ответ с графиком")

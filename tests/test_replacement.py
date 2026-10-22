@@ -281,6 +281,30 @@ class SearchFlowTest(Base):
         substitute = {"name": "Борис", "telegram_id": MEMBER, "username": ""}
         self.assertTrue(self.finish(request, substitute))
 
+    def test_timer_and_stop_failures_are_reported(self):
+        self.schedule_close.side_effect = RuntimeError("scheduler")
+        self.bot.stop_poll.side_effect = RuntimeError("no rights")
+        with patch.object(
+            self.registry, "close_replacement_poll",
+            side_effect=RuntimeError("disk"),
+        ):
+            self.start()
+        text = self.sent_to(ADMIN)[-1]
+        self.assertIn("остановить не удалось", text)
+        self.assertIn("голоса пока учитываются", text)
+        self.assertIn("после перезапуска бота", text)
+        # Открытая запись осталась — при запуске её снова поставят на таймер.
+        self.assertEqual(len(self.registry.list_open_replacement_polls()), 1)
+
+    def test_stop_failure_with_closed_request(self):
+        self.schedule_close.side_effect = RuntimeError("scheduler")
+        self.bot.stop_poll.side_effect = RuntimeError("no rights")
+        request = self.start()
+        self.assertEqual(request["status"], "closed")
+        text = self.sent_to(ADMIN)[-1]
+        self.assertIn("остановите его вручную, голоса в нём не учитываются", text)
+        self.assertNotIn("перезапуска", text)
+
     def test_task_member_wins_over_earlier_outsider(self):
         poll = self.start()
         self.registry.record_poll_answer(poll["poll_id"], OLD, "alex_one", "Алексей", True)
@@ -447,6 +471,43 @@ class HandlersTest(Base):
         ]
         self.assertEqual(press(), "Ответ сохранён")
         self.context.on_assignment_declined.assert_awaited_once()
+
+    def test_substitute_linked_under_other_name_can_answer(self):
+        """Заменяющий привязан к задаче под другим именем — ответ принимается."""
+        answer = [
+            item.callback for router in self.routers
+            for item in router.callback_query.handlers
+            if item.callback.__name__ == "on_personal_answer"
+        ][-1]
+        self.registry.set_replacement(
+            "sound", EVENT.isoformat(), "звук", "Алексей", "Борис Б.",
+            MEMBER, "boris_b", "admin", SUPER,
+        )
+        self.context.load_upcoming_service_events.return_value = [
+            SimpleNamespace(
+                service_id="sound", event_date=EVENT,
+                assignments=[SimpleNamespace(task="звук", name="Борис Б.")],
+            )
+        ]
+        cb = SimpleNamespace(
+            from_user=SimpleNamespace(id=MEMBER),
+            data=f"pcf:c:sound:{EVENT:%Y%m%d}:{task_token('звук')}",
+            answer=AsyncMock(), message=None,
+        )
+        asyncio.run(answer(cb))
+        self.assertEqual(cb.answer.await_args.args[0], "Спасибо!")
+
+        # Цепочка: заменяющего самого заменили — его кнопка устарела.
+        self.registry.set_replacement(
+            "sound", EVENT.isoformat(), "звук", "Борис Б.", "Алексей",
+            OLD, "alex_one", "admin", SUPER,
+        )
+        self.context.load_upcoming_service_events.return_value[0].assignments = [
+            SimpleNamespace(task="звук", name="Алексей")
+        ]
+        cb.answer = AsyncMock()
+        asyncio.run(answer(cb))
+        self.assertIn("устарело", cb.answer.await_args.args[0])
 
     def test_change_in_group_finds_request_without_poll(self):
         self.bot.send_poll.side_effect = RuntimeError("no rights")

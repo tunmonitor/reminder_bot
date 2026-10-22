@@ -191,26 +191,48 @@ async def _start_replacement_search_locked(
     except Exception:  # noqa: BLE001
         # Опрос без записи или без таймера итога не подвести — останавливаем.
         logger.exception("Не удалось запустить опрос замены %s", poll_id)
+        stopped = True
         try:
             await bot.stop_poll(chat_id, poll_message.message_id)
         except Exception:  # noqa: BLE001
+            stopped = False
             logger.warning(
                 "Не удалось остановить опрос замены %s", poll_id,
                 exc_info=True,
             )
         request = None
+        closed = True
         if created:
             # Запись есть: закрываем опрос, запрос остаётся ждать /change.
+            # Голоса в закрытый опрос не записываются, даже если опрос в
+            # чате остановить не удалось.
             try:
+                # False — запрос уже закрыт другим путём, это не сбой.
                 registry.close_replacement_poll(poll_id)
                 request = registry.get_replacement_poll(poll_id)
             except Exception:  # noqa: BLE001
+                closed = False
                 logger.exception("Не удалось закрыть опрос замены %s", poll_id)
+        if stopped:
+            state = ["Опрос в чате остановлен."]
+        elif closed:
+            state = [
+                "Опрос в чате остановить не удалось — остановите его "
+                "вручную, голоса в нём не учитываются."
+            ]
+        else:
+            state = ["Опрос в чате остановить не удалось."]
+        if not closed:
+            # Открытую запись при запуске бот снова ставит на таймер итога.
+            state.append(
+                "Запрос не удалось закрыть: голоса пока учитываются, итог "
+                "опроса подведётся после перезапуска бота."
+            )
         await _notify(
             bot, admins,
             f"⚠️ Поиск замены не запущен из-за ошибки: «{task}» · "
-            f"{service['name']} · {date_text} вместо {old_name}. Опрос в "
-            f"чате остановлен.\n{manual}",
+            f"{service['name']} · {date_text} вместо {old_name}. "
+            f"{' '.join(state)}\n{manual}",
             logger,
         )
         return request
