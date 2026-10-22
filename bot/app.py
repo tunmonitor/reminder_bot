@@ -232,6 +232,22 @@ def _remove_pid_if_owned(path: Path) -> None:
         os.close(directory_fd)
 
 
+def _reschedule_open_polls(registry, schedule_close, logger) -> None:
+    """Таймеры итога открытых опросов замены после перезапуска.
+
+    Сбой одного таймера не мешает запуску: запрос остаётся открытым,
+    замену можно назначить через /change."""
+    for poll in registry.list_open_replacement_polls():
+        try:
+            schedule_close(
+                poll["poll_id"], datetime.fromisoformat(poll["deadline"])
+            )
+        except Exception:
+            logger.exception(
+                "Не удалось поставить таймер опроса замены %s", poll["poll_id"]
+            )
+
+
 TELEGRAM_RETRY_FIRST_DELAY = 5
 TELEGRAM_RETRY_MAX_DELAY = 300
 
@@ -2118,10 +2134,9 @@ async def _run_locked(args: CliArgs) -> None:
             await refresh_service_reminders()
             await refresh_user_reminder_jobs()
             # Открытые опросы замены переживают перезапуск бота.
-            for poll in service_registry.list_open_replacement_polls():
-                schedule_replacement_close(
-                    poll["poll_id"], datetime.fromisoformat(poll["deadline"])
-                )
+            _reschedule_open_polls(
+                service_registry, schedule_replacement_close, debug_logger
+            )
         scheduler.start()
         if backup_manager is not None:
             if create_startup_backup is not None:

@@ -1791,6 +1791,19 @@ class ReminderBotEntrypointTest(unittest.TestCase):
         self.assertEqual(bot.me.await_count, 1)
         self.assertIs(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
 
+    def test_poll_timer_failure_does_not_stop_startup(self):
+        from bot import app
+
+        registry = SimpleNamespace(list_open_replacement_polls=lambda: [
+            {"poll_id": "a", "deadline": "2099-01-03T10:00:00+00:00"},
+            {"poll_id": "b", "deadline": "2099-01-03T11:00:00+00:00"},
+        ])
+        schedule = MagicMock(side_effect=[RuntimeError("scheduler"), None])
+        logger = MagicMock()
+        app._reschedule_open_polls(registry, schedule, logger)
+        self.assertEqual([call.args[0] for call in schedule.call_args_list], ["a", "b"])
+        logger.exception.assert_called_once()
+
     def test_command_menu_sync_does_not_block_startup(self):
         """Без DNS обновление меню висит, но PID-файл и опрос уже работают."""
         from bot import app

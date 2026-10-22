@@ -8408,6 +8408,40 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         async with lock:
             await _confirm_locked(cb, context, sunday_iso, role, interaction, debug)
 
+    async def scheduled_name(
+        registry: Any, service_id: str, event_date, task: str, telegram_id: int
+    ) -> tuple[bool, str | None]:
+        """(стоит ли человек в задаче на дату, его имя в графике).
+
+        График с заменами. Без данных графика проверить нельзя — ответ
+        принимается, имя берётся из контакта."""
+        try:
+            names = await task_names_on_date(service_id, event_date, task)
+            if not names:
+                return True, None
+            name = registry.contact_name_among(
+                service_id, task, names, telegram_id
+            )
+            if name:
+                return True, name
+            # Заменяющий по /change мог быть привязан к задаче под другим
+            # именем — его узнаём по Telegram ID в записи замены.
+            name = next(
+                (
+                    item["new_name"]
+                    for item in reversed(registry.list_replacements(
+                        service_id, event_date.isoformat()
+                    ))
+                    if item["task"] == task and item["new_name"] in names
+                    and item["telegram_id"] == telegram_id
+                ),
+                None,
+            )
+            return name is not None, name
+        except Exception:  # noqa: BLE001
+            debug.exception("Не удалось сверить ответ с графиком")
+            return True, None
+
     @router.callback_query(F.data.startswith("pcf:"))
     async def on_personal_answer(cb: CallbackQuery) -> None:
         """«✅ Принял» / «🚫 Не смогу» в личном напоминании (этап 3.2)."""
@@ -8440,11 +8474,20 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if task is None:
             await _answer_callback(cb, "❌ Вы не привязаны к этой задаче")
             return
+        assigned, schedule_name = await scheduled_name(
+            registry, service_id, event_date, task, cb.from_user.id
+        )
+        if not assigned:
+            await _answer_callback(
+                cb, "⚠️ Это напоминание устарело: в графике на эту дату "
+                "в задаче уже другой человек."
+            )
+            return
         status = "confirmed" if kind == "c" else "declined"
         try:
             name, changed = registry.set_confirmation(
                 service_id, event_date.isoformat(), task, cb.from_user.id,
-                status,
+                status, name=schedule_name,
             )
         except PermissionError:
             await _answer_callback(cb, "❌ Вы не привязаны к этой задаче")

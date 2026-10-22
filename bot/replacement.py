@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 from collections.abc import Callable
@@ -22,6 +23,10 @@ POLL_EVENT_MARGIN = timedelta(hours=12)
 # Если до этого рубежа уже меньше часа — короткий срок.
 POLL_SHORT = timedelta(hours=1)
 POLL_OPTIONS = ("Могу", "Не смогу")
+
+# Один поиск замены на (служение, дату, задачу, человека): между проверкой
+# «запрос уже есть» и его записью идут отправки в Telegram.
+_search_locks: dict[tuple[str, str, str, str], asyncio.Lock] = {}
 
 ScheduleClose = Callable[[str, datetime], None]
 
@@ -85,6 +90,37 @@ async def start_replacement_search(
     Запрос замены сохраняется всегда: без опроса (нет чата, опрос не
     отправился) он сразу ждёт /change. Возвращает запрос или None (уже
     есть невыполненный запрос на это)."""
+    key = (service_id, event_date.isoformat(), task, old_name)
+    # Блокировки прошедших дат больше не нужны; текущие не удаляются, чтобы
+    # ожидающий вызов и новый не получили разные блокировки.
+    today = datetime.now(tz).date().isoformat()
+    for stale in [item for item in _search_locks if item[1] < today]:
+        if not _search_locks[stale].locked():
+            del _search_locks[stale]
+    lock = _search_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        return await _start_replacement_search_locked(
+            bot, registry, service_id, event_date, task, old_name,
+            old_telegram_id, admin_actor_id=admin_actor_id, tz=tz,
+            logger=logger, schedule_close=schedule_close, now=now,
+        )
+
+
+async def _start_replacement_search_locked(
+    bot,
+    registry,
+    service_id: str,
+    event_date: date,
+    task: str,
+    old_name: str,
+    old_telegram_id: int | None,
+    *,
+    admin_actor_id: int,
+    tz,
+    logger: logging.Logger,
+    schedule_close: ScheduleClose | None,
+    now: datetime | None = None,
+) -> dict | None:
     service = registry.get_service(service_id)
     if service is None:
         return None
@@ -148,31 +184,48 @@ async def start_replacement_search(
             getattr(notice, "message_id", None),
             deadline.astimezone(timezone.utc).isoformat(),
         )
-        if schedule_close is not None:
-            schedule_close(poll_id, deadline)
     except Exception:  # noqa: BLE001
         # Опрос без записи нельзя подсчитать — останавливаем его.
         logger.exception("Не удалось сохранить опрос замены %s", poll_id)
+        stopped = True
         try:
             await bot.stop_poll(chat_id, poll_message.message_id)
         except Exception:  # noqa: BLE001
+            stopped = False
             logger.warning(
                 "Не удалось остановить опрос замены %s", poll_id,
                 exc_info=True,
             )
+        state = (
+            "Опрос в чате остановлен." if stopped else
+            "Опрос в чате остановить не удалось — остановите его вручную, "
+            "голоса в нём не учитываются."
+        )
         await _notify(
             bot, admins,
             f"⚠️ Поиск замены не запущен из-за ошибки: «{task}» · "
-            f"{service['name']} · {date_text} вместо {old_name}. Опрос в "
-            f"чате остановлен.\n{manual}",
+            f"{service['name']} · {date_text} вместо {old_name}. "
+            f"{state}\n{manual}",
             logger,
         )
         return None
+    timer_note = ""
+    if schedule_close is not None:
+        try:
+            schedule_close(poll_id, deadline)
+        except Exception:  # noqa: BLE001
+            # Опрос и запись остаются открытыми: при запуске бот снова
+            # ставит открытые опросы на таймер итога, /change работает всегда.
+            logger.exception("Не удалось поставить таймер опроса %s", poll_id)
+            timer_note = (
+                "\n⚠️ Таймер итога не поставлен: итог подведётся после "
+                "перезапуска бота, или назначьте замену сами."
+            )
     await _notify(
         bot, admins,
         f"🔎 Ищем замену: «{task}» · {service['name']} · {date_text} вместо "
         f"{old_name}. Опрос в чате служения до {_local(deadline, tz)}.\n"
-        f"{manual}",
+        f"{manual}{timer_note}",
         logger,
     )
     return registry.get_replacement_poll(poll_id)

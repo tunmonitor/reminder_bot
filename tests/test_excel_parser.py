@@ -531,6 +531,13 @@ class ExcelParserTest(unittest.TestCase):
             [["Октябрьские слайды"]],
         )
 
+    def test_dotted_month_keeps_explicit_year(self):
+        from bot.excel_parser import _cell_date
+
+        self.assertEqual(_cell_date("1 нояб. 2025", 2026, 11), date(2025, 11, 1))
+        self.assertEqual(_cell_date("1 нояб.", 2026, 11), date(2026, 11, 1))
+        self.assertEqual(_cell_date("1 нояб. 10:00", 2026, 11), date(2026, 11, 1))
+
     def test_short_text_dates_stop_month_sheet(self):
         """«01.11» без года на листе октября — не продолжение 25.10."""
         for label in ("01.11", "01.11.26", "1.11 10:00", "1 нояб.", "1 ноя"):
