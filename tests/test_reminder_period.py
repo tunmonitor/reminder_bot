@@ -117,6 +117,32 @@ class PeriodRegistryTest(unittest.TestCase):
         self.assertIsNone(reminder["active_until"])
 
 
+class PeriodOverlapTest(PeriodRegistryTest):
+    def test_same_slot_allowed_for_disjoint_periods_only(self):
+        today = date(2026, 10, 20)
+        self.registry.set_group_reminder_period(
+            SUPER, self.reminder_id, date(2026, 11, 1), date(2026, 11, 29),
+            today=today,
+        )
+        other = self.registry.add_group_reminder(
+            SUPER, "sound", 2, "07:15", allow_duplicate=True
+        )
+        self.registry.update_group_reminder(SUPER, other, enabled=False)
+        self.registry.set_group_reminder_period(
+            SUPER, other, date(2026, 12, 6), date(2026, 12, 27), today=today
+        )
+        self.registry.update_group_reminder(SUPER, other, enabled=True)
+        with self.assertRaisesRegex(ValueError, "уже задано"):
+            self.registry.set_group_reminder_period(
+                SUPER, other, date(2026, 11, 22), date(2026, 12, 27), today=today
+            )
+        with self.assertRaisesRegex(ValueError, "разные периоды"):
+            self.registry.merge_group_reminder(
+                SUPER, self.reminder_id, expected_slot=(2, "07:15"),
+                source_id=other, source_slot=(2, "07:15"),
+            )
+
+
 class PeriodScreenTest(unittest.TestCase):
     def setUp(self):
         temp_dir = tempfile.TemporaryDirectory()
@@ -187,8 +213,12 @@ class PeriodScreenTest(unittest.TestCase):
         ).callback_data)
         self.assertIn("🗓 Период: без ограничений", card.message.answer.await_args.args[0])
         period = self.press(self.button(card, "group_reminder:period_menu:").callback_data)
-        start = self.press(self.button(period, "group_reminder:period_from:sound:2:").callback_data)
-        end = self.press(self.button(start, "group_reminder:period_until:sound:3:").callback_data)
+        start = self.press(self.button(
+            period, f"group_reminder:period_from:sound:{self.reminder_id * 100 + 2}:"
+        ).callback_data)
+        end = self.press(self.button(
+            start, f"group_reminder:period_until:sound:{self.reminder_id * 100 + 3}:"
+        ).callback_data)
         reminder = self.registry.get_group_reminder(self.reminder_id)
         start_day = date.fromisoformat(reminder["active_from"])
         until_day = date.fromisoformat(reminder["active_until"])
@@ -216,6 +246,37 @@ class PeriodScreenTest(unittest.TestCase):
         ).callback_data)
         self.press(self.button(period, "group_reminder:period_clear:").callback_data)
         self.assertIsNone(self.registry.get_group_reminder(self.reminder_id)["active_until"])
+
+    def test_period_button_of_other_reminder_is_stale(self):
+        other = self.registry.add_group_reminder(SUPER, "sound", 3, "07:15")
+        command = SimpleNamespace(
+            from_user=SimpleNamespace(id=SUPER),
+            chat=SimpleNamespace(type="private", id=SUPER),
+            text="/service_notify", users_shared=None, chat_shared=None,
+            answer=AsyncMock(),
+        )
+        asyncio.run(self.handler("on_service_notify", "message")(command))
+        service = SimpleNamespace(
+            data="service:service_notify:sound",
+            from_user=SimpleNamespace(id=SUPER),
+            message=SimpleNamespace(
+                chat=SimpleNamespace(type="private", id=SUPER), answer=AsyncMock(),
+            ),
+            answer=AsyncMock(),
+        )
+        asyncio.run(self.handler("on_service_selected")(service))
+        listing = self.press(self.button(service, "group_reminder:list:sound:").callback_data)
+        card = self.press(self.button(
+            listing, f"group_reminder:open:sound:{self.reminder_id}:"
+        ).callback_data)
+        period = self.press(self.button(card, "group_reminder:period_menu:").callback_data)
+        session = period.data.rsplit(":", 1)[1]
+        stale = self.press(
+            f"group_reminder:period_from:sound:{other * 100 + 1}:{session}"
+        )
+        self.assertIn("устарел", stale.answer.await_args.args[0])
+        stale = self.press(f"group_reminder:period_clear:sound:{other}:{session}")
+        self.assertIn("устарел", stale.answer.await_args.args[0])
 
     def test_expired_reminder_cannot_be_enabled_by_toggle(self):
         self.registry.set_group_reminder_period(

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import calendar
 import logging
+from dataclasses import dataclass
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import date, datetime, time, timedelta
 
@@ -90,40 +91,62 @@ def service_labels(registry) -> dict[str, str]:
     }
 
 
+@dataclass
+class SummaryRun:
+    sent: int = 0
+    # Кто-то ждёт, пока в графике появятся его служения: следующая
+    # проверка — реже (MONTH_SUMMARY_WAIT).
+    waiting: bool = False
+
+
 async def send_due_month_summaries(
     bot,
     registry,
     load_events: Callable[..., Awaitable[list]],
     now: datetime,
     logger: logging.Logger,
-) -> int:
-    """Рассылает сводки, которым пришло время. Возвращает число отправленных.
+) -> SummaryRun:
+    """Рассылает сводки, которым пришло время.
 
-    Нет событий месяца в графике (лист ещё не опубликован) — сводка ждёт
-    следующей проверки. У человека нет назначений — отмечается без
-    сообщения."""
-    due: dict[tuple[int, int], list[int]] = {}
+    Сводка ждёт, пока в графике месяца появятся события всех служений
+    человека (лист или колонка ещё не заполнены); в первое воскресенье в
+    его время уходит то, что есть. У человека нет назначений — отмечается
+    без сообщения."""
+    run = SummaryRun()
+    due: dict[tuple[int, int], list[dict]] = {}
     for item in registry.list_enabled_month_summaries():
         target = due_month(now, item["reminder_days"], item["reminder_time"])
         if target is None or registry.is_month_summary_delivered(
             item["telegram_id"], month_key(*target)
         ):
             continue
-        due.setdefault(target, []).append(item["telegram_id"])
+        due.setdefault(target, []).append(item)
     if not due:
-        return 0
-    events = await load_events(until=max(month_end(*target) for target in due))
+        return run
+    # С 1-го числа: сводка за текущий месяц включает уже прошедшие дни.
+    events = await load_events(
+        since=date(*min(due), 1),
+        until=max(month_end(*target) for target in due),
+    )
     labels = service_labels(registry)
-    sent = 0
     for (year, month), users in due.items():
-        if not month_events(events, year, month):
-            continue
         key = month_key(year, month)
-        for telegram_id in users:
+        events_of_month = month_events(events, year, month)
+        published = {event.service_id for event in events_of_month}
+        for item in users:
+            telegram_id = item["telegram_id"]
             linked = linked_assignments(registry, telegram_id)
-            has_tasks = bool(personal_schedule_lines(
-                month_events(events, year, month), linked, labels
-            ))
+            last_chance = datetime.combine(
+                first_sunday(year, month),
+                time.fromisoformat(item["reminder_time"]),
+                tzinfo=now.tzinfo,
+            )
+            if {service_id for service_id, _, _ in linked} - published and (
+                now < last_chance
+            ):
+                run.waiting = True
+                continue
+            has_tasks = bool(personal_schedule_lines(events_of_month, linked, labels))
             if not registry.claim_month_summary(telegram_id, key) or not has_tasks:
                 continue
             text = month_summary_text(events, linked, labels, year, month)
@@ -144,5 +167,5 @@ async def send_due_month_summaries(
                     key, telegram_id, exc_info=True,
                 )
                 continue
-            sent += 1
-    return sent
+            run.sent += 1
+    return run

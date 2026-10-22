@@ -674,13 +674,15 @@ async def _load_upcoming_service_events(
     weeks: int = 6,
     services=None,
     until: date | None = None,
+    since: date | None = None,
 ) -> list:
-    """Read schedule events from today through the given number of weeks
-    (or through until, if it is later)."""
+    """Read schedule events from today (or since, if it is earlier) through
+    the given number of weeks (or through until, if it is later)."""
     today = datetime.now(tz).date()
+    first_day = min(since or today, today)
     last_day = max(today + timedelta(days=weeks * 7), until or today)
     months = []
-    month = today.replace(day=1)
+    month = first_day.replace(day=1)
     while month <= last_day:
         months.append(month)
         month = (month + timedelta(days=32)).replace(day=1)
@@ -726,7 +728,7 @@ async def _load_upcoming_service_events(
                 event
                 for service_events in events_by_service.values()
                 for event in service_events
-                if today <= event.event_date <= last_day
+                if first_day <= event.event_date <= last_day
             )
         return sorted(events, key=lambda event: (event.event_date, event.service_id))
     finally:
@@ -1790,24 +1792,31 @@ async def _run_locked(args: CliArgs) -> None:
         context.load_service_task_assignments = load_service_task_assignments
 
         upcoming_cache: dict[str, Any] = {
-            "loaded_at": None, "events": [], "until": None,
+            "loaded_at": None, "events": [], "until": None, "since": None,
         }
         upcoming_lock = asyncio.Lock()
 
         async def load_upcoming_service_events(
-            force: bool = False, until: date | None = None
+            force: bool = False, until: date | None = None,
+            since: date | None = None,
         ) -> list:
             # Один общий скачанный график на несколько минут для всех
             # пользователей: повторные нажатия не обращаются к Яндекс.Диску.
             # force — «🔄 Сверить график»: скачать заново. В кэше — график до
             # конца следующего месяца (для «🔁 Замена»); по умолчанию
-            # возвращаются ближайшие 6 недель, until — до этой даты.
+            # возвращаются ближайшие 6 недель, until — до этой даты, since —
+            # с этой даты (по умолчанию с сегодня; кэш — с начала месяца).
             today = datetime.now(tz).date()
             limit = until or today + timedelta(days=UPCOMING_WEEKS_DEFAULT * 7)
+            start = min(since or today, today)
+            month_start = today.replace(day=1)
 
             def window(events: list) -> list:
                 return _apply_event_replacements(
-                    [event for event in events if event.event_date <= limit],
+                    [
+                        event for event in events
+                        if start <= event.event_date <= limit
+                    ],
                     service_registry,
                 )
 
@@ -1821,6 +1830,8 @@ async def _run_locked(args: CliArgs) -> None:
                     # После смены месяца кэш может не покрывать окно.
                     and upcoming_cache["until"] is not None
                     and upcoming_cache["until"] >= limit
+                    and upcoming_cache.get("since") is not None
+                    and upcoming_cache["since"] <= start
                 ):
                     # Замены — из базы при каждом чтении: кэш хранит график.
                     return window(upcoming_cache["events"])
@@ -1837,10 +1848,12 @@ async def _run_locked(args: CliArgs) -> None:
                         if service_registry is not None else None
                     ),
                     until=max(end_of_next_month, limit),
+                    since=min(month_start, start),
                 )
                 upcoming_cache.update(
                     loaded_at=time.monotonic(), events=events,
                     until=max(end_of_next_month, limit),
+                    since=min(month_start, start),
                 )
                 return window(events)
 
@@ -2162,32 +2175,36 @@ async def _run_locked(args: CliArgs) -> None:
                 coalesce=True,
             )
 
-            month_summary_failed_at: list[datetime] = []
+            month_summary_pause: dict[str, datetime] = {}
 
             async def month_summary_tick() -> None:
                 """Сводка на месяц (этап 4.1): раз в минуту — кому пора.
 
-                После сбоя (например, график не скачался) — пауза 10 минут."""
+                После сбоя (график не скачался) — пауза 10 минут; пока
+                сводка ждёт публикации графика — 30 минут."""
                 now = datetime.now(tz)
-                if month_summary_failed_at and (
-                    now - month_summary_failed_at[0] < timedelta(minutes=10)
-                ):
+                resume_at = month_summary_pause.get("until")
+                if resume_at is not None and now < resume_at:
                     return
-                month_summary_failed_at.clear()
+                month_summary_pause.clear()
                 try:
-                    sent = await send_due_month_summaries(
+                    run = await send_due_month_summaries(
                         bot, service_registry,
                         context.load_upcoming_service_events, now, debug_logger,
                     )
                 except Exception as exc:
-                    month_summary_failed_at.append(now)
+                    month_summary_pause["until"] = now + timedelta(minutes=10)
                     debug_logger.warning(
                         "Сводка на месяц отложена на 10 минут: %s: %s",
                         type(exc).__name__, exc,
                     )
                     return
-                if sent:
-                    interaction_logger.info("Сводок на месяц отправлено: %s", sent)
+                if run.waiting:
+                    month_summary_pause["until"] = now + timedelta(minutes=30)
+                if run.sent:
+                    interaction_logger.info(
+                        "Сводок на месяц отправлено: %s", run.sent
+                    )
 
             scheduler.add_job(
                 month_summary_tick,

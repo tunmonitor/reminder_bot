@@ -2277,6 +2277,37 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_slot_with_other_period_is_not_merged(self):
+        async def run():
+            self._preview_with_data()
+            existing_id = self.registry.list_group_reminders("sound")[0]["id"]
+            self.registry.set_group_reminder_period(
+                67890, existing_id, date(2099, 1, 4), None,
+                today=date(2026, 10, 20),
+            )
+            other_id = self.registry.add_group_reminder(
+                67890, "sound", 2, "18:00", "Второй текст"
+            )
+            menu = await self._open_sound_reminders()
+            card = await self._click(
+                menu.message,
+                lambda button: button.callback_data.startswith(
+                    f"group_reminder:open:sound:{other_id}:"
+                ),
+            )
+            await self._click(
+                card.message, lambda button: button.text == "📅 Срок"
+            )
+            answer = await self._type("1")
+            self.assertIn(
+                "пересекающимся периодом", answer.answer.await_args.args[0]
+            )
+            self.assertEqual(
+                self.registry.get_group_reminder(other_id)["reminder_days"], 2
+            )
+
+        asyncio.run(run())
+
     def test_merge_is_not_offered_without_schedule_preview(self):
         async def run():
             self.context.get_group_reminder_preview = AsyncMock(

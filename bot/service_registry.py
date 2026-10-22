@@ -16,6 +16,7 @@ from dataclasses import replace
 from typing import Callable
 
 from .presentation import is_replaced
+from .scheduler import periods_overlap
 from .secure_fs import open_private_directory
 from .services import (
     SERVICES,
@@ -1210,6 +1211,8 @@ class ServiceRegistry:
                     "enabled": bool(reminder["enabled"]),
                     "created_at": reminder["created_at"],
                     "task": reminder["task"],
+                    "active_from": reminder["active_from"],
+                    "active_until": reminder["active_until"],
                 }
             )
         services = []
@@ -1690,6 +1693,7 @@ class ServiceRegistry:
                     allow_duplicate,
                     excluding_id=reminder_id,
                     task=row["task"],
+                    period=dict(row),
                 )
             elif new_enabled and not row["enabled"]:
                 self._ensure_group_schedule_unique(
@@ -1701,6 +1705,7 @@ class ServiceRegistry:
                     excluding_id=reminder_id,
                     enabled_only=True,
                     task=row["task"],
+                    period=dict(row),
                 )
             if slot_changed:
                 # Новый срок или время — новая отправка: отметки доставки
@@ -1809,8 +1814,8 @@ class ServiceRegistry:
                 raise stale
             if source_id is not None:
                 source = connection.execute(
-                    "SELECT service_id, reminder_days, reminder_time, task "
-                    "FROM group_reminders WHERE id = ?",
+                    "SELECT service_id, reminder_days, reminder_time, task, "
+                    "active_from, active_until FROM group_reminders WHERE id = ?",
                     (source_id,),
                 ).fetchone()
                 if source is None or source["service_id"] != target["service_id"]:
@@ -1824,6 +1829,13 @@ class ServiceRegistry:
                     or source["task"] != target["task"]
                 ):
                     raise stale
+                if (source["active_from"], source["active_until"]) != (
+                    target["active_from"], target["active_until"]
+                ):
+                    raise ValueError(
+                        "У напоминаний разные периоды — объединить их нельзя. "
+                        "Сохраните отдельно или выровняйте период."
+                    )
             new_body = target["body"] if body is _UNSET else body
             self._validate_group_reminder_values(
                 target["reminder_days"], target["reminder_time"],
@@ -2400,7 +2412,8 @@ class ServiceRegistry:
             raise ValueError("Окончание периода уже прошло.")
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT service_id FROM group_reminders WHERE id = ?",
+                "SELECT service_id, enabled, reminder_days, reminder_time, task "
+                "FROM group_reminders WHERE id = ?",
                 (reminder_id,),
             ).fetchone()
             if row is None:
@@ -2410,6 +2423,15 @@ class ServiceRegistry:
                 active_from.isoformat() if active_from else None,
                 active_until.isoformat() if active_until else None,
             )
+            if row["enabled"]:
+                # Новый период не должен пересечься с включённым напоминанием
+                # той же задачи на то же время.
+                self._ensure_group_schedule_unique(
+                    connection, row["service_id"], row["reminder_days"],
+                    row["reminder_time"], False, excluding_id=reminder_id,
+                    enabled_only=True, task=row["task"],
+                    period={"active_from": values[0], "active_until": values[1]},
+                )
             connection.execute(
                 "UPDATE group_reminders SET active_from = ?, active_until = ? "
                 "WHERE id = ?",
@@ -2450,8 +2472,8 @@ class ServiceRegistry:
         _validate_positive_id(reminder_id, "reminder_id")
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT service_id, task, enabled, reminder_days, reminder_time "
-                "FROM group_reminders WHERE id = ?",
+                "SELECT service_id, task, enabled, reminder_days, reminder_time, "
+                "active_from, active_until FROM group_reminders WHERE id = ?",
                 (reminder_id,),
             ).fetchone()
             if row is None:
@@ -2489,6 +2511,7 @@ class ServiceRegistry:
                     excluding_id=reminder_id,
                     enabled_only=True,
                     task=task,
+                    period=dict(row),
                 )
             connection.execute(
                 "UPDATE group_reminders SET task = ? WHERE id = ?",
@@ -2580,10 +2603,13 @@ class ServiceRegistry:
         excluding_id: int | None = None,
         enabled_only: bool = False,
         task: str | None = None,
+        period: dict | None = None,
     ) -> None:
-        # Напоминания разных задач в один слот не пересекаются (этап 3.1).
+        # Напоминания разных задач в один слот не пересекаются (этап 3.1),
+        # как и напоминания с непересекающимися периодами (этап 4.2).
         query = (
-            "SELECT 1 FROM group_reminders WHERE service_id = ? "
+            "SELECT active_from, active_until FROM group_reminders "
+            "WHERE service_id = ? "
             "AND reminder_days = ? AND reminder_time = ? AND task IS ?"
         )
         parameters: tuple = (service_id, days, time, task)
@@ -2592,9 +2618,10 @@ class ServiceRegistry:
         if excluding_id is not None:
             query += " AND id != ?"
             parameters += (excluding_id,)
-        if not allow_duplicate and connection.execute(
-            query, parameters
-        ).fetchone():
+        if not allow_duplicate and any(
+            periods_overlap(dict(row), period or {})
+            for row in connection.execute(query, parameters)
+        ):
             raise ValueError(
                 f"Напоминание за {days} дн. в {time} уже задано."
             )

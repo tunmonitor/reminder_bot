@@ -75,6 +75,7 @@ from .service_registry import (
     validate_notification_template,
 )
 from .scheduler import (
+    periods_overlap,
     reminder_occurrence,
     reminder_period_status,
 )
@@ -215,6 +216,7 @@ def _parse_period(text: str) -> tuple[date | None, date | None]:
     return bounds[0], bounds[1]
 
 
+PERIOD_CHOICE_BASE = 100
 PERIOD_STATUS_LABELS = {
     "active": "🟢 активно",
     "pending": "⏳ ещё не началось",
@@ -2171,13 +2173,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     def send_now_snapshot(reminder: dict | None):
         """Что должно не измениться между предпросмотром и отправкой:
-        напоминание и чат (тема) служения."""
+        напоминание (с периодом) и чат (тема) служения."""
         if reminder is None:
             return None
         service = service_registry().get_service(reminder["service_id"]) or {}
         return (
             reminder["service_id"], reminder["body"], reminder.get("task"),
             reminder["reminder_days"], reminder["reminder_time"],
+            reminder.get("active_from"), reminder.get("active_until"),
             service.get("group_chat_id"), service.get("group_thread_id"),
         )
 
@@ -2290,20 +2293,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         pending["period_pick_until"] = pick_until
         action = "period_until" if pick_until else "period_from"
         session = pending["session_id"]
+        # Номер воскресенья вместе с напоминанием: кнопка с экрана другого
+        # напоминания не изменит текущее.
+        def choice_data(index: int) -> str:
+            value = reminder_id * PERIOD_CHOICE_BASE + index
+            return f"group_reminder:{action}:{service_id}:{value}:{session}"
+
         buttons = [
-            InlineKeyboardButton(
-                text=f"🗓 {day:%d.%m}",
-                callback_data=(
-                    f"group_reminder:{action}:{service_id}:{index}:{session}"
-                ),
-            )
+            InlineKeyboardButton(text=f"🗓 {day:%d.%m}", callback_data=choice_data(index))
             for index, day in enumerate(choices, start=1)
         ]
         rows = [[
-            InlineKeyboardButton(
-                text=open_label,
-                callback_data=f"group_reminder:{action}:{service_id}:0:{session}",
-            )
+            InlineKeyboardButton(text=open_label, callback_data=choice_data(0))
         ]]
         rows.extend(buttons[index:index + 3] for index in range(0, len(buttons), 3))
         rows.append([
@@ -2746,8 +2747,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         *,
         excluding_id: int | None = None,
         task: str | None = None,
+        period: dict | None = None,
     ) -> dict | None:
-        """Включённое напоминание служения с тем же сроком, временем и задачей."""
+        """Включённое напоминание служения с тем же сроком, временем и
+        задачей, чей период пересекается с period (None — без периода)."""
         return next(
             (
                 item
@@ -2757,8 +2760,22 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 and item["reminder_days"] == days
                 and item["reminder_time"] == reminder_time
                 and item.get("task") == task
+                and periods_overlap(item, period or {})
             ),
             None,
+        )
+
+    def ensure_same_period(target: dict | None, period: dict) -> None:
+        """Объединять можно только напоминания с одинаковым периодом."""
+        if target is None or (
+            target.get("active_from"), target.get("active_until")
+        ) == (period.get("active_from"), period.get("active_until")):
+            return
+        raise ValueError(
+            f"В {target['reminder_time']} за {target['reminder_days']} дн. "
+            "уже есть напоминание с пересекающимся периодом "
+            f"({period_text(target, datetime.now(context.timezone).date())}). "
+            "Измените время или период."
         )
 
     async def finish_new_group_reminder(
@@ -2774,6 +2791,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         target = enabled_group_reminder_at(
             registry, service_id, draft["days"], draft["time"]
         )
+        ensure_same_period(target, {})
         if target is not None:
             await offer_group_reminder_merge(
                 message,
@@ -3469,16 +3487,19 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     callback.message, actor_id, service_id, reminder_id
                 )
             elif action in {"period_from", "period_until"}:
-                # reminder_id здесь — номер воскресенья (0 — без границы).
+                # reminder_id здесь — напоминание × PERIOD_CHOICE_BASE + номер
+                # воскресенья (0 — без границы).
+                target_id, index = divmod(reminder_id, PERIOD_CHOICE_BASE)
                 choices = pending.get("period_choices", [])
                 if (
                     pending.get("step") != "group_reminder_period"
+                    or target_id != pending.get("reminder_id")
                     or pending.get("period_pick_until") != (action == "period_until")
-                    or not 0 <= reminder_id <= len(choices)
+                    or not 0 <= index <= len(choices)
                 ):
                     await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
                     return
-                picked = choices[reminder_id - 1] if reminder_id else None
+                picked = choices[index - 1] if index else None
                 if action == "period_from":
                     await show_group_reminder_period(
                         callback.message, actor_id, service_id,
@@ -3496,7 +3517,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         pending["reminder_id"],
                     )
             elif action == "period_clear":
-                if pending.get("step") != "group_reminder_period":
+                if (
+                    pending.get("step") != "group_reminder_period"
+                    or reminder_id != pending.get("reminder_id")
+                ):
                     await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
                     return
                 registry.set_group_reminder_period(
@@ -3508,7 +3532,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     callback.message, actor_id, service_id, pending["reminder_id"]
                 )
             elif action == "period_input":
-                if pending.get("step") != "group_reminder_period":
+                if (
+                    pending.get("step") != "group_reminder_period"
+                    or reminder_id != pending.get("reminder_id")
+                ):
                     await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
                     return
                 pending["step"] = "group_reminder_period_input"
@@ -6697,7 +6724,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     parse_mode=None,
                 )
                 return
-            events = await loader(until=month_end(year, month))
+            events = await loader(
+                since=date(year, month, 1), until=month_end(year, month)
+            )
             text = month_summary_text(
                 events, linked, service_labels(registry), year, month
             )
@@ -8318,10 +8347,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                                 updated_time,
                                 excluding_id=reminder["id"],
                                 task=reminder.get("task"),
+                                period=reminder,
                             )
                             if reminder["enabled"]
                             else None
                         )
+                        ensure_same_period(target, reminder)
                         if target is None:
                             # Совпадение с выключенным напоминанием (или
                             # изменение выключенного) не даёт двойной отправки.

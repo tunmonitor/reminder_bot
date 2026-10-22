@@ -74,10 +74,13 @@ class SendTest(unittest.TestCase):
         self.loader = AsyncMock(side_effect=lambda **_: self.events)
         self.now = datetime(2026, 10, 31, 18, 5, tzinfo=TZ)
 
-    def send(self, now=None):
+    def run_summaries(self, now=None):
         return asyncio.run(send_due_month_summaries(
             self.bot, self.registry, self.loader, now or self.now, MagicMock()
         ))
+
+    def send(self, now=None):
+        return self.run_summaries(now).sent
 
     def test_defaults_off_and_sent_once_per_month(self):
         self.assertFalse(self.registry.get_month_summary(USER)["enabled"])
@@ -110,6 +113,20 @@ class SendTest(unittest.TestCase):
         )
         self.assertEqual(self.send(), 0)
         self.assertTrue(self.registry.is_month_summary_delivered(USER, "2026-11"))
+
+    def test_waits_for_every_linked_service(self):
+        """Звук опубликован, кухня — ещё нет: ждём до первого воскресенья."""
+        self.registry.set_responsible_contact(
+            SUPER, "kitchen", "старший", "Алексей", USER, "alex_one"
+        )
+        self.registry.set_month_summary(USER, enabled=True)
+        run = self.run_summaries()
+        self.assertEqual((run.sent, run.waiting), (0, True))
+        self.assertFalse(self.registry.is_month_summary_delivered(USER, "2026-11"))
+        # В первое воскресенье в его время уходит то, что есть.
+        run = self.run_summaries(datetime(2026, 11, 1, 18, 0, tzinfo=TZ))
+        self.assertEqual((run.sent, run.waiting), (1, False))
+        self.assertIn("ЗВУК", self.bot.send_message.await_args.args[1])
 
     def test_no_own_tasks_marks_without_message(self):
         self.registry.set_month_summary(USER, enabled=True)
@@ -164,6 +181,8 @@ class ScreensTest(SendTest):
         asyncio.run(self.handler("on_start_menu")(menu))
         text = menu.message.answer.await_args.args[0]
         self.assertIn("Ваши служения", text)
+        # Месяц целиком, включая уже прошедшие воскресенья.
+        self.assertEqual(self.loader.await_args.kwargs["since"].day, 1)
         forward = next(
             item for item in self.buttons(menu.message)
             if item.callback_data.startswith("mymonth:")

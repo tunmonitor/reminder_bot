@@ -46,6 +46,19 @@ def in_reminder_period(event_date: date, reminder: dict) -> bool:
     )
 
 
+def periods_overlap(first: dict, second: dict) -> bool:
+    """Пересекаются ли периоды двух напоминаний (NULL — открытая граница)."""
+    first_from = _period_bound(first.get("active_from"))
+    first_until = _period_bound(first.get("active_until"))
+    second_from = _period_bound(second.get("active_from"))
+    second_until = _period_bound(second.get("active_until"))
+    return (
+        first_from is None or second_until is None or first_from <= second_until
+    ) and (
+        second_from is None or first_until is None or second_from <= first_until
+    )
+
+
 def reminder_period_status(reminder: dict, today: date) -> str | None:
     """None — без периода; иначе active / pending / ended."""
     active_from = _period_bound(reminder.get("active_from"))

@@ -347,9 +347,13 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   (default off, 1 day / 18:00) and `month_summary_deliveries` (one per
   user+month, claimed before sending, released on failure). The
   `month-summary` cron job runs every minute; `due_month` is the window from
-  `first Sunday − days` at the time until the end of the first Sunday. No
-  events of that month in the schedule → wait; no own tasks → marked, no
-  message. `personal_schedule_lines` (presentation) is shared by
+  `first Sunday − days` at the time until the end of the first Sunday. A
+  summary waits until every linked service has events in that month; at the
+  first Sunday at the user's time it goes with what exists (`SummaryRun.waiting`
+  → tick pauses 30 min; a loader failure → 10 min). No own tasks → marked, no
+  message; Forbidden/BadRequest → mark kept. `load_upcoming_service_events(
+  since=...)`: the cache holds events from the 1st of the current month; the
+  default window starts today, «📆 На месяц» asks for the whole month. `personal_schedule_lines` (presentation) is shared by
   `/my_schedule` and the month view; «📆 На месяц» (`menu:my_month`,
   `mymonth:YYYYMM` for current/next month only).
 - Stage 4.2 period: `group_reminders.active_from/active_until` (Sundays,
@@ -357,7 +361,12 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   active_from, active_until)` return None after the period;
   `_process_service_reminder` skips events outside it;
   `disable_expired_group_reminders` runs on every reminder refresh and in the
-  `reminder-period-expiry` job (00:05). Job ids must not start with
+  `reminder-period-expiry` job (00:05); an expired reminder can't be toggled
+  on until a new period is set. Same-slot duplicates (`_ensure_group_schedule_unique`,
+  `enabled_group_reminder_at`) count only when periods overlap
+  (`periods_overlap`); merging reminders with different periods is refused.
+  Period buttons encode `reminder_id * 100 + index`; the send-now snapshot
+  includes the period. Job ids must not start with
   `group-reminder-` / `service-reminder-` (those prefixes are pruned).
 
 ### Service-selection menus and Telegram UI
