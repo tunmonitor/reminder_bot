@@ -350,7 +350,9 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   `first Sunday − days` at the time until the end of the first Sunday. A
   summary waits until every linked service has events in that month; at the
   first Sunday at the user's time it goes with what exists (`SummaryRun.waiting`
-  → tick pauses 30 min; a loader failure → 10 min). No own tasks → marked, no
+  → the tick keeps running every minute but rereads the schedule at most every
+  30 min; a loader failure pauses the tick for 10 min). A slot taken by a
+  reminder with a different period offers only «➕ Отдельно» (no merge). No own tasks → marked, no
   message; Forbidden/BadRequest → mark kept. `load_upcoming_service_events(
   since=...)`: the cache holds events from the 1st of the current month; the
   default window starts today, «📆 На месяц» asks for the whole month. `personal_schedule_lines` (presentation) is shared by

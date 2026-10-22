@@ -2765,19 +2765,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             None,
         )
 
-    def ensure_same_period(target: dict | None, period: dict) -> None:
-        """Объединять можно только напоминания с одинаковым периодом."""
-        if target is None or (
-            target.get("active_from"), target.get("active_until")
-        ) == (period.get("active_from"), period.get("active_until")):
-            return
-        raise ValueError(
-            f"В {target['reminder_time']} за {target['reminder_days']} дн. "
-            "уже есть напоминание с пересекающимся периодом "
-            f"({period_text(target, datetime.now(context.timezone).date())}). "
-            "Измените время или период."
-        )
-
     async def finish_new_group_reminder(
         message: Message, actor_id: int, service_id: str
     ) -> None:
@@ -2791,7 +2778,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         target = enabled_group_reminder_at(
             registry, service_id, draft["days"], draft["time"]
         )
-        ensure_same_period(target, {})
         if target is not None:
             await offer_group_reminder_merge(
                 message,
@@ -2826,6 +2812,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         body: str | None,
         source_id: int | None,
         source_slot: tuple[int, str] | None = None,
+        period: dict | None = None,
     ) -> None:
         """Offer to merge a reminder into an existing one with the same slot.
 
@@ -2886,6 +2873,27 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
         slot = _rule_label(days, time)
         cancel_row = [merge_button("✖️ Отмена", "mrg_no")]
+        period = period or {}
+        if (target.get("active_from"), target.get("active_until")) != (
+            period.get("active_from"), period.get("active_until")
+        ):
+            # Напоминания с разными периодами не объединяются (этап 4.2).
+            today = datetime.now(context.timezone).date()
+            await _send_dialog(
+                message,
+                f"⚠️ На «{slot}» уже есть напоминание с периодом "
+                f"{period_text(target, today)}.\n"
+                f"Период этого напоминания: {period_text(period, today)}.\n\n"
+                "Напоминания с разными периодами не объединяются. Сохраните "
+                "отдельно и задайте периоды в «🗓 Период» так, чтобы они не "
+                "пересекались, — иначе в общие воскресенья уйдут оба.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [merge_button("➕ Отдельно", "mrg_sep")],
+                    cancel_row,
+                ]),
+                parse_mode=None,
+            )
+            return
         if same_text:
             await _send_dialog(
                 message,
@@ -8352,7 +8360,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             if reminder["enabled"]
                             else None
                         )
-                        ensure_same_period(target, reminder)
                         if target is None:
                             # Совпадение с выключенным напоминанием (или
                             # изменение выключенного) не даёт двойной отправки.
@@ -8377,6 +8384,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                                     reminder["reminder_days"],
                                     reminder["reminder_time"],
                                 ),
+                                period=reminder,
                             )
                             return
                     has_schedule_change = bool(

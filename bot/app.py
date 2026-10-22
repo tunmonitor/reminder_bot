@@ -2176,12 +2176,25 @@ async def _run_locked(args: CliArgs) -> None:
             )
 
             month_summary_pause: dict[str, datetime] = {}
+            # Пока сводка ждёт публикации графика, график перечитывается
+            # не чаще раза в 30 минут; проверка сроков — каждую минуту.
+            waiting_events: dict[str, Any] = {}
+
+            async def month_summary_events(**kwargs) -> list:
+                now = datetime.now(tz)
+                if (
+                    waiting_events.get("kwargs") == kwargs
+                    and now - waiting_events["at"] < timedelta(minutes=30)
+                ):
+                    return waiting_events["events"]
+                events = await context.load_upcoming_service_events(**kwargs)
+                waiting_events.update(kwargs=kwargs, at=now, events=events)
+                return events
 
             async def month_summary_tick() -> None:
                 """Сводка на месяц (этап 4.1): раз в минуту — кому пора.
 
-                После сбоя (график не скачался) — пауза 10 минут; пока
-                сводка ждёт публикации графика — 30 минут."""
+                После сбоя загрузки графика — пауза 10 минут."""
                 now = datetime.now(tz)
                 resume_at = month_summary_pause.get("until")
                 if resume_at is not None and now < resume_at:
@@ -2189,18 +2202,20 @@ async def _run_locked(args: CliArgs) -> None:
                 month_summary_pause.clear()
                 try:
                     run = await send_due_month_summaries(
-                        bot, service_registry,
-                        context.load_upcoming_service_events, now, debug_logger,
+                        bot, service_registry, month_summary_events, now,
+                        debug_logger,
                     )
                 except Exception as exc:
+                    waiting_events.clear()
                     month_summary_pause["until"] = now + timedelta(minutes=10)
                     debug_logger.warning(
                         "Сводка на месяц отложена на 10 минут: %s: %s",
                         type(exc).__name__, exc,
                     )
                     return
-                if run.waiting:
-                    month_summary_pause["until"] = now + timedelta(minutes=30)
+                if not run.waiting:
+                    # Никто не ждёт — следующий раз график читается свежим.
+                    waiting_events.clear()
                 if run.sent:
                     interaction_logger.info(
                         "Сводок на месяц отправлено: %s", run.sent

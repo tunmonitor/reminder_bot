@@ -2298,12 +2298,25 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             await self._click(
                 card.message, lambda button: button.text == "📅 Срок"
             )
-            answer = await self._type("1")
+            offer = await self._type("1")
             self.assertIn(
-                "пересекающимся периодом", answer.answer.await_args.args[0]
+                "разными периодами не объединяются",
+                offer.answer.await_args.args[0],
             )
+            labels = [
+                button.text
+                for row in offer.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+            ]
+            self.assertFalse(any("Объединить" in label for label in labels))
             self.assertEqual(
                 self.registry.get_group_reminder(other_id)["reminder_days"], 2
+            )
+            await self._click(offer, lambda button: button.text == "➕ Отдельно")
+            self.assertEqual(
+                self.registry.get_group_reminder(other_id)["reminder_days"], 1
             )
 
         asyncio.run(run())

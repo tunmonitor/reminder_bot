@@ -94,8 +94,8 @@ def service_labels(registry) -> dict[str, str]:
 @dataclass
 class SummaryRun:
     sent: int = 0
-    # Кто-то ждёт, пока в графике появятся его служения: следующая
-    # проверка — реже (MONTH_SUMMARY_WAIT).
+    # Кто-то ждёт, пока в графике появятся его служения: график для
+    # следующих проверок перечитывается реже (month_summary_events в app).
     waiting: bool = False
 
 
