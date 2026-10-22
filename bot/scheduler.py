@@ -31,16 +31,54 @@ def reminder_send_date(event_date: date, reminder_days: int) -> date:
     return event_date - timedelta(days=reminder_days)
 
 
+def _period_bound(value) -> date | None:
+    if value is None or isinstance(value, date):
+        return value
+    return date.fromisoformat(value)
+
+
+def in_reminder_period(event_date: date, reminder: dict) -> bool:
+    """Дата события в периоде напоминания «с — по» (этап 4.2)."""
+    active_from = _period_bound(reminder.get("active_from"))
+    active_until = _period_bound(reminder.get("active_until"))
+    return (active_from is None or event_date >= active_from) and (
+        active_until is None or event_date <= active_until
+    )
+
+
+def reminder_period_status(reminder: dict, today: date) -> str | None:
+    """None — без периода; иначе active / pending / ended."""
+    active_from = _period_bound(reminder.get("active_from"))
+    active_until = _period_bound(reminder.get("active_until"))
+    if active_from is None and active_until is None:
+        return None
+    if active_until is not None and active_until < today:
+        return "ended"
+    if active_from is not None and active_from > today:
+        return "pending"
+    return "active"
+
+
 def next_reminder_occurrence(
     now: datetime,
     reminder_days: int,
     reminder_time: str,
-) -> tuple[date, date]:
+    *,
+    active_from: date | str | None = None,
+    active_until: date | str | None = None,
+) -> tuple[date, date] | None:
+    """Ближайшее (воскресенье, дата отправки); None — период завершён."""
     send_time = time.fromisoformat(reminder_time)
     days_until_sunday = (6 - now.date().weekday()) % 7
     event_date = now.date() + timedelta(days=days_until_sunday)
+    active_from = _period_bound(active_from)
+    active_until = _period_bound(active_until)
+    if active_from is not None and event_date < active_from:
+        event_date = active_from
 
     while True:
+        if active_until is not None and event_date > active_until:
+            return None
         send_date = reminder_send_date(event_date, reminder_days)
         send_datetime = datetime.combine(
             send_date, send_time, tzinfo=now.tzinfo
@@ -48,6 +86,16 @@ def next_reminder_occurrence(
         if send_datetime >= now:
             return event_date, send_date
         event_date += timedelta(days=7)
+
+
+def reminder_occurrence(now: datetime, reminder: dict) -> tuple[date, date] | None:
+    return next_reminder_occurrence(
+        now,
+        reminder["reminder_days"],
+        reminder["reminder_time"],
+        active_from=reminder.get("active_from"),
+        active_until=reminder.get("active_until"),
+    )
 
 
 def scheduled_reminder_date(now: datetime, reminder_time: str) -> date:

@@ -176,3 +176,37 @@ def is_replaced(replacements: list[dict], task: str, name: str) -> bool:
         elif item["new_name"] == name:
             current.add(name)
     return name not in current
+
+
+WEEKDAYS = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
+
+
+def personal_schedule_lines(
+    events, linked: set, labels: Mapping[str, str]
+) -> list[str]:
+    """Строки «🗓 дата, день» и «эмодзи СЛУЖЕНИЕ · задача» для человека.
+
+    linked — {(service_id, task, имя в графике)} его привязок."""
+    lines: list[str] = []
+    for event in events:
+        tasks = sorted(
+            {
+                assignment.task
+                for assignment in event.assignments
+                if not assignment.is_informational
+                and (event.service_id, assignment.task, assignment.name) in linked
+            }
+        )
+        if not tasks:
+            continue
+        label = labels.get(event.service_id, event.service_id)
+        day = (
+            f"🗓 {event.event_date:%d.%m.%Y}, "
+            f"{WEEKDAYS[event.event_date.weekday()]}"
+        )
+        if day not in lines:
+            if lines:
+                lines.append("")
+            lines.append(day)
+        lines.extend(f"{task_emoji(task)} {label} · {task}" for task in tasks)
+    return lines

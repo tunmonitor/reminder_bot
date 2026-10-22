@@ -198,6 +198,25 @@ class ServiceRegistry:
                         CHECK (enabled IN (0, 1))
                 );
 
+                -- Сводка на месяц (этап 4.1): личная, перед первым
+                -- воскресеньем месяца; по умолчанию выключена.
+                CREATE TABLE IF NOT EXISTS user_month_summaries (
+                    telegram_id INTEGER PRIMARY KEY CHECK (telegram_id > 0),
+                    enabled INTEGER NOT NULL DEFAULT 0
+                        CHECK (enabled IN (0, 1)),
+                    reminder_days INTEGER NOT NULL DEFAULT 1
+                        CHECK (reminder_days BETWEEN 0 AND 6),
+                    reminder_time TEXT NOT NULL DEFAULT '18:00',
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS month_summary_deliveries (
+                    telegram_id INTEGER NOT NULL,
+                    month TEXT NOT NULL,
+                    delivered_at TEXT NOT NULL,
+                    PRIMARY KEY (telegram_id, month)
+                );
+
                 CREATE TABLE IF NOT EXISTS user_reminder_deliveries (
                     schedule_id INTEGER NOT NULL
                         REFERENCES user_reminder_schedules(id) ON DELETE CASCADE,
@@ -582,6 +601,12 @@ class ServiceRegistry:
                 connection.execute(
                     "ALTER TABLE group_reminders ADD COLUMN task TEXT"
                 )
+            for column in ("active_from", "active_until"):
+                if column not in reminder_columns:
+                    # Период по датам воскресений (этап 4.2); NULL — без границы.
+                    connection.execute(
+                        f"ALTER TABLE group_reminders ADD COLUMN {column} TEXT"
+                    )
             self._sync_service_catalog(connection, assembly_group_chat_id)
             has_super_admin = connection.execute(
                 "SELECT 1 FROM super_admins LIMIT 1"
@@ -1169,7 +1194,8 @@ class ServiceRegistry:
             ).fetchall()
             reminders = connection.execute(
                 "SELECT id, service_id, body, reminder_days, reminder_time, "
-                "enabled, created_at, task FROM group_reminders "
+                "enabled, created_at, task, active_from, active_until "
+                "FROM group_reminders "
                 "ORDER BY service_id, reminder_days, reminder_time, id"
             ).fetchall()
         reminders_by_service: dict[str, list[dict]] = {}
@@ -1507,7 +1533,8 @@ class ServiceRegistry:
             self._require_service(connection, service_id)
             rows = connection.execute(
                 "SELECT id, service_id, body, reminder_days, reminder_time, "
-                "enabled, created_at, task FROM group_reminders "
+                "enabled, created_at, task, active_from, active_until "
+                "FROM group_reminders "
                 "WHERE service_id = ? "
                 "ORDER BY reminder_days, reminder_time, id",
                 (service_id,),
@@ -1543,7 +1570,8 @@ class ServiceRegistry:
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT id, service_id, body, reminder_days, reminder_time, "
-                "enabled, created_at, task FROM group_reminders WHERE id = ?",
+                "enabled, created_at, task, active_from, active_until "
+                "FROM group_reminders WHERE id = ?",
                 (reminder_id,),
             ).fetchone()
         return (
@@ -2344,6 +2372,76 @@ class ServiceRegistry:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def set_group_reminder_period(
+        self,
+        actor_id: int,
+        reminder_id: int,
+        active_from: date | None,
+        active_until: date | None,
+        *,
+        today: date,
+    ) -> None:
+        """Период напоминания по датам воскресений «с — по» (этап 4.2).
+
+        today — сегодняшняя дата в часовом поясе бота.
+
+        None — без границы. Вне периода напоминание не отправляется,
+        после окончания выключается (disable_expired_group_reminders)."""
+        _validate_positive_id(actor_id, "actor_id")
+        _validate_positive_id(reminder_id, "reminder_id")
+        for bound in (active_from, active_until):
+            if bound is not None and (
+                not isinstance(bound, date) or bound.weekday() != 6
+            ):
+                raise ValueError("Границы периода — даты воскресений.")
+        if active_from and active_until and active_from > active_until:
+            raise ValueError("Начало периода позже окончания.")
+        if active_until is not None and active_until < today:
+            raise ValueError("Окончание периода уже прошло.")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT service_id FROM group_reminders WHERE id = ?",
+                (reminder_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("Групповое напоминание больше не существует.")
+            self._require_service_editor(connection, actor_id, row["service_id"])
+            values = (
+                active_from.isoformat() if active_from else None,
+                active_until.isoformat() if active_until else None,
+            )
+            connection.execute(
+                "UPDATE group_reminders SET active_from = ?, active_until = ? "
+                "WHERE id = ?",
+                (*values, reminder_id),
+            )
+            self._audit(
+                connection, actor_id, "group_reminder_period",
+                row["service_id"],
+                {
+                    "reminder_id": reminder_id,
+                    "active_from": values[0],
+                    "active_until": values[1],
+                },
+            )
+
+    def disable_expired_group_reminders(self, today: date) -> list[int]:
+        """Выключает напоминания, чей период закончился до today."""
+        with self._connection() as connection:
+            ids = [
+                row["id"]
+                for row in connection.execute(
+                    "SELECT id FROM group_reminders WHERE enabled = 1 "
+                    "AND active_until IS NOT NULL AND active_until < ?",
+                    (today.isoformat(),),
+                )
+            ]
+            connection.executemany(
+                "UPDATE group_reminders SET enabled = 0 WHERE id = ?",
+                [(reminder_id,) for reminder_id in ids],
+            )
+        return ids
+
     def set_group_reminder_task(
         self, actor_id: int, reminder_id: int, task: str | None
     ) -> None:
@@ -2775,7 +2873,8 @@ class ServiceRegistry:
                 }
             current = connection.execute(
                 "SELECT id, service_id, body, reminder_days, reminder_time, "
-                "enabled, created_at, task FROM group_reminders "
+                "enabled, created_at, task, active_from, active_until "
+                "FROM group_reminders "
                 "WHERE id = ? AND service_id = ?",
                 (reminder_id, service_id),
             ).fetchone()
@@ -3459,6 +3558,95 @@ class ServiceRegistry:
                 (actor_id, service_id),
             ).fetchall()
         return [row["task"] for row in rows]
+
+    MONTH_SUMMARY_DEFAULTS = {
+        "enabled": False, "reminder_days": 1, "reminder_time": "18:00",
+    }
+
+    def get_month_summary(self, telegram_id: int) -> dict:
+        """Настройка сводки на месяц (этап 4.1); без записи — по умолчанию."""
+        _validate_positive_id(telegram_id, "telegram_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT enabled, reminder_days, reminder_time "
+                "FROM user_month_summaries WHERE telegram_id = ?",
+                (telegram_id,),
+            ).fetchone()
+        if row is None:
+            return dict(self.MONTH_SUMMARY_DEFAULTS)
+        return {**dict(row), "enabled": bool(row["enabled"])}
+
+    def set_month_summary(
+        self,
+        telegram_id: int,
+        *,
+        enabled: bool | None = None,
+        days: int | None = None,
+        time: str | None = None,
+    ) -> dict:
+        current = self.get_month_summary(telegram_id)
+        new = {
+            "enabled": current["enabled"] if enabled is None else enabled,
+            "reminder_days": current["reminder_days"] if days is None else days,
+            "reminder_time": current["reminder_time"] if time is None else time,
+        }
+        if not isinstance(new["enabled"], bool):
+            raise ValueError("enabled должен быть логическим значением")
+        self._validate_group_reminder_values(
+            new["reminder_days"], new["reminder_time"], None
+        )
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO user_month_summaries "
+                "(telegram_id, enabled, reminder_days, reminder_time, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(telegram_id) DO UPDATE SET "
+                "enabled = excluded.enabled, "
+                "reminder_days = excluded.reminder_days, "
+                "reminder_time = excluded.reminder_time, "
+                "updated_at = excluded.updated_at",
+                (
+                    telegram_id, int(new["enabled"]), new["reminder_days"],
+                    new["reminder_time"], _utc_now(),
+                ),
+            )
+        return new
+
+    def list_enabled_month_summaries(self) -> list[dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT telegram_id, reminder_days, reminder_time "
+                "FROM user_month_summaries WHERE enabled = 1 "
+                "ORDER BY telegram_id"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def is_month_summary_delivered(self, telegram_id: int, month: str) -> bool:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM month_summary_deliveries "
+                "WHERE telegram_id = ? AND month = ?",
+                (telegram_id, month),
+            ).fetchone()
+        return row is not None
+
+    def claim_month_summary(self, telegram_id: int, month: str) -> bool:
+        """Отметка доставки по (пользователь, месяц); False — уже отмечено."""
+        with self._connection(notify=False) as connection:
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO month_summary_deliveries "
+                "(telegram_id, month, delivered_at) VALUES (?, ?, ?)",
+                (telegram_id, month, _utc_now()),
+            )
+        return cursor.rowcount > 0
+
+    def release_month_summary(self, telegram_id: int, month: str) -> None:
+        """Снимает отметку, если сводку отправить не удалось."""
+        with self._connection(notify=False) as connection:
+            connection.execute(
+                "DELETE FROM month_summary_deliveries "
+                "WHERE telegram_id = ? AND month = ?",
+                (telegram_id, month),
+            )
 
     def list_user_assignments(self, actor_id: int) -> list[dict]:
         """Return every (service, task, schedule name) linked to this user."""

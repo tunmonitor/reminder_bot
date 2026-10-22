@@ -1382,7 +1382,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 answer=AsyncMock(),
             )
             with patch(
-                "bot.handlers.next_reminder_occurrence",
+                "bot.handlers.reminder_occurrence",
                 return_value=(date(2026, 10, 25), date(2026, 10, 24)),
             ):
                 await self.callback_handler("on_group_reminder_action")(
@@ -4688,7 +4688,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
             self.assertEqual(
                 self.callback_data_list(message),
-                ["menu:my_schedule", "menu:my_notifications"],
+                ["menu:my_schedule", "menu:my_month", "menu:my_notifications"],
             )
             text = message.answer.await_args.args[0]
             self.assertIn("Личные напоминания выключены: ЗВУК", text)
@@ -5421,7 +5421,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertNotIn("Пульт", text)
             self.assertEqual(
                 self.callback_data_list(message),
-                ["menu:my_notifications", "menu:start"],
+                ["menu:my_month", "menu:my_notifications", "menu:start"],
             )
 
         asyncio.run(run())

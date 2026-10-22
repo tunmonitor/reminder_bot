@@ -71,10 +71,12 @@ if __package__:
     )
     from .ui import send_telegram_screen, visible_units
     from .secure_fs import open_private_directory
+    from .month_summary import send_due_month_summaries
     from .scheduler import (
         add_service_reminder_jobs,
         build_scheduler,
-        next_reminder_occurrence,
+        in_reminder_period,
+        reminder_occurrence,
         next_sunday_date,
         refresh_user_reminder_jobs as refresh_user_reminder_schedule_jobs,
         scheduled_reminder_date,
@@ -131,10 +133,12 @@ else:  # pragma: no cover - поддержка запуска файла нап�
     )
     from bot.ui import send_telegram_screen, visible_units
     from bot.secure_fs import open_private_directory
+    from bot.month_summary import send_due_month_summaries
     from bot.scheduler import (
         add_service_reminder_jobs,
         build_scheduler,
-        next_reminder_occurrence,
+        in_reminder_period,
+        reminder_occurrence,
         next_sunday_date,
         refresh_user_reminder_jobs as refresh_user_reminder_schedule_jobs,
         scheduled_reminder_date,
@@ -785,11 +789,10 @@ async def get_group_reminder_preview(
     if service is None:
         raise ValueError("Служение для напоминания не найдено.")
 
-    event_date, send_date = next_reminder_occurrence(
-        datetime.now(tz),
-        reminder["reminder_days"],
-        reminder["reminder_time"],
-    )
+    occurrence = reminder_occurrence(datetime.now(tz), reminder)
+    if occurrence is None:
+        raise ValueError("Период напоминания завершён.")
+    event_date, send_date = occurrence
     date_text = event_date.strftime("%d.%m.%Y")
     result = {
         "date": date_text,
@@ -945,6 +948,12 @@ async def _process_service_reminder(
     event_date = (run_date or datetime.now(tz).date()) + timedelta(
         days=reminder["reminder_days"]
     )
+    if not in_reminder_period(event_date, reminder):
+        interaction_logger.info(
+            "Уведомление %s служения %s пропущено: %s вне периода",
+            reminder_id, service_id, event_date,
+        )
+        return
     schedule_issues: list[str] = []
     raw_assignments: dict = {}
     try:
@@ -1959,6 +1968,15 @@ async def _run_locked(args: CliArgs) -> None:
             async def refresh_service_reminders() -> None:
                 if service_registry is None or scheduler is None:
                     return
+                # Напоминания с завершённым периодом выключаются (этап 4.2).
+                expired = service_registry.disable_expired_group_reminders(
+                    datetime.now(tz).date()
+                )
+                if expired:
+                    interaction_logger.info(
+                        "Период напоминаний завершён, выключены: %s",
+                        ", ".join(map(str, expired)),
+                    )
                 await add_service_reminder_jobs(
                     scheduler,
                     service_registry.list_services(),
@@ -2132,6 +2150,55 @@ async def _run_locked(args: CliArgs) -> None:
             )
         if service_registry is not None:
             await refresh_service_reminders()
+            # Ночью выключаются напоминания с завершённым периодом (этап 4.2).
+            scheduler.add_job(
+                refresh_service_reminders,
+                "cron",
+                hour=0,
+                minute=5,
+                id="reminder-period-expiry",
+                replace_existing=True,
+                misfire_grace_time=None,
+                coalesce=True,
+            )
+
+            month_summary_failed_at: list[datetime] = []
+
+            async def month_summary_tick() -> None:
+                """Сводка на месяц (этап 4.1): раз в минуту — кому пора.
+
+                После сбоя (например, график не скачался) — пауза 10 минут."""
+                now = datetime.now(tz)
+                if month_summary_failed_at and (
+                    now - month_summary_failed_at[0] < timedelta(minutes=10)
+                ):
+                    return
+                month_summary_failed_at.clear()
+                try:
+                    sent = await send_due_month_summaries(
+                        bot, service_registry,
+                        context.load_upcoming_service_events, now, debug_logger,
+                    )
+                except Exception as exc:
+                    month_summary_failed_at.append(now)
+                    debug_logger.warning(
+                        "Сводка на месяц отложена на 10 минут: %s: %s",
+                        type(exc).__name__, exc,
+                    )
+                    return
+                if sent:
+                    interaction_logger.info("Сводок на месяц отправлено: %s", sent)
+
+            scheduler.add_job(
+                month_summary_tick,
+                "cron",
+                minute="*",
+                id="month-summary",
+                replace_existing=True,
+                misfire_grace_time=None,
+                coalesce=True,
+                max_instances=1,
+            )
             await refresh_user_reminder_jobs()
             # Открытые опросы замены переживают перезапуск бота.
             _reschedule_open_polls(

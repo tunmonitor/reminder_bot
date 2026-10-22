@@ -343,6 +343,22 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   the labeled button itself is needed.
 - Personal screens paginate only item rows; actions, page buttons, and
   back/close stay as separate bottom rows (`_dialog_keep_rows`).
+- Stage 4.1 month summary (`bot/month_summary.py`): `user_month_summaries`
+  (default off, 1 day / 18:00) and `month_summary_deliveries` (one per
+  user+month, claimed before sending, released on failure). The
+  `month-summary` cron job runs every minute; `due_month` is the window from
+  `first Sunday − days` at the time until the end of the first Sunday. No
+  events of that month in the schedule → wait; no own tasks → marked, no
+  message. `personal_schedule_lines` (presentation) is shared by
+  `/my_schedule` and the month view; «📆 На месяц» (`menu:my_month`,
+  `mymonth:YYYYMM` for current/next month only).
+- Stage 4.2 period: `group_reminders.active_from/active_until` (Sundays,
+  NULL = open). `reminder_occurrence`/`next_reminder_occurrence(...,
+  active_from, active_until)` return None after the period;
+  `_process_service_reminder` skips events outside it;
+  `disable_expired_group_reminders` runs on every reminder refresh and in the
+  `reminder-period-expiry` job (00:05). Job ids must not start with
+  `group-reminder-` / `service-reminder-` (those prefixes are pruned).
 
 ### Service-selection menus and Telegram UI
 
