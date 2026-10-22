@@ -2180,14 +2180,27 @@ async def _run_locked(args: CliArgs) -> None:
             # не чаще раза в 30 минут; проверка сроков — каждую минуту.
             waiting_events: dict[str, Any] = {}
 
-            async def month_summary_events(**kwargs) -> list:
+            async def month_summary_events(
+                *, fresh: bool = False, **kwargs
+            ) -> list:
                 now = datetime.now(tz)
+                # fresh — крайний срок сводки: скачать график заново, но не
+                # чаще раза в 10 минут (если отправка срывается и повторяется).
+                forced_at = waiting_events.get("forced_at")
+                fresh = fresh and (
+                    forced_at is None or now - forced_at >= timedelta(minutes=10)
+                )
                 if (
-                    waiting_events.get("kwargs") == kwargs
+                    not fresh
+                    and waiting_events.get("kwargs") == kwargs
                     and now - waiting_events["at"] < timedelta(minutes=30)
                 ):
                     return waiting_events["events"]
-                events = await context.load_upcoming_service_events(**kwargs)
+                events = await context.load_upcoming_service_events(
+                    force=fresh, **kwargs
+                )
+                if fresh:
+                    waiting_events["forced_at"] = now
                 waiting_events.update(kwargs=kwargs, at=now, events=events)
                 return events
 
@@ -2215,7 +2228,10 @@ async def _run_locked(args: CliArgs) -> None:
                     return
                 if not run.waiting:
                     # Никто не ждёт — следующий раз график читается свежим.
+                    forced_at = waiting_events.get("forced_at")
                     waiting_events.clear()
+                    if forced_at is not None:
+                        waiting_events["forced_at"] = forced_at
                 if run.sent:
                     interaction_logger.info(
                         "Сводок на месяц отправлено: %s", run.sent

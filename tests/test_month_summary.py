@@ -123,9 +123,12 @@ class SendTest(unittest.TestCase):
         run = self.run_summaries()
         self.assertEqual((run.sent, run.waiting), (0, True))
         self.assertFalse(self.registry.is_month_summary_delivered(USER, "2026-11"))
-        # В первое воскресенье в его время уходит то, что есть.
+        self.assertFalse(self.loader.await_args.kwargs["fresh"])
+        # В первое воскресенье в его время уходит то, что есть, по свежему
+        # графику.
         run = self.run_summaries(datetime(2026, 11, 1, 18, 0, tzinfo=TZ))
         self.assertEqual((run.sent, run.waiting), (1, False))
+        self.assertTrue(self.loader.await_args.kwargs["fresh"])
         self.assertIn("ЗВУК", self.bot.send_message.await_args.args[1])
 
     def test_no_own_tasks_marks_without_message(self):

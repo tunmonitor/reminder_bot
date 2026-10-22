@@ -108,6 +108,8 @@ async def send_due_month_summaries(
 ) -> SummaryRun:
     """Рассылает сводки, которым пришло время.
 
+    load_events(since=, until=, fresh=) — fresh: прочитать график заново.
+
     Сводка ждёт, пока в графике месяца появятся события всех служений
     человека (лист или колонка ещё не заполнены); в первое воскресенье в
     его время уходит то, что есть. У человека нет назначений — отмечается
@@ -123,10 +125,25 @@ async def send_due_month_summaries(
         due.setdefault(target, []).append(item)
     if not due:
         return run
+
+    def last_chance(target: tuple[int, int], item: dict) -> datetime:
+        return datetime.combine(
+            first_sunday(*target),
+            time.fromisoformat(item["reminder_time"]),
+            tzinfo=now.tzinfo,
+        )
+
+    # В крайний срок график читается свежим, без кэша ожидания: служение
+    # могли опубликовать после последней проверки.
+    fresh = any(
+        now >= last_chance(target, item)
+        for target, items in due.items() for item in items
+    )
     # С 1-го числа: сводка за текущий месяц включает уже прошедшие дни.
     events = await load_events(
         since=date(*min(due), 1),
         until=max(month_end(*target) for target in due),
+        fresh=fresh,
     )
     labels = service_labels(registry)
     for (year, month), users in due.items():
@@ -136,13 +153,8 @@ async def send_due_month_summaries(
         for item in users:
             telegram_id = item["telegram_id"]
             linked = linked_assignments(registry, telegram_id)
-            last_chance = datetime.combine(
-                first_sunday(year, month),
-                time.fromisoformat(item["reminder_time"]),
-                tzinfo=now.tzinfo,
-            )
             if {service_id for service_id, _, _ in linked} - published and (
-                now < last_chance
+                now < last_chance((year, month), item)
             ):
                 run.waiting = True
                 continue
