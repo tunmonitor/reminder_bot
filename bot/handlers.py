@@ -2200,7 +2200,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ),
         )
         result = None
-        if callable(loader):
+        current = registry.get_group_reminder(reminder_id) if registry else None
+        period_ended = current is not None and reminder_occurrence(
+            datetime.now(context.timezone), current
+        ) is None
+        if callable(loader) and not period_ended:
             try:
                 result = await loader(reminder_id)
             except Exception:  # noqa: BLE001
@@ -2217,6 +2221,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         elif service is None or not service.get("group_chat_id"):
             text, rows = (
                 "⚠️ У служения не привязан групповой чат — отправлять некуда.",
+                [[back]],
+            )
+        elif period_ended:
+            text, rows = (
+                "⚠️ Период напоминания завершён — задайте новый период "
+                "в «🗓 Период».",
                 [[back]],
             )
         elif not result or not result.get("has_data"):
@@ -3488,7 +3498,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         callback.message, actor_id, service_id
                     )
             elif action == "period_menu":
-                if pending.get("step") != "group_reminder_card":
+                if (
+                    pending.get("step") != "group_reminder_card"
+                    or reminder_id != pending.get("reminder_id")
+                ):
                     await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
                     return
                 await show_group_reminder_period(
