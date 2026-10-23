@@ -405,6 +405,16 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   refused while a run is parked. «➕ В состав» buttons carry a pending
   token; `bind_service_member(from_readiness=True)` refuses names bound to
   another Telegram in `service_members` or `responsible_contacts`.
+- Launch failure modes: intro chunks fall back to the general topic one by
+  one (`send_chunk` → `send_to_service_group`); a network/timeout error on
+  `send_poll` keeps the month closed (no auto relaunch) and asks admins to
+  check the chat; an unattached poll that cannot be stopped keeps a closed
+  run with its ids so the tick retries `stop_poll`. Votes that arrive
+  before the poll id is attached are held (`hold_early_answer`, 2 min) and
+  replayed after attach. Preview/missed notices are released if delivery
+  failed. A failed restart restores the old run without suppressing its
+  result. `_send_dialog` keeps the stored back route for messages without
+  inline buttons. «➕ В состав» buttons carry `YYYYMM.<telegram_id>`.
 
 ### Rich text, mentions, and message length
 

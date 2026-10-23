@@ -736,7 +736,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             state = nav_state.setdefault(
                 nav_actor, {"shown": False, "helpers": []}
             )
-            state["back"] = nav_back
+            if markup is not None or not text.startswith("⏳"):
+                state["back"] = nav_back
+            # «⏳ Загружаю…» шаг назад не меняет: «Отмена» вернёт с прежнего
+            # экрана. Итоговое сообщение без кнопок — «Отмена» ведёт в /start.
             state["screen"] = sent_message.message_id
             debug.log(
                 TRACE,
@@ -3339,7 +3342,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         rows = [
             [readiness_button(
                 f"➕ {readiness.outside_name(answer)} в состав"[:60],
-                "addm", service["id"], str(answer["telegram_id"]),
+                "addm", service["id"],
+                f"{year:04d}{month:02d}.{answer['telegram_id']}",
             )]
             for answer in summary.outside[:20]
         ]
@@ -3561,15 +3565,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                                 debug, TELEGRAM_TEXT_LIMIT,
                             )
                         except Exception as exc:  # noqa: BLE001
-                            if run is not None:
+                            if run is not None and registry.get_readiness_run(
+                                service_id, key
+                            ) is not None:
+                                # Новый опрос мог появиться в чате (ответ
+                                # Telegram потерян) — месяц за ним; прежние
+                                # ответы, как и обещал перезапуск, удаляются.
+                                registry.delete_readiness_run(run["id"])
+                            elif run is not None:
                                 # Опрос в чате остановлен — вернуть закрытым;
                                 # итог шлётся, только если ещё не был.
                                 registry.move_readiness_run(run["id"], key)
                                 registry.close_readiness_run(run["id"])
-                                if run["status"] == "open":
-                                    registry.mark_readiness_run(
-                                        run["id"], result_sent=True
-                                    )
                             if isinstance(exc, ValueError):
                                 notice = f"⚠️ {exc}"
                             else:
@@ -3726,7 +3733,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await show_readiness_text(callback.message, service_id, arg)
                 await _answer_callback(callback)
                 return
-            elif action == "addm" and arg and arg.isdigit():
+            elif action == "addm" and arg and arg.count(".") == 1 and (
+                arg.split(".")[0] != f"{year:04d}{month:02d}"
+            ):
+                notice = "⚠️ Экран устарел — месяц опроса сменился"
+            elif action == "addm" and arg and arg.split(".")[-1].isdigit():
+                arg = arg.split(".")[-1]
                 run = registry.get_readiness_run(service_id, key)
                 answer = next(
                     (
@@ -3809,19 +3821,25 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     )
                     await _answer_callback(callback)
                     return
-                pending_inputs.pop(actor_id, None)
                 try:
                     registry.bind_service_member(
                         actor_id, service_id, member["name"],
                         member["telegram_id"], member["username"],
                         tasks=member["selected"], from_readiness=True,
                     )
-                    notice = (
-                        f"✅ {member['name']} в составе: "
-                        + ", ".join(member["selected"])
-                    )
                 except ValueError as exc:
-                    notice = _status_text(str(exc), "⚠️")
+                    # Выбор задач сохраняется — можно вернуться к опросу.
+                    await show_readiness_member(
+                        callback.message, actor_id, service_id,
+                        _status_text(str(exc), "⚠️"),
+                    )
+                    await _answer_callback(callback)
+                    return
+                pending_inputs.pop(actor_id, None)
+                notice = (
+                    f"✅ {member['name']} в составе: "
+                    + ", ".join(member["selected"])
+                )
                 run = registry.get_readiness_run(service_id, key)
                 if run is not None and run["status"] != "skipped":
                     await show_readiness_progress(
@@ -8271,6 +8289,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         )
         try:
             run = registry.get_readiness_run_by_poll(poll_answer.poll_id)
+            if run is None and registry.get_replacement_poll(
+                poll_answer.poll_id
+            ) is None:
+                # Опрос готовности только что отправлен и ещё не записан —
+                # ответ учтётся сразу после записи.
+                readiness.hold_early_answer(
+                    poll_answer.poll_id, user.id, user.username or "",
+                    full_name, list(poll_answer.option_ids or ()),
+                )
+                return
             if run is not None:
                 # Опрос готовности (этап 5): варианты — даты месяца.
                 registry.record_readiness_answer(
