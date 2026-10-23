@@ -1798,7 +1798,7 @@ async def _run_locked(args: CliArgs) -> None:
 
         async def load_upcoming_service_events(
             force: bool = False, until: date | None = None,
-            since: date | None = None,
+            since: date | None = None, with_replacements: bool = True,
         ) -> list:
             # Один общий скачанный график на несколько минут для всех
             # пользователей: повторные нажатия не обращаются к Яндекс.Диску.
@@ -1812,13 +1812,15 @@ async def _run_locked(args: CliArgs) -> None:
             month_start = today.replace(day=1)
 
             def window(events: list) -> list:
-                return _apply_event_replacements(
-                    [
-                        event for event in events
-                        if start <= event.event_date <= limit
-                    ],
-                    service_registry,
-                )
+                selected = [
+                    event for event in events
+                    if start <= event.event_date <= limit
+                ]
+                # with_replacements=False — график как в файле (замены
+                # вызывающий применит сам, например к своему кэшу).
+                if not with_replacements:
+                    return selected
+                return _apply_event_replacements(selected, service_registry)
 
             async with upcoming_lock:
                 loaded_at = upcoming_cache["loaded_at"]
@@ -2190,19 +2192,23 @@ async def _run_locked(args: CliArgs) -> None:
                 fresh = fresh and (
                     forced_at is None or now - forced_at >= timedelta(minutes=10)
                 )
+                # В кэше — график без замен: замены применяются при каждом
+                # чтении, чтобы сводка учла замену, сделанную за эти минуты.
                 if (
                     not fresh
                     and waiting_events.get("kwargs") == kwargs
                     and now - waiting_events["at"] < timedelta(minutes=30)
                 ):
-                    return waiting_events["events"]
+                    return _apply_event_replacements(
+                        waiting_events["events"], service_registry
+                    )
                 events = await context.load_upcoming_service_events(
-                    force=fresh, **kwargs
+                    force=fresh, with_replacements=False, **kwargs
                 )
                 if fresh:
                     waiting_events["forced_at"] = now
                 waiting_events.update(kwargs=kwargs, at=now, events=events)
-                return events
+                return _apply_event_replacements(events, service_registry)
 
             async def month_summary_tick() -> None:
                 """Сводка на месяц (этап 4.1): раз в минуту — кому пора.
@@ -2223,7 +2229,7 @@ async def _run_locked(args: CliArgs) -> None:
                     month_summary_pause["until"] = now + timedelta(minutes=10)
                     debug_logger.warning(
                         "Сводка на месяц отложена на 10 минут: %s: %s",
-                        type(exc).__name__, exc,
+                        type(exc).__name__, exc, exc_info=True,
                     )
                     return
                 if not run.waiting:

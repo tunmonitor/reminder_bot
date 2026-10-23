@@ -278,6 +278,55 @@ class PeriodScreenTest(unittest.TestCase):
         stale = self.press(f"group_reminder:period_clear:sound:{other}:{session}")
         self.assertIn("устарел", stale.answer.await_args.args[0])
 
+    def open_card(self, reminder_id):
+        command = SimpleNamespace(
+            from_user=SimpleNamespace(id=SUPER),
+            chat=SimpleNamespace(type="private", id=SUPER),
+            text="/service_notify", users_shared=None, chat_shared=None,
+            answer=AsyncMock(),
+        )
+        asyncio.run(self.handler("on_service_notify", "message")(command))
+        service = SimpleNamespace(
+            data="service:service_notify:sound",
+            from_user=SimpleNamespace(id=SUPER),
+            message=SimpleNamespace(
+                chat=SimpleNamespace(type="private", id=SUPER), answer=AsyncMock(),
+            ),
+            answer=AsyncMock(),
+        )
+        asyncio.run(self.handler("on_service_selected")(service))
+        listing = self.press(self.button(service, "group_reminder:list:sound:").callback_data)
+        return self.press(self.button(
+            listing, f"group_reminder:open:sound:{reminder_id}:"
+        ).callback_data)
+
+    def test_period_menu_of_previous_card_is_stale(self):
+        other = self.registry.add_group_reminder(SUPER, "sound", 3, "07:15")
+        card = self.open_card(self.reminder_id)
+        old_period = self.button(card, "group_reminder:period_menu:").callback_data
+        nav = self.press(self.button(
+            card, f"group_reminder:nav:sound:{other}:"
+        ).callback_data)
+        self.assertIn(f":{other}:", self.button(nav, "group_reminder:period_menu:").callback_data)
+        stale = self.press(old_period)
+        self.assertIn("устарел", stale.answer.await_args.args[0])
+
+    def test_send_now_after_period_explains_ended_period(self):
+        self.registry.set_group_reminder_period(
+            SUPER, self.reminder_id, None, date(2026, 10, 25),
+            today=date(2026, 10, 20),
+        )
+        self.registry.set_group_chat(SUPER, "sound", -1005, enabled=True)
+        self.context.get_group_reminder_preview = AsyncMock()
+        with patch("bot.handlers.datetime") as fake:
+            fake.now.return_value = datetime(2026, 10, 27, 12, 0, tzinfo=TZ)
+            fake.strptime = datetime.strptime
+            fake.combine = datetime.combine
+            card = self.open_card(self.reminder_id)
+            sent = self.press(self.button(card, "group_reminder:send_now:").callback_data)
+        self.assertIn("Период напоминания завершён", sent.message.answer.await_args.args[0])
+        self.context.get_group_reminder_preview.assert_not_awaited()
+
     def test_expired_reminder_cannot_be_enabled_by_toggle(self):
         self.registry.set_group_reminder_period(
             SUPER, self.reminder_id, None, date(2026, 10, 25),
