@@ -297,6 +297,22 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   Field lists in input prompts come from `template_fields_help(...)`
   (`TEMPLATE_FIELD_HELP`), one field per line with a short explanation.
 
+### Stage 5: readiness poll and schedule planning
+
+- `bot/schedule_planner.py` is pure (no Telegram/DB): `PlanInput` (dates,
+  `needed` per task, `free` dates per person, `tasks` per person = «Списки»
+  ∪ bot bindings, `last_served` from the previous month) → `build_plan` →
+  `Plan.slots[(date, task)]`. Per date a min-cost maximum matching
+  (successive shortest paths) guarantees maximum coverage; cost = marginal
+  of `LOAD_WEIGHT × load²` + `GAP_PENALTY` (1 week 6, 2 weeks 2); then
+  `improve_plan` does replace/swap moves that keep one task per person per
+  day and lower `plan_cost`. Keep it deterministic (sorted iteration).
+  For ~30 people × 5 dates × 12 seats it takes up to ~1 s on the Pi —
+  call it via `asyncio.to_thread` from handlers/jobs.
+- `service_tasks.people_needed` (1–5, default 1, migrated with ALTER) is set
+  by the super admin in «📋 Задачи служения» → «👥 Нужно людей»
+  (`svc_tasks:people|ppick|pset`), `set_service_task_people_needed`.
+
 ### Rich text, mentions, and message length
 
 - Never build HTML by hand in message text. Use markers: `code(value)` for

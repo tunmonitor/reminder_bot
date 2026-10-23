@@ -5816,6 +5816,48 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_super_admin_sets_people_needed_for_task(self):
+        async def run():
+            opened = SimpleNamespace(
+                data="svc_tasks:open:sound",
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_tasks")(opened)
+            people = await self._click(
+                opened.message,
+                lambda button: button.text == "👥 Нужно людей",
+                actor_id=67890,
+            )
+            choice = await self._click(
+                people.message,
+                lambda button: button.text.startswith("👥 звук"),
+                actor_id=67890,
+            )
+            saved = await self._click(
+                choice.message,
+                lambda button: button.text == "👥 2",
+                actor_id=67890,
+            )
+            self.assertIn(
+                "✅ «звук»: нужно людей — 2",
+                saved.message.answer.await_args.args[0],
+            )
+            task = next(
+                item for item in self.registry.list_service_tasks("sound")
+                if item["name"] == "звук"
+            )
+            self.assertEqual(task["people_needed"], 2)
+            back = await self._click(
+                saved.message,
+                lambda button: button.text == "⬅️ К задачам",
+                actor_id=67890,
+            )
+            self.assertIn("👥 2", back.message.answer.await_args.args[0])
+
+        asyncio.run(run())
+
     def test_service_admin_cannot_open_service_tasks(self):
         async def run():
             self.registry.add_service_admin(67890, "sound", 24680)

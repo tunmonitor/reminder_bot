@@ -2810,9 +2810,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     if task["aliases"] else ""
                 )
                 off = "" if task["enabled"] else " · выключена"
+                people = (
+                    f" · 👥 {task['people_needed']}"
+                    if task["people_needed"] > 1 else ""
+                )
                 lines.append(
                     f"{status} {task_emoji(task['name'])} {task['name']}"
-                    f"{off}{aliases}"
+                    f"{people}{off}{aliases}"
                 )
             lines += [
                 "",
@@ -2837,12 +2841,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             for task in tasks
         ]
         rows = layout_buttons(buttons) if buttons else []
-        rows.append([
+        add_row = [
             InlineKeyboardButton(
                 text="➕ Добавить задачу",
                 callback_data=f"svc_tasks:add:{service_id}:{session_id}",
             )
-        ])
+        ]
+        if any(task["enabled"] for task in tasks):
+            add_row.append(InlineKeyboardButton(
+                text="👥 Нужно людей",
+                callback_data=f"svc_tasks:people:{service_id}:{session_id}",
+            ))
+        rows.append(add_row)
         rows.append([
             InlineKeyboardButton(
                 text="⬅️ К карточке служения",
@@ -2854,6 +2864,91 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "\n".join(lines),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             _dialog_keyboard_limit=sum(len(row) for row in rows),
+            parse_mode=None,
+        )
+
+    async def show_task_people(
+        message: Message, service_id: str, session_id: str,
+        notice: str | None = None,
+    ) -> None:
+        """«👥 Нужно людей»: сколько человек ставить в задачу при
+        распределении графика по опросу (этап 5)."""
+        registry = service_registry()
+        service = service_by_id(registry, service_id) if registry else None
+        if service is None:
+            await _send_dialog(message, "Служение не найдено.", parse_mode=None)
+            return
+        tasks = [
+            task for task in registry.list_service_tasks(service_id)
+            if task["enabled"]
+        ]
+        lines = [
+            f"👥 {service_label(service)} · нужно людей",
+            "",
+            "ℹ️ Сколько человек бот ставит в задачу на одно воскресенье "
+            "при составлении графика по опросу.",
+            "",
+            *(
+                f"{task_emoji(task['name'])} {task['name']} — "
+                f"{task['people_needed']}"
+                for task in tasks
+            ),
+        ]
+        if notice:
+            lines = [notice, ""] + lines
+        buttons = [
+            InlineKeyboardButton(
+                text=f"👥 {task['name']} · {task['people_needed']}"[:60],
+                callback_data=(
+                    f"svc_tasks:ppick:{service_id}:{task['position']}:"
+                    f"{session_id}"
+                ),
+            )
+            for task in tasks
+        ]
+        rows = layout_buttons(buttons) if buttons else []
+        rows.append([InlineKeyboardButton(
+            text="⬅️ К задачам",
+            callback_data=f"svc_tasks:open:{service_id}",
+        )])
+        await _send_dialog(
+            message,
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
+            _dialog_keep_rows=True,
+            parse_mode=None,
+        )
+
+    async def show_task_people_choice(
+        message: Message, service_id: str, task: dict, session_id: str
+    ) -> None:
+        counts = [
+            InlineKeyboardButton(
+                text=f"{'✅' if count == task['people_needed'] else '👥'} {count}",
+                callback_data=(
+                    f"svc_tasks:pset:{service_id}:{task['position']}:"
+                    f"{count}:{session_id}"
+                ),
+            )
+            for count in range(1, 6)
+        ]
+        await _send_dialog(
+            message,
+            f"👥 {task_emoji(task['name'])} {task['name']}\n\n"
+            f"Сейчас: {task['people_needed']}. Сколько человек нужно "
+            "на одно воскресенье?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                counts[:3],
+                counts[3:],
+                [InlineKeyboardButton(
+                    text="⬅️ К списку",
+                    callback_data=(
+                        f"svc_tasks:people:{service_id}:{session_id}"
+                    ),
+                )],
+            ]),
+            _dialog_keep_rows=True,
             parse_mode=None,
         )
 
@@ -2929,6 +3024,37 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     f"✅ «{task['name']}» "
                     f"{'выключена' if task['enabled'] else 'включена'}",
                 )
+            elif action == "people" and len(parts) == 4:
+                # Ввод названия новой задачи (шаг add_task) отменяется.
+                pending["step"] = "tasks"
+                await show_task_people(callback.message, service_id, session_id)
+            elif action in {"ppick", "pset"} and len(parts) in {5, 6}:
+                pending["step"] = "tasks"
+                position = int(parts[3])
+                task = next(
+                    (
+                        item for item in registry.list_service_tasks(service_id)
+                        if item["position"] == position and item["enabled"]
+                    ),
+                    None,
+                )
+                if task is None:
+                    raise ValueError("Задача больше не существует.")
+                if action == "ppick" and len(parts) == 5:
+                    await show_task_people_choice(
+                        callback.message, service_id, task, session_id
+                    )
+                elif action == "pset" and len(parts) == 6:
+                    registry.set_service_task_people_needed(
+                        actor_id, service_id, task["name"], int(parts[4])
+                    )
+                    await show_task_people(
+                        callback.message, service_id, session_id,
+                        f"✅ «{task['name']}»: нужно людей — {parts[4]}",
+                    )
+                else:
+                    await _answer_callback(callback, "⚠️ Неизвестное действие.")
+                    return
             elif action == "add" and len(parts) == 4:
                 pending["step"] = "add_task"
                 await _send_dialog(
