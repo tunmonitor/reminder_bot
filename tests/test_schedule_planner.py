@@ -1,3 +1,4 @@
+import time
 import unittest
 from datetime import date, timedelta
 
@@ -122,6 +123,28 @@ class SchedulePlannerTest(unittest.TestCase):
                 self.assertNotIn((day, person), per_day)
                 per_day[(day, person)] = True
         self.assertGreaterEqual(plan_cost(first, data), 0)
+
+    def test_dense_schedule_is_fast(self):
+        # Пять дат, 30 мест на дату, 30 человек: улучшение оценивает ходы
+        # по вкладу затронутых людей, а не пересчётом всего плана.
+        people = [f"Человек {index}" for index in range(30)]
+        tasks = [f"задача {index}" for index in range(6)]
+        data = plan_input(
+            {person: set(SUNDAYS) for person in people},
+            {
+                person: {tasks[index % 6], tasks[(index + 1) % 6]}
+                for index, person in enumerate(people)
+            },
+            needed={task: 5 for task in tasks},
+            last_served={
+                person: SUNDAYS[0] - timedelta(weeks=1 + index % 3)
+                for index, person in enumerate(people)
+            },
+        )
+        started = time.monotonic()
+        plan = build_plan(data)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(plan.covered(), 150)
 
 
 if __name__ == "__main__":

@@ -219,76 +219,96 @@ def build_plan(data: PlanInput) -> Plan:
     return plan
 
 
-def _busy(plan: Plan, event_date: date) -> set[str]:
-    return {
-        person
-        for (slot_date, _), people in plan.slots.items()
-        if slot_date == event_date
-        for person in people
-    }
-
-
-def _candidate_moves(plan: Plan, data: PlanInput) -> Iterable[Plan]:
-    """Планы на шаг от текущего: замена человека в месте на свободного
-    и обмен двух людей местами (между датами или задачами)."""
-    keys = sorted(plan.slots)
-    people = sorted(data.free)
-    for key in keys:
-        event_date, task = key
-        busy = _busy(plan, event_date)
-        for index, person in enumerate(plan.slots[key]):
-            for other in people:
-                if other in busy or not _can_serve(data, other, event_date, task):
-                    continue
-                moved = _copy(plan)
-                moved.slots[key][index] = other
-                yield moved
-    for first_index, first in enumerate(keys):
-        for second in keys[first_index + 1:]:
-            for i, a in enumerate(plan.slots[first]):
-                for j, b in enumerate(plan.slots[second]):
-                    if a == b:
-                        continue
-                    if not (
-                        _can_serve(data, b, first[0], first[1])
-                        and _can_serve(data, a, second[0], second[1])
-                    ):
-                        continue
-                    moved = _copy(plan)
-                    moved.slots[first][i] = b
-                    moved.slots[second][j] = a
-                    if _one_task_per_day(moved):
-                        yield moved
-
-
-def _one_task_per_day(plan: Plan) -> bool:
-    seen: set[tuple[date, str]] = set()
-    for (event_date, _), people in plan.slots.items():
-        for person in people:
-            if (event_date, person) in seen:
-                return False
-            seen.add((event_date, person))
-    return True
-
-
-def _copy(plan: Plan) -> Plan:
-    return Plan(
-        slots={key: list(people) for key, people in plan.slots.items()},
-        needed=plan.needed,
-    )
+def _person_cost(data: PlanInput, person: str, dates: Iterable[date]) -> int:
+    """Вклад человека в стоимость плана: нагрузка² и штрафы интервала."""
+    ordered = sorted(dates)
+    total = LOAD_WEIGHT * len(ordered) ** 2
+    previous = data.last_served.get(person)
+    for event_date in ordered:
+        total += _gap_penalty(previous, event_date)
+        previous = event_date
+    return total
 
 
 def improve_plan(plan: Plan, data: PlanInput) -> None:
-    """Локальные улучшения: покрытие не меняется, стоимость падает."""
-    cost = plan_cost(plan, data)
+    """Локальные улучшения: покрытие не меняется, стоимость падает.
+
+    Ходы — замена человека в месте на свободного и обмен двух людей
+    местами в разные даты (обмен в одну дату стоимость не меняет).
+    Ход затрагивает не больше двух людей, поэтому оценивается
+    пересчётом только их вклада; план меняется лишь лучшим ходом.
+    """
+    served: dict[str, set[date]] = {}
+    for (event_date, _), people in plan.slots.items():
+        for person in people:
+            served.setdefault(person, set()).add(event_date)
+    people_all = sorted(data.free)
+
+    def cost_of(person: str, dates: set[date]) -> int:
+        return _person_cost(data, person, dates)
+
     for _ in range(MAX_IMPROVE_ROUNDS):
-        best = None
-        best_cost = cost
-        for candidate in _candidate_moves(plan, data):
-            candidate_cost = plan_cost(candidate, data)
-            if candidate_cost < best_cost:
-                best, best_cost = candidate, candidate_cost
-        if best is None:
+        positions = [
+            (key, index, person)
+            for key in sorted(plan.slots)
+            for index, person in enumerate(plan.slots[key])
+        ]
+        busy: dict[date, set[str]] = {}
+        for (event_date, _), _, person in positions:
+            busy.setdefault(event_date, set()).add(person)
+        best_delta = 0
+        best_move = None
+        for key, index, person in positions:
+            event_date, task = key
+            mine = served[person]
+            before_mine = cost_of(person, mine)
+            after_mine = cost_of(person, mine - {event_date})
+            for other in people_all:
+                if other in busy[event_date] or not _can_serve(
+                    data, other, event_date, task
+                ):
+                    continue
+                theirs = served.get(other, set())
+                delta = (
+                    after_mine - before_mine
+                    + cost_of(other, theirs | {event_date})
+                    - cost_of(other, theirs)
+                )
+                if delta < best_delta:
+                    best_delta, best_move = delta, ("replace", key, index, other)
+        for first in range(len(positions)):
+            key_a, index_a, a = positions[first]
+            for second in range(first + 1, len(positions)):
+                key_b, index_b, b = positions[second]
+                date_a, date_b = key_a[0], key_b[0]
+                if date_a == date_b or a == b:
+                    continue
+                if (
+                    b in busy[date_a] or a in busy[date_b]
+                    or not _can_serve(data, b, date_a, key_a[1])
+                    or not _can_serve(data, a, date_b, key_b[1])
+                ):
+                    continue
+                dates_a, dates_b = served[a], served[b]
+                delta = (
+                    cost_of(a, (dates_a - {date_a}) | {date_b})
+                    + cost_of(b, (dates_b - {date_b}) | {date_a})
+                    - cost_of(a, dates_a) - cost_of(b, dates_b)
+                )
+                if delta < best_delta:
+                    best_delta = delta
+                    best_move = ("swap", key_a, index_a, key_b, index_b)
+        if best_move is None:
             return
-        plan.slots = best.slots
-        cost = best_cost
+        if best_move[0] == "replace":
+            _, key, index, other = best_move
+            person = plan.slots[key][index]
+            plan.slots[key][index] = other
+            served[person].discard(key[0])
+            served.setdefault(other, set()).add(key[0])
+        else:
+            _, key_a, index_a, key_b, index_b = best_move
+            a, b = plan.slots[key_a][index_a], plan.slots[key_b][index_b]
+            plan.slots[key_a][index_a], plan.slots[key_b][index_b] = b, a
+            served[a] = (served[a] - {key_a[0]}) | {key_b[0]}
+            served[b] = (served[b] - {key_b[0]}) | {key_a[0]}
