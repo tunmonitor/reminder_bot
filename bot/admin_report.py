@@ -133,8 +133,11 @@ def report_recipients(registry, service_id: str, fallback_admin_id: int) -> list
     return registry.list_service_admins(service_id) or [fallback_admin_id]
 
 
-def _report_text(registry, service: dict, event_date: date, assignments: dict,
-                 admin_actor_id: int, limit: int) -> str:
+def report_text(registry, service: dict, event_date: date, assignments: dict,
+                admin_actor_id: int, limit: int,
+                template: str | None = None) -> str:
+    """template — шаблон отчёта (черновик для предпросмотра); None —
+    встроенный."""
     contacts = registry.list_responsible_contacts(admin_actor_id, service["id"])
     # Замены на дату (этап 3.3) главнее назначений из графика.
     assignments = apply_replacements(
@@ -142,7 +145,7 @@ def _report_text(registry, service: dict, event_date: date, assignments: dict,
         registry.list_replacements(service["id"], event_date.isoformat()),
     )
     return build_report_text(
-        service.get("admin_report_template"),
+        template,
         service["name"],
         event_date,
         assignments,
@@ -169,8 +172,9 @@ async def send_admin_reports(
     редактируется, недоставленный или удалённый — отправляется заново.
     Снятые с служения админы обновлений больше не получают."""
     event_iso = event_date.isoformat()
-    text = _report_text(
-        registry, service, event_date, assignments, admin_actor_id, limit
+    text = report_text(
+        registry, service, event_date, assignments, admin_actor_id, limit,
+        service.get("admin_report_template"),
     )
     stored = {
         report["admin_id"]: report

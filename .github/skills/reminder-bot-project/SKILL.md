@@ -287,6 +287,15 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   finish only if this session edited it (`admin_report_template_edited`). Template `services.admin_report_template`
   (`ADMIN_REPORT_FIELDS`), edited under «📋 Отчёт админам» in
   `/service_notify` and saved on «Завершить и сохранить».
+- Template screens («📝 Шаблон по умолчанию», «📋 Отчёт админам») have
+  «👁 Предпросмотр» (`group_reminder:tpl_preview`, step `template_preview`,
+  back via `tpl_back`): `context.get_template_preview(service_id, kind,
+  template)` → `app.get_template_preview` renders the session draft
+  (`pending["group_template"]` / `pending["admin_report_template"]`, None =
+  built-in) for the next Sunday; the report uses raw assignments
+  (`raw_out`) because `admin_report.report_text` applies replacements itself.
+  Field lists in input prompts come from `template_fields_help(...)`
+  (`TEMPLATE_FIELD_HELP`), one field per line with a short explanation.
 
 ### Rich text, mentions, and message length
 
