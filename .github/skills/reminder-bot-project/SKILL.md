@@ -367,8 +367,13 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   on until a new period is set. Same-slot duplicates (`_ensure_group_schedule_unique`,
   `enabled_group_reminder_at`) count only when periods overlap
   (`periods_overlap`); merging reminders with different periods is refused.
-  Period buttons encode `reminder_id * 100 + index`; the send-now snapshot
-  includes the period. Job ids must not start with
+  Period buttons encode `reminder_id * 100 + index` and `period_menu`
+  checks the card's reminder id; the send-now snapshot includes the period,
+  and send-now on an ended period answers without loading the preview. The
+  month-summary waiting cache stores raw events
+  (`load_upcoming_service_events(with_replacements=False)`) and applies
+  replacements on every read; at the last chance it reads fresh (force, at
+  most every 10 min). Job ids must not start with
   `group-reminder-` / `service-reminder-` (those prefixes are pruned).
 
 ### Service-selection menus and Telegram UI
