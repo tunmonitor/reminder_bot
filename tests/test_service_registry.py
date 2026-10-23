@@ -254,7 +254,12 @@ class ServiceRegistryTest(unittest.TestCase):
         texts = self.registry.list_user_texts(4001, "assembly")
         self.assertEqual(
             [(text["id"], text["task"], text["body"]) for text in texts],
-            [(902, "Проповедь", "Свой текст")],
+            [(902, "Проповедь", None)],
+        )
+        # Свой текст задачи перешёл в её правило (личные напоминания v2).
+        self.assertEqual(
+            [rule["body"] for rule in self.registry.list_schedules(902)],
+            ["Свой текст"],
         )
         self.assertEqual(
             [
@@ -403,6 +408,257 @@ class ServiceRegistryTest(unittest.TestCase):
             positions,
             [("звук", 0), ("сборка", 1), ("спевка", 2), ("Перевозка", 3)],
         )
+
+    def test_roster_sync_keeps_bot_bindings_and_skips_noop_writes(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.set_responsible_contact(
+            1001, "sound", "звук", "Алексей", 2002, "alex_bot"
+        )
+        rosters = {
+            "sound": [
+                RosterMember("Алексей", ("звук", "сборка")),
+                RosterMember("Пётр", ("сборка",)),
+            ]
+        }
+        self.registry.sync_service_rosters(rosters)
+
+        members = {
+            member["name"]: member
+            for member in self.registry.list_service_members("sound")
+        }
+        self.assertEqual(members["Алексей"]["telegram_id"], 2002)
+        self.assertEqual(members["Алексей"]["username"], "alex_bot")
+        self.assertEqual(members["Алексей"]["tasks"], ["звук", "сборка"])
+        self.assertTrue(members["Алексей"]["in_list"])
+        self.assertIsNone(members["Пётр"]["telegram_id"])
+        contacts = {
+            (contact["task"], contact["name"]): contact["telegram_id"]
+            for contact in self.registry.list_responsible_contacts(
+                1001, "sound"
+            )
+        }
+        self.assertEqual(contacts[("сборка", "Алексей")], 2002)
+        self.assertNotIn(("сборка", "Пётр"), contacts)
+
+        changes = []
+        self.registry.on_change = lambda: changes.append(True)
+        self.registry.sync_service_rosters(rosters)
+        self.assertEqual(changes, [])
+
+        self.registry.sync_service_rosters({"sound": rosters["sound"][1:]})
+        members = {
+            member["name"]: member
+            for member in self.registry.list_service_members("sound")
+        }
+        self.assertFalse(members["Алексей"]["in_list"])
+        self.registry.sync_service_rosters({"kitchen": []})
+        self.assertTrue(
+            any(m["in_list"] for m in self.registry.list_service_members("sound"))
+        )
+        self.registry.sync_service_rosters({"sound": []})
+        self.assertFalse(
+            any(m["in_list"] for m in self.registry.list_service_members("sound"))
+        )
+
+    def test_member_binding_and_schedule_tasks(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.sync_service_rosters(
+            {"sound": [RosterMember("Мария", ("звук",))]}
+        )
+        self.registry.bind_service_member(
+            1001, "sound", "Мария", 5005, "@maria_x", tasks=("сборка",)
+        )
+        self.registry.ensure_member_contacts(
+            "sound",
+            {
+                "спевка": {"names": ["Мария"], "is_informational": False},
+                "Праздник": {"names": ["Мария"], "is_informational": True},
+                "звук": ["Кто-то"],
+            },
+        )
+
+        contacts = sorted(
+            (contact["task"], contact["telegram_id"], contact["username"])
+            for contact in self.registry.list_responsible_contacts(
+                1001, "sound"
+            )
+            if contact["name"] == "Мария"
+        )
+        self.assertEqual(
+            contacts,
+            [
+                ("звук", 5005, "maria_x"),
+                ("сборка", 5005, "maria_x"),
+                ("спевка", 5005, "maria_x"),
+            ],
+        )
+        long_name = "Иван  " + "Очень" * 15
+        self.registry.bind_service_member(1001, "sound", f" {long_name} ", 7007)
+        self.assertIn(
+            long_name,
+            [m["name"] for m in self.registry.list_service_members("sound")],
+        )
+        with self.assertRaisesRegex(ValueError, "обязательно"):
+            self.registry.bind_service_member(1001, "sound", "  ", 7007)
+        with self.assertRaises(PermissionError):
+            self.registry.bind_service_member(2002, "sound", "Мария", 6006)
+
+    def test_rebinding_one_task_moves_all_tasks_of_the_name(self):
+        self.registry.set_responsible_contact(1001, "sound", "звук", "Олег", 2002)
+        self.registry.set_responsible_contact(1001, "sound", "сборка", "Олег", 2002)
+
+        self.registry.set_responsible_contact(
+            1001, "sound", "звук", "Олег", 3003, "oleg_new"
+        )
+
+        contacts = sorted(
+            (contact["task"], contact["telegram_id"])
+            for contact in self.registry.list_responsible_contacts(1001, "sound")
+            if contact["name"] == "Олег"
+        )
+        self.assertEqual(contacts, [("звук", 3003), ("сборка", 3003)])
+
+    def test_renamed_person_binding_follows_schedule_name(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.set_responsible_contact(1001, "sound", "звук", "Саша", 2002)
+        self.registry.bind_service_member(1001, "sound", "Александр", 2002)
+        self.registry.set_responsible_contact(1001, "sound", "сборка", "Шура", 2002)
+        self.registry.ensure_member_contacts("sound", {"сборка": ["Александр"]})
+        self.assertIn(
+            ("сборка", "Шура"),
+            [
+                (c["task"], c["name"])
+                for c in self.registry.list_responsible_contacts(1001, "sound")
+            ],
+        )
+        self.registry.sync_service_rosters(
+            {"sound": [RosterMember("Александр", ("звук",))]}
+        )
+
+        self.registry.ensure_member_contacts("sound", {"звук": ["Александр"]})
+
+        names = [
+            contact["name"]
+            for contact in self.registry.list_responsible_contacts(1001, "sound")
+            if contact["task"] == "звук"
+        ]
+        self.assertEqual(names, ["Александр"])
+
+    def test_file_telegram_ids_are_dropped_once(self):
+        self.registry.bind_service_member(1001, "sound", "Олег", 2002)
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "INSERT INTO service_members (service_id, name, telegram_id, "
+                "username, tasks_json, in_list, source, updated_at) VALUES "
+                "('sound', 'Файл', 3003, 'from_file', '[\"звук\"]', 1, "
+                "'excel', '2026-10-20T00:00:00+00:00')"
+            )
+            connection.execute(
+                "INSERT INTO responsible_contacts (service_id, task, name, "
+                "telegram_id, username, updated_by, updated_at) VALUES "
+                "('sound', 'звук', 'Файл', 3003, 'from_file', 1001, "
+                "'2026-10-20T00:00:00+00:00')"
+            )
+            connection.execute(
+                "UPDATE service_members SET source = 'excel' WHERE name = 'Олег'"
+            )
+            connection.execute(
+                "DELETE FROM catalog_migrations WHERE name = 'members-v2'"
+            )
+
+        self.registry.initialize(1001, -10001)
+
+        members = {
+            member["name"]: member["telegram_id"]
+            for member in self.registry.list_service_members("sound")
+        }
+        self.assertIsNone(members["Файл"])
+        self.assertEqual(members["Олег"], 2002)
+        names = {
+            contact["name"]
+            for contact in self.registry.list_responsible_contacts(1001, "sound")
+        }
+        self.assertNotIn("Файл", names)
+
+    def test_group_thread_belongs_to_bound_chat(self):
+        self.registry.set_group_chat(1001, "sound", -10002, enabled=True)
+        with self.assertRaisesRegex(ValueError, "не привязан"):
+            self.registry.set_group_thread(1001, "sound", -19999, 7)
+        with self.assertRaises(PermissionError):
+            self.registry.set_group_thread(2002, "sound", -10002, 7)
+        self.registry.add_service_admin(1001, "sound", 2002)
+        self.registry.set_group_thread(2002, "sound", -10002, 7)
+        self.assertEqual(self.registry.get_service("sound")["group_thread_id"], 7)
+
+        self.registry.set_group_chat(1001, "sound", -10002, enabled=False)
+        self.assertEqual(self.registry.get_service("sound")["group_thread_id"], 7)
+        self.registry.set_group_chat(1001, "sound", -10003, enabled=True)
+        self.assertIsNone(self.registry.get_service("sound")["group_thread_id"])
+
+    def test_reminder_task_must_be_enabled_service_task(self):
+        reminder = self.registry.list_group_reminders("sound")[0]
+        with self.assertRaisesRegex(ValueError, "не из списка"):
+            self.registry.set_group_reminder_task(1001, reminder["id"], "спевка")
+        self.registry.set_group_reminder_task(1001, reminder["id"], "звук")
+        self.assertEqual(
+            self.registry.get_group_reminder(reminder["id"])["task"], "звук"
+        )
+        # Напоминание другой задачи в тот же слот — не дубликат.
+        self.registry.add_group_reminder(
+            1001, "sound", reminder["reminder_days"], reminder["reminder_time"]
+        )
+        with self.assertRaisesRegex(ValueError, "уже задано"):
+            self.registry.add_group_reminder(
+                1001, "sound", reminder["reminder_days"],
+                reminder["reminder_time"],
+            )
+        self.assertIn(
+            "{task_responsibles}",
+            self.registry.resolve_group_text(
+                self.registry.get_group_reminder(reminder["id"]),
+                self.registry.get_service("sound"),
+            ),
+        )
+        # Общее напоминание в том же слоте уже есть — сброс на «все задачи»
+        # дал бы два общих напоминания в один слот.
+        with self.assertRaisesRegex(ValueError, "уже задано"):
+            self.registry.set_group_reminder_task(1001, reminder["id"], None)
+        other = next(
+            item for item in self.registry.list_group_reminders("sound")
+            if item["id"] != reminder["id"]
+        )
+        with self.assertRaisesRegex(ValueError, "изменились"):
+            self.registry.merge_group_reminder(
+                1001, other["id"],
+                expected_slot=(other["reminder_days"], other["reminder_time"]),
+                source_id=reminder["id"],
+                source_slot=(reminder["reminder_days"], reminder["reminder_time"]),
+            )
+        with self.assertRaisesRegex(ValueError, "не поддерживается"):
+            self.registry.add_group_reminder(1001, "sound", 5, "07:00", "{task}")
+        with self.assertRaisesRegex(ValueError, "не поддерживается"):
+            self.registry.set_service_default_template(
+                1001, "sound", "{task_responsibles}"
+            )
+        self.registry.update_group_reminder(
+            1001, reminder["id"], body="{task}: {task_responsibles}"
+        )
+        with self.assertRaisesRegex(ValueError, "не поддерживается"):
+            self.registry.set_group_reminder_task(1001, other["id"], None)
+            self.registry.update_group_reminder(1001, other["id"], body="{task}")
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "UPDATE group_reminders SET body = '{task}' WHERE id = ?",
+                (other["id"],),
+            )
+        self.registry.update_group_reminder(1001, other["id"], enabled=False)
+        self.registry.set_service_task_enabled(1001, "sound", "звук", False)
+        detached = self.registry.get_group_reminder(reminder["id"])
+        self.assertIsNone(detached["task"])
+        self.assertFalse(detached["enabled"])
 
     def test_bootstrap_is_idempotent_and_does_not_promote_new_env_admin(self):
         self.registry.set_group_chat(1001, "sound", -10002, enabled=True)
@@ -1742,6 +1998,8 @@ class ServiceRegistryTest(unittest.TestCase):
                     "reminder_days": 0,
                     "reminder_time": "07:30",
                     "enabled": 1,
+                    "origin": "admin",
+                    "body": None,
                 }
             ],
         )
@@ -1790,3 +2048,109 @@ class ServiceRegistryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RescheduleResetsDeliveryTest(unittest.TestCase):
+    def test_changed_slot_clears_future_delivery_marks(self):
+        import tempfile
+        from datetime import date as _date, timedelta as _timedelta
+        from pathlib import Path as _Path
+
+        from bot.service_registry import ServiceRegistry as _Registry
+
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = _Registry(_Path(tmp) / "r.sqlite3")
+            registry.initialize(1001, -100)
+            reminder = registry.add_group_reminder(1001, "sound", 3, "10:00")
+            reminder_id = reminder["id"] if isinstance(reminder, dict) else reminder
+            future = (_date.today() + _timedelta(days=3)).isoformat()
+            past = (_date.today() - _timedelta(days=7)).isoformat()
+            for event in (future, past):
+                registry.mark_group_reminder_delivered(reminder_id, event, "group:-1")
+            registry.update_group_reminder(1001, reminder_id, body="Новый текст")
+            self.assertTrue(
+                registry.is_group_reminder_delivered(reminder_id, future, "group:-1")
+            )
+            registry.update_group_reminder(1001, reminder_id, days=0, time="23:59")
+            self.assertFalse(
+                registry.is_group_reminder_delivered(reminder_id, future, "group:-1")
+            )
+            self.assertTrue(
+                registry.is_group_reminder_delivered(reminder_id, past, "group:-1")
+            )
+
+
+class UserRuleRulesTest(unittest.TestCase):
+    def test_duplicates_limit_and_length(self):
+        import tempfile
+        from pathlib import Path as _Path
+
+        from bot.service_registry import ServiceRegistry as _Registry
+
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = _Registry(_Path(tmp) / "r.sqlite3")
+            registry.initialize(1001, -100)
+            registry.set_responsible_contact(1001, "sound", "звук", "Алексей", 2002)
+            text_id = registry.ensure_user_text(2002, "sound", "звук")
+            admin = registry.add_schedule(text_id, 1, "18:00")
+            with self.assertRaises(ValueError):
+                registry.add_schedule(text_id, 1, "18:00", origin="user")
+            copy = registry.add_schedule(
+                text_id, 1, "18:00", origin="user", enabled=False
+            )
+            with self.assertRaises(ValueError):
+                registry.update_schedule(copy["id"], enabled=True)
+            registry.update_schedule(copy["id"], days=0, time="08:00")
+            registry.update_schedule(copy["id"], enabled=True)
+            with self.assertRaises(ValueError):
+                registry.update_schedule(copy["id"], days=1, time="18:00")
+            registry.update_schedule(admin["id"], enabled=False)
+            registry.update_schedule(copy["id"], days=1, time="18:00")
+            with self.assertRaises(ValueError):
+                registry.update_schedule(copy["id"], body="x" * 3001)
+            # Лимит — только на свои напоминания.
+            for index in range(9):
+                registry.add_schedule(
+                    text_id, 2, f"0{index}:30", origin="user"
+                )
+            with self.assertRaises(ValueError):
+                registry.add_schedule(text_id, 3, "09:00", origin="user")
+            registry.add_schedule(text_id, 3, "09:00")
+
+
+class PersonalOriginMigrationTest(unittest.TestCase):
+    def test_legacy_rules_and_body_only_texts(self):
+        import sqlite3 as _sqlite3
+        import tempfile
+        from pathlib import Path as _Path
+
+        from bot.service_registry import ServiceRegistry as _Registry
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _Path(tmp) / "r.sqlite3"
+            registry = _Registry(path)
+            registry.initialize(1001, -100)
+            registry.set_responsible_contact(1001, "sound", "звук", "А", 2002)
+            registry.set_responsible_contact(1001, "sound", "сборка", "А", 2002)
+            sound = registry.ensure_user_text(2002, "sound", "звук")
+            build = registry.ensure_user_text(2002, "sound", "сборка")
+            registry.add_schedule(sound, 1, "18:00")
+            registry.add_schedule(sound, 0, "08:00")
+            with _sqlite3.connect(path) as connection:
+                connection.execute(
+                    "UPDATE user_reminder_texts SET body = 'Мой текст' WHERE id = ?",
+                    (build,),
+                )
+                connection.execute(
+                    "DELETE FROM catalog_migrations WHERE name = 'personal-origin-v2'"
+                )
+            _Registry(path).initialize(1001, -100)
+            rules = registry.list_user_service_schedules(2002, "sound")
+            self.assertEqual(
+                sorted((r["task"], r["origin"], r["enabled"], r["body"]) for r in rules),
+                [
+                    ("звук", "user", 1, None),
+                    ("звук", "user", 1, None),
+                    ("сборка", "user", 0, "Мой текст"),
+                ],
+            )

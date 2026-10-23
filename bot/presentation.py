@@ -1,6 +1,7 @@
 """Formatting helpers for user-facing assignment summaries."""
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping
 from typing import Any
 
@@ -58,6 +59,36 @@ def task_is_informational(task_info: Mapping | list[str]) -> bool:
     )
 
 
+def person_label(
+    task: str,
+    name: str,
+    contacts: dict[tuple[str, str], dict] | None = None,
+    *,
+    mark_unlinked: bool = False,
+) -> str:
+    """Имя ответственного: ссылка на Telegram, если человек привязан."""
+    contact = (contacts or {}).get((task, name))
+    username = contact.get("username") if contact else None
+    label = f"{name} (@{username})" if username else name
+    telegram_id = contact.get("telegram_id") if contact else None
+    if telegram_id:
+        return user_link(telegram_id, label)
+    if contact is None and mark_unlinked:
+        return f"{name} · не привязан"
+    return label
+
+
+def format_task_responsibles(
+    task: str,
+    names: list[str],
+    contacts: dict[tuple[str, str], dict] | None = None,
+) -> str:
+    """Поле {task_responsibles}: ответственные одной задачи через запятую."""
+    return ", ".join(
+        person_label(task, name, contacts, mark_unlinked=True) for name in names
+    )
+
+
 def format_task_assignments(
     assignments: dict[str, dict[str, Any] | list[str]],
     contacts: dict[tuple[str, str], dict] | None = None,
@@ -76,19 +107,17 @@ def format_task_assignments(
         if not names:
             lines.append("• Ответственные не указаны")
         for name in names:
-            contact = (contacts or {}).get((task, name))
-            username = contact.get("username") if contact else None
-            label = f"{name} (@{username})" if username else name
-            telegram_id = contact.get("telegram_id") if contact else None
-            if telegram_id:
-                person_str = user_link(telegram_id, label)
-            elif contact is None and mark_unlinked:
-                person_str = f"{name} · не привязан"
-            else:
-                person_str = label
-            lines.append(f"• {person_str}")
+            lines.append(
+                f"• {person_label(task, name, contacts, mark_unlinked=mark_unlinked)}"
+            )
         groups.append("\n".join(lines))
     return "\n\n".join(groups) or "⚪ Ответственные не указаны"
+
+def informational_label(task: str, values) -> str:
+    """«2я часть» + соседняя ячейка «нет» → «2я часть нет»."""
+    values = [value for value in values if value]
+    return " ".join([task, ", ".join(values)]) if values else task
+
 
 def format_informational_notes(
     assignments: dict[str, dict[str, Any] | list[str]],
@@ -97,9 +126,53 @@ def format_informational_notes(
     for task, task_info in assignments.items():
         if not task_is_informational(task_info):
             continue
-        values = task_assignment_names(task_info)
-        note = f"📌 {task}"
-        if values:
-            note += f" — {', '.join(values)}"
-        notes.append(note)
+        notes.append(f"📌 {informational_label(task, task_assignment_names(task_info))}")
     return "\n".join(notes)
+
+
+def apply_replacements(assignments: dict, replacements: list[dict]) -> dict:
+    """Копия назначений с заменами (по порядку назначения: цепочки
+    «А → Б → В» дают В). Замена главнее графика: если в графике на эту
+    задачу уже нет заменённого, заменяющий всё равно остаётся."""
+    if not replacements:
+        return assignments
+    result = copy.deepcopy(assignments)
+    for item in replacements:
+        task_info = result.get(item["task"])
+        if task_info is None:
+            continue
+        if isinstance(task_info, dict):
+            if task_info.get("is_informational"):
+                continue
+            names = list(task_info.get("names", []))
+        else:
+            names = list(task_info)
+        if item["old_name"] in names:
+            names = [
+                item["new_name"] if name == item["old_name"] else name
+                for name in names
+            ]
+        elif item["new_name"] not in names:
+            names.append(item["new_name"])
+        names = list(dict.fromkeys(names))
+        if isinstance(task_info, dict):
+            task_info["names"] = names
+        else:
+            result[item["task"]] = names
+    return result
+
+
+def is_replaced(replacements: list[dict], task: str, name: str) -> bool:
+    """Человек уже заменён на эту дату (отказ из старого напоминания).
+    Если любая замена вернула его в задачу (А→Б→А или В→А), он снова в
+    задаче."""
+    current = {name}
+    for item in replacements:
+        if item["task"] != task:
+            continue
+        if item["old_name"] in current:
+            current.discard(item["old_name"])
+            current.add(item["new_name"])
+        elif item["new_name"] == name:
+            current.add(name)
+    return name not in current

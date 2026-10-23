@@ -93,7 +93,24 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - Monthly sheets are named with a Russian month and two-digit year, e.g.
   `ОКТЯБРЬ26`. Schedule dates are in column A; task names and assignees are in
   columns A and B. The `Списки` sheet contains task headers in A and contact
-  name, username, and Telegram ID in A, B, and C.
+  name, username, and Telegram ID in A, B, and C (legacy assembly parser
+  `parse_people`).
+- `parse_service_rosters` reads `Списки` for all services: row 1 holds service
+  headers (block runs right to the next header), task cells start a task in
+  their column, people below. Username/ID cells are skipped, never read:
+  Telegram binding happens only in the bot. A person is identified by name
+  within a service (names must be unique; a repeated name in one task is an
+  issue). `ServiceRegistry.sync_service_rosters` stores names and tasks in
+  `service_members` (writes only on real changes,
+  because any write triggers a backup and job refresh). `_load_service_task_
+  assignments(..., registry=...)` syncs rosters and `ensure_member_contacts`
+  on every schedule read; roster failures are logged and never block
+  reminders. Binding UI is person-centric (`bind_service_member` covers all
+  the person's tasks); `members-v1` migrates old contacts once.
+- Chat topics: `/here [service]` in a group topic stores
+  `services.group_thread_id` (`set_group_thread`, service editor, chat must
+  be the bound one; `set_group_chat` to another chat resets it). Every send
+  to a service group passes `**thread_kwargs(service)`.
 - Services, tasks, and month-sheet columns come from
   `reminder_bot_services.json` (`bot/services.py` validates it at import).
   `parse_service_events(..., services)` maps column headers to services,
@@ -167,8 +184,109 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   item ID, and request-specific token before loading and after every relevant
   `await`. New previews invalidate old requests; old results must not replace
   a newer menu.
+- Changing a group reminder's days/time (`update_group_reminder`,
+  `slot_changed`) deletes its `group:%` delivery marks for event dates from yesterday on
+  (admin warning marks stay), so a rescheduled reminder fires again.
+- `context.load_upcoming_service_events(force=True)` bypasses the 5-minute
+  cache; «🔄 Сверить график» uses it.
+- Informational notes render as `informational_label(task, values)` →
+  «2я часть нет» (value from the neighbour cell); `_cell_date(value, year, month)` also
+  accepts text `dd.mm` / `dd.mm.yy` (two-digit day and month) or `d.mm HH:MM`
+  and month abbreviations, infers the year around the sheet month
+  (December→January), never treats numbers as dates, and accepts a year-less
+  `dd.mm` only for the sheet month ±1. `_process_service_reminder` re-checks
+  the slot (`_same_reminder_slot`) before sending and before marking delivery.
 - Preserve idempotent delivery records and per-service/event locking. A
   failed delivery must not be recorded as success.
+- Personal reminders carry `build_personal_answer_kb` buttons
+  (`pcf:{c|d}:{service}:{YYYYMMDD}:{task_token(task)}`, handler
+  `on_personal_answer`; the token is a name hash because task positions get
+  renumbered, resolved by `linked_task_by_token` among the caller's linked
+  tasks). Answers live in `service_confirmations` (`set_confirmation`
+  returns `(name, changed)`; only the contact linked to that task may
+  answer). An answered task/date gets no more personal reminders. A new
+  "declined" sends `notify_admins_declined` and calls the optional
+  `context.on_assignment_declined` hook (replacement search, stage 3.3).
+- Replacement (stage 3.3, `bot/replacement.py`): a new "declined" calls
+  `context.on_assignment_declined` = `start_replacement_search` (notice +
+  non-anonymous poll via `send_to_service_group`, row in `replacement_polls`,
+  `context.schedule_replacement_close` adds APScheduler job
+  `replacement-poll-{poll_id}`; open polls are rescheduled on startup).
+  `poll_deadline`: min(now+12h, event day start−12h), at least 1h. Votes:
+  `on_replacement_poll_answer` → `record_poll_answer`. `finish_replacement`
+  closes once (`close_replacement_poll` returns False on repeat), picks the
+  first "Могу" among `task_member_ids`, else the first "Могу". `/change task
+  @username [dd.mm]` (`on_change_command`, admins only) uses an unfilled
+  request if there is one, otherwise works without a decline (stage 3.4) on
+  the given or nearest date where the task has exactly one person. The
+  «🔁 Замена» card screen (`open_replace_dates`, callbacks `rpl:{session}:…`,
+  `pending_inputs` operation `service_replace`, Telegram pick via
+  `pending_shares` "service_replace") and `/change` both go through
+  `admin_assign_replacement`, which closes an active request for that person;
+  otherwise it calls `assign_replacement(..., expect_current=True)` →
+  `set_replacement(expect_current=True)` (BEGIN IMMEDIATE + `is_replaced`
+  chain check), so a stale screen returns False. `_notify` returns failed
+  chats; failed announcements warn service admins and the actor.
+  `context.load_upcoming_service_events(until=...)`: the cache holds events
+  through the end of next month, default return is 6 weeks.
+  `start_replacement_search` ignores a decline of an already replaced person
+  and holds a per-(service, date, task, person) asyncio lock across check +
+  Telegram sends + insert, so concurrent declines start one poll. If the
+  close timer cannot be scheduled after the insert, poll and row stay open
+  (startup reschedules open polls; `/change` works) and admins are told.
+  `on_personal_answer` rejects a stale button when the schedule (with
+  replacements) has the task on that date but not this Telegram user
+  (`scheduled_name`: contact name among scheduled names, else a replacement
+  row with this `telegram_id`; no data → accept). The scheduled name is stored
+  in the confirmation and used for the replacement search.
+  Every decline stores a request row in
+  `replacement_polls` (no group chat or failed poll → `manual-…` row with
+  status `closed`); `filled` marks a request that got a replacement
+  (`claim_replacement_request` / `release_replacement_request`), and `/change`
+  accepts any unfilled request from today (`list_unfilled_replacement_requests`).
+  `service_replacements` override Excel for one date:
+  `presentation.apply_replacements` runs in `_load_service_task_assignments`
+  only with `only_date` (month-wide lists stay raw; roster/contact sync always
+  sees raw names), in the admin report (reports store raw assignments via
+  `raw_out` and apply current replacements on render) and, via
+  `_apply_event_replacements`, on the cached upcoming events. `set_replacement` adds a task contact only for a
+  substitute already known in the service (member or contact). Poll votes use
+  `_connection(notify=False)`, so they do not trigger backups or job
+  refreshes; `/change` removes the pending close job
+  (`context.cancel_replacement_close`). Group sending lives in `bot/group_send.py`.
+- Personal reminders (`user_reminder_schedules.origin`/`body`, migrated:
+  rules of a task that had its own text became `user`): `admin` rules use the
+  admin template and the user may only toggle or copy them; `user` rules have
+  their own time/text (`update_schedule(body=...)`). `add_schedule` enforces
+  `USER_REMINDERS_PER_SERVICE` (10 own `user` rules) per user and service and
+  `_ensure_unique_enabled_rule` (no two enabled rules of a task at the same
+  days/time, also in `update_schedule`); own text ≤ 3000 chars;
+  `set_user_service_schedule` touches only `admin` rules. Screens
+  (`render_current_personal_level`): `service` (rule list), `rule`,
+  `delete_rule`, `add_task`, `add_time`. Sent text is always
+  `🔔 {service} · {task} · {date}` + body (shortened with «…» if it
+  exceeds the limit). Enabling/adding a single rule never flips the service
+  preference. Migration `personal-origin-v2` (catalog_migrations): only a
+  lone default (1, 18:00) rule without body stays `admin`; task bodies move
+  into its rules or into a disabled `user` rule. «📤 Отправить сейчас» keeps a
+  reminder snapshot and refuses to send if the reminder changed.
+- Group reminder card: «📤 Отправить сейчас» (`send_now` → preview →
+  `send_now_ok`, not marked delivered).
+- `_send_dialog` prefixes buttons without a known icon with 📋; add new
+  leading emoji to its list.
+- `bot/admin_report.py`: after a group reminder `send_admin_reports` sends
+  one report per service admin and date (fallback: super admin) and stores it
+  in `admin_report_messages`; later reminders and answers edit it
+  (`refresh_admin_reports` delegates to `send_admin_reports`, which targets
+  only current recipients, drops rows of removed admins, and resends a report
+  whose edit fails). `_process_service_reminder` calls it whenever the group
+  reminder of that date is delivered, so a failed report is retried without
+  resending the group. `build_report_text(limit=...)` keeps
+  `{confirmation_status}` visible by collapsing delivery, then assignments;
+  confirmations are keyed by `(task, telegram_id)`. The template is written on
+  finish only if this session edited it (`admin_report_template_edited`). Template `services.admin_report_template`
+  (`ADMIN_REPORT_FIELDS`), edited under «📋 Отчёт админам» in
+  `/service_notify` and saved on «Завершить и сохранить».
 
 ### Rich text, mentions, and message length
 
@@ -276,6 +394,7 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - `manage.sh` controls bot, Web App, logs, backups, and restore in test/prod
   deployments. Test and prod use separate directories/configuration. Avoid
   deployment commands during ordinary code changes.
+- Startup must not block on Telegram before the PID file is written: `manage.sh start` kills the process if the PID file is missing after 30 s. After a reboot DNS may be down for minutes and Telegram may answer 502. Command menus (`sync_admin_commands`, returns False on retryable errors) run as a background task after `_write_pid` and retry with backoff; `_wait_for_telegram` retries `getMe` before `start_polling` (aiogram's own `getMe` there has no retry). Menu writes for one user are serialized by a per-user lock in `bot/commands.py` (role read + request). Cron has an hourly `start` watchdog.
 
 ## Focused test modules
 
@@ -292,6 +411,8 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - Snapshot creation, retention, and restore: `tests/test_backup.py`
 - Web App static server/config: `tests/test_webapp_server.py`,
   `tests/test_config_service_registry.py`
+- Answers to personal reminders and admin reports: `tests/test_admin_report.py`
+- Replacement polls, `/change`, Excel override: `tests/test_replacement.py`
 - Runtime/CLI setup and dry-run: `tests/test_runtime_entrypoint.py`,
   `tests/test_debug_schedule.py`
 

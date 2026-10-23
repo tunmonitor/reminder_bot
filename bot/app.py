@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import os
+import signal
 import stat
 import tempfile
 import time
 from contextlib import suppress
+from dataclasses import replace as dataclass_replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,9 +17,15 @@ from typing import Any
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import MenuButtonWebApp, WebAppInfo
+from apscheduler.jobstores.base import JobLookupError
 
 if __package__:
     from .cli import CliArgs
@@ -39,9 +46,11 @@ if __package__:
         SheetEmptyError,
         SheetNotFoundError,
         parse_service_events,
+        parse_service_rosters,
         resolve_assignments,
     )
-    from .handlers import register
+    from .admin_report import send_admin_reports
+    from .handlers import register, send_to_service_group
     from .logger import setup_loggers
     from .notifier import (
         TELEGRAM_TEXT_LIMIT,
@@ -49,12 +58,14 @@ if __package__:
         _utf16_length,
         build_general_message,
         build_personal_message,
-        build_service_confirm_kb,
+        build_personal_answer_kb,
         send_assignments,
     )
     from .presentation import (
+        apply_replacements,
         format_informational_notes,
         format_task_assignments,
+        format_task_responsibles,
         task_assignment_names,
         task_is_informational,
     )
@@ -95,9 +106,11 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         SheetEmptyError,
         SheetNotFoundError,
         parse_service_events,
+        parse_service_rosters,
         resolve_assignments,
     )
-    from bot.handlers import register
+    from bot.admin_report import send_admin_reports
+    from bot.handlers import register, send_to_service_group
     from bot.logger import setup_loggers
     from bot.notifier import (
         TELEGRAM_TEXT_LIMIT,
@@ -105,12 +118,14 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         _utf16_length,
         build_general_message,
         build_personal_message,
-        build_service_confirm_kb,
+        build_personal_answer_kb,
         send_assignments,
     )
     from bot.presentation import (
+        apply_replacements,
         format_informational_notes,
         format_task_assignments,
+        format_task_responsibles,
         task_assignment_names,
         task_is_informational,
     )
@@ -135,6 +150,8 @@ else:  # pragma: no cover - поддержка запуска файла нап�
 
 
 UPCOMING_EVENTS_CACHE_SECONDS = 300
+# «Мои служения» и обзор ответственных — ближайшие недели.
+UPCOMING_WEEKS_DEFAULT = 6
 
 
 def _next_sunday_in_tz(tz) -> date:
@@ -213,6 +230,81 @@ def _remove_pid_if_owned(path: Path) -> None:
         os.unlink(path.name, dir_fd=directory_fd)
     finally:
         os.close(directory_fd)
+
+
+def _reschedule_open_polls(registry, schedule_close, logger) -> None:
+    """Таймеры итога открытых опросов замены после перезапуска.
+
+    Сбой одного таймера не мешает запуску: запрос остаётся открытым,
+    замену можно назначить через /change."""
+    for poll in registry.list_open_replacement_polls():
+        try:
+            schedule_close(
+                poll["poll_id"], datetime.fromisoformat(poll["deadline"])
+            )
+        except Exception:
+            logger.exception(
+                "Не удалось поставить таймер опроса замены %s", poll["poll_id"]
+            )
+
+
+TELEGRAM_RETRY_FIRST_DELAY = 5
+TELEGRAM_RETRY_MAX_DELAY = 300
+
+
+async def _retry_delays():
+    """Паузы между повторами: 5 с, затем вдвое больше, но не дольше 5 минут."""
+    delay = TELEGRAM_RETRY_FIRST_DELAY
+    while True:
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, TELEGRAM_RETRY_MAX_DELAY)
+        yield
+
+
+async def _wait_for_telegram(bot: Bot, logger) -> bool:
+    """Ждёт, пока Telegram ответит на getMe.
+
+    aiogram вызывает getMe в начале start_polling без повторов: сбой DNS после
+    перезагрузки сервера или 502 от Telegram иначе завершает процесс.
+    Обработчики SIGTERM/SIGINT aiogram ставит только в start_polling, поэтому
+    на время ожидания стоп-сигнал обрабатывается здесь. Возвращает False,
+    если пришёл сигнал остановки.
+    """
+    if not callable(getattr(bot, "me", None)):
+        return True
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    installed = []
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with suppress(NotImplementedError, RuntimeError, ValueError):
+            loop.add_signal_handler(sig, stop.set)
+            installed.append(sig)
+    stop_wait = asyncio.create_task(stop.wait())
+    delay = TELEGRAM_RETRY_FIRST_DELAY
+    try:
+        while True:
+            request = asyncio.create_task(bot.me())
+            await asyncio.wait({request, stop_wait}, return_when=asyncio.FIRST_COMPLETED)
+            if stop.is_set():
+                request.cancel()
+                await asyncio.gather(request, return_exceptions=True)
+                return False
+            try:
+                request.result()
+                return True
+            except (TelegramNetworkError, TelegramServerError, TelegramRetryAfter) as exc:
+                logger.warning("Telegram недоступен при запуске, повторим: %s", exc)
+                pause = delay
+                if isinstance(exc, TelegramRetryAfter):
+                    pause = max(pause, exc.retry_after)
+            await asyncio.wait({stop_wait}, timeout=pause)
+            if stop.is_set():
+                return False
+            delay = min(delay * 2, TELEGRAM_RETRY_MAX_DELAY)
+    finally:
+        stop_wait.cancel()
+        for sig in installed:
+            loop.remove_signal_handler(sig)
 
 
 async def _configure_webapp_menu(bot: Bot, project_dir: Path, logger) -> None:
@@ -446,8 +538,14 @@ async def _load_service_task_assignments(
     return_event_found: bool = False,
     services=None,
     issues: list[str] | None = None,
+    registry: ServiceRegistry | None = None,
+    raw_out: dict | None = None,
 ) -> dict[str, dict[str, object]] | tuple[dict[str, dict[str, object]], bool]:
-    """Назначения служения из графика; issues пополняется предупреждениями."""
+    """Назначения служения из графика; issues пополняется предупреждениями.
+
+    С registry заодно обновляется состав служений из «Списков», а люди,
+    уже привязанные к Telegram, получают привязки к новым задачам графика.
+    """
     sunday_date = only_date or _next_sunday_in_tz(tz)
     debug_dir = shm_dir / "debug"
     directory_fd = open_private_directory(debug_dir, create=True)
@@ -500,11 +598,68 @@ async def _load_service_task_assignments(
             }
             for task, task_info in sorted(assignments.items())
         }
+        if raw_out is not None:
+            # Назначения из графика без замен: отчёт админам применяет
+            # действующие замены сам при каждом обновлении.
+            raw_out.clear()
+            raw_out.update(result)
+        if registry is not None:
+            # Привязки и состав — по графику, без замен.
+            _sync_rosters_and_contacts(
+                registry, xlsx_path, service_id, result, services,
+                debug_logger, issues,
+            )
+            if only_date is not None:
+                # Замена на одну дату (этап 3.3) главнее графика. Без
+                # only_date здесь имена за весь месяц — замены не применяются.
+                result = apply_replacements(
+                    result,
+                    registry.list_replacements(service_id, only_date.isoformat()),
+                )
         if return_event_found:
             return result, event_found
         return result
     finally:
         xlsx_path.unlink(missing_ok=True)
+
+
+# Проблемы листа «Списки» в целом (неизвестное служение) — не одного
+# служения: админ получает их с первым отправленным уведомлением дня.
+SHEET_ISSUE_PREFIX = "«Списки»:"
+_REPORTED_SHEET_ISSUES: dict[str, date] = {}
+
+
+def _sync_rosters_and_contacts(
+    registry: ServiceRegistry,
+    xlsx_path: Path,
+    service_id: str,
+    assignments: dict,
+    services,
+    debug_logger,
+    issues: list[str] | None,
+) -> None:
+    """Сбой «Списков» не мешает напоминаниям: он только записывается в лог."""
+    roster_issues: list[str] = []
+    try:
+        rosters = parse_service_rosters(
+            xlsx_path, debug_logger, services, roster_issues
+        )
+        registry.sync_service_rosters(rosters)
+    except Exception:
+        debug_logger.exception("Не удалось обновить состав служений из «Списков»")
+    else:
+        service = registry.get_service(service_id)
+        prefixes = (SHEET_ISSUE_PREFIX,) + (
+            (f"«Списки», {service['name']}:",) if service else ()
+        )
+        if issues is not None:
+            issues.extend(
+                issue for issue in roster_issues if issue.startswith(prefixes)
+            )
+    try:
+        registry.ensure_member_contacts(service_id, assignments)
+    except Exception:
+        debug_logger.exception("Не удалось дополнить привязки участников служения")
 
 
 async def _load_upcoming_service_events(
@@ -514,10 +669,12 @@ async def _load_upcoming_service_events(
     debug_logger,
     weeks: int = 6,
     services=None,
+    until: date | None = None,
 ) -> list:
-    """Read schedule events from today through the given number of weeks."""
+    """Read schedule events from today through the given number of weeks
+    (or through until, if it is later)."""
     today = datetime.now(tz).date()
-    last_day = today + timedelta(days=weeks * 7)
+    last_day = max(today + timedelta(days=weeks * 7), until or today)
     months = []
     month = today.replace(day=1)
     while month <= last_day:
@@ -572,6 +729,44 @@ async def _load_upcoming_service_events(
         xlsx_path.unlink(missing_ok=True)
 
 
+def _apply_event_replacements(events: list, registry) -> list:
+    """События графика с заменами на их даты (этап 3.3): заменённый
+    уходит из задачи, заменяющий появляется."""
+    if registry is None:
+        return events
+    result = []
+    for event in events:
+        replacements = registry.list_replacements(
+            event.service_id, event.event_date.isoformat()
+        )
+        if not replacements:
+            result.append(event)
+            continue
+        assignments = list(event.assignments)
+        for item in replacements:
+            task_rows = [
+                row for row in assignments
+                if row.task == item["task"] and not row.is_informational
+            ]
+            if not task_rows:
+                continue
+            names = [row.name for row in task_rows]
+            if item["old_name"] in names:
+                assignments = [
+                    dataclass_replace(row, name=item["new_name"])
+                    if row in task_rows and row.name == item["old_name"]
+                    else row
+                    for row in assignments
+                ]
+            elif item["new_name"] not in names:
+                assignments.append(
+                    dataclass_replace(task_rows[0], name=item["new_name"])
+                )
+        unique = list(dict.fromkeys(assignments))
+        result.append(dataclass_replace(event, assignments=tuple(unique)))
+    return result
+
+
 async def get_group_reminder_preview(
     reminder_id: int,
     credentials,
@@ -614,6 +809,7 @@ async def get_group_reminder_preview(
             only_date=event_date,
             return_event_found=True,
             services=registry.service_catalog(),
+            registry=registry,
         )
     except Exception:
         debug_logger.exception(
@@ -637,28 +833,27 @@ async def get_group_reminder_preview(
         )
         return result
 
+    if _reminder_task_names(reminder, assignments) == []:
+        result["error"] = (
+            f"На {date_text} для задачи «{reminder['task']}» никто не "
+            "назначен. Напоминание не будет отправлено."
+        )
+        return result
+
     contacts = registry.list_responsible_contacts(
         credentials.admin_tg_id, service["id"]
     )
     contacts_by_name = {
         (contact["task"], contact["name"]): contact for contact in contacts
     }
-    assignment_text = format_task_assignments(
-        assignments, contacts_by_name, mark_unlinked=True
-    )
-    informational_notes = format_informational_notes(assignments)
     template = (
         body if body is not None
         else registry.resolve_group_text(reminder, service)
     )
     try:
-        result["text"] = template.format_map(
-            _TemplateValues(
-                service_name=service["name"],
-                sunday_date=date_text,
-                task_assignments=assignment_text,
-                informational_notes=informational_notes,
-            )
+        result["text"] = _render_group_reminder(
+            template, reminder, service, assignments, contacts_by_name,
+            date_text,
         )
     except (AttributeError, IndexError, ValueError):
         result["error"] = "Ошибка в синтаксисе шаблона."
@@ -672,11 +867,55 @@ class _TemplateValues(dict):
         return "{" + key + "}"
 
 
-def _service_confirmation_key(service_id: str, task: str, telegram_id: int) -> str:
-    digest = hashlib.sha256(
-        f"{service_id}\0{task}\0{telegram_id}".encode("utf-8")
-    ).hexdigest()[:16]
-    return f"service_{digest}"
+def _reminder_task_names(reminder: dict, assignments: dict) -> list[str] | None:
+    """Ответственные задачи напоминания на дату; None — напоминание общее."""
+    task = reminder.get("task")
+    if not task:
+        return None
+    task_info = assignments.get(task)
+    if task_info is None or task_is_informational(task_info):
+        return []
+    return task_assignment_names(task_info)
+
+
+def _render_group_reminder(
+    template: str,
+    reminder: dict,
+    service: dict,
+    assignments: dict,
+    contacts_by_name: dict,
+    date_text: str,
+) -> str:
+    """Текст группового напоминания; для задачи — только её ответственные."""
+    task = reminder.get("task") or ""
+    task_names = _reminder_task_names(reminder, assignments)
+    scoped = (
+        {task: assignments[task]} if task_names else assignments
+    )
+    return template.format_map(
+        _TemplateValues(
+            service_name=service["name"],
+            sunday_date=date_text,
+            task_assignments=format_task_assignments(
+                scoped, contacts_by_name, mark_unlinked=True
+            ),
+            informational_notes=format_informational_notes(assignments),
+            task=task,
+            task_responsibles=(
+                format_task_responsibles(task, task_names, contacts_by_name)
+                if task_names
+                else ""
+            ),
+        )
+    )
+
+
+def _same_reminder_slot(registry: ServiceRegistry, reminder: dict) -> bool:
+    """Срок и время напоминания не менялись с начала обработки."""
+    current = registry.get_group_reminder(reminder["id"])
+    return current is not None and (
+        current["reminder_days"], current["reminder_time"]
+    ) == (reminder["reminder_days"], reminder["reminder_time"])
 
 
 async def _process_service_reminder(
@@ -707,6 +946,7 @@ async def _process_service_reminder(
         days=reminder["reminder_days"]
     )
     schedule_issues: list[str] = []
+    raw_assignments: dict = {}
     try:
         assignments, event_found = await _load_service_task_assignments(
             credentials,
@@ -718,6 +958,8 @@ async def _process_service_reminder(
             return_event_found=True,
             services=registry.service_catalog(),
             issues=schedule_issues,
+            registry=registry,
+            raw_out=raw_assignments,
         )
     except Exception as exc:
         debug_logger.exception(
@@ -741,6 +983,17 @@ async def _process_service_reminder(
         )
         return
     issues_recipient = "admin:schedule-issues"
+    today = datetime.now(tz).date()
+    for reported, reported_on in list(_REPORTED_SHEET_ISSUES.items()):
+        if reported_on != today:
+            _REPORTED_SHEET_ISSUES.pop(reported, None)
+    schedule_issues = [
+        issue for issue in schedule_issues
+        if not (
+            issue.startswith(SHEET_ISSUE_PREFIX)
+            and issue in _REPORTED_SHEET_ISSUES
+        )
+    ]
     if schedule_issues and not registry.is_group_reminder_delivered(
         reminder["id"], event_date.isoformat(), issues_recipient
     ):
@@ -757,6 +1010,9 @@ async def _process_service_reminder(
             registry.mark_group_reminder_delivered(
                 reminder["id"], event_date.isoformat(), issues_recipient
             )
+            for issue in unique_issues:
+                if issue.startswith(SHEET_ISSUE_PREFIX):
+                    _REPORTED_SHEET_ISSUES[issue] = today
 
     try:
         contacts = registry.list_responsible_contacts(
@@ -794,18 +1050,11 @@ async def _process_service_reminder(
                 len(stale_contacts),
             )
     date_text = event_date.strftime("%d.%m.%Y")
-    assignment_text = format_task_assignments(
-        assignments, contacts_by_name, mark_unlinked=True
-    )
     group_template = registry.resolve_group_text(reminder, service)
     try:
-        group_text = group_template.format_map(
-            _TemplateValues(
-                service_name=service["name"],
-                sunday_date=date_text,
-                task_assignments=assignment_text,
-                informational_notes=format_informational_notes(assignments),
-            )
+        group_text = _render_group_reminder(
+            group_template, reminder, service, assignments, contacts_by_name,
+            date_text,
         )
     except (AttributeError, IndexError, KeyError, ValueError) as exc:
         await _notify_admin(
@@ -815,6 +1064,24 @@ async def _process_service_reminder(
             f"{type(exc).__name__}",
             debug_logger,
         )
+        return
+
+    if _reminder_task_names(reminder, assignments) == []:
+        # Напоминание задачи без ответственных на дату не отправляется.
+        missing_recipient = "admin:no-task-responsibles"
+        if not registry.is_group_reminder_delivered(
+            reminder["id"], event_date.isoformat(), missing_recipient
+        ) and await _notify_admin(
+            bot,
+            credentials.admin_tg_id,
+            f"⚠️ Напоминание «{service['name']}» для задачи "
+            f"«{reminder['task']}» на {date_text} не отправлено: "
+            "в графике никто не назначен.",
+            debug_logger,
+        ):
+            registry.mark_group_reminder_delivered(
+                reminder["id"], event_date.isoformat(), missing_recipient
+            )
         return
 
     if not any(
@@ -839,6 +1106,14 @@ async def _process_service_reminder(
             f"Для служения «{service['name']}» не задан групповой чат.",
             debug_logger,
         )
+    elif not _same_reminder_slot(registry, reminder):
+        # Пока скачивался график, срок или время напоминания изменили:
+        # отправит задача нового расписания, эта не ставит отметку.
+        debug_logger.info(
+            "Напоминание %s перенесено во время подготовки — отправка "
+            "отменена", reminder["id"],
+        )
+        return
     elif not registry.is_group_reminder_delivered(
         reminder["id"], event_date.isoformat(), group_recipient
     ):
@@ -852,11 +1127,16 @@ async def _process_service_reminder(
             )
         else:
             try:
-                await send_telegram_screen(
-                    bot.send_message,
+                await send_to_service_group(
+                    lambda chat_id, text, **kwargs: send_telegram_screen(
+                        bot.send_message, chat_id, text,
+                        limit=TELEGRAM_TEXT_LIMIT, **kwargs,
+                    ),
                     group_chat_id,
                     group_text,
-                    limit=TELEGRAM_TEXT_LIMIT,
+                    service,
+                    registry=registry,
+                    logger=debug_logger,
                 )
             except Exception as exc:
                 debug_logger.exception(
@@ -873,16 +1153,33 @@ async def _process_service_reminder(
                     debug_logger,
                 )
             else:
-                registry.mark_group_reminder_delivered(
-                    reminder["id"],
-                    event_date.isoformat(),
-                    group_recipient,
-                )
+                if _same_reminder_slot(registry, reminder):
+                    registry.mark_group_reminder_delivered(
+                        reminder["id"],
+                        event_date.isoformat(),
+                        group_recipient,
+                    )
                 interaction_logger.info(
                     "Групповое уведомление служения %s отправлено на %s",
                     service_id,
                     event_date,
                 )
+    if group_chat_id is not None and registry.is_group_reminder_delivered(
+        reminder["id"], event_date.isoformat(), group_recipient
+    ):
+        # Отчёт отдельно от группового сообщения: недоставленный ранее
+        # отчёт отправится при следующем запуске, не повторяя группу.
+        try:
+            await send_admin_reports(
+                bot, registry, service, event_date,
+                raw_assignments or assignments,
+                credentials.admin_tg_id, debug_logger, TELEGRAM_TEXT_LIMIT,
+            )
+        except Exception:  # noqa: BLE001
+            debug_logger.exception(
+                "Не удалось подготовить отчёт админам служения %s",
+                service_id,
+            )
 
 
 async def _process_user_reminder_schedule(
@@ -932,6 +1229,7 @@ async def _process_user_reminder_schedule(
             only_date=event_date,
             return_event_found=True,
             services=registry.service_catalog(),
+            registry=registry,
         )
     except Exception as exc:
         debug_logger.exception(
@@ -968,6 +1266,7 @@ async def _process_user_reminder_schedule(
         schedule["service_id"],
         schedule["task"],
         service["personal_templates"],
+        body=schedule.get("body"),
     )
     try:
         text = template.format_map(
@@ -992,8 +1291,20 @@ async def _process_user_reminder_schedule(
             debug_logger,
         )
         return
-    if not text.startswith("🔔"):
-        text = f"🔔 {text}"
+    # Заголовок всегда: к чему относятся «Принял» / «Не смогу», даже если
+    # текст напоминания свой.
+    header = (
+        f"🔔 {schedule['service_name']} · {schedule['task']} · "
+        f"{event_date:%d.%m.%Y}"
+    )
+    body_text = text.removeprefix("🔔").strip()
+    text = f"{header}\n{body_text}"
+    if _utf16_length(text) > TELEGRAM_TEXT_LIMIT:
+        # Поля шаблона раздули текст: напоминание всё равно уходит,
+        # сокращённым, — иначе человек остался бы без него.
+        while body_text and _utf16_length(f"{header}\n{body_text}…") > TELEGRAM_TEXT_LIMIT:
+            body_text = body_text[: max(len(body_text) - 200, 0)]
+        text = f"{header}\n{body_text}…"
     if _utf16_length(text) > TELEGRAM_TEXT_LIMIT:
         await _notify_admin(
             bot,
@@ -1004,62 +1315,16 @@ async def _process_user_reminder_schedule(
         )
         return
 
-    confirmation = None
-    if schedule["service_id"] == "assembly" and state_cache is not None:
-        key = _service_confirmation_key(
-            schedule["service_id"], schedule["task"], schedule["actor_id"]
+    # Ответ уже дан («Принял» или «Не смогу») — повторно не напоминаем.
+    if registry.get_confirmation(
+        schedule["service_id"], event_iso, schedule["task"], schedule["actor_id"]
+    ):
+        return
+    send_kwargs = {
+        "reply_markup": build_personal_answer_kb(
+            schedule["service_id"], event_date, schedule["task"]
         )
-        current_state = state_cache.state
-        if not current_state or current_state.get("sunday_date") != event_iso:
-            current_state = {
-                "sunday_date": event_iso,
-                "group_chat_id": service["group_chat_id"],
-                "general_message_id": None,
-                "general_sent": False,
-                "general_text": None,
-                "complete": False,
-                "participants": {},
-            }
-            state_cache.state = current_state
-        participants = current_state.setdefault("participants", {})
-        participant = participants.setdefault(
-            key,
-            {
-                "name": schedule["name"],
-                "username": schedule["username"],
-                "tg_id": schedule["actor_id"],
-                "task": schedule["task"],
-                "service_id": schedule["service_id"],
-                "delivered": False,
-                "confirmed": False,
-                "message_id": None,
-                "chat_id": None,
-                "group_chat_id": service["group_chat_id"],
-            },
-        )
-        if participant.get("confirmed"):
-            return
-        confirmation = (key, participant)
-        try:
-            state_cache.save()
-        except OSError as exc:
-            debug_logger.exception(
-                "Не удалось подготовить состояние подтверждения служения"
-            )
-            await _notify_admin(
-                bot,
-                credentials.admin_tg_id,
-                f"Личное уведомление для {schedule['name']} не отправлено: "
-                f"не удалось сохранить состояние подтверждения ({exc}).",
-                debug_logger,
-            )
-            return
-
-    send_kwargs = {}
-    if confirmation:
-        send_kwargs["reply_markup"] = build_service_confirm_kb(
-            confirmation[0], event_iso
-        )
+    }
     try:
         sent_message = await send_telegram_screen(
             bot.send_message,
@@ -1082,21 +1347,6 @@ async def _process_user_reminder_schedule(
         return
 
     registry.mark_user_reminder_delivered(schedule_id, event_iso)
-    if confirmation:
-        participant = confirmation[1]
-        participant["delivered"] = True
-        participant["message_id"] = getattr(sent_message, "message_id", None)
-        participant["chat_id"] = getattr(
-            getattr(sent_message, "chat", None), "id", schedule["actor_id"]
-        )
-        try:
-            state_cache.save()
-        except OSError:
-            debug_logger.exception(
-                "Не удалось сохранить подтверждение личного уведомления "
-                "для расписания %s",
-                schedule_id,
-            )
     interaction_logger.info(
         "Личное уведомление отправлено: service=%s task=%s tg_id=%s "
         "event_date=%s schedule_id=%s",
@@ -1130,6 +1380,7 @@ async def _prepare_service_test_previews(
         debug_logger,
         only_date=sunday_date,
         services=registry.service_catalog(),
+        registry=registry,
     )
     contacts = registry.list_responsible_contacts(
         credentials.admin_tg_id, service_id
@@ -1451,6 +1702,7 @@ async def _run_locked(args: CliArgs) -> None:
     bot = None
     scheduler = None
     nightly_backup_task: asyncio.Task | None = None
+    commands_task: asyncio.Task | None = None
     pid_created = False
     active_jobs: set[asyncio.Task[None]] = set()
     service_reminder_locks: dict[tuple[str, date], asyncio.Lock] = {}
@@ -1461,10 +1713,6 @@ async def _run_locked(args: CliArgs) -> None:
             token=credentials.bot_token,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         )
-        if callable(getattr(bot, "set_my_commands", None)):
-            await sync_admin_commands(
-                bot, service_registry, credentials.admin_tg_id, debug_logger
-            )
         dp = Dispatcher(storage=MemoryStorage())
         context = SimpleNamespace(
             bot=bot,
@@ -1492,6 +1740,7 @@ async def _run_locked(args: CliArgs) -> None:
                     service_registry.service_catalog()
                     if service_registry is not None else None
                 ),
+                registry=service_registry,
             )
 
         async def prepare_service_test_previews(
@@ -1531,31 +1780,60 @@ async def _run_locked(args: CliArgs) -> None:
         context.prepare_test_previews = prepare_test_previews
         context.load_service_task_assignments = load_service_task_assignments
 
-        upcoming_cache: dict[str, Any] = {"loaded_at": None, "events": []}
+        upcoming_cache: dict[str, Any] = {
+            "loaded_at": None, "events": [], "until": None,
+        }
         upcoming_lock = asyncio.Lock()
 
-        async def load_upcoming_service_events() -> list:
+        async def load_upcoming_service_events(
+            force: bool = False, until: date | None = None
+        ) -> list:
             # Один общий скачанный график на несколько минут для всех
             # пользователей: повторные нажатия не обращаются к Яндекс.Диску.
+            # force — «🔄 Сверить график»: скачать заново. В кэше — график до
+            # конца следующего месяца (для «🔁 Замена»); по умолчанию
+            # возвращаются ближайшие 6 недель, until — до этой даты.
+            today = datetime.now(tz).date()
+            limit = until or today + timedelta(days=UPCOMING_WEEKS_DEFAULT * 7)
+
+            def window(events: list) -> list:
+                return _apply_event_replacements(
+                    [event for event in events if event.event_date <= limit],
+                    service_registry,
+                )
+
             async with upcoming_lock:
                 loaded_at = upcoming_cache["loaded_at"]
                 if (
-                    loaded_at is not None
+                    not force
+                    and loaded_at is not None
                     and time.monotonic() - loaded_at
                     < UPCOMING_EVENTS_CACHE_SECONDS
+                    # После смены месяца кэш может не покрывать окно.
+                    and upcoming_cache["until"] is not None
+                    and upcoming_cache["until"] >= limit
                 ):
-                    return upcoming_cache["events"]
+                    # Замены — из базы при каждом чтении: кэш хранит график.
+                    return window(upcoming_cache["events"])
+                next_month = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
+                end_of_next_month = (
+                    (next_month + timedelta(days=32)).replace(day=1)
+                    - timedelta(days=1)
+                )
                 events = await _load_upcoming_service_events(
                     credentials, shm_dir, tz, debug_logger,
+                    weeks=UPCOMING_WEEKS_DEFAULT,
                     services=(
                         service_registry.service_catalog()
                         if service_registry is not None else None
                     ),
+                    until=max(end_of_next_month, limit),
                 )
                 upcoming_cache.update(
-                    loaded_at=time.monotonic(), events=events
+                    loaded_at=time.monotonic(), events=events,
+                    until=max(end_of_next_month, limit),
                 )
-                return events
+                return window(events)
 
         context.load_upcoming_service_events = load_upcoming_service_events
         context.prepare_service_test_previews = prepare_service_test_previews
@@ -1772,6 +2050,45 @@ async def _run_locked(args: CliArgs) -> None:
 
             service_registry.on_change = schedule_user_job_refresh
 
+            async def scheduled_replacement_close(poll_id: str) -> None:
+                task = asyncio.current_task()
+                if task is not None:
+                    active_jobs.add(task)
+                try:
+                    await context.close_replacement_poll(poll_id)
+                except Exception:
+                    debug_logger.exception(
+                        "Ошибка подведения итога опроса замены %s", poll_id
+                    )
+                finally:
+                    if task is not None:
+                        active_jobs.discard(task)
+
+            def schedule_replacement_close(poll_id: str, deadline) -> None:
+                """Итог опроса замены по сроку (этап 3.3)."""
+                if scheduler is None:
+                    return
+                scheduler.add_job(
+                    scheduled_replacement_close,
+                    "date",
+                    run_date=max(deadline, datetime.now(tz)),
+                    args=[poll_id],
+                    id=f"replacement-poll-{poll_id}",
+                    replace_existing=True,
+                    misfire_grace_time=None,
+                )
+
+            def cancel_replacement_close(poll_id: str) -> None:
+                if scheduler is None:
+                    return
+                try:
+                    scheduler.remove_job(f"replacement-poll-{poll_id}")
+                except JobLookupError:
+                    pass
+
+            context.schedule_replacement_close = schedule_replacement_close
+            context.cancel_replacement_close = cancel_replacement_close
+
         try:
             _write_pid(pid_file)
             pid_created = True
@@ -1793,11 +2110,34 @@ async def _run_locked(args: CliArgs) -> None:
             debug_logger.error(message)
             raise FileExistsError(message) from exc
 
+        # Меню команд обновляется в фоне: после перезагрузки сервера DNS
+        # бывает недоступен минутами, а manage.sh ждёт PID-файл лишь 30 с.
+        if callable(getattr(bot, "set_my_commands", None)):
+            async def sync_commands_in_background() -> None:
+                retries = _retry_delays()
+                while True:
+                    try:
+                        if await sync_admin_commands(
+                            bot, service_registry, credentials.admin_tg_id, debug_logger
+                        ):
+                            return
+                    except Exception:
+                        debug_logger.exception("Не удалось обновить меню команд")
+                        return
+                    await anext(retries)
+
+            commands_task = asyncio.create_task(
+                sync_commands_in_background(),
+                name="reminder-bot-sync-commands",
+            )
         if service_registry is not None:
             await refresh_service_reminders()
             await refresh_user_reminder_jobs()
+            # Открытые опросы замены переживают перезапуск бота.
+            _reschedule_open_polls(
+                service_registry, schedule_replacement_close, debug_logger
+            )
         scheduler.start()
-        await _configure_webapp_menu(bot, PROJECT_DIR, debug_logger)
         if backup_manager is not None:
             if create_startup_backup is not None:
                 backup_manager.start_task(
@@ -1808,11 +2148,16 @@ async def _run_locked(args: CliArgs) -> None:
                 backup_manager.run_nightly(),
                 name="reminder-bot-nightly-backup",
             )
+        if not await _wait_for_telegram(bot, debug_logger):
+            debug_logger.info("Остановка до подключения к Telegram")
+            return
+        await _configure_webapp_menu(bot, PROJECT_DIR, debug_logger)
         await dp.start_polling(bot, close_bot_session=False)
     finally:
-        if nightly_backup_task is not None:
-            nightly_backup_task.cancel()
-            await asyncio.gather(nightly_backup_task, return_exceptions=True)
+        for background_task in (nightly_backup_task, commands_task):
+            if background_task is not None:
+                background_task.cancel()
+                await asyncio.gather(background_task, return_exceptions=True)
         try:
             if scheduler is not None and scheduler.running:
                 scheduler.pause()

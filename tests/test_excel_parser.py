@@ -16,6 +16,7 @@ from bot.excel_parser import (
     parse_people,
     parse_schedule,
     parse_service_events as parse_with_catalog,
+    parse_service_rosters,
     resolve_assignments,
 )
 from bot.services import SERVICES, parse_catalog
@@ -530,6 +531,68 @@ class ExcelParserTest(unittest.TestCase):
             [["Октябрьские слайды"]],
         )
 
+    def test_dotted_month_keeps_explicit_year(self):
+        from bot.excel_parser import _cell_date
+
+        self.assertEqual(_cell_date("1 нояб. 2025", 2026, 11), date(2025, 11, 1))
+        self.assertEqual(_cell_date("1 нояб.", 2026, 11), date(2026, 11, 1))
+        self.assertEqual(_cell_date("1 нояб. 10:00", 2026, 11), date(2026, 11, 1))
+
+    def test_short_text_dates_stop_month_sheet(self):
+        """«01.11» без года на листе октября — не продолжение 25.10."""
+        for label in ("01.11", "01.11.26", "1.11 10:00", "1 нояб.", "1 ноя"):
+            with self.subTest(label=label):
+                workbook = Workbook()
+                schedule = workbook.active
+                schedule.title = "ОКТЯБРЬ26"
+                schedule.append(["СОБРАНИЕ"])
+                schedule.append([date(2026, 10, 25)])
+                schedule.append(["ХКЦ", "Октябрьский"])
+                schedule.append([label])
+                schedule.append(["ХКЦ", "Ноябрьский"])
+                workbook.save(self.path)
+                parsed = parse_service_events(
+                    self.path, date(2026, 10, 1), self.debug_logger
+                )
+                self.assertEqual(
+                    [item.name for item in parsed["assembly"][0].assignments],
+                    ["Октябрьский"],
+                )
+
+    def test_ambiguous_numbers_are_not_dates(self):
+        from bot.excel_parser import _cell_date
+
+        for value in ("1.10", "10.10 кг", "5.5", 1.1, 10.3, "10.30"):
+            with self.subTest(value=value):
+                self.assertIsNone(_cell_date(value, 2026, 10))
+        self.assertEqual(_cell_date("03.01", 2026, 12), date(2027, 1, 3))
+        self.assertEqual(_cell_date("3 января", 2026, 12), date(2027, 1, 3))
+        self.assertEqual(_cell_date("28.12", 2027, 1), date(2026, 12, 28))
+        self.assertEqual(_cell_date("01.11", 2026, 10), date(2026, 11, 1))
+        for time_like in ("09.05", "10.05", "11.02"):
+            with self.subTest(time_like=time_like):
+                self.assertIsNone(_cell_date(time_like, 2026, 10))
+
+    def test_informational_value_from_next_cell(self):
+        workbook = Workbook()
+        schedule = workbook.active
+        schedule.title = "ОКТЯБРЬ26"
+        schedule.append(["СОБРАНИЕ"])
+        schedule.append([date(2026, 10, 4)])
+        schedule.append(["ХКЦ", "Ответственный"])
+        schedule.append(["*Причастие", "В.П."])
+        schedule.append(["*2я часть", "нет"])
+        workbook.save(self.path)
+        parsed = parse_service_events(
+            self.path, date(2026, 10, 1), self.debug_logger
+        )
+        notes = [
+            (item.task, item.name)
+            for item in parsed["assembly"][0].assignments
+            if item.is_informational
+        ]
+        self.assertEqual(notes, [("Причастие", "В.П."), ("2я часть", "нет")])
+
     def test_december_sheet_stops_at_january_text_date(self):
         workbook = Workbook()
         schedule = workbook.active
@@ -690,6 +753,54 @@ class ExcelParserTest(unittest.TestCase):
         self.assertEqual(
             [event.event_date for event in events],
             [date(2026, 10, 4), date(2026, 10, 11), date(2026, 10, 18)],
+        )
+
+    def test_service_rosters_read_names_and_tasks_only(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Списки"
+        sheet.append(["Звук", None, None, "Кухня"])
+        sheet.append(["звук", "@orphan_user", None, "старший"])
+        sheet.append(["Алексей", "@alex_sound", 11111, "Мария"])
+        sheet.append(["Перевозка + сборка", "звук"])
+        sheet.append(["Алексей", "Daniel"])
+        sheet.append(["Пётр"])
+        sheet.append(["спевка"])
+        sheet.append(["Иван"])
+        sheet.append(["Перевозка + сборка"])
+        sheet.append(["пётр"])
+        sheet.append(["ivan_petrov", 55555])
+        sheet["G1"] = "Книги"
+        sheet["G2"] = "Ольга"
+        sheet["H3"] = "@lost_user"
+        sheet["I3"] = 99999
+        sheet["H4"] = "Daniel"
+        workbook.save(self.path)
+        issues = []
+
+        rosters = parse_service_rosters(
+            self.path, self.debug_logger, SERVICES, issues
+        )
+
+        sound = {member.name: member for member in rosters["sound"]}
+        self.assertEqual(sorted(sound), ["Daniel", "Алексей", "Пётр"])
+        self.assertEqual(sound["Daniel"].tasks, ("звук",))
+        self.assertEqual(sound["Алексей"].tasks, ("звук", "сборка"))
+        self.assertEqual(sound["Пётр"].tasks, ("сборка",))
+        self.assertEqual(
+            [(member.name, member.tasks) for member in rosters["kitchen"]],
+            [("Мария", ("старший",))],
+        )
+        self.assertNotIn("order", rosters)
+        self.assertEqual(
+            [member.name for member in rosters["books"]], ["Ольга", "Daniel"]
+        )
+        self.assertEqual(
+            issues,
+            [
+                "«Списки», Звук: задача «сборка»: «пётр» указан дважды — "
+                "уточните фамилией",
+            ],
         )
 
     def test_parses_multiple_legacy_assignments_from_one_row(self):

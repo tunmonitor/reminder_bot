@@ -62,6 +62,10 @@ _MONTH_NAMES = {
     "октября": 10, "октябрь": 10,
     "ноября": 11, "ноябрь": 11,
     "декабря": 12, "декабрь": 12,
+    # Сокращения: «1 нояб.», «1 ноя».
+    "янв": 1, "фев": 2, "февр": 2, "мар": 3, "апр": 4, "июн": 6,
+    "июл": 7, "авг": 8, "сен": 9, "сент": 9, "окт": 10, "ноя": 11,
+    "нояб": 11, "дек": 12,
 }
 _ROLE_ALIASES = {
     "ответственный": "Ответственный",
@@ -193,7 +197,11 @@ def _rows_before_other_month(
         for column in date_columns:
             if len(row) <= column:
                 continue
-            event_date = (row_date or _cell_date)(row[column], month.year)
+            event_date = (
+                row_date(row[column], month.year)
+                if row_date is not None
+                else _cell_date(row[column], month.year, month.month)
+            )
             if event_date is None:
                 continue
             if (event_date.year, event_date.month) == (month.year, month.month):
@@ -220,7 +228,19 @@ def _find_sheet(workbook, expected: str, legacy_names: tuple[str, ...] = ()):
     return None, None
 
 
-def _cell_date(value, target_year: int) -> date | None:
+def _year_near_sheet(target_year: int, target_month: int | None, month: int) -> int:
+    """Год даты без года: «03.01» на листе декабря — следующий год,
+    «28.12» на листе января — предыдущий."""
+    if target_month == 12 and month == 1:
+        return target_year + 1
+    if target_month == 1 and month == 12:
+        return target_year - 1
+    return target_year
+
+
+def _cell_date(
+    value, target_year: int, target_month: int | None = None
+) -> date | None:
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
@@ -232,13 +252,50 @@ def _cell_date(value, target_year: int) -> date | None:
             return date(*(int(part) for part in (numeric[3], numeric[2], numeric[1])))
         except ValueError:
             return None
-    named = re.match(r"^(\d{1,2})\s+([а-я]+)(?:\s+(\d{4}))?(?:\b|$)", text)
+    # «01.11», «01.11.26», «1.11 10:00» — дата без года или с коротким
+    # годом: иначе блок такой даты приклеился бы к предыдущему воскресенью.
+    # Только текст и только в однозначной записи: числа (1.1, 10.3),
+    # время и вес («1.10», «5.5 кг») датой не считаются.
+    short = (
+        re.match(
+            r"^(\d{2})\.(\d{2})(?:\.(\d{2}))?$"
+            r"|^(\d{1,2})\.(\d{1,2})(?:\.(\d{2}))?\s+\d{1,2}:\d{2}(?:\s|$)",
+            text,
+        )
+        if isinstance(value, str)
+        else None
+    )
+    if short:
+        day, month, short_year = (
+            short.group(1, 2, 3) if short[1] else short.group(4, 5, 6)
+        )
+        # «09.10» может быть временем: без года принимается только месяц
+        # листа или соседний.
+        if (
+            not short_year
+            and target_month is not None
+            and (int(month) - target_month) % 12 not in {0, 1, 11}
+        ):
+            return None
+        year = (
+            2000 + int(short_year) if short_year
+            else _year_near_sheet(target_year, target_month, int(month))
+        )
+        try:
+            return date(year, int(month), int(day))
+        except ValueError:
+            return None
+    named = re.match(r"^(\d{1,2})\s+([а-я]+)\.?(?:\s*(\d{4}))?(?![\wа-я])", text)
     if named:
         month = _MONTH_NAMES.get(named[2])
         if month is None:
             return None
+        year = (
+            int(named[3]) if named[3]
+            else _year_near_sheet(target_year, target_month, month)
+        )
         try:
-            return date(int(named[3] or target_year), month, int(named[1]))
+            return date(year, month, int(named[1]))
         except ValueError:
             return None
     return None
@@ -443,7 +500,7 @@ def _column_assignments(
                 assignments.append(
                     ServiceAssignment(task=task, name="", is_informational=True)
                 )
-            elif name and _cell_date(name, month.year) is None:
+            elif name and _cell_date(name, month.year, month.month) is None:
                 assignments.append(ServiceAssignment(task=default_task, name=name))
             continue
 
@@ -702,7 +759,11 @@ def parse_service_events(
                 (row_index, event_date)
                 for row_index, row in enumerate(rows)
                 if len(row) > start_column
-                and (event_date := _cell_date(row[start_column], month.year))
+                and (
+                    event_date := _cell_date(
+                        row[start_column], month.year, month.month
+                    )
+                )
                 is not None
             ]
             for event_index, (row_index, event_date) in enumerate(event_rows):
@@ -878,6 +939,164 @@ def parse_people(path: Path,
             sheet_name, {role: list(names) for role, names in people.items()},
         )
         return people
+    finally:
+        workbook.close()
+
+
+@dataclass(frozen=True)
+class RosterMember:
+    """Человек из состава служения на листе «Списки»."""
+    name: str
+    tasks: tuple[str, ...] = ()
+
+
+_USERNAME_CELL = re.compile(r"@?([A-Za-z][A-Za-z0-9_]{4,31})")
+
+
+def _is_contact_cell(text: str) -> bool:
+    """«@username» или Telegram ID — не имя участника."""
+    return bool(
+        (text.startswith("@") and _USERNAME_CELL.fullmatch(text))
+        or _telegram_id(text) is not None
+    )
+
+
+def parse_service_rosters(
+    path: Path,
+    debug_logger: logging.Logger,
+    services: tuple[ServiceDefinition, ...] | None = None,
+    issues: list[str] | None = None,
+) -> dict[str, list[RosterMember]]:
+    """Читает состав служений с листа «Списки».
+
+    В строке 1 — названия служений; блок служения тянется вправо до
+    следующего названия. Ячейка с названием или синонимом задачи служения
+    начинает задачу в своей колонке; остальные ячейки ниже — люди этой
+    задачи. Люди под выключенной задачей пропускаются. Username и
+    Telegram ID из «Списков» не читаются (привязка — только в боте); пока
+    такие колонки есть, их ячейки не считаются людьми. Повтор имени в
+    одной задаче — предупреждение: имена в служении должны быть уникальны.
+    В результате только служения, у которых есть блок на листе.
+    """
+    services = SERVICES if services is None else services
+    issues = [] if issues is None else issues
+    workbook = _load_workbook(path, debug_logger)
+    try:
+        worksheet, sheet_name = _find_sheet(workbook, "Списки")
+        if worksheet is None:
+            raise RuntimeError("Лист 'Списки' не найден")
+        worksheet.reset_dimensions()
+        rows = [list(row) for row in worksheet.iter_rows(values_only=True)]
+        if not rows:
+            raise RuntimeError("Лист 'Списки' пуст")
+        aliases = {
+            normalized_name(alias): service
+            for service in services
+            for alias in (service.name, *service.aliases)
+        }
+        headers: list[tuple[int, ServiceDefinition | None]] = []
+        for column, value in enumerate(rows[0]):
+            header = _clean(value)
+            if not header:
+                continue
+            service = aliases.get(normalized_name(header))
+            if service is None:
+                issues.append(f"«Списки»: служение «{header}» не найдено в каталоге")
+                debug_logger.warning(
+                    "Лист 'Списки': неизвестное служение '%s'", header
+                )
+            headers.append((column, service))
+        width = max(len(row) for row in rows)
+        # Служения без блока на листе в результат не попадают: их состав
+        # не трогается (иначе опечатка в заголовке сняла бы всех из списка).
+        result: dict[str, list[RosterMember]] = {}
+        for index, (start, service) in enumerate(headers):
+            if service is None:
+                continue
+            end = headers[index + 1][0] if index + 1 < len(headers) else width
+            task_by_key = {
+                normalized_name(key): task
+                for task in service.tasks
+                for key in (task.name, *task.aliases)
+            }
+            people: dict[str, list[str]] = {}
+            consumed: set[tuple[int, int]] = set()
+            seen: dict[str | None, set[str]] = {}
+            for column in range(start, end):
+                current_task = None
+                for row_index in range(1, len(rows)):
+                    row = rows[row_index]
+                    if (row_index, column) in consumed or column >= len(row):
+                        continue
+                    text = _clean(row[column])
+                    if not text or _is_contact_cell(text):
+                        continue
+                    task = task_by_key.get(normalized_name(text))
+                    right = (
+                        _clean(row[column + 1])
+                        if column + 1 < end and column + 1 < len(row)
+                        else ""
+                    )
+                    if (
+                        task is None
+                        and _USERNAME_CELL.fullmatch(text)
+                        and _telegram_id(right) is not None
+                    ):
+                        # Username без «@» с Telegram ID правее — контакт.
+                        consumed.add((row_index, column + 1))
+                        continue
+                    # Username и Telegram ID правее имени или задачи из
+                    # «Списков» не читаются (привязка — только в боте), но
+                    # и людьми не считаются.
+                    # Username без «@» узнаётся только по Telegram ID правее:
+                    # латинское имя в соседней задаче — тоже человек.
+                    def neighbour_value(offset):
+                        neighbour = column + offset
+                        if neighbour < end and neighbour < len(row):
+                            return _clean(row[neighbour])
+                        return ""
+                    username_cell = neighbour_value(1)
+                    has_id = _telegram_id(neighbour_value(2)) is not None
+                    if username_cell and normalized_name(username_cell) not in task_by_key and (
+                        (username_cell.startswith("@") or has_id)
+                        and _USERNAME_CELL.fullmatch(username_cell)
+                    ):
+                        consumed.add((row_index, column + 1))
+                    if has_id:
+                        consumed.add((row_index, column + 2))
+                    if task is not None:
+                        current_task = task
+                        continue
+                    if service.tasks and current_task is None:
+                        issues.append(
+                            f"«Списки», {service.name}: «{text}» указан "
+                            "без задачи"
+                        )
+                        continue
+                    if current_task is not None and not current_task.enabled:
+                        continue
+                    task_name = current_task.name if current_task else None
+                    names = seen.setdefault(task_name, set())
+                    if normalized_name(text) in names:
+                        where = f"задача «{task_name}»: " if task_name else ""
+                        issues.append(
+                            f"«Списки», {service.name}: {where}«{text}» "
+                            "указан дважды — уточните фамилией"
+                        )
+                        continue
+                    names.add(normalized_name(text))
+                    person = people.setdefault(text, [])
+                    if task_name is not None and task_name not in person:
+                        person.append(task_name)
+            result[service.id] = [
+                RosterMember(name=name, tasks=tuple(tasks))
+                for name, tasks in people.items()
+            ]
+            debug_logger.debug(
+                "Лист 'Списки': служение %s, людей=%s",
+                service.id, len(result[service.id]),
+            )
+        return result
     finally:
         workbook.close()
 

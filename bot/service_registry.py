@@ -1,6 +1,7 @@
 """Persistent configuration for service access and participant contacts."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -8,12 +9,13 @@ import secrets
 import sqlite3
 import stat
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from string import Formatter
 from dataclasses import replace
 from typing import Callable
 
+from .presentation import is_replaced
 from .secure_fs import open_private_directory
 from .services import (
     SERVICES,
@@ -29,8 +31,13 @@ GROUP_TEMPLATE_FIELDS = frozenset(
         "sunday_date",
         "task_assignments",
         "informational_notes",
+        "task",
+        "task_responsibles",
     }
 )
+# Поля задачи есть только у напоминания задачи (этап 3.1): в общем
+# напоминании и шаблоне служения они были бы пустыми.
+GENERAL_GROUP_TEMPLATE_FIELDS = GROUP_TEMPLATE_FIELDS - {"task", "task_responsibles"}
 PERSONAL_TEMPLATE_FIELDS = frozenset(
     {"name", "task", "service_name", "sunday_date", "telegram_id", "username"}
 )
@@ -38,7 +45,39 @@ DEFAULT_GROUP_TEMPLATE = (
     "Напоминание о служении «{service_name}» в воскресенье "
     "{sunday_date}:\n{task_assignments}"
 )
+ADMIN_REPORT_FIELDS = frozenset(
+    {
+        "service_name",
+        "sunday_date",
+        "task_assignments",
+        "delivery_status",
+        "confirmation_status",
+    }
+)
+DEFAULT_ADMIN_REPORT_TEMPLATE = (
+    "📋 Отчёт · {service_name} · {sunday_date}\n\n"
+    "{task_assignments}\n\n"
+    "📨 Личные уведомления:\n{delivery_status}\n\n"
+    "✅ Подтверждения:\n{confirmation_status}"
+)
+# Шаблон по умолчанию для напоминания одной задачи (этап 3.1).
+DEFAULT_TASK_TEMPLATE = (
+    "Напоминание о служении «{service_name}» в воскресенье {sunday_date}.\n"
+    "{task}: {task_responsibles}"
+)
 _UNSET = object()
+# Своих личных напоминаний человека в одном служении.
+USER_REMINDERS_PER_SERVICE = 10
+USER_REMINDER_BODY_LIMIT = 3000
+
+
+def task_token(task: str) -> str:
+    """Короткий устойчивый идентификатор задачи для callback_data.
+
+    Позиции задач перенумеровываются, а название может не поместиться в
+    64 байта, поэтому в кнопку кладём хэш названия.
+    """
+    return hashlib.sha1(task.encode("utf-8")).hexdigest()[:10]
 
 
 def validate_notification_template(
@@ -252,6 +291,98 @@ class ServiceRegistry:
                     name TEXT PRIMARY KEY
                 );
 
+                CREATE TABLE IF NOT EXISTS service_members (
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    telegram_id INTEGER
+                        CHECK (telegram_id IS NULL OR telegram_id > 0),
+                    username TEXT NOT NULL DEFAULT '',
+                    tasks_json TEXT NOT NULL DEFAULT '[]',
+                    in_list INTEGER NOT NULL DEFAULT 0
+                        CHECK (in_list IN (0, 1)),
+                    source TEXT NOT NULL
+                        CHECK (source IN ('excel', 'manual', 'legacy')),
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (service_id, name)
+                );
+
+                -- Ответы на личные напоминания (этап 3.2): «Принял» или
+                -- «Не смогу» по задаче на дату события.
+                CREATE TABLE IF NOT EXISTS service_confirmations (
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    event_date TEXT NOT NULL,
+                    task TEXT NOT NULL,
+                    telegram_id INTEGER NOT NULL CHECK (telegram_id > 0),
+                    name TEXT NOT NULL,
+                    status TEXT NOT NULL
+                        CHECK (status IN ('confirmed', 'declined')),
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (service_id, event_date, task, telegram_id)
+                );
+
+                -- Отправленные отчёты админам служения: редактируются при
+                -- подтверждениях; assignments_json — назначения на дату.
+                CREATE TABLE IF NOT EXISTS admin_report_messages (
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    event_date TEXT NOT NULL,
+                    admin_id INTEGER NOT NULL CHECK (admin_id > 0),
+                    message_id INTEGER NOT NULL,
+                    assignments_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (service_id, event_date, admin_id)
+                );
+
+                -- Замена ответственного на одну дату (этап 3.3); главнее
+                -- графика. old_name — кого заменили (из графика или прошлая
+                -- замена), new_name — кто вместо него.
+                CREATE TABLE IF NOT EXISTS service_replacements (
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    event_date TEXT NOT NULL,
+                    task TEXT NOT NULL,
+                    old_name TEXT NOT NULL,
+                    new_name TEXT NOT NULL,
+                    telegram_id INTEGER
+                        CHECK (telegram_id IS NULL OR telegram_id > 0),
+                    username TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL CHECK (source IN ('poll', 'admin')),
+                    created_by INTEGER,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (service_id, event_date, task, old_name)
+                );
+
+                -- Опросы «Кто сможет…» в чате служения (этап 3.3).
+                CREATE TABLE IF NOT EXISTS replacement_polls (
+                    poll_id TEXT PRIMARY KEY,
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    event_date TEXT NOT NULL,
+                    task TEXT NOT NULL,
+                    old_name TEXT NOT NULL,
+                    old_telegram_id INTEGER,
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    notice_message_id INTEGER,
+                    deadline TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open'
+                        CHECK (status IN ('open', 'closed')),
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS replacement_poll_answers (
+                    poll_id TEXT NOT NULL REFERENCES replacement_polls(poll_id)
+                        ON DELETE CASCADE,
+                    telegram_id INTEGER NOT NULL CHECK (telegram_id > 0),
+                    username TEXT NOT NULL DEFAULT '',
+                    full_name TEXT NOT NULL DEFAULT '',
+                    can INTEGER NOT NULL CHECK (can IN (0, 1)),
+                    answered_at TEXT NOT NULL,
+                    PRIMARY KEY (poll_id, telegram_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS group_reminder_legacy_ids (
                     legacy_id INTEGER PRIMARY KEY,
                     reminder_id INTEGER NOT NULL
@@ -440,6 +571,17 @@ class ServiceRegistry:
                 (secrets.randbelow(2**30) + 2**30,),
             )
             now = _utc_now()
+            reminder_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(group_reminders)"
+                )
+            }
+            if "task" not in reminder_columns:
+                # Задача напоминания (этап 3.1); NULL — все задачи служения.
+                connection.execute(
+                    "ALTER TABLE group_reminders ADD COLUMN task TEXT"
+                )
             self._sync_service_catalog(connection, assembly_group_chat_id)
             has_super_admin = connection.execute(
                 "SELECT 1 FROM super_admins LIMIT 1"
@@ -474,7 +616,80 @@ class ServiceRegistry:
                     "VALUES ('legacy-reminders')"
                 )
             self._migrate_to_service_catalog(connection)
+            self._migrate_members(connection)
+            self._drop_file_telegram_ids(connection)
             self._migrate_service_reminders(connection)
+
+    @staticmethod
+    def _drop_file_telegram_ids(connection: sqlite3.Connection) -> None:
+        """Однократно снимает Telegram ID, взятые из «Списков».
+
+        Telegram задаётся только в боте. Участник, созданный из «Списков»
+        (source='excel'), с Telegram ID без записи о привязке в боте получил
+        ID из файла: ID и созданные из него привязки к задачам удаляются.
+        """
+        if connection.execute(
+            "SELECT 1 FROM catalog_migrations WHERE name = 'members-v2'"
+        ).fetchone():
+            return
+        members = connection.execute(
+            "SELECT service_id, name, telegram_id FROM service_members "
+            "WHERE source = 'excel' AND telegram_id IS NOT NULL"
+        ).fetchall()
+        for member in members:
+            bound_in_bot = connection.execute(
+                "SELECT 1 FROM configuration_audit "
+                "WHERE service_id = ? AND action IN "
+                "('responsible_contact_updated', 'service_member_bound') "
+                "AND json_extract(details_json, '$.name') = ? "
+                "AND json_extract(details_json, '$.telegram_id') = ?",
+                (member["service_id"], member["name"], member["telegram_id"]),
+            ).fetchone()
+            if bound_in_bot:
+                continue
+            connection.execute(
+                "DELETE FROM responsible_contacts "
+                "WHERE service_id = ? AND name = ? AND telegram_id = ?",
+                (member["service_id"], member["name"], member["telegram_id"]),
+            )
+            connection.execute(
+                "UPDATE service_members SET telegram_id = NULL, username = '' "
+                "WHERE service_id = ? AND name = ?",
+                (member["service_id"], member["name"]),
+            )
+            ServiceRegistry._cleanup_unbound_user_data(
+                connection, member["service_id"]
+            )
+        connection.execute(
+            "INSERT INTO catalog_migrations (name) VALUES ('members-v2')"
+        )
+
+    @staticmethod
+    def _migrate_members(connection: sqlite3.Connection) -> None:
+        """Однократно создаёт участников служений из привязок к задачам.
+
+        При нескольких Telegram ID у одного имени берётся последняя привязка;
+        сами привязки к задачам не меняются.
+        """
+        if connection.execute(
+            "SELECT 1 FROM catalog_migrations WHERE name = 'members-v1'"
+        ).fetchone():
+            return
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO service_members (
+                service_id, name, telegram_id, username, source, updated_at
+            )
+            SELECT service_id, name, telegram_id, username, 'legacy',
+                   updated_at
+            FROM responsible_contacts
+            WHERE service_id IN (SELECT id FROM services WHERE archived = 0)
+            ORDER BY updated_at DESC
+            """
+        )
+        connection.execute(
+            "INSERT INTO catalog_migrations (name) VALUES ('members-v1')"
+        )
 
     @staticmethod
     def _sync_service_catalog(
@@ -494,6 +709,99 @@ class ServiceRegistry:
             connection.execute(
                 "ALTER TABLE services ADD COLUMN archived INTEGER NOT NULL "
                 "DEFAULT 0 CHECK (archived IN (0, 1))"
+            )
+        if "admin_report_template" not in columns:
+            # Шаблон отчёта админам (этап 3.2); NULL — встроенный.
+            connection.execute(
+                "ALTER TABLE services ADD COLUMN admin_report_template TEXT"
+            )
+        if "group_thread_id" not in columns:
+            # Тема (topic) группового чата; NULL — общая тема.
+            connection.execute(
+                "ALTER TABLE services ADD COLUMN group_thread_id INTEGER "
+                "CHECK (group_thread_id IS NULL OR group_thread_id > 0)"
+            )
+        poll_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(replacement_polls)")
+        }
+        if "filled" not in poll_columns:
+            # Запрос замены выполнен (этап 3.3): закрытый опрос без замены
+            # и запрос без опроса остаются доступны для /change.
+            connection.execute(
+                "ALTER TABLE replacement_polls ADD COLUMN filled INTEGER "
+                "NOT NULL DEFAULT 0 CHECK (filled IN (0, 1))"
+            )
+            # Запросы, по которым замену уже назначили, — выполнены.
+            connection.execute(
+                "UPDATE replacement_polls SET filled = 1 WHERE EXISTS ("
+                "SELECT 1 FROM service_replacements r "
+                "WHERE r.service_id = replacement_polls.service_id "
+                "AND r.event_date = replacement_polls.event_date "
+                "AND r.task = replacement_polls.task "
+                "AND r.old_name = replacement_polls.old_name)"
+            )
+        schedule_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(user_reminder_schedules)"
+            )
+        }
+        if "origin" not in schedule_columns:
+            # Личные напоминания (отзыв 21.10): «admin» — с текстом админа,
+            # пользователь только включает/выключает; «user» — своё, со
+            # своим временем и текстом. Свой текст задачи переходит в её
+            # правила.
+            connection.execute(
+                "ALTER TABLE user_reminder_schedules ADD COLUMN origin TEXT "
+                "NOT NULL DEFAULT 'admin' CHECK (origin IN ('admin', 'user'))"
+            )
+            connection.execute(
+                "ALTER TABLE user_reminder_schedules ADD COLUMN body TEXT"
+            )
+            connection.execute(
+                "UPDATE user_reminder_schedules SET origin = 'user', body = ("
+                "SELECT body FROM user_reminder_texts t WHERE t.id = text_id) "
+                "WHERE text_id IN (SELECT id FROM user_reminder_texts "
+                "WHERE body IS NOT NULL)"
+            )
+        if connection.execute(
+            "SELECT 1 FROM catalog_migrations WHERE name = 'personal-origin-v2'"
+        ).fetchone() is None:
+            # Напоминанием админа остаётся только правило по умолчанию
+            # («за 1 дн. в 18:00», единственное у задачи, без своего
+            # текста); правила, которые человек задавал сам, — свои.
+            connection.execute(
+                "UPDATE user_reminder_schedules SET origin = 'user' "
+                "WHERE origin = 'admin' AND body IS NULL AND ("
+                "reminder_days != 1 OR reminder_time != '18:00' OR "
+                "(SELECT COUNT(*) FROM user_reminder_schedules other "
+                "WHERE other.text_id = user_reminder_schedules.text_id "
+                "AND other.origin = 'admin') > 1)"
+            )
+            # Свой текст задачи — в её правила (если их ещё не скопировали)
+            # или, если правил нет, в выключенное своё напоминание.
+            connection.execute(
+                "UPDATE user_reminder_schedules SET origin = 'user', body = ("
+                "SELECT body FROM user_reminder_texts t WHERE t.id = text_id) "
+                "WHERE body IS NULL AND text_id IN (SELECT id FROM "
+                "user_reminder_texts WHERE body IS NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO user_reminder_schedules "
+                "(text_id, reminder_days, reminder_time, enabled, origin, body) "
+                "SELECT id, 1, '18:00', 0, 'user', body "
+                "FROM user_reminder_texts t WHERE body IS NOT NULL "
+                "AND NOT EXISTS (SELECT 1 FROM user_reminder_schedules s "
+                "WHERE s.text_id = t.id)"
+            )
+            connection.execute(
+                "UPDATE user_reminder_texts SET body = NULL "
+                "WHERE body IS NOT NULL"
+            )
+            connection.execute(
+                "INSERT INTO catalog_migrations (name) "
+                "VALUES ('personal-origin-v2')"
             )
         for service in SERVICES:
             is_assembly = service.id == "assembly"
@@ -546,6 +854,9 @@ class ServiceRegistry:
                 "DELETE FROM service_tasks WHERE service_id = ? "
                 f"AND source = 'catalog' AND name NOT IN ({placeholders})",
                 (service.id, *catalog_names),
+            )
+            ServiceRegistry._detach_unavailable_reminder_tasks(
+                connection, service.id
             )
             # Задачи, добавленные суперадмином, идут после задач каталога;
             # позиции уникальны и служат идентификатором кнопок.
@@ -722,7 +1033,7 @@ class ServiceRegistry:
             new_ids_by_schedule: dict[tuple[str, int, str], int] = {}
             for row in connection.execute(
                 "SELECT id, service_id, reminder_days, reminder_time "
-                "FROM group_reminders ORDER BY id"
+                "FROM group_reminders WHERE task IS NULL ORDER BY id"
             ):
                 schedule_key = (
                     row["service_id"],
@@ -833,7 +1144,9 @@ class ServiceRegistry:
         return connection
 
     @contextmanager
-    def _connection(self):
+    def _connection(self, *, notify: bool = True):
+        """notify=False — запись, от которой не зависят задачи планировщика
+        (голоса в опросе): без резервной копии и пересборки задач."""
         connection = self._connect()
         changed = False
         try:
@@ -842,20 +1155,21 @@ class ServiceRegistry:
             changed = connection.total_changes > 0
         finally:
             connection.close()
-        if changed and self.on_change is not None:
+        if notify and changed and self.on_change is not None:
             self.on_change()
 
     def list_services(self) -> list[dict]:
         with self._connection() as connection:
             rows = connection.execute(
                 "SELECT id, name, aliases_json, assignment_layout, "
-                "group_chat_id, enabled, reminder_days, reminder_time, "
-                "group_template, personal_templates_json "
+                "group_chat_id, group_thread_id, enabled, reminder_days, "
+                "reminder_time, group_template, personal_templates_json, "
+                "admin_report_template "
                 "FROM services WHERE archived = 0 ORDER BY id"
             ).fetchall()
             reminders = connection.execute(
                 "SELECT id, service_id, body, reminder_days, reminder_time, "
-                "enabled, created_at FROM group_reminders "
+                "enabled, created_at, task FROM group_reminders "
                 "ORDER BY service_id, reminder_days, reminder_time, id"
             ).fetchall()
         reminders_by_service: dict[str, list[dict]] = {}
@@ -869,6 +1183,7 @@ class ServiceRegistry:
                     "reminder_time": reminder["reminder_time"],
                     "enabled": bool(reminder["enabled"]),
                     "created_at": reminder["created_at"],
+                    "task": reminder["task"],
                 }
             )
         services = []
@@ -940,6 +1255,21 @@ class ServiceRegistry:
             for service in SERVICES
         )
 
+    @staticmethod
+    def _detach_unavailable_reminder_tasks(
+        connection: sqlite3.Connection, service_id: str
+    ) -> None:
+        """Напоминание задачи, которой больше нет (или она выключена),
+        выключается и становится общим: иначе оно не отправлялось бы, а
+        админ получал бы ⚠️ на каждую дату."""
+        connection.execute(
+            "UPDATE group_reminders SET task = NULL, enabled = 0 "
+            "WHERE service_id = ? AND task IS NOT NULL AND task NOT IN ("
+            "SELECT name FROM service_tasks WHERE service_id = ? "
+            "AND enabled = 1)",
+            (service_id, service_id),
+        )
+
     def set_service_task_enabled(
         self, actor_id: int, service_id: str, task: str, enabled: bool
     ) -> None:
@@ -956,6 +1286,7 @@ class ServiceRegistry:
             )
             if cursor.rowcount == 0:
                 raise ValueError(f"Задача «{task}» не найдена.")
+            self._detach_unavailable_reminder_tasks(connection, service_id)
             self._audit(
                 connection, actor_id, "service_task_updated", service_id,
                 {"task": task, "enabled": enabled},
@@ -1093,13 +1424,61 @@ class ServiceRegistry:
         with self._connection() as connection:
             self._require_super_admin(connection, actor_id)
             self._require_service(connection, service_id)
+            # Новый чат — тема прежнего чата к нему не относится.
             connection.execute(
-                "UPDATE services SET group_chat_id = ?, enabled = ? WHERE id = ?",
-                (group_chat_id, int(enabled), service_id),
+                "UPDATE services SET group_thread_id = CASE "
+                "WHEN group_chat_id IS ? THEN group_thread_id ELSE NULL END, "
+                "group_chat_id = ?, enabled = ? WHERE id = ?",
+                (group_chat_id, group_chat_id, int(enabled), service_id),
             )
             self._audit(
                 connection, actor_id, "service_chat_updated", service_id,
                 {"group_chat_id": group_chat_id, "enabled": enabled},
+            )
+
+    def set_group_thread(
+        self,
+        actor_id: int,
+        service_id: str,
+        group_chat_id: int,
+        thread_id: int | None,
+    ) -> None:
+        """Тема чата служения для напоминаний (команда /here в теме).
+
+        Задать может суперадмин или админ служения и только в чате,
+        привязанном к служению; thread_id None — общая тема.
+        """
+        _validate_positive_id(actor_id, "actor_id")
+        if thread_id is not None:
+            _validate_positive_id(thread_id, "thread_id")
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            self._require_service_editor(connection, actor_id, service_id)
+            current = connection.execute(
+                "SELECT group_chat_id FROM services WHERE id = ?",
+                (service_id,),
+            ).fetchone()
+            if current["group_chat_id"] != group_chat_id:
+                raise ValueError(
+                    "Этот чат не привязан к служению. Сначала выберите его "
+                    "в карточке служения."
+                )
+            connection.execute(
+                "UPDATE services SET group_thread_id = ? WHERE id = ?",
+                (thread_id, service_id),
+            )
+            self._audit(
+                connection, actor_id, "service_thread_updated", service_id,
+                {"group_chat_id": group_chat_id, "thread_id": thread_id},
+            )
+
+    def reset_group_thread(self, service_id: str, thread_id: int) -> None:
+        """Системный сброс темы, которой больше нет в чате (тема удалена)."""
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE services SET group_thread_id = NULL "
+                "WHERE id = ? AND group_thread_id = ?",
+                (service_id, thread_id),
             )
 
     def set_service_enabled(
@@ -1128,7 +1507,7 @@ class ServiceRegistry:
             self._require_service(connection, service_id)
             rows = connection.execute(
                 "SELECT id, service_id, body, reminder_days, reminder_time, "
-                "enabled, created_at FROM group_reminders "
+                "enabled, created_at, task FROM group_reminders "
                 "WHERE service_id = ? "
                 "ORDER BY reminder_days, reminder_time, id",
                 (service_id,),
@@ -1164,7 +1543,7 @@ class ServiceRegistry:
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT id, service_id, body, reminder_days, reminder_time, "
-                "enabled, created_at FROM group_reminders WHERE id = ?",
+                "enabled, created_at, task FROM group_reminders WHERE id = ?",
                 (reminder_id,),
             ).fetchone()
         return (
@@ -1260,8 +1639,11 @@ class ServiceRegistry:
             new_time = row["reminder_time"] if time is None else time
             new_body = row["body"] if body is _UNSET else body
             new_enabled = bool(row["enabled"]) if enabled is None else enabled
+            # Поля текста проверяются, только когда текст меняют: старый
+            # текст не должен мешать выключить или перенести напоминание.
             self._validate_group_reminder_values(
-                new_days, new_time, new_body
+                new_days, new_time,
+                new_body if body is not _UNSET else None, row["task"],
             )
             if not isinstance(new_enabled, bool):
                 raise ValueError("enabled должен быть логическим значением")
@@ -1279,6 +1661,7 @@ class ServiceRegistry:
                     new_time,
                     allow_duplicate,
                     excluding_id=reminder_id,
+                    task=row["task"],
                 )
             elif new_enabled and not row["enabled"]:
                 self._ensure_group_schedule_unique(
@@ -1289,6 +1672,19 @@ class ServiceRegistry:
                     allow_duplicate,
                     excluding_id=reminder_id,
                     enabled_only=True,
+                    task=row["task"],
+                )
+            if slot_changed:
+                # Новый срок или время — новая отправка: отметки доставки
+                # на предстоящие даты сбрасываются, иначе напоминание,
+                # уже ушедшее на это воскресенье, молча не сработает.
+                # Только групповое сообщение: предупреждения админу о
+                # графике не повторяются. День запаса — на часовой пояс.
+                connection.execute(
+                    "DELETE FROM group_reminder_deliveries "
+                    "WHERE reminder_id = ? AND event_date >= ? "
+                    "AND recipient_key LIKE 'group:%'",
+                    (reminder_id, (date.today() - timedelta(days=1)).isoformat()),
                 )
             connection.execute(
                 "UPDATE group_reminders SET body = ?, reminder_days = ?, "
@@ -1385,7 +1781,7 @@ class ServiceRegistry:
                 raise stale
             if source_id is not None:
                 source = connection.execute(
-                    "SELECT service_id, reminder_days, reminder_time "
+                    "SELECT service_id, reminder_days, reminder_time, task "
                     "FROM group_reminders WHERE id = ?",
                     (source_id,),
                 ).fetchone()
@@ -1396,11 +1792,14 @@ class ServiceRegistry:
                 if (
                     (source["reminder_days"], source["reminder_time"])
                     != tuple(source_slot)
+                    # Напоминания разных задач не объединяются.
+                    or source["task"] != target["task"]
                 ):
                     raise stale
             new_body = target["body"] if body is _UNSET else body
             self._validate_group_reminder_values(
-                target["reminder_days"], target["reminder_time"], new_body
+                target["reminder_days"], target["reminder_time"],
+                new_body if body is not _UNSET else None, target["task"],
             )
             connection.execute(
                 "UPDATE group_reminders SET body = ? WHERE id = ?",
@@ -1435,7 +1834,572 @@ class ServiceRegistry:
     def resolve_group_text(self, reminder: dict, service: dict) -> str:
         if reminder.get("body") is not None:
             return reminder["body"]
+        if reminder.get("task"):
+            return DEFAULT_TASK_TEMPLATE
         return service.get("group_template") or DEFAULT_GROUP_TEMPLATE
+
+    def set_admin_report_template(
+        self, actor_id: int, service_id: str, template: str | None
+    ) -> None:
+        """Шаблон отчёта админам служения; None — встроенный."""
+        _validate_positive_id(actor_id, "actor_id")
+        if template is not None:
+            if not isinstance(template, str) or not template.strip():
+                raise ValueError("Шаблон отчёта не может быть пустым")
+            validate_notification_template(
+                template, ADMIN_REPORT_FIELDS, "Шаблон отчёта админам"
+            )
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            self._require_service_editor(connection, actor_id, service_id)
+            connection.execute(
+                "UPDATE services SET admin_report_template = ? WHERE id = ?",
+                (template.strip() if template else None, service_id),
+            )
+            self._audit(
+                connection, actor_id, "admin_report_template_updated",
+                service_id, {"has_custom_template": template is not None},
+            )
+
+    def linked_task_by_token(
+        self, service_id: str, telegram_id: int, token: str
+    ) -> str | None:
+        """Задача служения с этим task_token, к которой привязан человек."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT task FROM responsible_contacts "
+                "WHERE service_id = ? AND telegram_id = ?",
+                (service_id, telegram_id),
+            ).fetchall()
+        return next(
+            (row["task"] for row in rows if task_token(row["task"]) == token),
+            None,
+        )
+
+    def set_confirmation(
+        self,
+        service_id: str,
+        event_date: str,
+        task: str,
+        telegram_id: int,
+        status: str,
+        name: str | None = None,
+    ) -> tuple[str, bool]:
+        """Ответ человека на личное напоминание: (имя, ответ изменился).
+
+        Ответить может только привязанный к задаче пользователь. name —
+        имя в графике на эту дату (у заменяющего может отличаться от
+        имени контакта); по умолчанию — имя контакта.
+        """
+        _validate_positive_id(telegram_id, "telegram_id")
+        if status not in {"confirmed", "declined"}:
+            raise ValueError("Некорректный ответ")
+        date.fromisoformat(event_date)
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            contact = connection.execute(
+                "SELECT name FROM responsible_contacts "
+                "WHERE service_id = ? AND task = ? AND telegram_id = ?",
+                (service_id, task, telegram_id),
+            ).fetchone()
+            if contact is None:
+                raise PermissionError("Вы не привязаны к этой задаче.")
+            cursor = connection.execute(
+                """
+                INSERT INTO service_confirmations (
+                    service_id, event_date, task, telegram_id, name, status,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(service_id, event_date, task, telegram_id)
+                DO UPDATE SET status = excluded.status,
+                              name = excluded.name,
+                              updated_at = excluded.updated_at
+                WHERE service_confirmations.status != excluded.status
+                """,
+                (
+                    service_id, event_date, task, telegram_id,
+                    name or contact["name"], status, _utc_now(),
+                ),
+            )
+        return name or contact["name"], cursor.rowcount > 0
+
+    def get_confirmation(
+        self, service_id: str, event_date: str, task: str, telegram_id: int
+    ) -> str | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT status FROM service_confirmations "
+                "WHERE service_id = ? AND event_date = ? AND task = ? "
+                "AND telegram_id = ?",
+                (service_id, event_date, task, telegram_id),
+            ).fetchone()
+        return row["status"] if row else None
+
+    def list_confirmations(
+        self, service_id: str, event_date: str
+    ) -> dict[tuple[str, str], str]:
+        """{(задача, Telegram ID): status} на дату события."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT task, telegram_id, status FROM service_confirmations "
+                "WHERE service_id = ? AND event_date = ?",
+                (service_id, event_date),
+            ).fetchall()
+        return {
+            (row["task"], row["telegram_id"]): row["status"] for row in rows
+        }
+
+    def save_admin_report(
+        self,
+        service_id: str,
+        event_date: str,
+        admin_id: int,
+        message_id: int,
+        assignments: dict,
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO admin_report_messages (
+                    service_id, event_date, admin_id, message_id,
+                    assignments_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(service_id, event_date, admin_id) DO UPDATE SET
+                    message_id = excluded.message_id,
+                    assignments_json = excluded.assignments_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    service_id, event_date, admin_id, message_id,
+                    json.dumps(assignments, ensure_ascii=False, sort_keys=True),
+                    _utc_now(),
+                ),
+            )
+
+    def delete_admin_report(
+        self, service_id: str, event_date: str, admin_id: int
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "DELETE FROM admin_report_messages WHERE service_id = ? "
+                "AND event_date = ? AND admin_id = ?",
+                (service_id, event_date, admin_id),
+            )
+
+    def list_admin_reports(self, service_id: str, event_date: str) -> list[dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT admin_id, message_id, assignments_json "
+                "FROM admin_report_messages "
+                "WHERE service_id = ? AND event_date = ? ORDER BY admin_id",
+                (service_id, event_date),
+            ).fetchall()
+        return [
+            {
+                "admin_id": row["admin_id"],
+                "message_id": row["message_id"],
+                "assignments": json.loads(row["assignments_json"]),
+            }
+            for row in rows
+        ]
+
+    # --- Замена ответственного (этап 3.3) ---
+
+    @staticmethod
+    def _poll_row(row) -> dict | None:
+        return dict(row) if row is not None else None
+
+    def create_replacement_poll(
+        self,
+        poll_id: str,
+        service_id: str,
+        event_date: str,
+        task: str,
+        old_name: str,
+        old_telegram_id: int | None,
+        chat_id: int,
+        message_id: int,
+        notice_message_id: int | None,
+        deadline: str,
+        status: str = "open",
+    ) -> None:
+        """status="closed" — запрос без опроса (нет чата служения или опрос
+        не отправился): ждёт /change."""
+        date.fromisoformat(event_date)
+        datetime.fromisoformat(deadline)
+        if status not in {"open", "closed"}:
+            raise ValueError("Некорректное состояние опроса")
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            connection.execute(
+                """
+                INSERT INTO replacement_polls (
+                    poll_id, service_id, event_date, task, old_name,
+                    old_telegram_id, chat_id, message_id, notice_message_id,
+                    deadline, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    poll_id, service_id, event_date, task, old_name,
+                    old_telegram_id, chat_id, message_id, notice_message_id,
+                    deadline, status, _utc_now(),
+                ),
+            )
+
+    def get_replacement_poll(self, poll_id: str) -> dict | None:
+        with self._connection() as connection:
+            return self._poll_row(connection.execute(
+                "SELECT * FROM replacement_polls WHERE poll_id = ?",
+                (poll_id,),
+            ).fetchone())
+
+    def find_active_replacement_request(
+        self, service_id: str, event_date: str, task: str, old_name: str
+    ) -> dict | None:
+        """Невыполненный запрос замены: идёт опрос или ждёт /change."""
+        with self._connection() as connection:
+            return self._poll_row(connection.execute(
+                "SELECT * FROM replacement_polls WHERE service_id = ? "
+                "AND event_date = ? AND task = ? AND old_name = ? "
+                "AND filled = 0",
+                (service_id, event_date, task, old_name),
+            ).fetchone())
+
+    def replacement_poll_by_message(
+        self, chat_id: int, message_id: int
+    ) -> dict | None:
+        """Опрос по сообщению опроса или по объявлению перед ним."""
+        with self._connection() as connection:
+            return self._poll_row(connection.execute(
+                "SELECT * FROM replacement_polls WHERE chat_id = ? "
+                "AND (message_id = ? OR notice_message_id = ?) "
+                "ORDER BY created_at DESC LIMIT 1",
+                (chat_id, message_id, message_id),
+            ).fetchone())
+
+    def list_unfilled_replacement_requests(self, since: str) -> list[dict]:
+        """Запросы без назначенной замены на даты с since — для /change."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM replacement_polls WHERE filled = 0 "
+                "AND event_date >= ? ORDER BY event_date, created_at",
+                (since,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def claim_replacement_request(self, poll_id: str) -> bool:
+        """Отмечает запрос выполненным; False — замену уже назначили."""
+        with self._connection(notify=False) as connection:
+            cursor = connection.execute(
+                "UPDATE replacement_polls SET filled = 1, status = 'closed' "
+                "WHERE poll_id = ? AND filled = 0",
+                (poll_id,),
+            )
+        return cursor.rowcount > 0
+
+    def release_replacement_request(self, poll_id: str) -> None:
+        """Назначение не удалось — запрос снова ждёт /change."""
+        with self._connection(notify=False) as connection:
+            connection.execute(
+                "UPDATE replacement_polls SET filled = 0 WHERE poll_id = ?",
+                (poll_id,),
+            )
+
+    def list_open_replacement_polls(self) -> list[dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM replacement_polls WHERE status = 'open' "
+                "ORDER BY deadline, poll_id"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def close_replacement_poll(self, poll_id: str) -> bool:
+        """True — опрос закрыт этим вызовом (защита от двойного итога)."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE replacement_polls SET status = 'closed' "
+                "WHERE poll_id = ? AND status = 'open'",
+                (poll_id,),
+            )
+        return cursor.rowcount > 0
+
+    def record_poll_answer(
+        self,
+        poll_id: str,
+        telegram_id: int,
+        username: str,
+        full_name: str,
+        can: bool | None,
+    ) -> bool:
+        """Ответ в опросе; can=None — голос отозван. False — опрос закрыт."""
+        _validate_positive_id(telegram_id, "telegram_id")
+        with self._connection(notify=False) as connection:
+            poll = connection.execute(
+                "SELECT status FROM replacement_polls WHERE poll_id = ?",
+                (poll_id,),
+            ).fetchone()
+            if poll is None or poll["status"] != "open":
+                return False
+            if can is None:
+                connection.execute(
+                    "DELETE FROM replacement_poll_answers "
+                    "WHERE poll_id = ? AND telegram_id = ?",
+                    (poll_id, telegram_id),
+                )
+                return True
+            connection.execute(
+                """
+                INSERT INTO replacement_poll_answers (
+                    poll_id, telegram_id, username, full_name, can,
+                    answered_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(poll_id, telegram_id) DO UPDATE SET
+                    username = excluded.username,
+                    full_name = excluded.full_name,
+                    can = excluded.can,
+                    answered_at = excluded.answered_at
+                """,
+                (
+                    poll_id, telegram_id, (username or "").lstrip("@"),
+                    full_name or "", int(bool(can)), _utc_now(),
+                ),
+            )
+        return True
+
+    def list_poll_answers(self, poll_id: str) -> list[dict]:
+        """Ответы в порядке времени: первый «Могу» — первый в списке."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT telegram_id, username, full_name, can, answered_at "
+                "FROM replacement_poll_answers WHERE poll_id = ? "
+                "ORDER BY answered_at, rowid",
+                (poll_id,),
+            ).fetchall()
+        return [
+            {**dict(row), "can": bool(row["can"])} for row in rows
+        ]
+
+    def task_member_ids(self, service_id: str, task: str) -> set[int]:
+        """Telegram ID людей с этой задачей: «Списки» и привязки задачи."""
+        with self._connection() as connection:
+            members = connection.execute(
+                "SELECT telegram_id, tasks_json FROM service_members "
+                "WHERE service_id = ? AND telegram_id IS NOT NULL",
+                (service_id,),
+            ).fetchall()
+            contacts = connection.execute(
+                "SELECT telegram_id FROM responsible_contacts "
+                "WHERE service_id = ? AND task = ?",
+                (service_id, task),
+            ).fetchall()
+        ids = {
+            row["telegram_id"] for row in members
+            if task in json.loads(row["tasks_json"])
+        }
+        ids.update(row["telegram_id"] for row in contacts)
+        return ids
+
+    def service_person(
+        self, service_id: str, telegram_id: int, task: str | None = None
+    ) -> dict | None:
+        """Человек служения по Telegram ID: имя привязки к задаче, иначе из
+        состава, иначе из любой привязки."""
+        with self._connection() as connection:
+            row = (task is not None and connection.execute(
+                "SELECT name, telegram_id, username FROM responsible_contacts "
+                "WHERE service_id = ? AND task = ? AND telegram_id = ?",
+                (service_id, task, telegram_id),
+            ).fetchone()) or connection.execute(
+                "SELECT name, telegram_id, username FROM service_members "
+                "WHERE service_id = ? AND telegram_id = ? "
+                "ORDER BY in_list DESC, rowid LIMIT 1",
+                (service_id, telegram_id),
+            ).fetchone() or connection.execute(
+                "SELECT name, telegram_id, username FROM responsible_contacts "
+                "WHERE service_id = ? AND telegram_id = ? "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (service_id, telegram_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def find_service_person_by_username(
+        self, service_id: str, username: str
+    ) -> dict | None:
+        """@username в составе служения или его привязках (без учёта регистра)."""
+        username = (username or "").strip().lstrip("@").casefold()
+        if not username:
+            return None
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            row = connection.execute(
+                "SELECT name, telegram_id, username FROM service_members "
+                "WHERE service_id = ? AND telegram_id IS NOT NULL "
+                "AND lower(username) = ? ORDER BY in_list DESC, rowid LIMIT 1",
+                (service_id, username),
+            ).fetchone() or connection.execute(
+                "SELECT name, telegram_id, username FROM responsible_contacts "
+                "WHERE service_id = ? AND lower(username) = ? "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (service_id, username),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def set_replacement(
+        self,
+        service_id: str,
+        event_date: str,
+        task: str,
+        old_name: str,
+        new_name: str,
+        telegram_id: int | None,
+        username: str,
+        source: str,
+        created_by: int | None,
+        expect_current: bool = False,
+    ) -> bool:
+        """Замена на одну дату.
+
+        expect_current — заменённый ещё стоит в задаче (его не заменили,
+        пока админ выбирал); иначе возвращается False. Заменяющий из
+        состава служения (есть в составе или привязках) получает привязку к
+        задаче под этим именем — для упоминаний и личных напоминаний.
+        Участник чата не из состава указывается только по имени."""
+        date.fromisoformat(event_date)
+        if source not in {"poll", "admin"}:
+            raise ValueError("Некорректный источник замены")
+        if not new_name or not old_name or new_name == old_name:
+            raise ValueError("Некорректная замена")
+        if telegram_id is not None:
+            _validate_positive_id(telegram_id, "telegram_id")
+        username = (username or "").strip().lstrip("@")
+        now = _utc_now()
+        with self._connection() as connection:
+            # Проверка и запись — одной транзакцией: два подтверждения
+            # подряд не назначат замену дважды.
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_service(connection, service_id)
+            if expect_current:
+                rows = connection.execute(
+                    "SELECT task, old_name, new_name FROM service_replacements "
+                    "WHERE service_id = ? AND event_date = ? "
+                    "ORDER BY created_at, rowid",
+                    (service_id, event_date),
+                ).fetchall()
+                if is_replaced([dict(row) for row in rows], task, old_name):
+                    return False
+            connection.execute(
+                """
+                INSERT INTO service_replacements (
+                    service_id, event_date, task, old_name, new_name,
+                    telegram_id, username, source, created_by, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(service_id, event_date, task, old_name)
+                DO UPDATE SET new_name = excluded.new_name,
+                              telegram_id = excluded.telegram_id,
+                              username = excluded.username,
+                              source = excluded.source,
+                              created_by = excluded.created_by,
+                              created_at = excluded.created_at
+                """,
+                (
+                    service_id, event_date, task, old_name, new_name,
+                    telegram_id, username, source, created_by, now,
+                ),
+            )
+            known = telegram_id is not None and connection.execute(
+                "SELECT 1 FROM service_members WHERE service_id = ? "
+                "AND telegram_id = ? UNION SELECT 1 FROM responsible_contacts "
+                "WHERE service_id = ? AND telegram_id = ? LIMIT 1",
+                (service_id, telegram_id, service_id, telegram_id),
+            ).fetchone() is not None
+            if known:
+                actor = created_by or connection.execute(
+                    "SELECT telegram_id FROM super_admins "
+                    "ORDER BY created_at LIMIT 1"
+                ).fetchone()["telegram_id"]
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO responsible_contacts (
+                        service_id, task, name, telegram_id, username,
+                        updated_by, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        service_id, task, new_name, telegram_id, username,
+                        actor, now,
+                    ),
+                )
+        return True
+
+    def list_replacements(self, service_id: str, event_date: str) -> list[dict]:
+        """Замены на дату в порядке назначения (цепочки применяются по
+        очереди)."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT task, old_name, new_name, telegram_id, username, "
+                "source FROM service_replacements "
+                "WHERE service_id = ? AND event_date = ? "
+                "ORDER BY created_at, rowid",
+                (service_id, event_date),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def set_group_reminder_task(
+        self, actor_id: int, reminder_id: int, task: str | None
+    ) -> None:
+        """Задача напоминания: только её ответственные; None — все задачи."""
+        _validate_positive_id(actor_id, "actor_id")
+        _validate_positive_id(reminder_id, "reminder_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT service_id, task, enabled, reminder_days, reminder_time "
+                "FROM group_reminders WHERE id = ?",
+                (reminder_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("Групповое напоминание больше не существует.")
+            self._require_service_editor(connection, actor_id, row["service_id"])
+            if task is not None:
+                enabled_tasks = {
+                    item["name"]
+                    for item in connection.execute(
+                        "SELECT name FROM service_tasks "
+                        "WHERE service_id = ? AND enabled = 1",
+                        (row["service_id"],),
+                    )
+                }
+                if task not in enabled_tasks:
+                    raise ValueError(f"Задача «{task}» не из списка служения.")
+            if task is None:
+                body = connection.execute(
+                    "SELECT body FROM group_reminders WHERE id = ?",
+                    (reminder_id,),
+                ).fetchone()["body"]
+                if body is not None:
+                    self._validate_group_reminder_values(
+                        row["reminder_days"], row["reminder_time"], body
+                    )
+            if row["enabled"]:
+                # Иначе в один слот попали бы два включённых напоминания
+                # одной задачи (или два общих).
+                self._ensure_group_schedule_unique(
+                    connection,
+                    row["service_id"],
+                    row["reminder_days"],
+                    row["reminder_time"],
+                    False,
+                    excluding_id=reminder_id,
+                    enabled_only=True,
+                    task=task,
+                )
+            connection.execute(
+                "UPDATE group_reminders SET task = ? WHERE id = ?",
+                (task, reminder_id),
+            )
+            self._audit(
+                connection, actor_id, "group_reminder_task_updated",
+                row["service_id"], {"reminder_id": reminder_id, "task": task},
+            )
 
     def set_service_default_template(
         self, actor_id: int, service_id: str, template: str | None
@@ -1446,7 +2410,7 @@ class ServiceRegistry:
                 raise ValueError("Текст группового шаблона не может быть пустым")
             validate_notification_template(
                 template,
-                GROUP_TEMPLATE_FIELDS,
+                GENERAL_GROUP_TEMPLATE_FIELDS,
                 "Шаблон группового уведомления",
             )
             template = template.strip()
@@ -1490,7 +2454,7 @@ class ServiceRegistry:
 
     @staticmethod
     def _validate_group_reminder_values(
-        days: int, time: str, body: str | None
+        days: int, time: str, body: str | None, task: str | None = None
     ) -> None:
         if isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 6:
             raise ValueError("Число дней должно быть от 0 до 6.")
@@ -1503,7 +2467,7 @@ class ServiceRegistry:
                 raise ValueError("Текст группового напоминания не может быть пустым.")
             validate_notification_template(
                 body,
-                GROUP_TEMPLATE_FIELDS,
+                GROUP_TEMPLATE_FIELDS if task else GENERAL_GROUP_TEMPLATE_FIELDS,
                 "Текст группового напоминания",
             )
 
@@ -1517,12 +2481,14 @@ class ServiceRegistry:
         *,
         excluding_id: int | None = None,
         enabled_only: bool = False,
+        task: str | None = None,
     ) -> None:
+        # Напоминания разных задач в один слот не пересекаются (этап 3.1).
         query = (
             "SELECT 1 FROM group_reminders WHERE service_id = ? "
-            "AND reminder_days = ? AND reminder_time = ?"
+            "AND reminder_days = ? AND reminder_time = ? AND task IS ?"
         )
-        parameters: tuple = (service_id, days, time)
+        parameters: tuple = (service_id, days, time, task)
         if enabled_only:
             query += " AND enabled = 1"
         if excluding_id is not None:
@@ -1576,7 +2542,7 @@ class ServiceRegistry:
                 raise ValueError("Текст группового уведомления не может быть пустым")
             validate_notification_template(
                 group_template,
-                GROUP_TEMPLATE_FIELDS,
+                GENERAL_GROUP_TEMPLATE_FIELDS,
                 "Шаблон группового уведомления",
             )
         self._validate_personal_templates(personal_templates)
@@ -1626,7 +2592,7 @@ class ServiceRegistry:
             if normalized_reminders is None:
                 primary = connection.execute(
                     "SELECT id FROM group_reminders WHERE service_id = ? "
-                    "ORDER BY id LIMIT 1",
+                    "AND task IS NULL ORDER BY id LIMIT 1",
                     (service_id,),
                 ).fetchone()
                 if primary is None:
@@ -1667,11 +2633,12 @@ class ServiceRegistry:
         allow_duplicate: bool,
     ) -> None:
         existing_rows = connection.execute(
-            "SELECT id, reminder_days, reminder_time FROM group_reminders "
+            "SELECT id, reminder_days, reminder_time, task FROM group_reminders "
             "WHERE service_id = ?",
             (service_id,),
         ).fetchall()
         existing = {row["id"] for row in existing_rows}
+        task_by_id = {row["id"]: row["task"] for row in existing_rows}
         final_ids = {
             item["id"] for item in reminders if item["id"] is not None
         }
@@ -1680,7 +2647,11 @@ class ServiceRegistry:
         if not allow_duplicate:
             seen = set()
             for item in reminders:
-                key = (item["reminder_days"], item["reminder_time"])
+                key = (
+                    item["reminder_days"],
+                    item["reminder_time"],
+                    task_by_id.get(item["id"]),
+                )
                 if key in seen:
                     raise ValueError(
                         f"Уведомление за {key[0]} дн. в {key[1]} уже задано."
@@ -1804,7 +2775,7 @@ class ServiceRegistry:
                 }
             current = connection.execute(
                 "SELECT id, service_id, body, reminder_days, reminder_time, "
-                "enabled, created_at FROM group_reminders "
+                "enabled, created_at, task FROM group_reminders "
                 "WHERE id = ? AND service_id = ?",
                 (reminder_id, service_id),
             ).fetchone()
@@ -2011,6 +2982,11 @@ class ServiceRegistry:
         telegram_id: int,
         username: str = "",
     ) -> None:
+        """Привязывает Telegram к имени в задаче и ко всем задачам этого имени.
+
+        Привязка — к человеку: прежний Telegram ID этого имени в других
+        задачах заменяется, чтобы у человека не осталось двух ID.
+        """
         _validate_positive_id(actor_id, "actor_id")
         _validate_positive_id(telegram_id, "telegram_id")
         task = task.strip()
@@ -2020,53 +2996,319 @@ class ServiceRegistry:
         with self._connection() as connection:
             self._require_super_admin(connection, actor_id)
             self._require_service(connection, service_id)
-            connection.execute(
-                "DELETE FROM responsible_contacts "
-                "WHERE service_id = ? AND task = ? "
-                "AND (name = ? OR telegram_id = ?)",
-                (service_id, task, name, telegram_id),
-            )
+            other_tasks = [
+                row["task"]
+                for row in connection.execute(
+                    "SELECT DISTINCT task FROM responsible_contacts "
+                    "WHERE service_id = ? AND name = ? AND task != ?",
+                    (service_id, name, task),
+                )
+            ]
+            for contact_task in (task, *other_tasks):
+                self._write_contact(
+                    connection, actor_id, service_id, contact_task, name,
+                    telegram_id, username.strip().lstrip("@"),
+                )
             connection.execute(
                 """
-                INSERT INTO responsible_contacts (
+                INSERT INTO service_members (
+                    service_id, name, telegram_id, username, source,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, 'manual', ?)
+                ON CONFLICT(service_id, name) DO UPDATE SET
+                    telegram_id = excluded.telegram_id,
+                    username = excluded.username,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    service_id, name, telegram_id,
+                    username.strip().lstrip("@"), _utc_now(),
+                ),
+            )
+            self._cleanup_unbound_user_data(connection, service_id)
+            self._audit(
+                connection, actor_id, "responsible_contact_updated", service_id,
+                {"task": task, "name": name, "telegram_id": telegram_id},
+            )
+
+    @staticmethod
+    def _write_contact(
+        connection: sqlite3.Connection,
+        actor_id: int,
+        service_id: str,
+        task: str,
+        name: str,
+        telegram_id: int,
+        username: str,
+    ) -> None:
+        connection.execute(
+            "DELETE FROM responsible_contacts "
+            "WHERE service_id = ? AND task = ? "
+            "AND (name = ? OR telegram_id = ?)",
+            (service_id, task, name, telegram_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO responsible_contacts (
+                service_id, task, name, telegram_id, username,
+                updated_by, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                service_id, task, name, telegram_id, username, actor_id,
+                _utc_now(),
+            ),
+        )
+
+    @staticmethod
+    def _cleanup_unbound_user_data(
+        connection: sqlite3.Connection, service_id: str
+    ) -> None:
+        """Удаляет личные настройки задач, к которым пользователь не привязан."""
+        connection.execute(
+            """
+            DELETE FROM user_notification_prefs
+            WHERE service_id = ? AND NOT EXISTS (
+                SELECT 1 FROM responsible_contacts
+                WHERE responsible_contacts.service_id = ?
+                  AND responsible_contacts.telegram_id =
+                          user_notification_prefs.actor_id
+            )
+            """,
+            (service_id, service_id),
+        )
+        connection.execute(
+            """
+            DELETE FROM user_reminder_texts
+            WHERE service_id = ? AND NOT EXISTS (
+                SELECT 1 FROM responsible_contacts
+                WHERE responsible_contacts.service_id =
+                          user_reminder_texts.service_id
+                  AND responsible_contacts.task = user_reminder_texts.task
+                  AND responsible_contacts.telegram_id =
+                          user_reminder_texts.actor_id
+            )
+            """,
+            (service_id,),
+        )
+
+    def list_service_members(self, service_id: str) -> list[dict]:
+        """Состав служения: сначала люди из «Списков», затем остальные."""
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            rows = connection.execute(
+                "SELECT name, telegram_id, username, tasks_json, in_list, "
+                "source FROM service_members WHERE service_id = ? "
+                "ORDER BY in_list DESC, rowid",
+                (service_id,),
+            ).fetchall()
+        return [
+            {
+                "name": row["name"],
+                "telegram_id": row["telegram_id"],
+                "username": row["username"],
+                "tasks": json.loads(row["tasks_json"]),
+                "in_list": bool(row["in_list"]),
+                "source": row["source"],
+            }
+            for row in rows
+        ]
+
+    def sync_service_rosters(self, rosters) -> None:
+        """Переносит состав служений с листа «Списки» (системная операция).
+
+        rosters — {service_id: [RosterMember]}. Из файла берутся только
+        имена и задачи; Telegram ID и username задаются только в боте. Люди,
+        которых больше нет в «Списках», остаются с отметкой «нет в списке».
+        """
+        now = _utc_now()
+        with self._connection() as connection:
+            active = {
+                row["id"]
+                for row in connection.execute(
+                    "SELECT id FROM services WHERE archived = 0"
+                )
+            }
+            for service_id, members in rosters.items():
+                if service_id not in active:
+                    continue
+                names = [member.name for member in members]
+                for member in members:
+                    connection.execute(
+                        """
+                        INSERT INTO service_members (
+                            service_id, name, tasks_json, in_list, source,
+                            updated_at
+                        ) VALUES (?, ?, ?, 1, 'excel', ?)
+                        ON CONFLICT(service_id, name) DO UPDATE SET
+                            tasks_json = excluded.tasks_json,
+                            in_list = 1
+                        -- Без изменений строка не пишется: запись считается
+                        -- изменением данных (бэкап, обновление задач).
+                        WHERE service_members.tasks_json
+                                  IS NOT excluded.tasks_json
+                           OR service_members.in_list = 0
+                        """,
+                        (
+                            service_id,
+                            member.name,
+                            json.dumps(list(member.tasks), ensure_ascii=False),
+                            now,
+                        ),
+                    )
+                placeholders = ", ".join("?" for _ in names) or "''"
+                connection.execute(
+                    "UPDATE service_members SET in_list = 0 "
+                    "WHERE service_id = ? AND in_list = 1 "
+                    f"AND name NOT IN ({placeholders})",
+                    (service_id, *names),
+                )
+                for member in members:
+                    self._ensure_member_task_contacts(
+                        connection, service_id, member.name, member.tasks
+                    )
+
+    def bind_service_member(
+        self,
+        actor_id: int,
+        service_id: str,
+        name: str,
+        telegram_id: int,
+        username: str = "",
+        tasks=(),
+    ) -> None:
+        """Привязывает Telegram к человеку служения во всех его задачах.
+
+        Задачи — из «Списков», из прежних привязок этого имени и tasks
+        (например, задачи из графика). Человек не из состава добавляется.
+        """
+        _validate_positive_id(actor_id, "actor_id")
+        _validate_positive_id(telegram_id, "telegram_id")
+        # Имя как в графике и «Списках» (без схлопывания пробелов), иначе
+        # привязка не совпала бы с записью графика.
+        name = name.strip() if isinstance(name, str) else ""
+        if not name or "\x00" in name:
+            raise ValueError("Имя участника обязательно.")
+        username = username.strip().lstrip("@")
+        with self._connection() as connection:
+            self._require_super_admin(connection, actor_id)
+            self._require_service(connection, service_id)
+            member = connection.execute(
+                "SELECT tasks_json FROM service_members "
+                "WHERE service_id = ? AND name = ?",
+                (service_id, name),
+            ).fetchone()
+            now = _utc_now()
+            if member is None:
+                connection.execute(
+                    "INSERT INTO service_members (service_id, name, "
+                    "telegram_id, username, source, updated_at) "
+                    "VALUES (?, ?, ?, ?, 'manual', ?)",
+                    (service_id, name, telegram_id, username, now),
+                )
+                roster_tasks = []
+            else:
+                connection.execute(
+                    "UPDATE service_members SET telegram_id = ?, "
+                    "username = ?, updated_at = ? "
+                    "WHERE service_id = ? AND name = ?",
+                    (telegram_id, username, now, service_id, name),
+                )
+                roster_tasks = json.loads(member["tasks_json"])
+            bound_tasks = [
+                row["task"]
+                for row in connection.execute(
+                    "SELECT DISTINCT task FROM responsible_contacts "
+                    "WHERE service_id = ? AND name = ?",
+                    (service_id, name),
+                )
+            ]
+            all_tasks = list(dict.fromkeys([*roster_tasks, *bound_tasks, *tasks]))
+            for task in all_tasks:
+                self._write_contact(
+                    connection, actor_id, service_id, task, name,
+                    telegram_id, username,
+                )
+            self._cleanup_unbound_user_data(connection, service_id)
+            self._audit(
+                connection, actor_id, "service_member_bound", service_id,
+                {"name": name, "telegram_id": telegram_id, "tasks": all_tasks},
+            )
+
+    def ensure_member_contacts(self, service_id: str, assignments) -> None:
+        """Создаёт привязки «задача + имя» для привязанных людей служения.
+
+        assignments — {задача: [имена] | {"names": [...]}} из графика. Новая
+        задача человека в графике сразу считается привязанной. Чужие
+        привязки (то же имя у другого Telegram ID) не меняются.
+        """
+        with self._connection() as connection:
+            for task, info in assignments.items():
+                if isinstance(info, dict):
+                    if info.get("is_informational"):
+                        continue
+                    names = info.get("names", [])
+                else:
+                    names = info
+                for name in names:
+                    self._ensure_member_task_contacts(
+                        connection, service_id, name, (task,),
+                        scheduled_names=names,
+                    )
+
+    @staticmethod
+    def _ensure_member_task_contacts(
+        connection: sqlite3.Connection,
+        service_id: str,
+        name: str,
+        tasks,
+        scheduled_names=None,
+    ) -> None:
+        """scheduled_names — имена задачи в графике. Привязка этого Telegram
+        под другим именем, которого в графике задачи уже нет (человека
+        переименовали), переходит на имя из графика.
+        """
+        member = connection.execute(
+            "SELECT telegram_id, username FROM service_members "
+            "WHERE service_id = ? AND name = ? AND telegram_id IS NOT NULL",
+            (service_id, name),
+        ).fetchone()
+        if member is None:
+            return
+        actor = connection.execute(
+            "SELECT telegram_id FROM super_admins ORDER BY created_at LIMIT 1"
+        ).fetchone()
+        for task in tasks:
+            if scheduled_names is not None:
+                # Переименование подтверждают «Списки»: новое имя в списке,
+                # старого там нет. Иначе (варианты написания, разные даты)
+                # привязка не переходит между именами.
+                connection.execute(
+                    "UPDATE OR IGNORE responsible_contacts SET name = ? "
+                    "WHERE service_id = ? AND task = ? AND telegram_id = ? "
+                    f"AND name NOT IN ({', '.join('?' for _ in scheduled_names)}) "
+                    "AND name NOT IN (SELECT name FROM service_members "
+                    "WHERE service_id = ? AND in_list = 1) "
+                    "AND EXISTS (SELECT 1 FROM service_members "
+                    "WHERE service_id = ? AND name = ? AND in_list = 1)",
+                    (
+                        name, service_id, task, member["telegram_id"],
+                        *scheduled_names, service_id, service_id, name,
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO responsible_contacts (
                     service_id, task, name, telegram_id, username,
                     updated_by, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    service_id, task, name, telegram_id,
-                    username.strip().lstrip("@"), actor_id, _utc_now(),
+                    service_id, task, name, member["telegram_id"],
+                    member["username"],
+                    actor["telegram_id"] if actor else member["telegram_id"],
+                    _utc_now(),
                 ),
-            )
-            connection.execute(
-                """
-                DELETE FROM user_notification_prefs
-                WHERE service_id = ? AND NOT EXISTS (
-                    SELECT 1 FROM responsible_contacts
-                    WHERE responsible_contacts.service_id = ?
-                      AND responsible_contacts.telegram_id =
-                              user_notification_prefs.actor_id
-                )
-                """,
-                (service_id, service_id),
-            )
-            connection.execute(
-                """
-                DELETE FROM user_reminder_texts
-                WHERE service_id = ? AND NOT EXISTS (
-                    SELECT 1 FROM responsible_contacts
-                    WHERE responsible_contacts.service_id =
-                              user_reminder_texts.service_id
-                      AND responsible_contacts.task = user_reminder_texts.task
-                      AND responsible_contacts.telegram_id =
-                              user_reminder_texts.actor_id
-                )
-                """,
-                (service_id,),
-            )
-            self._audit(
-                connection, actor_id, "responsible_contact_updated", service_id,
-                {"task": task, "name": name, "telegram_id": telegram_id},
             )
 
     def get_user_notifications_enabled(
@@ -2415,38 +3657,135 @@ class ServiceRegistry:
                 (actor_id, service_id, task.strip()),
             )
 
+    _SCHEDULE_COLUMNS = (
+        "id, text_id, reminder_days, reminder_time, enabled, origin, body"
+    )
+
     def list_schedules(self, text_id: int) -> list[dict]:
         _validate_positive_id(text_id, "text_id")
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT id, text_id, reminder_days, reminder_time, enabled "
+                f"SELECT {self._SCHEDULE_COLUMNS} "
                 "FROM user_reminder_schedules WHERE text_id = ? ORDER BY id",
                 (text_id,),
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def add_schedule(self, text_id: int, days: int, time: str) -> dict:
+    def list_user_service_schedules(
+        self, actor_id: int, service_id: str
+    ) -> list[dict]:
+        """Все личные напоминания человека в служении (с задачей)."""
+        _validate_positive_id(actor_id, "actor_id")
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT s.id, s.text_id, s.reminder_days, s.reminder_time, "
+                "s.enabled, s.origin, s.body, t.task "
+                "FROM user_reminder_schedules s "
+                "JOIN user_reminder_texts t ON t.id = s.text_id "
+                "WHERE t.actor_id = ? AND t.service_id = ? "
+                "ORDER BY t.task, s.origin, s.reminder_days DESC, "
+                "s.reminder_time, s.id",
+                (actor_id, service_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def add_schedule(
+        self,
+        text_id: int,
+        days: int,
+        time: str,
+        *,
+        origin: str = "admin",
+        body: str | None = None,
+        enabled: bool = True,
+    ) -> dict:
         _validate_positive_id(text_id, "text_id")
         self._validate_user_schedule(days, time)
+        if origin not in {"admin", "user"}:
+            raise ValueError("Некорректный вид напоминания")
+        body = self._validated_user_body(body)
         with self._connection() as connection:
-            exists = connection.execute(
-                "SELECT 1 FROM user_reminder_texts WHERE id = ?",
+            text = connection.execute(
+                "SELECT actor_id, service_id FROM user_reminder_texts "
+                "WHERE id = ?",
                 (text_id,),
             ).fetchone()
-            if exists is None:
+            if text is None:
                 raise ValueError("Текст личного уведомления не найден")
+            if origin == "user":
+                self._ensure_user_schedule_limit(
+                    connection, text["actor_id"], text["service_id"]
+                )
+            if enabled:
+                self._ensure_unique_enabled_rule(connection, text_id, days, time)
             cursor = connection.execute(
                 "INSERT INTO user_reminder_schedules "
-                "(text_id, reminder_days, reminder_time) VALUES (?, ?, ?)",
-                (text_id, days, time),
+                "(text_id, reminder_days, reminder_time, enabled, origin, body) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (text_id, days, time, int(enabled), origin, body),
             )
             schedule_id = cursor.lastrowid
             row = connection.execute(
-                "SELECT id, text_id, reminder_days, reminder_time, enabled "
+                f"SELECT {self._SCHEDULE_COLUMNS} "
                 "FROM user_reminder_schedules WHERE id = ?",
                 (schedule_id,),
             ).fetchone()
         return dict(row)
+
+    @staticmethod
+    def _validated_user_body(body: str | None) -> str | None:
+        if body is None:
+            return None
+        if not isinstance(body, str) or not body.strip():
+            raise ValueError("Текст уведомления не может быть пустым")
+        if len(body.encode("utf-16-le")) // 2 > USER_REMINDER_BODY_LIMIT:
+            # Запас под заголовок и подставленные поля: иначе сообщение не
+            # уйдёт из-за лимита Telegram.
+            raise ValueError(
+                f"Текст напоминания — не длиннее {USER_REMINDER_BODY_LIMIT} "
+                "символов."
+            )
+        validate_notification_template(
+            body, PERSONAL_TEMPLATE_FIELDS, "Текст личного напоминания"
+        )
+        return body.strip()
+
+    @staticmethod
+    def _ensure_unique_enabled_rule(
+        connection: sqlite3.Connection, text_id: int, days: int, time: str,
+        excluding_id: int | None = None,
+    ) -> None:
+        """Два включённых напоминания задачи на одно время — два одинаковых
+        сообщения; такое не сохраняется."""
+        duplicate = connection.execute(
+            "SELECT 1 FROM user_reminder_schedules WHERE text_id = ? "
+            "AND reminder_days = ? AND reminder_time = ? AND enabled = 1 "
+            "AND id IS NOT ?",
+            (text_id, days, time, excluding_id),
+        ).fetchone()
+        if duplicate is not None:
+            raise ValueError(
+                "На это время у задачи уже есть включённое напоминание. "
+                "Выберите другое время."
+            )
+
+    @staticmethod
+    def _ensure_user_schedule_limit(
+        connection: sqlite3.Connection, actor_id: int, service_id: str
+    ) -> None:
+        # Считаются свои напоминания: напоминания админа бот создаёт сам
+        # (по одному на задачу).
+        count = connection.execute(
+            "SELECT COUNT(*) FROM user_reminder_schedules s "
+            "JOIN user_reminder_texts t ON t.id = s.text_id "
+            "WHERE t.actor_id = ? AND t.service_id = ? AND s.origin = 'user'",
+            (actor_id, service_id),
+        ).fetchone()[0]
+        if count >= USER_REMINDERS_PER_SERVICE:
+            raise ValueError(
+                f"В одном служении можно не больше "
+                f"{USER_REMINDERS_PER_SERVICE} личных напоминаний."
+            )
 
     def update_schedule(
         self,
@@ -2454,11 +3793,15 @@ class ServiceRegistry:
         days: int | None = None,
         time: str | None = None,
         enabled: bool | None = None,
+        body=_UNSET,
     ) -> None:
+        """body — свой текст напоминания (None — текст админа)."""
         _validate_positive_id(schedule_id, "schedule_id")
+        if body is not _UNSET:
+            body = self._validated_user_body(body)
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT reminder_days, reminder_time, enabled "
+                "SELECT text_id, reminder_days, reminder_time, enabled, body "
                 "FROM user_reminder_schedules WHERE id = ?",
                 (schedule_id,),
             ).fetchone()
@@ -2472,6 +3815,15 @@ class ServiceRegistry:
                 bool(row["enabled"]) if enabled is None else enabled
             )
             self._validate_user_schedule(new_days, new_time)
+            if new_enabled and (
+                not row["enabled"]
+                or (new_days, new_time)
+                != (row["reminder_days"], row["reminder_time"])
+            ):
+                self._ensure_unique_enabled_rule(
+                    connection, row["text_id"], new_days, new_time,
+                    excluding_id=schedule_id,
+                )
             if (
                 new_days != row["reminder_days"]
                 or new_time != row["reminder_time"]
@@ -2483,9 +3835,12 @@ class ServiceRegistry:
                 )
             connection.execute(
                 "UPDATE user_reminder_schedules "
-                "SET reminder_days = ?, reminder_time = ?, enabled = ? "
-                "WHERE id = ?",
-                (new_days, new_time, int(new_enabled), schedule_id),
+                "SET reminder_days = ?, reminder_time = ?, enabled = ?, "
+                "body = ? WHERE id = ?",
+                (
+                    new_days, new_time, int(new_enabled),
+                    row["body"] if body is _UNSET else body, schedule_id,
+                ),
             )
 
     def delete_schedule(self, schedule_id: int) -> None:
@@ -2535,11 +3890,12 @@ class ServiceRegistry:
                     "WHERE actor_id = ? AND service_id = ? AND task = ?",
                     (actor_id, service_id, task),
                 ).fetchone()["id"]
+                # Только напоминания с текстом админа: свои не меняются.
                 schedule_ids = [
                     row["id"]
                     for row in connection.execute(
                         "SELECT id FROM user_reminder_schedules "
-                        "WHERE text_id = ? ORDER BY id",
+                        "WHERE text_id = ? AND origin = 'admin' ORDER BY id",
                         (text_id,),
                     ).fetchall()
                 ]
@@ -2590,7 +3946,8 @@ class ServiceRegistry:
         query = """
             SELECT schedules.id AS schedule_id, schedules.text_id,
                    schedules.reminder_days, schedules.reminder_time,
-                   texts.actor_id, texts.service_id, texts.task, texts.body,
+                   texts.actor_id, texts.service_id, texts.task,
+                   schedules.body AS body, schedules.origin,
                    services.name AS service_name,
                    services.enabled AS service_enabled,
                    preferences.enabled AS notifications_enabled
@@ -2635,7 +3992,8 @@ class ServiceRegistry:
                 """
                 SELECT schedules.id AS schedule_id, schedules.text_id,
                        schedules.reminder_days, schedules.reminder_time,
-                       texts.actor_id, texts.service_id, texts.task, texts.body,
+                       texts.actor_id, texts.service_id, texts.task,
+                       schedules.body AS body, schedules.origin,
                        services.name AS service_name,
                        services.enabled AS service_enabled,
                        preferences.enabled AS notifications_enabled,
@@ -2693,16 +4051,18 @@ class ServiceRegistry:
         service_id: str,
         task: str,
         personal_templates: dict[str, str] | None = None,
+        body: str | None = None,
     ) -> str:
+        """body — свой текст напоминания; иначе текст админа задачи."""
+        if body:
+            return body
         user_text = self.get_user_text(actor_id, service_id, task)
         if user_text is not None and user_text["body"] is not None:
             return user_text["body"]
         if personal_templates and personal_templates.get(task):
             return personal_templates[task]
-        return (
-            "{name}, напоминаем о задаче «{task}» службы "
-            "«{service_name}» на {sunday_date}."
-        )
+        # Служение, задача и дата — уже в заголовке напоминания.
+        return "{name}, напоминаем о вашем служении."
 
     def get_responsible_contact(
         self, service_id: str, task: str, name: str
@@ -2715,6 +4075,23 @@ class ServiceRegistry:
                 (service_id, task.strip(), name.strip()),
             ).fetchone()
         return dict(row) if row else None
+
+    def contact_name_among(
+        self, service_id: str, task: str, names, telegram_id: int
+    ) -> str | None:
+        """Под каким из этих имён telegram_id привязан к задаче (или None)."""
+        names = [name.strip() for name in names if name and name.strip()]
+        if not names:
+            return None
+        marks = ", ".join("?" for _ in names)
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT name FROM responsible_contacts WHERE service_id = ? "
+                f"AND task = ? AND telegram_id = ? AND name IN ({marks}) "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (service_id, task.strip(), telegram_id, *names),
+            ).fetchone()
+        return row["name"] if row else None
 
     def list_responsible_contacts(
         self, actor_id: int, service_id: str
@@ -2908,6 +4285,15 @@ def _move_user_text(
 def _validate_positive_id(value: int, field: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{field} должен быть положительным целым числом")
+
+
+def normalize_member_name(name) -> str:
+    """Имя нового участника, введённое вручную: пробелы схлопываются,
+    1–60 символов. Имена из графика и «Списков» хранятся как записаны."""
+    name = " ".join(name.split()) if isinstance(name, str) else ""
+    if not name or len(name) > 60 or "\x00" in name:
+        raise ValueError("Имя участника: от 1 до 60 символов.")
+    return name
 
 
 def _utc_now() -> str:

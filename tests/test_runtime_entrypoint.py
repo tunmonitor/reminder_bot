@@ -13,6 +13,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 
+def group_sends(bot):
+    """Отправки в группы (отрицательный chat_id), без отчётов админам."""
+    return [
+        call for call in bot.send_message.await_args_list
+        if isinstance(call.args[0], int) and call.args[0] < 0
+    ]
+
+
 class ReminderBotEntrypointTest(unittest.TestCase):
     def test_webapp_menu_button_uses_configured_https_url(self):
         from bot.app import _configure_webapp_menu
@@ -178,13 +186,13 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                         state_cache=state_cache,
                     )
 
-                self.assertEqual(bot.send_message.await_count, 1)
+                self.assertEqual(len(group_sends(bot)), 1)
                 self.assertEqual(
-                    bot.send_message.await_args_list[0].args[0], -10001
+                    group_sends(bot)[0].args[0], -10001
                 )
                 self.assertIn(
-                    "📌 2-я часть — нет",
-                    bot.send_message.await_args_list[0].args[1],
+                    "📌 2-я часть нет",
+                    group_sends(bot)[0].args[1],
                 )
                 state_cache.save.assert_not_called()
                 notify_admin.assert_not_awaited()
@@ -228,6 +236,69 @@ class ReminderBotEntrypointTest(unittest.TestCase):
         self.assertEqual([event.event_date for event in events], [today])
         self.assertGreaterEqual(len(parsed_months), 2)
         self.assertEqual(leftovers, [])
+
+    def test_roster_sync_failure_is_logged_and_issues_are_per_service(self):
+        from bot import app
+        from bot.excel_parser import RosterMember
+        from bot.service_registry import ServiceRegistry
+
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+            registry.initialize(1001, -10001)
+            logger = MagicMock()
+            with patch.object(
+                app, "parse_service_rosters",
+                side_effect=RuntimeError("Лист 'Списки' не найден"),
+            ):
+                app._sync_rosters_and_contacts(
+                    registry, Path(tmp_dir) / "x.xlsx", "sound", {}, None,
+                    logger, [],
+                )
+            logger.exception.assert_called_once()
+
+            def parse(path, logger, services, issues):
+                issues.extend([
+                    "«Списки», Звук: «Иван» указан без задачи",
+                    "«Списки», Кухня: «Анна» указан без задачи",
+                    "«Списки»: служение «Хор» не найдено в каталоге",
+                ])
+                return {"sound": [RosterMember("Иван", ("звук",))]}
+
+            registry.bind_service_member(1001, "sound", "Иван", 7007)
+            issues = []
+            with patch.object(app, "parse_service_rosters", side_effect=parse):
+                app._sync_rosters_and_contacts(
+                    registry, Path(tmp_dir) / "x.xlsx", "sound",
+                    {"сборка": {"names": ["Иван"], "is_informational": False}},
+                    None, logger, issues,
+                )
+            self.assertEqual(
+                issues,
+                [
+                    "«Списки», Звук: «Иван» указан без задачи",
+                    "«Списки»: служение «Хор» не найдено в каталоге",
+                ],
+            )
+            repeated = []
+            with patch.object(app, "parse_service_rosters", side_effect=parse):
+                app._sync_rosters_and_contacts(
+                    registry, Path(tmp_dir) / "x.xlsx", "kitchen", {}, None,
+                    logger, repeated,
+                )
+            self.assertEqual(
+                repeated,
+                [
+                    "«Списки», Кухня: «Анна» указан без задачи",
+                    "«Списки»: служение «Хор» не найдено в каталоге",
+                ],
+            )
+            tasks = sorted(
+                contact["task"]
+                for contact in registry.list_responsible_contacts(1001, "sound")
+                if contact["name"] == "Иван"
+            )
+            self.assertEqual(tasks, ["звук", "сборка"])
 
     def test_upcoming_events_skip_empty_later_sheet(self):
         from bot import app
@@ -360,8 +431,8 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     len(raw_text.encode("utf-16-le")) // 2, TELEGRAM_TEXT_LIMIT
                 )
                 notify_admin.assert_not_awaited()
-                self.assertEqual(bot.send_message.await_count, 1)
-                sent = bot.send_message.await_args.args[1]
+                self.assertEqual(len(group_sends(bot)), 1)
+                sent = group_sends(bot)[-1].args[1]
                 self.assertIn('<a href="tg://user?id=3049">', sent)
                 self.assertNotIn("\x00", sent)
 
@@ -412,10 +483,10 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                             run_date=run_date,
                         )
 
-                self.assertEqual(bot.send_message.await_count, 2)
+                self.assertEqual(len(group_sends(bot)), 2)
                 sent_texts = [
                     call.args[1]
-                    for call in bot.send_message.await_args_list
+                    for call in group_sends(bot)
                 ]
                 self.assertTrue(
                     any("Отдельный текст Собрание" in text for text in sent_texts)
@@ -471,10 +542,224 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     call.args[1]
                     for call in bot.send_message.await_args_list
                     if call.args[0] == 1001
+                    and "Проверьте график" in call.args[1]
                 ]
                 self.assertEqual(len(admin_messages), 1)
                 self.assertIn("строка без задачи", admin_messages[0])
                 self.assertIn("Проверьте график «Собрание»", admin_messages[0])
+
+        asyncio.run(process())
+
+    def test_sheet_wide_roster_issue_is_sent_once_after_delivery(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        sheet_issue = "«Списки»: служение «Хор» не найдено в каталоге"
+        found = {"sound": False, "assembly": True, "broadcast": True}
+
+        async def load(credentials, shm_dir, tz, service_id, *args,
+                       issues=None, **kwargs):
+            issues.append(sheet_issue)
+            return {"Ведущий": ["Анна"]}, found[service_id]
+
+        async def process():
+            app._REPORTED_SHEET_ISSUES.clear()
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                for service_id in ("sound", "broadcast"):
+                    registry.set_group_chat(
+                        1001, service_id, -10002, enabled=True
+                    )
+                bot = SimpleNamespace(send_message=AsyncMock())
+                logger = MagicMock()
+                with patch.object(
+                    app, "_load_service_task_assignments",
+                    new=AsyncMock(side_effect=load),
+                ), patch.object(
+                    app, "_notify_admin", new=AsyncMock(return_value=True)
+                ) as notify_admin:
+                    for service_id in ("sound", "assembly", "broadcast"):
+                        reminder = registry.list_group_reminders(service_id)[0]
+                        await app._process_service_reminder(
+                            bot, SimpleNamespace(admin_tg_id=1001),
+                            Path(tmp_dir), ZoneInfo("UTC"), registry,
+                            service_id, reminder["id"], logger, logger,
+                            run_date=date(2026, 10, 11) - timedelta(
+                                days=reminder["reminder_days"]
+                            ),
+                        )
+                texts = [call.args[2] for call in notify_admin.await_args_list]
+                self.assertEqual(
+                    [text for text in texts if sheet_issue in text
+                     and "Проверьте график" in text],
+                    [next(t for t in texts if "«Собрание»" in t)],
+                )
+            app._REPORTED_SHEET_ISSUES.clear()
+
+        asyncio.run(process())
+
+    def test_group_reminder_is_sent_to_chosen_topic(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                registry.set_group_thread(1001, "assembly", -10001, 9)
+                reminder = registry.list_group_reminders("assembly")[0]
+                bot = SimpleNamespace(send_message=AsyncMock())
+                logger = MagicMock()
+                with patch.object(
+                    app, "_load_service_task_assignments",
+                    new=AsyncMock(return_value=({"Ведущий": ["Анна"]}, True)),
+                ):
+                    await app._process_service_reminder(
+                        bot, SimpleNamespace(admin_tg_id=1001), Path(tmp_dir),
+                        ZoneInfo("UTC"), registry, "assembly", reminder["id"],
+                        logger, logger,
+                        run_date=date(2026, 10, 11) - timedelta(
+                            days=reminder["reminder_days"]
+                        ),
+                    )
+                group_calls = [
+                    call for call in bot.send_message.await_args_list
+                    if call.args[0] == -10001
+                ]
+                self.assertEqual(len(group_calls), 1)
+                self.assertEqual(
+                    group_calls[0].kwargs.get("message_thread_id"), 9
+                )
+
+        asyncio.run(process())
+
+    def test_deleted_topic_falls_back_to_general_and_is_reset(self):
+        from aiogram.exceptions import TelegramBadRequest
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        errors = iter((
+            "Bad Request: message thread not found",
+            "Bad Request: TOPIC_CLOSED",
+        ))
+
+        async def send(chat_id, text, **kwargs):
+            if kwargs.get("message_thread_id"):
+                raise TelegramBadRequest(method=MagicMock(), message=next(errors))
+            return SimpleNamespace(message_id=1)
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                registry.set_group_thread(1001, "assembly", -10001, 9)
+                reminder = registry.list_group_reminders("assembly")[0]
+                bot = SimpleNamespace(send_message=AsyncMock(side_effect=send))
+                logger = MagicMock()
+                event_date = date(2026, 10, 11)
+                with patch.object(
+                    app, "_load_service_task_assignments",
+                    new=AsyncMock(return_value=({"Ведущий": ["Анна"]}, True)),
+                ):
+                    await app._process_service_reminder(
+                        bot, SimpleNamespace(admin_tg_id=1001), Path(tmp_dir),
+                        ZoneInfo("UTC"), registry, "assembly", reminder["id"],
+                        logger, logger,
+                        run_date=event_date - timedelta(
+                            days=reminder["reminder_days"]
+                        ),
+                    )
+                self.assertIsNone(
+                    registry.get_service("assembly")["group_thread_id"]
+                )
+                self.assertTrue(
+                    registry.is_group_reminder_delivered(
+                        reminder["id"], event_date.isoformat(), "group:-10001"
+                    )
+                )
+                from bot.handlers import send_to_service_group
+
+                registry.set_group_thread(1001, "assembly", -10001, 9)
+                await send_to_service_group(
+                    bot.send_message, -10001, "тест",
+                    registry.get_service("assembly"), registry=registry,
+                )
+                self.assertEqual(
+                    registry.get_service("assembly")["group_thread_id"], 9
+                )
+
+        asyncio.run(process())
+
+    def test_task_reminder_lists_only_its_responsibles_or_warns(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                registry.set_responsible_contact(
+                    1001, "assembly", "Ведущий", "Анна", 2002, "anna_lead"
+                )
+                reminder = registry.list_group_reminders("assembly")[0]
+                registry.set_group_reminder_task(1001, reminder["id"], "Ведущий")
+                bot = SimpleNamespace(send_message=AsyncMock())
+                logger = MagicMock()
+                run_date = date(2026, 10, 11) - timedelta(
+                    days=reminder["reminder_days"]
+                )
+                assignments = {
+                    "Ведущий": {"names": ["Анна"], "is_informational": False},
+                    "Проповедь": {"names": ["Иван"], "is_informational": False},
+                }
+                with patch.object(
+                    app, "_load_service_task_assignments",
+                    new=AsyncMock(return_value=(assignments, True)),
+                ):
+                    await app._process_service_reminder(
+                        bot, SimpleNamespace(admin_tg_id=1001), Path(tmp_dir),
+                        ZoneInfo("UTC"), registry, "assembly", reminder["id"],
+                        logger, logger, run_date=run_date,
+                    )
+                group_text = next(
+                    call.args[1] for call in bot.send_message.await_args_list
+                    if call.args[0] == -10001
+                )
+                self.assertIn("Ведущий:", group_text)
+                self.assertIn("anna_lead", group_text)
+                self.assertNotIn("Иван", group_text)
+
+                other_date = date(2026, 10, 18) - timedelta(
+                    days=reminder["reminder_days"]
+                )
+                info_only = {"Праздник": {"names": [], "is_informational": True}}
+                with patch.object(
+                    app, "_load_service_task_assignments",
+                    new=AsyncMock(side_effect=[
+                        ({"Проповедь": ["Иван"]}, True),
+                        (info_only, True),
+                    ]),
+                ), patch.object(
+                    app, "_notify_admin", new=AsyncMock(return_value=True)
+                ) as notify_admin:
+                    for _ in range(2):
+                        await app._process_service_reminder(
+                            bot, SimpleNamespace(admin_tg_id=1001),
+                            Path(tmp_dir), ZoneInfo("UTC"), registry,
+                            "assembly", reminder["id"], logger, logger,
+                            run_date=other_date,
+                        )
+                warnings = [
+                    call.args[2] for call in notify_admin.await_args_list
+                    if "никто не назначен" in call.args[2]
+                ]
+                self.assertEqual(len(warnings), 1)
+                self.assertFalse(
+                    registry.is_group_reminder_delivered(
+                        reminder["id"], "2026-10-18", "group:-10001"
+                    )
+                )
 
         asyncio.run(process())
 
@@ -570,9 +855,9 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                         state_cache=state_cache,
                     )
 
-                self.assertEqual(bot.send_message.await_count, 1)
+                self.assertEqual(len(group_sends(bot)), 1)
                 self.assertEqual(
-                    bot.send_message.await_args.args[0], -10001
+                    group_sends(bot)[-1].args[0], -10001
                 )
                 self.assertTrue(
                     registry.is_group_reminder_delivered(
@@ -589,6 +874,96 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     )
                 )
                 logger.info.assert_called()
+
+        asyncio.run(process())
+
+    def test_reminder_moved_during_download_is_not_marked(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                reminder = registry.get_service("assembly")["reminders"][0]
+                bot = SimpleNamespace(
+                    send_message=AsyncMock(return_value=SimpleNamespace(message_id=1)),
+                    edit_message_text=AsyncMock(),
+                )
+
+                async def load(*args, **kwargs):
+                    # Админ меняет время, пока скачивается график.
+                    registry.update_group_reminder(1001, reminder["id"], time="23:58")
+                    return {"Камеры": ["Анна"]}, True
+
+                with patch.object(app, "_load_service_task_assignments", new=load):
+                    await app._process_service_reminder(
+                        bot, SimpleNamespace(admin_tg_id=1001), Path(tmp_dir),
+                        ZoneInfo("UTC"), registry, "assembly", reminder["id"],
+                        MagicMock(), MagicMock(),
+                        run_date=(
+                            date(2026, 10, 11)
+                            - timedelta(days=reminder["reminder_days"])
+                        ),
+                        state_cache=SimpleNamespace(state={}, save=MagicMock()),
+                    )
+                self.assertEqual(group_sends(bot), [])
+                self.assertFalse(registry.is_group_reminder_delivered(
+                    reminder["id"], "2026-10-11", "group:-10001"
+                ))
+
+        asyncio.run(process())
+
+    def test_failed_admin_report_is_retried_without_repeating_group(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                reminder = registry.get_service("assembly")["reminders"][0]
+                admin_fails = {"value": True}
+
+                async def send_message(chat_id, text, **kwargs):
+                    if chat_id == 1001 and admin_fails["value"]:
+                        raise RuntimeError("blocked")
+                    return SimpleNamespace(message_id=70)
+
+                bot = SimpleNamespace(
+                    send_message=AsyncMock(side_effect=send_message),
+                    edit_message_text=AsyncMock(),
+                )
+                logger = MagicMock()
+
+                async def run_reminder():
+                    await app._process_service_reminder(
+                        bot, SimpleNamespace(admin_tg_id=1001), Path(tmp_dir),
+                        ZoneInfo("UTC"), registry, "assembly", reminder["id"],
+                        logger, logger,
+                        run_date=(
+                            date(2026, 10, 11)
+                            - timedelta(days=reminder["reminder_days"])
+                        ),
+                        state_cache=SimpleNamespace(state={}, save=MagicMock()),
+                    )
+
+                with patch.object(
+                    app,
+                    "_load_service_task_assignments",
+                    new=AsyncMock(return_value=({"Камеры": ["Анна"]}, True)),
+                ):
+                    await run_reminder()
+                    self.assertEqual(
+                        registry.list_admin_reports("assembly", "2026-10-11"), []
+                    )
+                    admin_fails["value"] = False
+                    await run_reminder()
+
+                self.assertEqual(len(group_sends(bot)), 1)
+                self.assertEqual(
+                    len(registry.list_admin_reports("assembly", "2026-10-11")), 1
+                )
 
         asyncio.run(process())
 
@@ -668,9 +1043,99 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     bot.send_message.await_args_list[0].args[1],
-                    "<b>🔔 Личное: Алексей, Микшер, Звук, 18.10.2026</b>",
+                    "<b>🔔 Звук · Микшер · 18.10.2026</b>\n"
+                    "Личное: Алексей, Микшер, Звук, 18.10.2026",
                 )
                 self.assertEqual(load_assignments.await_count, 3)
+
+        asyncio.run(process())
+
+    def test_user_reminder_has_answer_buttons_and_stops_after_answer(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                registry.set_group_chat(1001, "sound", -10055, enabled=True)
+                registry.set_responsible_contact(
+                    1001, "sound", "звук", "Алексей", 2002, "alex"
+                )
+                registry.set_user_notifications_enabled(2002, "sound", True)
+                text_id = registry.upsert_user_text(
+                    2002, "sound", "звук", "Личное: {name}"
+                )
+                first = registry.add_schedule(text_id, 3, "09:00")
+                second = registry.add_schedule(text_id, 1, "18:00")
+                bot = SimpleNamespace(
+                    send_message=AsyncMock(
+                        return_value=SimpleNamespace(message_id=55)
+                    )
+                )
+                logger = MagicMock()
+
+                async def remind(schedule):
+                    await app._process_user_reminder_schedule(
+                        bot, SimpleNamespace(admin_tg_id=1001), Path(tmp_dir),
+                        ZoneInfo("UTC"), registry, schedule["id"], logger,
+                        logger,
+                        run_date=(
+                            date(2026, 10, 18)
+                            - timedelta(days=schedule["reminder_days"])
+                        ),
+                    )
+
+                with patch.object(
+                    app,
+                    "_load_service_task_assignments",
+                    new=AsyncMock(return_value=({"звук": ["Алексей"]}, True)),
+                ):
+                    await remind(first)
+                    markup = bot.send_message.await_args.kwargs["reply_markup"]
+                    labels = [b.text for b in markup.inline_keyboard[0]]
+                    self.assertEqual(labels, ["✅ Принял", "🚫 Не смогу"])
+                    registry.set_confirmation(
+                        "sound", "2026-10-18", "звук", 2002, "declined"
+                    )
+                    await remind(second)
+
+                self.assertEqual(bot.send_message.await_count, 1)
+
+        asyncio.run(process())
+
+    def test_oversized_personal_reminder_is_shortened_not_dropped(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                registry.set_group_chat(1001, "sound", -10055, enabled=True)
+                registry.set_responsible_contact(
+                    1001, "sound", "звук", "Алексей" * 30, 2002
+                )
+                registry.set_user_notifications_enabled(2002, "sound", True)
+                text_id = registry.ensure_user_text(2002, "sound", "звук")
+                schedule = registry.add_schedule(
+                    text_id, 1, "18:00", origin="user", body="{name} " * 300
+                )
+                bot = SimpleNamespace(
+                    send_message=AsyncMock(return_value=SimpleNamespace(message_id=5))
+                )
+                with patch.object(
+                    app, "_load_service_task_assignments",
+                    new=AsyncMock(return_value=({"звук": ["Алексей" * 30]}, True)),
+                ):
+                    await app._process_user_reminder_schedule(
+                        bot, SimpleNamespace(admin_tg_id=1001), Path(tmp_dir),
+                        ZoneInfo("UTC"), registry, schedule["id"], MagicMock(),
+                        MagicMock(), run_date=date(2026, 10, 17),
+                    )
+                sent = [c for c in bot.send_message.await_args_list if c.args[0] == 2002]
+                self.assertEqual(len(sent), 1)
+                self.assertIn("…", sent[0].args[1])
 
         asyncio.run(process())
 
@@ -1278,6 +1743,150 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 self.assertIsNone(register.call_args.args[1].service_registry)
                 debug_logger.exception.assert_called_once()
                 self.assertFalse((shm_dir / "reminder_bot_bot.pid").exists())
+
+        asyncio.run(run_bot())
+
+    def test_wait_for_telegram_retries_until_get_me_succeeds(self):
+        from aiogram.exceptions import TelegramNetworkError, TelegramServerError
+
+        from bot import app
+
+        bot = SimpleNamespace(
+            me=AsyncMock(
+                side_effect=[
+                    TelegramNetworkError(method=MagicMock(), message="DNS"),
+                    TelegramServerError(method=MagicMock(), message="Bad Gateway"),
+                    None,
+                ]
+            )
+        )
+        logger = MagicMock()
+        with patch.object(app, "TELEGRAM_RETRY_FIRST_DELAY", 0.01):
+            self.assertTrue(asyncio.run(app._wait_for_telegram(bot, logger)))
+
+        self.assertEqual(bot.me.await_count, 3)
+        self.assertEqual(logger.warning.call_count, 2)
+
+    def test_wait_for_telegram_stops_on_sigterm(self):
+        """manage.sh stop во время ожидания: выход без getMe и с очисткой."""
+        import signal
+
+        from aiogram.exceptions import TelegramNetworkError
+
+        from bot import app
+
+        bot = SimpleNamespace(
+            me=AsyncMock(side_effect=TelegramNetworkError(method=MagicMock(), message="DNS"))
+        )
+
+        async def scenario():
+            asyncio.get_running_loop().call_later(
+                0.05, os.kill, os.getpid(), signal.SIGTERM
+            )
+            return await asyncio.wait_for(
+                app._wait_for_telegram(bot, MagicMock()), timeout=5
+            )
+
+        self.assertFalse(asyncio.run(scenario()))
+        self.assertEqual(bot.me.await_count, 1)
+        self.assertIs(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+
+    def test_poll_timer_failure_does_not_stop_startup(self):
+        from bot import app
+
+        registry = SimpleNamespace(list_open_replacement_polls=lambda: [
+            {"poll_id": "a", "deadline": "2099-01-03T10:00:00+00:00"},
+            {"poll_id": "b", "deadline": "2099-01-03T11:00:00+00:00"},
+        ])
+        schedule = MagicMock(side_effect=[RuntimeError("scheduler"), None])
+        logger = MagicMock()
+        app._reschedule_open_polls(registry, schedule, logger)
+        self.assertEqual([call.args[0] for call in schedule.call_args_list], ["a", "b"])
+        logger.exception.assert_called_once()
+
+    def test_command_menu_sync_does_not_block_startup(self):
+        """Без DNS обновление меню висит, но PID-файл и опрос уже работают."""
+        from bot import app
+
+        async def run_bot():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                shm_dir = Path(tmp_dir) / "shm"
+                log_dir = Path(tmp_dir) / "logs"
+                shm_dir.mkdir(mode=0o700)
+                log_dir.mkdir(mode=0o700)
+                bot = SimpleNamespace(
+                    session=SimpleNamespace(close=AsyncMock()),
+                    set_my_commands=AsyncMock(),
+                )
+                dispatcher = SimpleNamespace()
+                scheduler = SimpleNamespace(
+                    running=True,
+                    start=MagicMock(),
+                    pause=MagicMock(),
+                    shutdown=MagicMock(),
+                )
+                sync_started = asyncio.Event()
+                sync_cancelled = asyncio.Event()
+                pid_seen = []
+
+                async def hanging_sync(*_args):
+                    sync_started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        sync_cancelled.set()
+                        raise
+
+                async def start_polling(_bot, **_kwargs):
+                    pid_seen.append((shm_dir / "reminder_bot_bot.pid").exists())
+                    await sync_started.wait()
+
+                dispatcher.start_polling = AsyncMock(side_effect=start_polling)
+                with ExitStack() as stack:
+                    stack.enter_context(patch.object(
+                        app, "setup_loggers", return_value=(MagicMock(), MagicMock()),
+                    ))
+                    stack.enter_context(patch.object(
+                        app,
+                        "load_credentials",
+                        return_value=SimpleNamespace(
+                            timezone="UTC",
+                            bot_token="token",
+                            group_chat_id=1,
+                            admin_tg_id=2,
+                        ),
+                    ))
+                    stack.enter_context(patch.object(
+                        app,
+                        "service_registry_path",
+                        return_value=Path(tmp_dir) / "service-registry.sqlite3",
+                    ))
+                    stack.enter_context(patch.object(app, "load_templates", return_value={}))
+                    stack.enter_context(patch.object(app, "get_tz", return_value=ZoneInfo("UTC")))
+                    stack.enter_context(patch.object(app, "StateCache"))
+                    stack.enter_context(patch.object(app, "Bot", return_value=bot))
+                    stack.enter_context(patch.object(app, "Dispatcher", return_value=dispatcher))
+                    stack.enter_context(patch.object(app, "register"))
+                    stack.enter_context(patch.object(
+                        app.ServiceRegistry,
+                        "initialize",
+                        side_effect=PermissionError("invalid registry permissions"),
+                    ))
+                    stack.enter_context(patch.object(app, "load_schedule", return_value=[]))
+                    stack.enter_context(patch.object(app, "build_scheduler", return_value=scheduler))
+                    stack.enter_context(patch.object(
+                        app, "sync_admin_commands", side_effect=hanging_sync,
+                    ))
+                    stack.enter_context(patch.object(
+                        app, "_configure_webapp_menu", AsyncMock(),
+                    ))
+                    await asyncio.wait_for(
+                        app.run(SimpleNamespace(shm_dir=str(shm_dir), log_dir=str(log_dir))),
+                        timeout=5,
+                    )
+
+                self.assertEqual(pid_seen, [True])
+                self.assertTrue(sync_cancelled.is_set())
 
         asyncio.run(run_bot())
 
