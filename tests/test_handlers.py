@@ -956,6 +956,27 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_stored_nav_hint_is_deleted_after_restart(self):
+        async def run():
+            # Подсказка осталась от прошлого запуска бота.
+            self.registry.set_nav_hints(12345, [777, 778])
+            def delete(chat_id, message_id):
+                if message_id == 778:
+                    raise TelegramAPIError(MagicMock(), "flood")
+
+            self.context.bot.delete_message.side_effect = delete
+            start = self.admin_router.message.handlers[8].callback
+            await start(self.message(12345, "/start"))
+            deleted = [
+                call.kwargs["message_id"]
+                for call in self.context.bot.delete_message.await_args_list
+            ]
+            self.assertIn(777, deleted)
+            # Неудавшееся удаление остаётся в базе для следующей попытки.
+            self.assertEqual(self.registry.get_nav_hints(12345), [778])
+
+        asyncio.run(run())
+
     def test_nav_keyboard_middleware_installed_on_real_bot_session(self):
         from aiogram import Bot
 
@@ -5947,6 +5968,11 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 "Используется встроенный текст",
                 text_screen.message.answer.await_args.args[0],
             )
+            preview = await press("rdy:tplprev:sound:intro")
+            self.assertIn(
+                "Спасибо за твое служение",
+                preview.message.answer.await_args.args[0],
+            )
             prompt = await press("rdy:tpledit:sound:intro")
             self.assertIn(
                 "• {people} — ", prompt.message.answer.await_args.args[0]
@@ -5977,6 +6003,27 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIn("Опрос завершён",
                           finished.message.answer.await_args.args[0])
             self.context.bot.stop_poll.assert_awaited_once()
+            confirm = await press(f"rdy:restart:sound:{month_arg}")
+            self.assertIn("ответы удалены",
+                          confirm.message.answer.await_args.args[0])
+            # Сбой отправки нового опроса — прежние ответы на месте.
+            self.context.bot.send_poll.side_effect = RuntimeError("network")
+            failed = await press(f"rdy:restartok:sound:{month_arg}")
+            self.assertIn("прежние ответы сохранены",
+                          failed.message.answer.await_args.args[0])
+            kept = self.registry.get_readiness_run("sound", f"{year:04d}-{month:02d}")
+            self.assertEqual(kept["poll_id"], "ready-poll")
+            self.assertEqual(len(self.registry.list_readiness_answers(kept["id"])), 1)
+            self.context.bot.send_poll.side_effect = None
+            self.context.bot.send_poll.return_value = SimpleNamespace(
+                message_id=13, poll=SimpleNamespace(id="ready-poll-2"),
+            )
+            restarted = await press(f"rdy:restartok:sound:{month_arg}")
+            self.assertIn("Новый опрос отправлен",
+                          restarted.message.answer.await_args.args[0])
+            run = self.registry.list_open_readiness_runs()[0]
+            self.assertEqual(run["poll_id"], "ready-poll-2")
+            self.assertEqual(self.registry.list_readiness_answers(run["id"]), [])
 
         self.context.bot.stop_poll = AsyncMock()
         asyncio.run(run())

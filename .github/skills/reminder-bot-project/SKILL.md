@@ -348,10 +348,23 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   `--trace` / `manage.sh trace on` (flag `.runtime/trace_enabled`).
   `admin_router` outer middlewares `trace_callback` / `trace_message` and
   `_send_dialog` / `on_nav_button` log with `debug.log(TRACE, ...)` — never
-  free text of user messages. `back_callback` falls back to the last «✖️ …»
-  button when a screen has no «⬅️ …». The nav hint id is persisted in
-  `nav_hints` (`get_nav_hints` / `set_nav_hints`) so a restart still
-  deletes the old hint.
+  free text of user messages (commands — only the command word). Trace
+  middlewares sit on the dispatcher observers (all routers), falling back to
+  `admin_router` when the dispatcher is a test stub. `back_callback` falls
+  back to the last «✖️ Закрыть настройку» / «✖️ Отмена» (`_CLOSE_TEXTS`)
+  when a screen has no «⬅️ …»; the root «✖️ Закрыть» of /my_notifications is
+  not a back button. Nav hint ids are persisted in `nav_hints`;
+  `drop_old_hints` removes an id only after the message is deleted (or is
+  already gone), also on root screens when the keyboard was already
+  replaced. A user message marks `hint_stale`; the next screen with a back
+  button re-sends the hint above itself (`show_nav_keyboard(force=True)`).
+- Readiness restart: `rdy:restart` (confirmation) → `rdy:restartok` under
+  `service_lock`: stop the open poll (abort if that fails), park the old run
+  under month `KEY#id` (`move_readiness_run`), `launch_run` with
+  `manual_deadline`; on success `delete_readiness_run` (answers and reminder
+  marks too), on failure move it back as closed with both flags set. Preview:
+  `rdy:tplprev:<service>:intro|rem`. `launch_run` records all intro chunk
+  ids and deletes them all if the poll fails.
 - `service_tasks.people_needed` (1–5, default 1, migrated with ALTER) is set
   by the super admin in «📋 Задачи служения» → «👥 Нужно людей»
   (`svc_tasks:people|ppick|pset`), `set_service_task_people_needed`.

@@ -30,6 +30,9 @@ _PAGE_PREFIXES = ("ui_page:", "task_page:")
 # В навигации по ответственным возврат — «⬅️ К …», а «⬅️ Назад» — листание
 # списка участников.
 _CONTACT_NAV_PREFIX = "contact_nav:"
+# Выход из настройки к её родителю — тоже шаг назад. «✖️ Закрыть» корня
+# «Моих уведомлений» сюда не входит: это корневой экран.
+_CLOSE_TEXTS = ("✖️ Закрыть настройку", "✖️ Отмена")
 # Шаг назад по диалогу; «⬅️ Стр. N», «⬅️ Предыдущее», «⬅️ дд.мм» —
 # листание, а не возврат.
 _BACK_PREFIXES = ("⬅️ К ", "↩️ К ", "⬅️ Назад", "⬅️ Отмена")
@@ -48,7 +51,7 @@ def nav_keyboard() -> ReplyKeyboardMarkup:
 
 def back_callback(markup: InlineKeyboardMarkup) -> str | None:
     """callback_data последней кнопки «⬅️ К …»/«⬅️ Назад»; если таких нет —
-    последней «✖️ …» (закрыть настройку, отмена): с такого экрана тоже
+    последней «✖️ Закрыть настройку» / «✖️ Отмена»: с такого экрана тоже
     есть куда вернуться, это не корневой экран."""
     back = close = None
     for row in markup.inline_keyboard:
@@ -61,7 +64,7 @@ def back_callback(markup: InlineKeyboardMarkup) -> str | None:
                 and not button.text.startswith("⬅️ К ")
             ):
                 back = data
-            elif button.text.startswith("✖️"):
+            elif button.text.startswith(_CLOSE_TEXTS):
                 close = data
     return back or close
 

@@ -291,9 +291,18 @@ async def launch_run(
     dates = [day.isoformat() for day in month_sundays(year, month)]
     people = registry.readiness_people(service["id"])
     settings = registry.get_readiness_settings(service["id"])
+    # Вступление может уйти несколькими сообщениями (длинный шаблон,
+    # много упоминаний) — запоминаются все, чтобы убрать при сбое опроса.
+    intro_ids: list[int] = []
+
+    async def send_chunk(chat, text, **kwargs):
+        message = await bot.send_message(chat, text, **kwargs)
+        intro_ids.append(message.message_id)
+        return message
+
     intro = await send_to_service_group(
         lambda chat, text, **kwargs: send_telegram_screen(
-            bot.send_message, chat, text, limit=text_limit, **kwargs
+            send_chunk, chat, text, limit=text_limit, **kwargs
         ),
         chat_id,
         intro_text(
@@ -317,9 +326,9 @@ async def launch_run(
     except Exception:
         # Без опроса вступление в чате лишнее: повторный запуск прислал бы
         # второе.
-        if getattr(intro, "message_id", None):
+        for message_id in intro_ids:
             try:
-                await bot.delete_message(chat_id, intro.message_id)
+                await bot.delete_message(chat_id, message_id)
             except Exception:  # noqa: BLE001
                 logger.info("Вступление опроса не удалено", exc_info=True)
         raise
@@ -331,7 +340,9 @@ async def launch_run(
             poll_id=poll_message.poll.id,
             chat_id=chat_id,
             message_id=poll_message.message_id,
-            intro_message_id=getattr(intro, "message_id", None),
+            intro_message_id=intro_ids[0] if intro_ids else getattr(
+                intro, "message_id", None
+            ),
             deadline=deadline.astimezone(timezone.utc).isoformat(),
         )
     except Exception:

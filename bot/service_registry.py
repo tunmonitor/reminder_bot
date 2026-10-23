@@ -4789,10 +4789,24 @@ class ServiceRegistry:
         return self.get_readiness_run_by_id(run_id)
 
     def delete_readiness_run(self, run_id: int) -> None:
-        """Отмена пропуска месяца или неудачного запуска (ответов нет)."""
+        """Отмена пропуска месяца или перезапуск: опрос удаляется вместе
+        с ответами и отметками напоминаний."""
         with self._connection() as connection:
+            for table in ("readiness_answers", "readiness_reminders"):
+                connection.execute(
+                    f"DELETE FROM {table} WHERE run_id = ?", (run_id,)
+                )
             connection.execute(
                 "DELETE FROM readiness_runs WHERE id = ?", (run_id,)
+            )
+
+    def move_readiness_run(self, run_id: int, month: str) -> None:
+        """Переносит опрос под другой ключ месяца: при перезапуске старый
+        откладывается, пока не отправлен новый (при сбое — возвращается)."""
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE readiness_runs SET month = ? WHERE id = ?",
+                (month, run_id),
             )
 
     def close_readiness_run(self, run_id: int) -> bool:

@@ -376,8 +376,19 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     async def trace_message(handler, event, data):
         """Отладка навигации: команды и кнопки навигации — текстом,
-        остальное — только длиной (личный текст в лог не пишется)."""
+        остальное — только длиной (личный текст в лог не пишется).
+        Сообщение пользователя «отрывает» подсказку от экранов — со
+        следующим экраном она присылается заново."""
         text = getattr(event, "text", None) or ""
+        actor = getattr(getattr(event, "from_user", None), "id", None)
+        chat_type = getattr(getattr(event, "chat", None), "type", None)
+        if (
+            chat_type == ChatType.PRIVATE
+            and actor in nav_state
+            and nav_state[actor].get("shown")
+            and text not in NAV_TEXTS
+        ):
+            nav_state[actor]["hint_stale"] = True
         shown = text.split()[0] if text.startswith("/") else text if (
             text in NAV_TEXTS
         ) else (
@@ -389,8 +400,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         )
         return await handler(event, data)
 
-    admin_router.callback_query.outer_middleware(trace_callback)
-    admin_router.message.outer_middleware(trace_message)
+    # На уровне диспетчера — все нажатия (и кнопки напоминаний в
+    # соседнем роутере); в тестах диспетчер-заглушка — тогда admin_router.
+    for observer_name, middleware in (
+        ("callback_query", trace_callback), ("message", trace_message),
+    ):
+        observer = getattr(dispatcher, observer_name, None)
+        if not callable(getattr(observer, "outer_middleware", None)):
+            observer = getattr(admin_router, observer_name)
+        observer.outer_middleware(middleware)
 
     session_middleware = getattr(
         getattr(getattr(context, "bot", None), "session", None),
@@ -401,20 +419,49 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         # Как в документации aiogram: bot.session.middleware(...).
         session_middleware(track_reply_keyboards)
 
-    async def delete_quietly(chat_id: int, message_ids: list[int]) -> None:
+    async def delete_quietly(chat_id: int, message_ids: list[int]) -> list[int]:
+        """Удаляет сообщения; возвращает ID, которые удалить не удалось
+        (уже удалённые считаются удалёнными)."""
+        failed = []
         for message_id in message_ids:
             try:
                 await context.bot.delete_message(
                     chat_id=chat_id, message_id=message_id
                 )
-            except TelegramAPIError:
+            except TelegramAPIError as exc:
+                if "not found" in str(exc).lower():
+                    continue
                 debug.debug(
                     "Не удалось удалить сообщение навигации %s", message_id
                 )
+                failed.append(message_id)
+        return failed
 
-    async def show_nav_keyboard(target: Message, actor_id: int) -> None:
+    async def drop_old_hints(
+        chat_id: int, actor_id: int, keep: int | None = None
+    ) -> None:
+        """Удаляет сохранённые подсказки, кроме keep; неудалённые остаются
+        в базе, чтобы следующая попытка (и после перезапуска) их нашла."""
+        state = nav_state.get(actor_id) or {}
+        known = list(dict.fromkeys([
+            *state.get("helpers", []), *stored_hints(actor_id),
+        ]))
+        stale = [
+            message_id for message_id in known
+            if message_id != keep and isinstance(message_id, int)
+        ]
+        failed = await delete_quietly(chat_id, stale)
+        remaining = [*failed, *([keep] if isinstance(keep, int) else [])]
+        if state:
+            state["helpers"] = remaining
+        if remaining != known:
+            store_hints(actor_id, remaining)
+
+    async def show_nav_keyboard(
+        target: Message, actor_id: int, *, force: bool = False
+    ) -> None:
         async with nav_locks.setdefault(actor_id, asyncio.Lock()):
-            await _show_nav_keyboard(target, actor_id)
+            await _show_nav_keyboard(target, actor_id, force=force)
 
     async def hide_nav_keyboard(chat_id: int, actor_id: int) -> None:
         # Показ и скрытие одного пользователя — по очереди, иначе ответы
@@ -423,9 +470,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await _hide_nav_keyboard(chat_id, actor_id)
 
     def stored_hints(actor_id: int) -> list[int]:
-        registry = service_registry()
+        load = getattr(service_registry(), "get_nav_hints", None)
         try:
-            return registry.get_nav_hints(actor_id) if registry else []
+            return load(actor_id) if callable(load) else []
         except sqlite3.Error:
             debug.debug("Не удалось прочитать подсказки навигации", exc_info=True)
             return []
@@ -433,20 +480,22 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     def store_hints(actor_id: int, message_ids: list[int]) -> None:
         """ID подсказок — в базе: после перезапуска бота старая подсказка
         всё равно удаляется, а не остаётся второй в чате."""
-        registry = service_registry()
-        if registry is None:
+        save = getattr(service_registry(), "set_nav_hints", None)
+        if not callable(save):
             return
         try:
-            registry.set_nav_hints(actor_id, message_ids)
+            save(actor_id, message_ids)
         except sqlite3.Error:
             debug.debug("Не удалось сохранить подсказки навигации", exc_info=True)
 
-    async def _show_nav_keyboard(target: Message, actor_id: int) -> None:
+    async def _show_nav_keyboard(
+        target: Message, actor_id: int, *, force: bool = False
+    ) -> None:
+        """force — подсказку «оторвало» сообщение пользователя: прислать
+        её заново над новым экраном, старую удалить."""
         state = nav_state.setdefault(actor_id, {"shown": False, "helpers": []})
-        if state["shown"]:
+        if state["shown"] and not force:
             return
-        stale = list(dict.fromkeys([*state["helpers"], *stored_hints(actor_id)]))
-        state["helpers"] = []
         try:
             hint = await target.answer(
                 NAV_HINT, reply_markup=nav_keyboard(), parse_mode=None
@@ -455,14 +504,23 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             debug.warning("Не удалось показать клавиатуру навигации %s", actor_id)
             return
         state["shown"] = True
-        state["helpers"] = [hint.message_id]
+        state["hint_stale"] = False
+        state["helpers"] = [*state.get("helpers", []), hint.message_id]
         if isinstance(hint.message_id, int):
-            store_hints(actor_id, [hint.message_id])
-        await delete_quietly(target.chat.id, stale)
+            # Сначала сохранить новую вместе со старыми: старые удаляются
+            # из базы только после успешного удаления в чате.
+            store_hints(actor_id, list(dict.fromkeys([
+                *stored_hints(actor_id), hint.message_id,
+            ])))
+        await drop_old_hints(target.chat.id, actor_id, keep=hint.message_id)
 
     async def _hide_nav_keyboard(chat_id: int, actor_id: int) -> None:
         state = nav_state.get(actor_id)
         if state is None or not state["shown"]:
+            # Клавиатуру уже заменила другая (или бот перезапущен) —
+            # подсказки всё равно убрать.
+            if (state or {}).get("helpers") or stored_hints(actor_id):
+                await drop_old_hints(chat_id, actor_id)
             return
         try:
             removed = await context.bot.send_message(
@@ -475,10 +533,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             state["shown"] = True
             return
         state["shown"] = False
-        helpers = list(dict.fromkeys([*state["helpers"], *stored_hints(actor_id)]))
-        state["helpers"] = []
-        store_hints(actor_id, [])
-        await delete_quietly(chat_id, [*helpers, removed.message_id])
+        state["hint_stale"] = False
+        await delete_quietly(chat_id, [removed.message_id])
+        await drop_old_hints(chat_id, actor_id)
     pending_personal_actions: dict[
         str, tuple[int, str, str, str, dict[str, Any]]
     ] = {}
@@ -628,7 +685,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             nav_back = back_callback(markup)
             if nav_back is not None:
                 nav_action = "показать"
-                await show_nav_keyboard(target, nav_actor)
+                await show_nav_keyboard(
+                    target, nav_actor,
+                    force=nav_state.get(nav_actor, {}).get("hint_stale", False),
+                )
             else:
                 nav_action = "убрать"
                 await hide_nav_keyboard(target.chat.id, nav_actor)
@@ -3103,10 +3163,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 readiness_button("⏳ +1 день", "extend", service_id, month_arg),
                 readiness_button("⏹ Завершить", "finish", service_id, month_arg),
             ])
+            rows.append([
+                readiness_button("🔄 Перезапустить", "restart", service_id,
+                                 month_arg),
+            ])
         else:
             lines.append(f"Опрос на {title}: ✅ завершён.")
             rows.append([
                 readiness_button("📊 Итог опроса", "progress", service_id, month_arg),
+                readiness_button("🔄 Перезапустить", "restart", service_id,
+                                 month_arg),
             ])
         rows.append([
             readiness_button("⏳ Срок", "dur", service_id),
@@ -3178,6 +3244,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             lines = [notice, ""] + lines
         rows = [[
             readiness_button("✏️ Изменить", "tpledit", service_id, kind),
+            readiness_button("👁 Предпросмотр", "tplprev", service_id, kind),
         ]]
         if template:
             rows[0].append(
@@ -3277,6 +3344,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             notice = None
             if action in {
                 "start", "skip", "unskip", "progress", "extend", "finish",
+                "restart", "restartok",
             } and arg != f"{year:04d}{month:02d}":
                 # Экран показан до смены месяца — действие относилось бы
                 # к другому месяцу.
@@ -3311,6 +3379,75 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     except Exception:  # noqa: BLE001
                         debug.exception("Не удалось запустить опрос готовности")
                         notice = "❌ Опрос отправить не удалось"
+                await show_readiness(callback.message, service_id, notice)
+                return
+            elif action == "restart":
+                await _send_dialog(
+                    callback.message,
+                    f"🔄 Перезапустить опрос на {month_title(year, month)}?\n\n"
+                    "Опрос в чате будет остановлен, все ответы удалены, и "
+                    "в чат уйдёт новый опрос. Отвечать придётся заново.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [readiness_button(
+                            "✅ Да, перезапустить", "restartok", service_id, arg,
+                        )],
+                        [readiness_button("⬅️ К опросу", "open", service_id)],
+                    ]),
+                    _dialog_keep_rows=True,
+                    parse_mode=None,
+                )
+                await _answer_callback(callback)
+                return
+            elif action == "restartok":
+                await _answer_callback(callback, "⏳ Перезапускаю опрос…")
+                async with readiness.service_lock(service_id):
+                    run = registry.get_readiness_run(service_id, key)
+                    if run is not None and run["status"] == "skipped":
+                        notice = "⚠️ Месяц пропущен — сначала «↩️ Не пропускать»"
+                    elif run is not None and run["status"] == "open" and not (
+                        await readiness.stop_run_poll(context.bot, run, debug)
+                    ):
+                        # Иначе в чате остались бы два открытых опроса.
+                        notice = (
+                            "⚠️ Не удалось остановить опрос в чате — "
+                            "перезапуск отменён, попробуйте позже"
+                        )
+                    else:
+                        if run is not None:
+                            # Старый опрос откладывается: при сбое отправки
+                            # нового он вернётся вместе с ответами.
+                            registry.move_readiness_run(
+                                run["id"], f"{key}#{run['id']}"
+                            )
+                        try:
+                            await readiness.launch_run(
+                                context.bot, registry, service, year, month,
+                                readiness.manual_deadline(now, settings), tz,
+                                debug, TELEGRAM_TEXT_LIMIT,
+                            )
+                            notice = "✅ Новый опрос отправлен в чат служения"
+                            if run is not None:
+                                registry.delete_readiness_run(run["id"])
+                        except Exception as exc:  # noqa: BLE001
+                            if run is not None:
+                                # Опрос в чате уже остановлен — вернуть его
+                                # закрытым, без повторного итога админам.
+                                registry.move_readiness_run(run["id"], key)
+                                registry.close_readiness_run(run["id"])
+                                registry.mark_readiness_run(
+                                    run["id"], poll_stopped=True,
+                                    result_sent=True,
+                                )
+                            if isinstance(exc, ValueError):
+                                notice = f"⚠️ {exc}"
+                            else:
+                                debug.exception(
+                                    "Не удалось перезапустить опрос готовности"
+                                )
+                                notice = (
+                                    "❌ Новый опрос отправить не удалось — "
+                                    "прежние ответы сохранены"
+                                )
                 await show_readiness(callback.message, service_id, notice)
                 return
             elif action == "skip":
@@ -3441,6 +3578,40 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 return
             elif action == "tpl" and arg in READINESS_TEXTS:
                 await show_readiness_text(callback.message, service_id, arg)
+                await _answer_callback(callback)
+                return
+            elif action == "tplprev" and arg in READINESS_TEXTS:
+                # Как сообщение будет выглядеть: месяц и срок опроса этого
+                # месяца (идущего или по расписанию), упоминания состава.
+                run = registry.get_readiness_run(service_id, key)
+                deadline = (
+                    readiness.deadline_of(run)
+                    if run is not None and run.get("deadline")
+                    else readiness.schedule(settings, year, month, tz)[1]
+                )
+                if arg == "intro":
+                    body = readiness.intro_text(
+                        service, registry.readiness_people(service_id),
+                        year, month, deadline, tz, settings["intro_template"],
+                    )
+                    where = "в чате служения перед опросом"
+                else:
+                    body = readiness.reminder_text(
+                        service,
+                        {"month": key, "deadline": deadline.isoformat()},
+                        tz, settings["reminder_template"],
+                    )
+                    where = "лично тем, кто не ответил"
+                await _send_dialog(
+                    callback.message,
+                    f"👁 Предпросмотр · {where}\n\n"
+                    "──────────────────\n\n" + body,
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        readiness_button("⬅️ К тексту", "tpl", service_id, arg)
+                    ]]),
+                    _dialog_text_limit=TELEGRAM_TEXT_LIMIT,
+                    parse_mode=None,
+                )
                 await _answer_callback(callback)
                 return
             elif action == "tpledit" and arg in READINESS_TEXTS:
