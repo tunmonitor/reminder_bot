@@ -7,7 +7,7 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
 from bot import readiness
@@ -480,6 +480,8 @@ class ReadinessFlowTest(unittest.TestCase):
         bot = fake_bot()
 
         async def send_poll(*args, **kwargs):
+            # Буфер полон чужим ответом — вытесняется он, а не новый.
+            readiness.hold_early_answer("foreign", 9, "", "", [0])
             # Голос пришёл раньше, чем бот записал ID опроса.
             self.assertTrue(readiness.hold_early_answer(
                 "poll-1", 501, "alex", "Алексей", [0, 1]
@@ -489,7 +491,8 @@ class ReadinessFlowTest(unittest.TestCase):
             )
 
         bot.send_poll = AsyncMock(side_effect=send_poll)
-        run = self.launch(bot)
+        with patch.object(readiness, "_EARLY_LIMIT", 1):
+            run = self.launch(bot)
         answers = self.registry.list_readiness_answers(run["id"])
         self.assertEqual(answers[0]["dates"], run["dates"][:2])
 

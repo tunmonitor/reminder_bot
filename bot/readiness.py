@@ -480,6 +480,7 @@ async def _abandon_poll(bot, registry, run: dict, poll_message, chat_id: int,
 # придерживаются и учитываются сразу после записи.
 _EARLY_ANSWERS: dict[str, list[tuple[float, tuple]]] = {}
 _EARLY_TTL = 120
+_EARLY_LIMIT = 2000
 
 
 def hold_early_answer(poll_id: str, *answer) -> bool:
@@ -493,8 +494,16 @@ def hold_early_answer(poll_id: str, *answer) -> bool:
         ]
         if not _EARLY_ANSWERS[key]:
             del _EARLY_ANSWERS[key]
-    if sum(len(items) for items in _EARLY_ANSWERS.values()) >= 2000:
-        return False
+    if sum(len(items) for items in _EARLY_ANSWERS.values()) >= _EARLY_LIMIT:
+        # Переполнение (за доли секунды отправки — практически невозможно):
+        # вытесняется самый старый ответ, а не новый, и это видно в логе.
+        oldest = min(_EARLY_ANSWERS, key=lambda key: _EARLY_ANSWERS[key][0][0])
+        _EARLY_ANSWERS[oldest].pop(0)
+        if not _EARLY_ANSWERS[oldest]:
+            del _EARLY_ANSWERS[oldest]
+        logging.getLogger("reminder_bot.debug").warning(
+            "Буфер ранних ответов опроса полон — вытеснен самый старый"
+        )
     _EARLY_ANSWERS.setdefault(poll_id, []).append((now, answer))
     return True
 
