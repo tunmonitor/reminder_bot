@@ -363,8 +363,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         "middleware",
         None,
     )
-    if callable(getattr(session_middleware, "register", None)):
-        session_middleware.register(track_reply_keyboards)
+    if callable(session_middleware):
+        # Как в документации aiogram: bot.session.middleware(...).
+        session_middleware(track_reply_keyboards)
 
     async def delete_quietly(chat_id: int, message_ids: list[int]) -> None:
         for message_id in message_ids:
