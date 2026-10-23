@@ -2016,6 +2016,34 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 for handler in logger.handlers:
                     handler.close()
 
+    def test_trace_level_only_when_enabled(self):
+        from bot.cli import parse_args
+        from bot.logger import TRACE, setup_loggers
+
+        self.assertFalse(parse_args(["--shm-dir", "a", "--log-dir", "b"]).trace)
+        self.assertTrue(
+            parse_args(["--shm-dir", "a", "--log-dir", "b", "--trace"]).trace
+        )
+        for trace in (False, True):
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                interaction_logger, debug_logger = setup_loggers(
+                    Path(tmp_dir), trace=trace
+                )
+                try:
+                    debug_logger.log(TRACE, "Нажатие 1: menu:start")
+                    for handler in debug_logger.handlers:
+                        handler.flush()
+                    debug_log = (
+                        Path(tmp_dir) / "reminder_bot_debug.log"
+                    ).read_text(encoding="utf-8")
+                    self.assertEqual("menu:start" in debug_log, trace)
+                    if trace:
+                        self.assertIn("TRACE", debug_log)
+                finally:
+                    for logger in (interaction_logger, debug_logger):
+                        for handler in logger.handlers:
+                            handler.close()
+
     def test_assignment_details_are_written_only_to_debug_log(self):
         from bot.logger import setup_loggers
 

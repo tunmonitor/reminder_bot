@@ -218,6 +218,12 @@ def nav_row(
     return [button for button in (back, save, cancel) if button is not None]
 
 
+def _already_gone(exc: TelegramAPIError) -> bool:
+    """Сообщения уже нет (удалено раньше) — чистить больше нечего."""
+    text = str(exc).lower()
+    return "message to delete not found" in text or "message_id_invalid" in text
+
+
 async def clean_previous_menu(
     message: Message | None,
     debug: logging.Logger,
@@ -240,7 +246,13 @@ async def clean_previous_menu(
         if callable(delete):
             try:
                 await delete()
-            except TelegramAPIError:
+            except TelegramAPIError as exc:
+                if _already_gone(exc):
+                    debug.debug(
+                        "Предыдущее меню %s уже удалено",
+                        getattr(message, "message_id", None),
+                    )
+                    return
                 debug.debug(
                     "Не удалось удалить предыдущее меню %s; пробую очистить его",
                     getattr(message, "message_id", None),
@@ -288,7 +300,10 @@ async def clean_previous_menu_by_id(
     if callable(delete):
         try:
             await delete(chat_id=chat_id, message_id=message_id)
-        except TelegramAPIError:
+        except TelegramAPIError as exc:
+            if _already_gone(exc):
+                debug.debug("Предыдущее меню %s уже удалено", message_id)
+                return
             debug.debug(
                 "Не удалось удалить предыдущее меню %s; пробую очистить его",
                 message_id,

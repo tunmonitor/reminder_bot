@@ -3,16 +3,18 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from aiogram.exceptions import TelegramAPIError
+from aiogram.types import ReplyKeyboardRemove
 
 from bot.excel_parser import ServiceAssignment, ServiceEvent
 from bot.handlers import register, router
+from bot.navigation import NAV_CANCEL_TEXT, NAV_HINT, NAV_HOME_TEXT
 from bot.service_registry import ServiceRegistry
 
 
@@ -866,6 +868,246 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_nav_keyboard_cancel_steps_back_and_home_opens_start(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 12345)
+            await self.admin_router.message.handlers[6].callback(
+                self.message(12345, "/service_notify")
+            )
+            nav = next(
+                item.callback for item in self.admin_router.message.handlers
+                if item.callback.__name__ == "on_nav_button"
+            )
+
+            async def press(data):
+                callback = SimpleNamespace(
+                    data=data,
+                    from_user=SimpleNamespace(id=12345),
+                    message=self.message(12345, ""),
+                    answer=AsyncMock(),
+                )
+                callback.message.answer.return_value = SimpleNamespace(
+                    message_id=700
+                )
+                handler = (
+                    "on_service_selected" if data.startswith("service:")
+                    else "on_group_reminder_action"
+                )
+                await self.callback_handler(handler)(callback)
+                return callback.message.answer
+
+            def buttons(answer):
+                return [
+                    item.callback_data
+                    for row in answer.await_args.kwargs[
+                        "reply_markup"
+                    ].inline_keyboard
+                    for item in row
+                ]
+
+            async def tap(text):
+                message = self.message(12345, text)
+                message.answer.return_value = SimpleNamespace(message_id=800)
+                await nav(message)
+                return message.answer
+
+            root = await press("service:service_notify:sound")
+            default = next(
+                data for data in buttons(root)
+                if data.startswith("group_reminder:default:")
+            )
+            screen = await press(default)
+            # Корень настройки («✖️ Закрыть настройку») — уже второй
+            # уровень: сначала подсказка с нижней клавиатурой.
+            hint = root.await_args_list[0]
+            self.assertEqual(hint.args[0], NAV_HINT)
+            self.assertEqual(
+                [b.text for b in hint.kwargs["reply_markup"].keyboard[0]],
+                [NAV_CANCEL_TEXT, NAV_HOME_TEXT],
+            )
+            # На шаге ввода «Отмена» — как «Назад без изменения».
+            edit = next(
+                data for data in buttons(screen)
+                if data.startswith("group_reminder:edit_default:")
+            )
+            await press(edit)
+            back = await tap(NAV_CANCEL_TEXT)
+            self.assertIn("шаблон по умолчанию", back.await_args.args[0])
+            self.assertIsNone(
+                next(
+                    service for service in self.registry.list_services()
+                    if service["id"] == "sound"
+                )["group_template"]
+            )
+            # Ещё раз «Отмена» — «⬅️ К настройкам».
+            menu = await tap(NAV_CANCEL_TEXT)
+            self.assertTrue(any(
+                data.startswith("group_reminder:default:")
+                for data in buttons(menu)
+            ))
+            home = await tap(NAV_HOME_TEXT)
+            self.assertTrue(any(
+                data.startswith("menu:") for data in buttons(home)
+            ))
+            removal = self.context.bot.send_message.await_args_list[-1]
+            self.assertIsInstance(
+                removal.kwargs["reply_markup"], ReplyKeyboardRemove
+            )
+
+        asyncio.run(run())
+
+    def test_stored_nav_hint_is_deleted_after_restart(self):
+        async def run():
+            # Подсказка осталась от прошлого запуска бота.
+            self.registry.set_nav_hints(12345, [777, 778])
+            def delete(chat_id, message_id):
+                if message_id == 778:
+                    raise TelegramAPIError(MagicMock(), "flood")
+
+            self.context.bot.delete_message.side_effect = delete
+            start = self.admin_router.message.handlers[8].callback
+            await start(self.message(12345, "/start"))
+            deleted = [
+                call.kwargs["message_id"]
+                for call in self.context.bot.delete_message.await_args_list
+            ]
+            self.assertIn(777, deleted)
+            # Неудавшееся удаление остаётся в базе для следующей попытки.
+            self.assertEqual(self.registry.get_nav_hints(12345), [778])
+
+        asyncio.run(run())
+
+    def test_nav_keyboard_middleware_installed_on_real_bot_session(self):
+        from aiogram import Bot
+
+        bot = Bot("123456:TEST-TOKEN")
+        self.addCleanup(lambda: asyncio.run(bot.session.close()))
+        context = SimpleNamespace(**{**vars(self.context), "bot": bot})
+        register(SimpleNamespace(include_router=MagicMock()), context)
+        self.assertEqual(
+            [item.__name__ for item in bot.session.middleware],
+            ["track_reply_keyboards"],
+        )
+
+    def test_nav_keyboard_removal_is_retried_and_start_without_menu_hides(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 12345)
+            await self.admin_router.message.handlers[6].callback(
+                self.message(12345, "/service_notify")
+            )
+            callback = SimpleNamespace(
+                data="service:service_notify:sound",
+                from_user=SimpleNamespace(id=12345),
+                message=self.message(12345, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_selected")(callback)
+            default = next(
+                button.callback_data
+                for row in callback.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith("group_reminder:default:")
+            )
+            callback.data = default
+            await self.callback_handler("on_group_reminder_action")(callback)
+            self.assertIn(
+                NAV_HINT,
+                [call.args[0] for call in callback.message.answer.await_args_list],
+            )
+
+            send = self.context.bot.send_message
+            send.side_effect = TelegramAPIError(MagicMock(), "flood")
+            start = self.admin_router.message.handlers[8].callback
+            await start(self.message(12345, "/start"))
+            failed = send.await_count
+            self.assertGreaterEqual(failed, 1)
+            # Клавиатура осталась у клиента — следующий /start убирает снова.
+            send.side_effect = None
+            await start(self.message(12345, "/start"))
+            self.assertEqual(send.await_count, failed + 1)
+            self.assertIsInstance(
+                send.await_args.kwargs["reply_markup"], ReplyKeyboardRemove
+            )
+            await start(self.message(12345, "/start"))
+            self.assertEqual(send.await_count, failed + 1)
+
+        asyncio.run(run())
+
+    def test_template_screens_offer_preview_and_field_help(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 12345)
+            self.registry.set_service_default_template(
+                67890, "sound", "Свой {sunday_date}"
+            )
+            await self.admin_router.message.handlers[6].callback(
+                self.message(12345, "/service_notify")
+            )
+            self.context.get_template_preview = AsyncMock(return_value={
+                "date": "25.10.2026", "text": "Готовый текст",
+                "has_data": True, "error": None,
+            })
+            action = self.callback_handler("on_group_reminder_action")
+
+            async def press(data):
+                callback = SimpleNamespace(
+                    data=data,
+                    from_user=SimpleNamespace(id=12345),
+                    message=self.message(12345, ""),
+                    answer=AsyncMock(),
+                )
+                callback.message.answer.return_value = SimpleNamespace(
+                    message_id=600
+                )
+                if data.startswith("service:"):
+                    await self.callback_handler("on_service_selected")(callback)
+                elif data.startswith("notify_back:"):
+                    await self.callback_handler(
+                        "on_notification_edit_back"
+                    )(callback)
+                else:
+                    await action(callback)
+                return callback.message.answer.await_args
+
+            def button(call, prefix):
+                return next(
+                    item.callback_data
+                    for row in call.kwargs["reply_markup"].inline_keyboard
+                    for item in row
+                    if item.callback_data.startswith(prefix)
+                )
+
+            root = await press("service:service_notify:sound")
+            for screen, edit, kind, fields in (
+                ("group_reminder:default:", "group_reminder:edit_default:",
+                 "default", "{informational_notes} — "),
+                ("group_reminder:report:", "group_reminder:edit_report:",
+                 "report", "{confirmation_status} — "),
+            ):
+                template_screen = await press(button(root, screen))
+                preview = await press(
+                    button(template_screen, "group_reminder:tpl_preview:")
+                )
+                self.assertIn("Готовый текст", preview.args[0])
+                self.assertIn("25.10.2026", preview.args[0])
+                self.assertEqual(
+                    self.context.get_template_preview.await_args.args,
+                    ("sound", kind,
+                     "Свой {sunday_date}" if kind == "default" else None),
+                )
+                back = await press(button(preview, "group_reminder:tpl_back:"))
+                prompt = await press(button(back, edit))
+                self.assertIn("\n• {service_name} — ", prompt.args[0])
+                self.assertIn(fields, prompt.args[0])
+                template_screen = await press(button(prompt, "notify_back:"))
+                button(template_screen, "group_reminder:tpl_preview:")
+                root = await press(
+                    button(template_screen, "group_reminder:root_back:")
+                )
+
+        asyncio.run(run())
+
     def test_notification_step_back_keeps_session_and_root_close_has_navigation(self):
         async def run():
             self.registry.add_service_admin(67890, "sound", 12345)
@@ -1006,12 +1248,16 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 len(result_markup.inline_keyboard),
                 2,
             )
+            # Последнее 501 — подсказка навигации (тот же мок ответа, что у
+            # корня настройки): итоговый экран без «⬅️ …» убирает нижнюю
+            # клавиатуру вместе с ней.
             self.assertEqual(
                 [
                     call.kwargs["message_id"]
                     for call in self.context.bot.delete_message.await_args_list
+                    if isinstance(call.kwargs["message_id"], int)
                 ],
-                [501, 502, 502, 503, 503],
+                [501, 502, 502, 503, 503, 501],
             )
 
         asyncio.run(run())
@@ -1775,6 +2021,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             handler_name = "on_notification_edit_back"
         elif button.callback_data.startswith("svc_tasks:"):
             handler_name = "on_service_tasks"
+        elif button.callback_data.startswith("rdy:"):
+            handler_name = "on_readiness"
         else:
             handler_name = "on_group_reminder_action"
         await self.callback_handler(handler_name)(callback)
@@ -3808,8 +4056,11 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
             await self.admin_router.message.handlers[1].callback(message)
 
-            self.assertEqual(message.answer.await_count, 1)
-            chunks = [call.args[0] for call in message.answer.await_args_list]
+            chunks = [
+                call.args[0] for call in message.answer.await_args_list
+                if call.args[0] != NAV_HINT
+            ]
+            self.assertEqual(len(chunks), 1)
             self.assertTrue(
                 all(len(chunk.encode("utf-16-le")) // 2 <= 500 for chunk in chunks)
             )
@@ -5534,6 +5785,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "service:service_admin_add:sound",
                     "service:service_admin_remove:sound",
                     "service:test_notify:sound",
+                    "rdy:open:sound",
                     "svc_tasks:open:sound",
                     "service:back_to_services:list",
                 ],
@@ -5555,7 +5807,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 message=self.message(67890, ""),
                 answer=AsyncMock(),
             )
+            opened.message.delete = AsyncMock()
             await self.callback_handler("on_service_tasks")(opened)
+            # Карточка служения не остаётся под экраном задач.
+            opened.message.delete.assert_awaited_once()
             screen = opened.message.answer.await_args.args[0]
             self.assertIn("ЗВУК · задачи", screen)
             self.assertIn("🔴 🎶 спевка · выключена", screen)
@@ -5588,6 +5843,258 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_super_admin_sets_people_needed_for_task(self):
+        async def run():
+            opened = SimpleNamespace(
+                data="svc_tasks:open:sound",
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_tasks")(opened)
+            people = await self._click(
+                opened.message,
+                lambda button: button.text == "👥 Нужно людей",
+                actor_id=67890,
+            )
+            choice = await self._click(
+                people.message,
+                lambda button: button.text.startswith("👥 звук"),
+                actor_id=67890,
+            )
+            saved = await self._click(
+                choice.message,
+                lambda button: button.text == "👥 3–4",
+                actor_id=67890,
+            )
+            self.assertIn(
+                "✅ «звук»: нужно людей — 3–4",
+                saved.message.answer.await_args.args[0],
+            )
+            task = next(
+                item for item in self.registry.list_service_tasks("sound")
+                if item["name"] == "звук"
+            )
+            self.assertEqual((task["people_needed"], task["people_max"]), (3, 4))
+            back = await self._click(
+                saved.message,
+                lambda button: button.text == "⬅️ К задачам",
+                actor_id=67890,
+            )
+            self.assertIn("👥 3–4", back.message.answer.await_args.args[0])
+
+        asyncio.run(run())
+
+    def test_readiness_screen_settings_skip_start_and_votes(self):
+        self.registry.set_group_chat(67890, "sound", -1005555, enabled=True)
+        self.context.bot.send_poll = AsyncMock(return_value=SimpleNamespace(
+            message_id=12, poll=SimpleNamespace(id="ready-poll"),
+        ))
+        self.context.bot.send_message.return_value = SimpleNamespace(
+            message_id=11
+        )
+        handler = self.callback_handler("on_readiness")
+        today = datetime.now(ZoneInfo("UTC")).date()
+        year, month = (
+            (today.year + 1, 1) if today.month == 12
+            else (today.year, today.month + 1)
+        )
+        month_arg = f"{year:04d}{month:02d}"
+
+        async def press(data, actor_id=67890):
+            callback = SimpleNamespace(
+                data=data,
+                from_user=SimpleNamespace(id=actor_id),
+                message=self.message(actor_id, ""),
+                answer=AsyncMock(),
+            )
+            await handler(callback)
+            return callback
+
+        async def run():
+            screen = await press("rdy:open:sound")
+            text = screen.message.answer.await_args.args[0]
+            self.assertIn("🗳 Опрос готовности", text)
+            self.assertIn("🔴 выключен", text)
+            denied = await press("rdy:open:sound", actor_id=24680)
+            self.assertIn("Недостаточно прав", denied.answer.await_args.args[0])
+
+            await press("rdy:toggle:sound")
+            self.assertTrue(
+                self.registry.get_readiness_settings("sound")["enabled"]
+            )
+            await press("rdy:dur:sound:2")
+            await press("rdy:time:sound:0900")
+            settings = self.registry.get_readiness_settings("sound")
+            self.assertEqual(
+                (settings["duration_days"], settings["start_time"]), (2, "09:00")
+            )
+
+            skipped = await press(f"rdy:skip:sound:{month_arg}")
+            self.assertIn("опрос не запустится",
+                          skipped.message.answer.await_args.args[0])
+            await press(f"rdy:unskip:sound:{month_arg}")
+            started = await press(f"rdy:start:sound:{month_arg}")
+            self.assertIn("✅ Опрос отправлен",
+                          started.message.answer.await_args.args[0])
+            self.context.bot.send_poll.assert_awaited_once()
+            again = await press(f"rdy:start:sound:{month_arg}")
+            self.assertIn("⏹ Завершить", str(
+                again.message.answer.await_args.kwargs["reply_markup"]
+            ))
+
+            poll_answer = [
+                item.callback for item in router.poll_answer.handlers
+                if item.callback.__name__ == "on_replacement_poll_answer"
+            ][-1]
+            await poll_answer(SimpleNamespace(
+                poll_id="ready-poll", option_ids=[0, 1],
+                user=SimpleNamespace(
+                    id=12345, is_bot=False, username="alex",
+                    first_name="Алексей", last_name=None,
+                ),
+            ))
+            run = next(
+                item for item in self.registry.list_open_readiness_runs()
+                if item["poll_id"] == "ready-poll"
+            )
+            answers = self.registry.list_readiness_answers(run["id"])
+            self.assertEqual(answers[0]["dates"], run["dates"][:2])
+
+            stale = await press("rdy:finish:sound:200001")
+            self.assertIn(
+                "Экран устарел", stale.message.answer.await_args.args[0]
+            )
+            text_screen = await press("rdy:tpl:sound:intro")
+            self.assertIn(
+                "Используется встроенный текст",
+                text_screen.message.answer.await_args.args[0],
+            )
+            preview = await press("rdy:tplprev:sound:intro")
+            self.assertIn(
+                "Спасибо за твое служение",
+                preview.message.answer.await_args.args[0],
+            )
+            prompt = await press("rdy:tpledit:sound:intro")
+            self.assertIn(
+                "• {people} — ", prompt.message.answer.await_args.args[0]
+            )
+            text_handler = next(
+                item.callback for item in self.admin_router.message.handlers
+                if item.callback.__name__ == "on_service_parameter"
+            )
+            bad = self.message(67890, "Привет {name}")
+            await text_handler(bad)
+            self.assertIn("не поддерживается", bad.answer.await_args.args[0])
+            good = self.message(67890, "Опрос {service_name} на {month}")
+            await text_handler(good)
+            self.assertIn("✅ Текст сохранён", good.answer.await_args.args[0])
+            self.assertEqual(
+                self.registry.get_readiness_settings("sound")["intro_template"],
+                "Опрос {service_name} на {month}",
+            )
+            await press("rdy:tplreset:sound:intro")
+            self.assertIsNone(
+                self.registry.get_readiness_settings("sound")["intro_template"]
+            )
+            progress = await press(f"rdy:progress:sound:{month_arg}")
+            self.assertIn(
+                "Ход опроса", progress.message.answer.await_args.args[0]
+            )
+            # Ответивший вне состава — «➕ В состав» с выбором задач.
+            add_button = next(
+                button.callback_data
+                for row in progress.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.text.startswith("➕")
+            )
+            self.assertEqual(add_button, f"rdy:addm:sound:{month_arg}.12345")
+            old_month = await press("rdy:addm:sound:200001.12345")
+            self.assertIn("Экран устарел",
+                          old_month.message.answer.await_args.args[0])
+            # Уже в составе без задач — задачи привязываются к нему, а не
+            # ко второму участнику с именем из Telegram.
+            self.registry.bind_service_member(
+                67890, "sound", "Алексей из Списков", 12345
+            )
+            member_screen = await press(add_button)
+            token = next(
+                button.callback_data.split(":")[-1]
+                for row in member_screen.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith("rdy:addms:")
+            )
+            stale = await press("rdy:addms:sound:old")
+            self.assertIn("устарел", stale.answer.await_args.args[0])
+            empty = await press(f"rdy:addms:sound:{token}")
+            self.assertIn("хотя бы одну задачу",
+                          empty.message.answer.await_args.args[0])
+            await press(f"rdy:addmt:sound:{token}.0")
+            saved = await press(f"rdy:addms:sound:{token}")
+            self.assertIn("Алексей из Списков в составе",
+                          saved.message.answer.await_args.args[0])
+            self.assertEqual(
+                [
+                    member["name"]
+                    for member in self.registry.list_service_members("sound")
+                    if member["telegram_id"] == 12345
+                ],
+                ["Алексей из Списков"],
+            )
+            self.assertIn(12345, {
+                person["telegram_id"]
+                for person in self.registry.readiness_people("sound")
+                if person["tasks"]
+            })
+            finished = await press(f"rdy:finish:sound:{month_arg}")
+            self.assertIn("Опрос завершён",
+                          finished.message.answer.await_args.args[0])
+            self.context.bot.stop_poll.assert_awaited_once()
+            confirm = await press(f"rdy:restart:sound:{month_arg}")
+            self.assertIn("будут удалены",
+                          confirm.message.answer.await_args.args[0])
+            # Сбой отправки нового опроса — прежние ответы на месте.
+            self.context.bot.send_poll.side_effect = RuntimeError("network")
+            failed = await press(f"rdy:restartok:sound:{month_arg}")
+            self.assertIn("прежние ответы сохранены",
+                          failed.message.answer.await_args.args[0])
+            kept = self.registry.get_readiness_run("sound", f"{year:04d}-{month:02d}")
+            self.assertEqual(kept["poll_id"], "ready-poll")
+            self.assertEqual(len(self.registry.list_readiness_answers(kept["id"])), 1)
+            self.context.bot.send_poll.side_effect = None
+            self.context.bot.send_poll.return_value = SimpleNamespace(
+                message_id=13, poll=SimpleNamespace(id="ready-poll-2"),
+            )
+            restarted = await press(f"rdy:restartok:sound:{month_arg}")
+            self.assertIn("Новый опрос отправлен",
+                          restarted.message.answer.await_args.args[0])
+            run = self.registry.list_open_readiness_runs()[0]
+            self.assertEqual(run["poll_id"], "ready-poll-2")
+            self.assertEqual(self.registry.list_readiness_answers(run["id"]), [])
+            # Ответ Telegram потерян при перезапуске — месяц за новой
+            # записью, админ видит, что проверить.
+            from aiogram.exceptions import TelegramNetworkError
+
+            self.context.bot.send_poll.side_effect = TelegramNetworkError(
+                method=SimpleNamespace(), message="timeout"
+            )
+            lost = await press(f"rdy:restartok:sound:{month_arg}")
+            self.assertIn("проверьте", lost.message.answer.await_args.args[0])
+            self.assertIsNone(self.registry.get_readiness_run_by_id(run["id"]))
+            self.assertEqual(
+                self.registry.get_readiness_run(
+                    "sound", f"{year:04d}-{month:02d}"
+                )["status"],
+                "closed",
+            )
+
+        self.context.bot.stop_poll = AsyncMock()
+        asyncio.run(run())
+
     def test_service_admin_cannot_open_service_tasks(self):
         async def run():
             self.registry.add_service_admin(67890, "sound", 24680)
@@ -5618,7 +6125,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertEqual(
                 self.callback_data_list(callback.message),
                 ["service:edit_notify:sound", "service:service_replace:sound",
-                 "service:back_to_services:list"],
+                 "rdy:open:sound", "service:back_to_services:list"],
             )
             self.assertIn(
                 "👤 Администраторы · 1",

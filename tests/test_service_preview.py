@@ -11,7 +11,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
-from bot.app import _prepare_service_test_previews, get_group_reminder_preview
+from bot.app import (
+    _prepare_service_test_previews,
+    get_group_reminder_preview,
+    get_template_preview,
+)
 from bot.scheduler import next_reminder_occurrence, reminder_send_date
 from bot.service_registry import ServiceRegistry
 from bot.ui import plain_text, render_screen_chunks
@@ -51,6 +55,65 @@ class ServicePreviewTest(unittest.TestCase):
                 )
 
         return asyncio.run(run()), reminder
+
+    def _template_preview(self, registry, temp_dir, kind, template,
+                          assignments, found=True):
+        credentials = SimpleNamespace(admin_tg_id=67890)
+
+        async def load(*_args, raw_out, **_kwargs):
+            raw_out.update(assignments)
+            return assignments, found
+
+        async def run():
+            with patch(
+                "bot.app._next_sunday_in_tz", return_value=date(2026, 10, 25)
+            ), patch(
+                "bot.app._load_service_task_assignments",
+                new=AsyncMock(side_effect=load),
+            ):
+                return await get_template_preview(
+                    "sound", kind, template, credentials, Path(temp_dir),
+                    ZoneInfo("UTC"), registry,
+                    logging.getLogger("test-template-preview"),
+                )
+
+        return asyncio.run(run())
+
+    def test_template_preview_renders_draft_and_builtin_templates(self):
+        assignments = {"Микшер": {"names": ["Алексей"], "is_informational": False}}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ServiceRegistry(Path(temp_dir) / "registry.sqlite3")
+            registry.initialize(67890, -100)
+            draft = self._template_preview(
+                registry, temp_dir, "default", "Черновик {sunday_date}",
+                assignments,
+            )
+            self.assertEqual(draft["text"], "Черновик 25.10.2026")
+            builtin = self._template_preview(
+                registry, temp_dir, "default", None, assignments
+            )
+            self.assertIn("в воскресенье 25.10.2026", builtin["text"])
+            report = self._template_preview(
+                registry, temp_dir, "report", None, assignments
+            )
+            self.assertTrue(report["has_data"])
+            self.assertIn("📋 Отчёт · Звук · 25.10.2026", report["text"])
+            self.assertIn("⏳ нет ответа — Алексей (Микшер)", report["text"])
+            custom = self._template_preview(
+                registry, temp_dir, "report", "{confirmation_status}",
+                assignments,
+            )
+            self.assertEqual(custom["text"], "⏳ нет ответа — Алексей (Микшер)")
+
+    def test_template_preview_reports_missing_event_data(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ServiceRegistry(Path(temp_dir) / "registry.sqlite3")
+            registry.initialize(67890, -100)
+            result = self._template_preview(
+                registry, temp_dir, "default", None, {}, found=False
+            )
+            self.assertFalse(result["has_data"])
+            self.assertEqual(result["error"], "Нет данных из графика на 25.10.2026.")
 
     def test_group_reminder_preview_renders_body_override(self):
         with tempfile.TemporaryDirectory() as temp_dir:

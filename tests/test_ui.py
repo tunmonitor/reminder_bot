@@ -387,5 +387,28 @@ class CleanPreviousMenuTest(unittest.TestCase):
         asyncio.run(run())
 
 
+    def test_already_deleted_message_is_not_edited(self):
+        async def run():
+            gone = TelegramAPIError(
+                method=SimpleNamespace(),
+                message="Bad Request: message to delete not found",
+            )
+            bot = SimpleNamespace(
+                delete_message=AsyncMock(side_effect=gone),
+                edit_message_text=AsyncMock(),
+            )
+            await clean_previous_menu_by_id(
+                bot, 42, 13, logging.getLogger(__name__)
+            )
+            bot.edit_message_text.assert_not_awaited()
+            message = SimpleNamespace(
+                message_id=13, date=datetime.now(timezone.utc),
+                delete=AsyncMock(side_effect=gone), edit_text=AsyncMock(),
+            )
+            await clean_previous_menu(message, logging.getLogger(__name__))
+            message.edit_text.assert_not_awaited()
+
+        asyncio.run(run())
+
 if __name__ == "__main__":
     unittest.main()

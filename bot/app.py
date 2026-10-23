@@ -49,7 +49,7 @@ if __package__:
         parse_service_rosters,
         resolve_assignments,
     )
-    from .admin_report import send_admin_reports
+    from .admin_report import report_text, send_admin_reports
     from .handlers import register, send_to_service_group
     from .logger import setup_loggers
     from .notifier import (
@@ -72,6 +72,7 @@ if __package__:
     from .ui import send_telegram_screen, visible_units
     from .secure_fs import open_private_directory
     from .month_summary import send_due_month_summaries
+    from .readiness import run_readiness_tick
     from .scheduler import (
         add_service_reminder_jobs,
         build_scheduler,
@@ -81,7 +82,7 @@ if __package__:
         refresh_user_reminder_jobs as refresh_user_reminder_schedule_jobs,
         scheduled_reminder_date,
     )
-    from .service_registry import ServiceRegistry
+    from .service_registry import DEFAULT_GROUP_TEMPLATE, ServiceRegistry
     from .state import StateCache
     from .yandex_disk import download_public
     from .backup import (
@@ -111,7 +112,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         parse_service_rosters,
         resolve_assignments,
     )
-    from bot.admin_report import send_admin_reports
+    from bot.admin_report import report_text, send_admin_reports
     from bot.handlers import register, send_to_service_group
     from bot.logger import setup_loggers
     from bot.notifier import (
@@ -134,6 +135,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
     from bot.ui import send_telegram_screen, visible_units
     from bot.secure_fs import open_private_directory
     from bot.month_summary import send_due_month_summaries
+    from bot.readiness import run_readiness_tick
     from bot.scheduler import (
         add_service_reminder_jobs,
         build_scheduler,
@@ -143,7 +145,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         refresh_user_reminder_jobs as refresh_user_reminder_schedule_jobs,
         scheduled_reminder_date,
     )
-    from bot.service_registry import ServiceRegistry
+    from bot.service_registry import DEFAULT_GROUP_TEMPLATE, ServiceRegistry
     from bot.state import StateCache
     from bot.yandex_disk import download_public
     from bot.backup import (
@@ -860,6 +862,78 @@ async def get_group_reminder_preview(
             template, reminder, service, assignments, contacts_by_name,
             date_text,
         )
+    except (AttributeError, IndexError, ValueError):
+        result["error"] = "Ошибка в синтаксисе шаблона."
+        return result
+    result["has_data"] = True
+    return result
+
+
+async def get_template_preview(
+    service_id: str,
+    kind: str,
+    template: str | None,
+    credentials,
+    shm_dir: Path,
+    tz,
+    registry: ServiceRegistry,
+    debug_logger,
+) -> dict:
+    """Предпросмотр шаблона служения на ближайшее воскресенье.
+
+    kind: "default" — шаблон группового напоминания по умолчанию,
+    "report" — отчёт админам. template — черновик из настройки;
+    None — встроенный шаблон.
+    """
+    service = registry.get_service(service_id)
+    if service is None:
+        raise ValueError("Служение не найдено.")
+    event_date = _next_sunday_in_tz(tz)
+    date_text = event_date.strftime("%d.%m.%Y")
+    result = {"date": date_text, "text": "", "has_data": False, "error": None}
+    raw: dict = {}
+    try:
+        assignments, event_found = await _load_service_task_assignments(
+            credentials,
+            shm_dir,
+            tz,
+            service_id,
+            debug_logger,
+            only_date=event_date,
+            return_event_found=True,
+            services=registry.service_catalog(),
+            registry=registry,
+            raw_out=raw,
+        )
+    except Exception:
+        debug_logger.exception(
+            "Не удалось загрузить график для предпросмотра шаблона %s",
+            service_id,
+        )
+        result["error"] = "Не удалось загрузить график. Попробуйте позже."
+        return result
+    if not event_found:
+        result["error"] = f"Нет данных из графика на {date_text}."
+        return result
+    try:
+        if kind == "report":
+            # Как при отправке: замены применяет сам отчёт.
+            result["text"] = report_text(
+                registry, service, event_date, raw,
+                credentials.admin_tg_id, TELEGRAM_TEXT_LIMIT, template,
+            )
+        else:
+            contacts = registry.list_responsible_contacts(
+                credentials.admin_tg_id, service_id
+            )
+            result["text"] = _render_group_reminder(
+                template or DEFAULT_GROUP_TEMPLATE,
+                {"task": None},
+                service,
+                assignments,
+                {(item["task"], item["name"]): item for item in contacts},
+                date_text,
+            )
     except (AttributeError, IndexError, ValueError):
         result["error"] = "Ошибка в синтаксисе шаблона."
         return result
@@ -1672,7 +1746,11 @@ async def _run_locked(args: CliArgs) -> None:
         directory_fd = open_private_directory(directory, create=True)
         os.close(directory_fd)
 
-    interaction_logger, debug_logger = setup_loggers(log_dir)
+    interaction_logger, debug_logger = setup_loggers(
+        log_dir, trace=getattr(args, "trace", False)
+    )
+    if getattr(args, "trace", False):
+        debug_logger.info("Отслеживание навигации (TRACE) включено")
     credentials = load_credentials()
     templates = load_templates()
     tz = get_tz(credentials.timezone)
@@ -1862,6 +1940,24 @@ async def _run_locked(args: CliArgs) -> None:
         context.load_upcoming_service_events = load_upcoming_service_events
         context.prepare_service_test_previews = prepare_service_test_previews
         context.get_group_reminder_preview = prepare_group_reminder_preview
+
+        async def prepare_template_preview(
+            service_id: str, kind: str, template: str | None
+        ) -> dict:
+            if service_registry is None:
+                raise ValueError("Реестр настроек служений недоступен")
+            return await get_template_preview(
+                service_id,
+                kind,
+                template,
+                credentials,
+                shm_dir,
+                tz,
+                service_registry,
+                debug_logger,
+            )
+
+        context.get_template_preview = prepare_template_preview
         register(dp, context)
 
         if backup_manager is not None:
@@ -2248,6 +2344,29 @@ async def _run_locked(args: CliArgs) -> None:
                 "cron",
                 minute="*",
                 id="month-summary",
+                replace_existing=True,
+                misfire_grace_time=None,
+                coalesce=True,
+                max_instances=1,
+            )
+
+            async def readiness_tick() -> None:
+                """Опрос готовности (этап 5): превью, запуск, напоминание,
+                срок — раз в минуту; после перезапуска досылается."""
+                try:
+                    await run_readiness_tick(
+                        bot, service_registry, datetime.now(tz), tz,
+                        credentials.admin_tg_id, debug_logger,
+                        TELEGRAM_TEXT_LIMIT,
+                    )
+                except Exception:
+                    debug_logger.exception("Сбой проверки опроса готовности")
+
+            scheduler.add_job(
+                readiness_tick,
+                "cron",
+                minute="*",
+                id="readiness",
                 replace_existing=True,
                 misfire_grace_time=None,
                 coalesce=True,

@@ -96,6 +96,44 @@ class ServiceRegistryTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.registry.set_service_task_enabled(1001, "sound", "нет", True)
 
+    def test_people_needed_validated_and_migrated(self):
+        self.registry.add_service_admin(1001, "sound", 2002)
+        with self.assertRaises(PermissionError):
+            self.registry.set_service_task_people_needed(3003, "sound", "звук", 2)
+        # Админ служения может; диапазон «3–4».
+        self.registry.set_service_task_people_needed(2002, "sound", "звук", 3, 4)
+        task = next(
+            item for item in self.registry.list_service_tasks("sound")
+            if item["name"] == "звук"
+        )
+        self.assertEqual((task["people_needed"], task["people_max"]), (3, 4))
+        with self.assertRaises(ValueError):
+            self.registry.set_service_task_people_needed(1001, "sound", "звук", 3, 2)
+        for bad in (0, 6, True, "2"):
+            with self.assertRaises(ValueError):
+                self.registry.set_service_task_people_needed(
+                    1001, "sound", "звук", bad
+                )
+        with self.assertRaises(ValueError):
+            self.registry.set_service_task_people_needed(1001, "sound", "нет", 2)
+        self.registry.set_service_task_people_needed(1001, "sound", "звук", 3)
+        self.assertEqual(
+            {
+                task["name"]: task["people_needed"]
+                for task in self.registry.list_service_tasks("sound")
+            }["звук"],
+            3,
+        )
+        # Старая база без колонки получает её со значением 1.
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute("ALTER TABLE service_tasks DROP COLUMN people_needed")
+            connection.commit()
+        self.registry.initialize(1001, -10001)
+        self.assertTrue(all(
+            task["people_needed"] == 1
+            for task in self.registry.list_service_tasks("sound")
+        ))
+
     def test_services_missing_from_catalog_are_archived_not_deleted(self):
         with sqlite3.connect(self.path) as connection:
             connection.execute(

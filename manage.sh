@@ -12,7 +12,8 @@
 #   - PID: /dev/shm/reminder_bot/{test|prod}/reminder_bot_bot.pid
 #   - Логи: reminder_bot_interaction.log (INFO), reminder_bot_debug.log (DEBUG)
 #   - Команды: start | stop | restart | status | backup | backup-data |
-#     restore-data | webapp {start|stop|restart|status} | logs | debug-logs | clear-logs
+#     restore-data | webapp {start|stop|restart|status} | logs | debug-logs |
+#     clear-logs | trace {on|off|status}
 #   - stop делает backup перед kill; start восстанавливает лог из backup при чистой ОЗУ.
 #   - status печатает "БОТ РАБОТАЕТ" для CI-проверок.
 
@@ -51,6 +52,10 @@ WEBAPP_LOG_FILE="$LOG_DIR/reminder_bot_webapp.log"
 
 # Персистентные бэкапы логов на SD-карте
 BACKUP_DIR="$PROJECT_DIR/logs_backup"
+
+# Отслеживание навигации (уровень TRACE в debug.log): флаг в .runtime/,
+# который развёртывание не трогает; действует со следующего запуска.
+TRACE_FLAG="$PROJECT_DIR/.runtime/trace_enabled"
 
 ensure_backup_dir() {
     if [ -L "$BACKUP_DIR" ]; then
@@ -483,11 +488,18 @@ cmd_start() {
 
     cd "$PROJECT_DIR" || exit 1
 
+    local trace_args=()
+    if [ -f "$TRACE_FLAG" ] && [ ! -L "$TRACE_FLAG" ]; then
+        trace_args=(--trace)
+        echo "🔎 Отслеживание навигации (TRACE) включено."
+    fi
+
     PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
         RUNNER_TRACKING_ID=0 \
         nohup "$PYTHON_EXEC" -u "$BOT_SCRIPT" \
         --shm-dir "$SHM_DIR" \
         --log-dir "$LOG_DIR" \
+        "${trace_args[@]}" \
         >> "$NOHUP_LOG" 2>&1 &
     local new_pid=$!
 
@@ -878,6 +890,39 @@ cmd_clear_logs() {
 }
 
 # --------------------------------------------
+# Команда trace: отслеживание навигации (TRACE в debug.log)
+# --------------------------------------------
+cmd_trace() {
+    case "$1" in
+        on)
+            mkdir -p "$PROJECT_DIR/.runtime" && chmod 700 "$PROJECT_DIR/.runtime" || exit 1
+            if [ -L "$TRACE_FLAG" ]; then
+                echo "❌ Флаг отслеживания не должен быть ссылкой: $TRACE_FLAG" >&2
+                exit 1
+            fi
+            : > "$TRACE_FLAG" || exit 1
+            echo "🔎 Отслеживание навигации включено — действует после: $0 restart"
+            ;;
+        off)
+            rm -f -- "$TRACE_FLAG"
+            echo "⏹ Отслеживание навигации выключено — действует после: $0 restart"
+            ;;
+        status|"")
+            if [ -f "$TRACE_FLAG" ]; then
+                echo "🔎 Отслеживание навигации: включено (строки TRACE в $DEBUG_LOG_FILE)"
+            else
+                echo "⏹ Отслеживание навигации: выключено"
+            fi
+            ;;
+        *)
+            echo "📋 Использование: $0 trace {on|off|status}"
+            exit 1
+            ;;
+    esac
+    exit 0
+}
+
+# --------------------------------------------
 # Диспетчер команд
 # --------------------------------------------
 case "$1" in
@@ -918,8 +963,12 @@ case "$1" in
     clear-logs)
         cmd_clear_logs
         ;;
+    trace)
+        shift
+        cmd_trace "$@"
+        ;;
     *)
-        echo "📋 Использование: $0 {start|stop|restart|status|backup|backup-data|restore-data <snapshot>|webapp {start|stop|restart|status}|logs [--follow]|debug-logs [--follow]|clear-logs}"
+        echo "📋 Использование: $0 {start|stop|restart|status|backup|backup-data|restore-data <snapshot>|webapp {start|stop|restart|status}|logs [--follow]|debug-logs [--follow]|clear-logs|trace {on|off|status}}"
         echo "   ENV определяется автоматически по имени каталога ($ENV_NAME)."
         exit 1
         ;;
