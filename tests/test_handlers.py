@@ -5759,6 +5759,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "service:service_admin_add:sound",
                     "service:service_admin_remove:sound",
                     "service:test_notify:sound",
+                    "rdy:open:sound",
                     "svc_tasks:open:sound",
                     "service:back_to_services:list",
                 ],
@@ -5858,6 +5859,88 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_readiness_screen_settings_skip_start_and_votes(self):
+        self.registry.set_group_chat(67890, "sound", -1005555, enabled=True)
+        self.context.bot.send_poll = AsyncMock(return_value=SimpleNamespace(
+            message_id=12, poll=SimpleNamespace(id="ready-poll"),
+        ))
+        self.context.bot.send_message.return_value = SimpleNamespace(
+            message_id=11
+        )
+        handler = self.callback_handler("on_readiness")
+
+        async def press(data, actor_id=67890):
+            callback = SimpleNamespace(
+                data=data,
+                from_user=SimpleNamespace(id=actor_id),
+                message=self.message(actor_id, ""),
+                answer=AsyncMock(),
+            )
+            await handler(callback)
+            return callback
+
+        async def run():
+            screen = await press("rdy:open:sound")
+            text = screen.message.answer.await_args.args[0]
+            self.assertIn("🗳 Опрос готовности", text)
+            self.assertIn("🔴 выключен", text)
+            denied = await press("rdy:open:sound", actor_id=24680)
+            self.assertIn("Недостаточно прав", denied.answer.await_args.args[0])
+
+            await press("rdy:toggle:sound")
+            self.assertTrue(
+                self.registry.get_readiness_settings("sound")["enabled"]
+            )
+            await press("rdy:dur:sound:2")
+            await press("rdy:time:sound:0900")
+            settings = self.registry.get_readiness_settings("sound")
+            self.assertEqual(
+                (settings["duration_days"], settings["start_time"]), (2, "09:00")
+            )
+
+            skipped = await press("rdy:skip:sound")
+            self.assertIn("опрос не запустится",
+                          skipped.message.answer.await_args.args[0])
+            await press("rdy:unskip:sound")
+            started = await press("rdy:start:sound")
+            self.assertIn("✅ Опрос отправлен",
+                          started.message.answer.await_args.args[0])
+            self.context.bot.send_poll.assert_awaited_once()
+            again = await press("rdy:start:sound")
+            self.assertIn("⏹ Завершить", str(
+                again.message.answer.await_args.kwargs["reply_markup"]
+            ))
+
+            poll_answer = [
+                item.callback for item in router.poll_answer.handlers
+                if item.callback.__name__ == "on_replacement_poll_answer"
+            ][-1]
+            await poll_answer(SimpleNamespace(
+                poll_id="ready-poll", option_ids=[0, 1],
+                user=SimpleNamespace(
+                    id=12345, is_bot=False, username="alex",
+                    first_name="Алексей", last_name=None,
+                ),
+            ))
+            run = next(
+                item for item in self.registry.list_open_readiness_runs()
+                if item["poll_id"] == "ready-poll"
+            )
+            answers = self.registry.list_readiness_answers(run["id"])
+            self.assertEqual(answers[0]["dates"], run["dates"][:2])
+
+            progress = await press("rdy:progress:sound")
+            self.assertIn(
+                "Ход опроса", progress.message.answer.await_args.args[0]
+            )
+            finished = await press("rdy:finish:sound")
+            self.assertIn("Опрос завершён",
+                          finished.message.answer.await_args.args[0])
+            self.context.bot.stop_poll.assert_awaited_once()
+
+        self.context.bot.stop_poll = AsyncMock()
+        asyncio.run(run())
+
     def test_service_admin_cannot_open_service_tasks(self):
         async def run():
             self.registry.add_service_admin(67890, "sound", 24680)
@@ -5888,7 +5971,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertEqual(
                 self.callback_data_list(callback.message),
                 ["service:edit_notify:sound", "service:service_replace:sound",
-                 "service:back_to_services:list"],
+                 "rdy:open:sound", "service:back_to_services:list"],
             )
             self.assertIn(
                 "👤 Администраторы · 1",

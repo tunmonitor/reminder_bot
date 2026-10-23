@@ -72,6 +72,7 @@ if __package__:
     from .ui import send_telegram_screen, visible_units
     from .secure_fs import open_private_directory
     from .month_summary import send_due_month_summaries
+    from .readiness import run_readiness_tick
     from .scheduler import (
         add_service_reminder_jobs,
         build_scheduler,
@@ -134,6 +135,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
     from bot.ui import send_telegram_screen, visible_units
     from bot.secure_fs import open_private_directory
     from bot.month_summary import send_due_month_summaries
+    from bot.readiness import run_readiness_tick
     from bot.scheduler import (
         add_service_reminder_jobs,
         build_scheduler,
@@ -2338,6 +2340,29 @@ async def _run_locked(args: CliArgs) -> None:
                 "cron",
                 minute="*",
                 id="month-summary",
+                replace_existing=True,
+                misfire_grace_time=None,
+                coalesce=True,
+                max_instances=1,
+            )
+
+            async def readiness_tick() -> None:
+                """Опрос готовности (этап 5): превью, запуск, напоминание,
+                срок — раз в минуту; после перезапуска досылается."""
+                try:
+                    await run_readiness_tick(
+                        bot, service_registry, datetime.now(tz), tz,
+                        credentials.admin_tg_id, debug_logger,
+                        TELEGRAM_TEXT_LIMIT,
+                    )
+                except Exception:
+                    debug_logger.exception("Сбой проверки опроса готовности")
+
+            scheduler.add_job(
+                readiness_tick,
+                "cron",
+                minute="*",
+                id="readiness",
                 replace_existing=True,
                 misfire_grace_time=None,
                 coalesce=True,
