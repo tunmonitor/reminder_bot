@@ -3,7 +3,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -5868,6 +5868,12 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             message_id=11
         )
         handler = self.callback_handler("on_readiness")
+        today = datetime.now(ZoneInfo("UTC")).date()
+        year, month = (
+            (today.year + 1, 1) if today.month == 12
+            else (today.year, today.month + 1)
+        )
+        month_arg = f"{year:04d}{month:02d}"
 
         async def press(data, actor_id=67890):
             callback = SimpleNamespace(
@@ -5898,15 +5904,15 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 (settings["duration_days"], settings["start_time"]), (2, "09:00")
             )
 
-            skipped = await press("rdy:skip:sound")
+            skipped = await press(f"rdy:skip:sound:{month_arg}")
             self.assertIn("опрос не запустится",
                           skipped.message.answer.await_args.args[0])
-            await press("rdy:unskip:sound")
-            started = await press("rdy:start:sound")
+            await press(f"rdy:unskip:sound:{month_arg}")
+            started = await press(f"rdy:start:sound:{month_arg}")
             self.assertIn("✅ Опрос отправлен",
                           started.message.answer.await_args.args[0])
             self.context.bot.send_poll.assert_awaited_once()
-            again = await press("rdy:start:sound")
+            again = await press(f"rdy:start:sound:{month_arg}")
             self.assertIn("⏹ Завершить", str(
                 again.message.answer.await_args.kwargs["reply_markup"]
             ))
@@ -5929,11 +5935,15 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             answers = self.registry.list_readiness_answers(run["id"])
             self.assertEqual(answers[0]["dates"], run["dates"][:2])
 
-            progress = await press("rdy:progress:sound")
+            stale = await press("rdy:finish:sound:200001")
+            self.assertIn(
+                "Экран устарел", stale.message.answer.await_args.args[0]
+            )
+            progress = await press(f"rdy:progress:sound:{month_arg}")
             self.assertIn(
                 "Ход опроса", progress.message.answer.await_args.args[0]
             )
-            finished = await press("rdy:finish:sound")
+            finished = await press(f"rdy:finish:sound:{month_arg}")
             self.assertIn("Опрос завершён",
                           finished.message.answer.await_args.args[0])
             self.context.bot.stop_poll.assert_awaited_once()

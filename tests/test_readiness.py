@@ -54,6 +54,10 @@ class ReadinessDatesTest(unittest.TestCase):
         self.assertEqual(
             readiness.manual_deadline(last, settings), last + timedelta(hours=1)
         )
+        with self.assertRaises(ValueError):
+            readiness.manual_deadline(
+                datetime(2026, 10, 31, 23, 30, tzinfo=TZ), settings
+            )
 
     def test_answer_dates(self):
         dates = ["2026-11-01", "2026-11-08"]
@@ -260,6 +264,108 @@ class ReadinessFlowTest(unittest.TestCase):
         self.assertEqual(
             [item["full_name"] for item in summary.outside], ["Евгений"]
         )
+
+    def set_enabled_at(self, moment):
+        with closing(sqlite3.connect(self.registry.path)) as connection:
+            connection.execute(
+                "UPDATE readiness_settings SET enabled_at = ?",
+                (moment.astimezone(timezone.utc).isoformat(),),
+            )
+            connection.commit()
+
+    def tick(self, bot, moment):
+        asyncio.run(readiness.run_readiness_tick(
+            bot, self.registry, moment, TZ, 1001, LOG, 4096,
+        ))
+
+    def test_missed_window_alert_only_when_bot_was_down(self):
+        bot = fake_bot()
+        # Автозапуск включён после времени запуска — не пропуск.
+        self.set_enabled_at(datetime(2026, 10, 25, 12, 0, tzinfo=TZ))
+        self.tick(bot, datetime(2026, 10, 25, 12, 5, tzinfo=TZ))
+        bot.send_message.assert_not_awaited()
+        # Был включён заранее, бот лежал всё окно — одно предупреждение.
+        self.set_enabled_at(datetime(2026, 10, 1, 12, 0, tzinfo=TZ))
+        self.tick(bot, datetime(2026, 10, 25, 12, 5, tzinfo=TZ))
+        self.tick(bot, datetime(2026, 10, 25, 12, 6, tzinfo=TZ))
+        self.assertEqual(bot.send_message.await_count, 1)
+        self.assertIn("не был запущен вовремя", bot.send_message.await_args.args[1])
+        bot.send_poll.assert_not_awaited()
+
+    def test_missed_alert_survives_month_rollover(self):
+        bot = fake_bot()
+        self.set_enabled_at(datetime(2026, 10, 1, 12, 0, tzinfo=TZ))
+        # Бот поднялся уже 1 ноября: ноябрьский опрос пропущен.
+        self.tick(bot, datetime(2026, 11, 1, 9, 0, tzinfo=TZ))
+        texts = [call.args[1] for call in bot.send_message.await_args_list]
+        self.assertTrue(any("ноябрь 2026" in text for text in texts))
+
+    def test_no_missed_alert_after_failed_launch(self):
+        bot = fake_bot()
+        self.set_enabled_at(datetime(2026, 10, 1, 12, 0, tzinfo=TZ))
+        bot.send_poll.side_effect = RuntimeError("no rights")
+        self.tick(bot, datetime(2026, 10, 19, 10, 0, tzinfo=TZ))
+        bot.send_message.reset_mock()
+        self.tick(bot, datetime(2026, 10, 23, 10, 0, tzinfo=TZ))
+        bot.send_message.assert_not_awaited()
+
+    def test_reminder_retried_after_transient_failure(self):
+        bot = fake_bot()
+        self.tick(bot, datetime(2026, 10, 19, 10, 0, tzinfo=TZ))
+        with closing(sqlite3.connect(self.registry.path)) as connection:
+            connection.execute(
+                "UPDATE readiness_runs SET created_at = ?",
+                (datetime(2026, 10, 19, 7, 0, tzinfo=timezone.utc).isoformat(),),
+            )
+            connection.commit()
+        bot.send_message.reset_mock()
+        bot.send_message.side_effect = [
+            RuntimeError("network"), SimpleNamespace(message_id=1),
+            SimpleNamespace(message_id=2),
+        ]
+        self.tick(bot, datetime(2026, 10, 21, 20, 0, tzinfo=TZ))
+        bot.send_message.side_effect = None
+        self.tick(bot, datetime(2026, 10, 21, 20, 1, tzinfo=TZ))
+        self.tick(bot, datetime(2026, 10, 21, 20, 2, tzinfo=TZ))
+        recipients = [call.args[0] for call in bot.send_message.await_args_list]
+        # 501 — сбой и повтор; доставленным второй раз не пишем.
+        self.assertEqual(sorted(recipients), [501, 501, 502, 503])
+
+    def test_close_retries_stop_and_result(self):
+        bot = fake_bot()
+        run = self.launch(bot)
+        bot.stop_poll.side_effect = RuntimeError("network")
+        bot.send_message.side_effect = RuntimeError("network")
+        asyncio.run(readiness.close_run(
+            bot, self.registry, run, self.service(), TZ, 1001, LOG, 4096,
+        ))
+        self.assertEqual(
+            [item["id"] for item in self.registry.list_unfinished_readiness_runs()],
+            [run["id"]],
+        )
+        bot.stop_poll.side_effect = None
+        bot.send_message.side_effect = None
+        self.tick(bot, datetime.now(TZ))
+        self.assertEqual(self.registry.list_unfinished_readiness_runs(), [])
+        self.assertIn("Опрос завершён", bot.send_message.await_args.args[1])
+
+    def test_same_names_stay_distinct(self):
+        self.registry.set_responsible_contact(
+            1001, "sound", "сборка", "Глеб", 503
+        )
+        with closing(sqlite3.connect(self.registry.path)) as connection:
+            connection.execute(
+                "INSERT INTO responsible_contacts (service_id, task, name, "
+                "telegram_id, username, updated_by, updated_at) "
+                "VALUES ('sound', 'звук', 'Глеб', 599, '', 1001, 'x')"
+            )
+            connection.commit()
+        people = [
+            person for person in self.registry.readiness_people("sound")
+            if person["name"] == "Глеб"
+        ]
+        self.assertEqual(len(people), 2)
+        self.assertEqual(len({person["key"] for person in people}), 2)
 
     def test_skipped_month_is_not_launched(self):
         self.registry.create_readiness_run("sound", "2026-11", status="skipped")

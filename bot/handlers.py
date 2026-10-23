@@ -2988,6 +2988,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             service_id, f"{year:04d}-{month:02d}"
         )
         title = month_title(year, month)
+        month_arg = f"{year:04d}{month:02d}"
         weekdays = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
         lines = [
             f"🗳 Опрос готовности · {service_label(service)}",
@@ -3015,14 +3016,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if run is None:
             lines.append(f"Опрос на {title}: ещё не запускался.")
             rows.append([
-                readiness_button("▶️ Запустить сейчас", "start", service_id),
+                readiness_button(
+                    "▶️ Запустить сейчас", "start", service_id, month_arg
+                ),
                 readiness_button(f"⏭ Пропустить {title.split()[0]}",
-                                 "skip", service_id),
+                                 "skip", service_id, month_arg),
             ])
         elif run["status"] == "skipped":
             lines.append(f"Опрос на {title}: ⏭ пропущен.")
             rows.append([
-                readiness_button("↩️ Не пропускать", "unskip", service_id),
+                readiness_button(
+                    "↩️ Не пропускать", "unskip", service_id, month_arg
+                ),
             ])
         elif run["status"] == "open":
             lines.append(
@@ -3030,14 +3035,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 f"{readiness.local_text(run['deadline'], tz)}."
             )
             rows.append([
-                readiness_button("📊 Ход опроса", "progress", service_id),
-                readiness_button("⏳ +1 день", "extend", service_id),
-                readiness_button("⏹ Завершить", "finish", service_id),
+                readiness_button("📊 Ход опроса", "progress", service_id, month_arg),
+                readiness_button("⏳ +1 день", "extend", service_id, month_arg),
+                readiness_button("⏹ Завершить", "finish", service_id, month_arg),
             ])
         else:
             lines.append(f"Опрос на {title}: ✅ завершён.")
             rows.append([
-                readiness_button("📊 Итог опроса", "progress", service_id),
+                readiness_button("📊 Итог опроса", "progress", service_id, month_arg),
             ])
         rows.append([
             readiness_button("⏳ Срок", "dur", service_id),
@@ -3120,6 +3125,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await clean_and_clear_pending_actor(actor_id)
             await clean_previous_menu(callback.message, debug)
             notice = None
+            if action in {
+                "start", "skip", "unskip", "progress", "extend", "finish",
+            } and arg != f"{year:04d}{month:02d}":
+                # Экран показан до смены месяца — действие относилось бы
+                # к другому месяцу.
+                await show_readiness(
+                    callback.message, service_id,
+                    "⚠️ Экран устарел — месяц опроса сменился",
+                )
+                await _answer_callback(callback)
+                return
             if action == "open":
                 pass
             elif action == "toggle":
@@ -3148,15 +3164,23 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await show_readiness(callback.message, service_id, notice)
                 return
             elif action == "skip":
-                try:
-                    registry.create_readiness_run(service_id, key, status="skipped")
-                    notice = f"⏭ {month_title(year, month)}: опрос не запустится"
-                except ValueError as exc:
-                    notice = f"⚠️ {exc}"
+                # Под той же блокировкой, что и автозапуск: пропуск либо
+                # успевает раньше запуска, либо видит идущий опрос.
+                async with readiness.service_lock(service_id):
+                    try:
+                        registry.create_readiness_run(
+                            service_id, key, status="skipped"
+                        )
+                        notice = (
+                            f"⏭ {month_title(year, month)}: опрос не запустится"
+                        )
+                    except ValueError as exc:
+                        notice = f"⚠️ {exc}"
             elif action == "unskip":
-                run = registry.get_readiness_run(service_id, key)
-                if run is not None and run["status"] == "skipped":
-                    registry.delete_readiness_run(run["id"])
+                async with readiness.service_lock(service_id):
+                    run = registry.get_readiness_run(service_id, key)
+                    if run is not None and run["status"] == "skipped":
+                        registry.delete_readiness_run(run["id"])
                 notice = "↩️ Пропуск отменён"
             elif action in {"progress", "extend", "finish"}:
                 run = registry.get_readiness_run(service_id, key)
@@ -3165,6 +3189,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 elif action == "extend":
                     async with readiness.service_lock(service_id):
                         run = registry.get_readiness_run(service_id, key)
+                        expired = readiness.deadline_of(run) <= now
                         # +1 день по местному времени (переход на зимнее
                         # время не сдвигает час окончания).
                         local = readiness.deadline_of(run).astimezone(tz)
@@ -3172,7 +3197,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             local.date() + timedelta(days=1),
                             local.time(), tzinfo=tz,
                         )
-                        if (
+                        if expired:
+                            # Срок прошёл, итог подведёт ближайшая проверка.
+                            notice = "⚠️ Срок опроса уже прошёл"
+                        elif (
                             new_deadline.astimezone(tz).date()
                             > readiness.latest_deadline_day(run)
                         ):

@@ -231,6 +231,7 @@ class ServiceRegistry:
                     deadline_time TEXT NOT NULL DEFAULT '20:00',
                     remind_days INTEGER NOT NULL DEFAULT 1
                         CHECK (remind_days BETWEEN 0 AND 5),
+                    enabled_at TEXT,
                     updated_at TEXT NOT NULL
                 );
 
@@ -249,7 +250,19 @@ class ServiceRegistry:
                     deadline TEXT,
                     created_at TEXT NOT NULL,
                     closed_at TEXT,
+                    poll_stopped INTEGER NOT NULL DEFAULT 0,
+                    result_sent INTEGER NOT NULL DEFAULT 0,
                     UNIQUE (service_id, month)
+                );
+
+                -- Личные напоминания об опросе — отметка на человека после
+                -- доставки: временный сбой повторяется следующей минутой.
+                CREATE TABLE IF NOT EXISTS readiness_reminders (
+                    run_id INTEGER NOT NULL REFERENCES readiness_runs(id)
+                        ON DELETE CASCADE,
+                    telegram_id INTEGER NOT NULL,
+                    sent_at TEXT NOT NULL,
+                    PRIMARY KEY (run_id, telegram_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS readiness_answers (
@@ -675,6 +688,28 @@ class ServiceRegistry:
                     "INTEGER NOT NULL DEFAULT 1 "
                     "CHECK (people_needed BETWEEN 1 AND 5)"
                 )
+            # Опрос готовности (этап 5): колонки, добавленные после
+            # первого развёртывания.
+            for table, column, ddl in (
+                ("readiness_settings", "enabled_at", "TEXT"),
+                ("readiness_runs", "poll_stopped", "INTEGER NOT NULL DEFAULT 0"),
+                ("readiness_runs", "result_sent", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                columns = {
+                    row["name"]
+                    for row in connection.execute(f"PRAGMA table_info({table})")
+                }
+                if column not in columns:
+                    connection.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"
+                    )
+                    if table == "readiness_runs":
+                        # Закрытые до миграции опросы уже подведены — без
+                        # повторного итога админам.
+                        connection.execute(
+                            f"UPDATE readiness_runs SET {column} = 1 "
+                            "WHERE status != 'open'"
+                        )
             self._sync_service_catalog(connection, assembly_group_chat_id)
             has_super_admin = connection.execute(
                 "SELECT 1 FROM super_admins LIMIT 1"
@@ -4471,11 +4506,12 @@ class ServiceRegistry:
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT enabled, start_time, duration_days, deadline_time, "
-                "remind_days FROM readiness_settings WHERE service_id = ?",
+                "remind_days, enabled_at FROM readiness_settings "
+                "WHERE service_id = ?",
                 (service_id,),
             ).fetchone()
         if row is None:
-            return dict(self.READINESS_DEFAULTS)
+            return {**self.READINESS_DEFAULTS, "enabled_at": None}
         return {**dict(row), "enabled": bool(row["enabled"])}
 
     def set_readiness_settings(
@@ -4485,7 +4521,8 @@ class ServiceRegistry:
         unknown = set(changes) - set(self.READINESS_DEFAULTS)
         if unknown:
             raise ValueError(f"Неизвестные настройки: {', '.join(sorted(unknown))}")
-        new = {**self.get_readiness_settings(service_id), **changes}
+        current = self.get_readiness_settings(service_id)
+        new = {**current, **changes}
         if not isinstance(new["enabled"], bool):
             raise ValueError("enabled должен быть логическим значением")
         for key in ("start_time", "deadline_time"):
@@ -4504,20 +4541,26 @@ class ServiceRegistry:
         with self._connection() as connection:
             self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
+            now = _utc_now()
+            # Когда включён автозапуск: «не запущен вовремя» — только если
+            # автозапуск был включён до времени запуска.
+            if new["enabled"] and not current["enabled"]:
+                new["enabled_at"] = now
             connection.execute(
                 "INSERT INTO readiness_settings (service_id, enabled, "
                 "start_time, duration_days, deadline_time, remind_days, "
-                "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "enabled_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id) DO UPDATE SET "
                 "enabled = excluded.enabled, start_time = excluded.start_time, "
                 "duration_days = excluded.duration_days, "
                 "deadline_time = excluded.deadline_time, "
                 "remind_days = excluded.remind_days, "
+                "enabled_at = excluded.enabled_at, "
                 "updated_at = excluded.updated_at",
                 (
                     service_id, int(new["enabled"]), new["start_time"],
                     new["duration_days"], new["deadline_time"],
-                    new["remind_days"], _utc_now(),
+                    new["remind_days"], new["enabled_at"], now,
                 ),
             )
             self._audit(
@@ -4551,9 +4594,13 @@ class ServiceRegistry:
                 "ORDER BY task, name",
                 (service_id,),
             ).fetchall()
-        people: dict[str, dict] = {}
+        # Человек — Telegram ID, а у непривязанного — имя: два аккаунта с
+        # одинаковым именем остаются разными людьми.
+        people: list[dict] = []
+        by_id: dict[int, dict] = {}
+        by_name: dict[str, dict] = {}
         for row in members:
-            people[row["name"]] = {
+            person = {
                 "name": row["name"],
                 "telegram_id": row["telegram_id"],
                 "username": row["username"] or "",
@@ -4562,23 +4609,42 @@ class ServiceRegistry:
                     if task in enabled
                 },
             }
+            if row["telegram_id"] in by_id:
+                by_id[row["telegram_id"]]["tasks"] |= person["tasks"]
+                continue
+            people.append(person)
+            if row["telegram_id"]:
+                by_id[row["telegram_id"]] = person
+            else:
+                by_name.setdefault(row["name"], person)
         for row in contacts:
-            person = people.setdefault(row["name"], {
-                "name": row["name"],
-                "telegram_id": row["telegram_id"],
-                "username": row["username"] or "",
-                "tasks": set(),
-            })
-            if person["telegram_id"] is None:
-                person["telegram_id"] = row["telegram_id"]
+            person = by_id.get(row["telegram_id"])
+            if person is None:
+                person = by_name.pop(row["name"], None)
+                if person is not None:
+                    person["telegram_id"] = row["telegram_id"]
+                else:
+                    person = {
+                        "name": row["name"],
+                        "telegram_id": row["telegram_id"],
+                        "username": "",
+                        "tasks": set(),
+                    }
+                    people.append(person)
+                by_id[row["telegram_id"]] = person
             if not person["username"]:
                 person["username"] = row["username"] or ""
             if row["task"] in enabled:
                 person["tasks"].add(row["task"])
-        return [
-            {**person, "tasks": sorted(person["tasks"])}
-            for person in people.values()
-        ]
+        names = [person["name"] for person in people]
+        result = []
+        for person in people:
+            # Ключ распределения уникален и при совпадении имён.
+            key = person["name"]
+            if names.count(key) > 1:
+                key = f"{key} · {person['telegram_id'] or 'без Telegram'}"
+            result.append({**person, "key": key, "tasks": sorted(person["tasks"])})
+        return result
 
     def get_readiness_run(self, service_id: str, month: str) -> dict | None:
         with self._connection() as connection:
@@ -4667,6 +4733,53 @@ class ServiceRegistry:
                 (_utc_now(), run_id),
             )
         return cursor.rowcount > 0
+
+    def mark_readiness_run(self, run_id: int, **flags: bool) -> None:
+        """poll_stopped / result_sent — шаги закрытия, которые удались."""
+        for name in flags:
+            if name not in {"poll_stopped", "result_sent"}:
+                raise ValueError(f"Неизвестный шаг: {name}")
+        with self._connection(notify=False) as connection:
+            for name, value in flags.items():
+                connection.execute(
+                    f"UPDATE readiness_runs SET {name} = ? WHERE id = ?",
+                    (int(bool(value)), run_id),
+                )
+
+    def list_unfinished_readiness_runs(self) -> list[dict]:
+        """Закрытые опросы, у которых не остановлен опрос или не дошёл итог."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM readiness_runs WHERE status = 'closed' "
+                "AND (poll_stopped = 0 OR result_sent = 0) ORDER BY id"
+            ).fetchall()
+        return [self._readiness_run(row) for row in rows]
+
+    def reminded_readiness_ids(self, run_id: int) -> set[int]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT telegram_id FROM readiness_reminders WHERE run_id = ?",
+                (run_id,),
+            ).fetchall()
+        return {row["telegram_id"] for row in rows}
+
+    def mark_readiness_reminded(self, run_id: int, telegram_id: int) -> None:
+        with self._connection(notify=False) as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO readiness_reminders "
+                "(run_id, telegram_id, sent_at) VALUES (?, ?, ?)",
+                (run_id, telegram_id, _utc_now()),
+            )
+
+    def has_readiness_notice(
+        self, service_id: str, month: str, kind: str
+    ) -> bool:
+        with self._connection() as connection:
+            return connection.execute(
+                "SELECT 1 FROM readiness_notices "
+                "WHERE service_id = ? AND month = ? AND kind = ?",
+                (service_id, month, kind),
+            ).fetchone() is not None
 
     def set_readiness_deadline(self, run_id: int, deadline: str) -> bool:
         with self._connection() as connection:
