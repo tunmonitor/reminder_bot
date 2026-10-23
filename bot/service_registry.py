@@ -304,6 +304,8 @@ class ServiceRegistry:
                     aliases_json TEXT NOT NULL DEFAULT '[]',
                     source TEXT NOT NULL
                         CHECK (source IN ('catalog', 'admin')),
+                    people_needed INTEGER NOT NULL DEFAULT 1
+                        CHECK (people_needed BETWEEN 1 AND 5),
                     PRIMARY KEY (service_id, name)
                 );
 
@@ -608,6 +610,17 @@ class ServiceRegistry:
                     connection.execute(
                         f"ALTER TABLE group_reminders ADD COLUMN {column} TEXT"
                     )
+            task_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(service_tasks)")
+            }
+            if "people_needed" not in task_columns:
+                # Сколько людей нужно в задаче (этап 5.4).
+                connection.execute(
+                    "ALTER TABLE service_tasks ADD COLUMN people_needed "
+                    "INTEGER NOT NULL DEFAULT 1 "
+                    "CHECK (people_needed BETWEEN 1 AND 5)"
+                )
             self._sync_service_catalog(connection, assembly_group_chat_id)
             has_super_admin = connection.execute(
                 "SELECT 1 FROM super_admins LIMIT 1"
@@ -1247,8 +1260,8 @@ class ServiceRegistry:
         """Задачи служения в порядке каталога, включая выключенные."""
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT name, position, enabled, aliases_json, source "
-                "FROM service_tasks WHERE service_id = ? "
+                "SELECT name, position, enabled, aliases_json, source, "
+                "people_needed FROM service_tasks WHERE service_id = ? "
                 "ORDER BY position, name",
                 (service_id,),
             ).fetchall()
@@ -1259,6 +1272,7 @@ class ServiceRegistry:
                 "enabled": bool(row["enabled"]),
                 "aliases": json.loads(row["aliases_json"]),
                 "source": row["source"],
+                "people_needed": row["people_needed"],
             }
             for row in rows
         ]
@@ -1319,6 +1333,39 @@ class ServiceRegistry:
             self._audit(
                 connection, actor_id, "service_task_updated", service_id,
                 {"task": task, "enabled": enabled},
+            )
+
+    def set_service_task_people_needed(
+        self, actor_id: int, service_id: str, task: str, count: int
+    ) -> None:
+        """«👥 Нужно людей» в задаче для распределения графика (этап 5.4)."""
+        _validate_positive_id(actor_id, "actor_id")
+        if (
+            not isinstance(count, int)
+            or isinstance(count, bool)
+            or not 1 <= count <= 5
+        ):
+            raise ValueError("Нужно людей: от 1 до 5.")
+        with self._connection() as connection:
+            self._require_super_admin(connection, actor_id)
+            self._require_service(connection, service_id)
+            cursor = connection.execute(
+                "UPDATE service_tasks SET people_needed = ? "
+                "WHERE service_id = ? AND name = ? AND people_needed != ?",
+                (count, service_id, task, count),
+            )
+            if cursor.rowcount == 0:
+                exists = connection.execute(
+                    "SELECT 1 FROM service_tasks "
+                    "WHERE service_id = ? AND name = ?",
+                    (service_id, task),
+                ).fetchone()
+                if exists is None:
+                    raise ValueError(f"Задача «{task}» не найдена.")
+                return
+            self._audit(
+                connection, actor_id, "service_task_updated", service_id,
+                {"task": task, "people_needed": count},
             )
 
     def add_service_task(
