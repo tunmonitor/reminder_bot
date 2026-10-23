@@ -14,6 +14,10 @@ from pathlib import Path
 
 INTERACTION_LOG = "reminder_bot_interaction.log"
 DEBUG_LOG = "reminder_bot_debug.log"
+# Отслеживание навигации (нажатия, экраны, нижняя клавиатура) — ниже DEBUG,
+# включается `manage.sh trace on` (аргумент --trace).
+TRACE = 5
+logging.addLevelName(TRACE, "TRACE")
 
 _FMT = "%(asctime)s | %(levelname)-7s | %(message)s"
 _DATEFMT = "%Y-%m-%d %H:%M:%S"
@@ -55,7 +59,9 @@ def _file_handler(path: Path, formatter: logging.Formatter) -> logging.Handler:
     return handler
 
 
-def setup_loggers(log_dir: Path) -> tuple[logging.Logger, logging.Logger]:
+def setup_loggers(
+    log_dir: Path, *, trace: bool = False
+) -> tuple[logging.Logger, logging.Logger]:
     log_dir.mkdir(parents=True, exist_ok=True)
 
     formatter = logging.Formatter(_FMT, datefmt=_DATEFMT)
@@ -77,7 +83,7 @@ def setup_loggers(log_dir: Path) -> tuple[logging.Logger, logging.Logger]:
     interaction.addHandler(ih)
 
     # --- debug ---
-    debug.setLevel(logging.DEBUG)
+    debug.setLevel(TRACE if trace else logging.DEBUG)
     debug.propagate = False
     debug.handlers.clear()
     dh = _file_handler(log_dir / DEBUG_LOG, formatter)
@@ -85,6 +91,7 @@ def setup_loggers(log_dir: Path) -> tuple[logging.Logger, logging.Logger]:
     debug.addHandler(ih)                     # INFO-события дублируются в debug
     sh = logging.StreamHandler(sys.stderr)
     sh.setFormatter(formatter)
+    sh.setLevel(logging.DEBUG)               # TRACE — только в debug.log
     debug.addHandler(sh)
 
     return interaction, debug

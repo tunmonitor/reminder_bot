@@ -367,6 +367,33 @@ class ReadinessFlowTest(unittest.TestCase):
         self.assertEqual(len(people), 2)
         self.assertEqual(len({person["key"] for person in people}), 2)
 
+    def test_custom_intro_and_reminder_templates(self):
+        with self.assertRaises(ValueError):
+            self.registry.set_readiness_settings(
+                1001, "sound", intro_template="{name}"
+            )
+        self.registry.set_readiness_settings(
+            1001, "sound",
+            intro_template="Опрос {service_name} · {month} до {deadline}\n👥 {people}",
+            reminder_template="Напоминаю: {month}, до {deadline}",
+        )
+        bot = fake_bot()
+        run = self.launch(bot)
+        intro = bot.send_message.await_args.args[1]
+        self.assertIn("Опрос Звук · ноябрь 2026 до 22.10 20:00", intro)
+        self.assertIn("Алексей", intro)
+        self.assertEqual(
+            readiness.reminder_text(
+                self.service(), run, TZ,
+                self.registry.get_readiness_settings("sound")["reminder_template"],
+            ),
+            "Напоминаю: ноябрь 2026, до 22.10 20:00",
+        )
+        # Без опрашиваемых строка «👥» не остаётся пустой.
+        self.assertEqual(
+            readiness.render_template("А\n👥 {people}", people=""), "А"
+        )
+
     def test_skipped_month_is_not_launched(self):
         self.registry.create_readiness_run("sound", "2026-11", status="skipped")
         bot = fake_bot()

@@ -917,8 +917,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 if data.startswith("group_reminder:default:")
             )
             screen = await press(default)
-            # Экран второго уровня: сначала подсказка с нижней клавиатурой.
-            hint = screen.await_args_list[0]
+            # Корень настройки («✖️ Закрыть настройку») — уже второй
+            # уровень: сначала подсказка с нижней клавиатурой.
+            hint = root.await_args_list[0]
             self.assertEqual(hint.args[0], NAV_HINT)
             self.assertEqual(
                 [b.text for b in hint.kwargs["reply_markup"].keyboard[0]],
@@ -990,8 +991,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             callback.data = default
             await self.callback_handler("on_group_reminder_action")(callback)
-            self.assertEqual(
-                callback.message.answer.await_args_list[-2].args[0], NAV_HINT
+            self.assertIn(
+                NAV_HINT,
+                [call.args[0] for call in callback.message.answer.await_args_list],
             )
 
             send = self.context.bot.send_message
@@ -1225,15 +1227,16 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 len(result_markup.inline_keyboard),
                 2,
             )
-            # Второе 502 — подсказка навигации (тот же мок ответа): итоговый
-            # экран без «⬅️ …» убирает нижнюю клавиатуру вместе с ней.
+            # Последнее 501 — подсказка навигации (тот же мок ответа, что у
+            # корня настройки): итоговый экран без «⬅️ …» убирает нижнюю
+            # клавиатуру вместе с ней.
             self.assertEqual(
                 [
                     call.kwargs["message_id"]
                     for call in self.context.bot.delete_message.await_args_list
                     if isinstance(call.kwargs["message_id"], int)
                 ],
-                [501, 502, 502, 503, 502, 503],
+                [501, 502, 502, 503, 503, 501],
             )
 
         asyncio.run(run())
@@ -5938,6 +5941,33 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             stale = await press("rdy:finish:sound:200001")
             self.assertIn(
                 "Экран устарел", stale.message.answer.await_args.args[0]
+            )
+            text_screen = await press("rdy:tpl:sound:intro")
+            self.assertIn(
+                "Используется встроенный текст",
+                text_screen.message.answer.await_args.args[0],
+            )
+            prompt = await press("rdy:tpledit:sound:intro")
+            self.assertIn(
+                "• {people} — ", prompt.message.answer.await_args.args[0]
+            )
+            text_handler = next(
+                item.callback for item in self.admin_router.message.handlers
+                if item.callback.__name__ == "on_service_parameter"
+            )
+            bad = self.message(67890, "Привет {name}")
+            await text_handler(bad)
+            self.assertIn("не поддерживается", bad.answer.await_args.args[0])
+            good = self.message(67890, "Опрос {service_name} на {month}")
+            await text_handler(good)
+            self.assertIn("✅ Текст сохранён", good.answer.await_args.args[0])
+            self.assertEqual(
+                self.registry.get_readiness_settings("sound")["intro_template"],
+                "Опрос {service_name} на {month}",
+            )
+            await press("rdy:tplreset:sound:intro")
+            self.assertIsNone(
+                self.registry.get_readiness_settings("sound")["intro_template"]
             )
             progress = await press(f"rdy:progress:sound:{month_arg}")
             self.assertIn(

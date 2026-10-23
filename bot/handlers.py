@@ -38,6 +38,7 @@ from .commands import (
 )
 from .admin_report import notify_admins_declined, refresh_admin_reports
 from .group_send import send_to_service_group, thread_kwargs
+from .logger import TRACE
 from .navigation import (
     NAV_CALLBACK_ID,
     NAV_CANCEL_TEXT,
@@ -266,11 +267,16 @@ TEMPLATE_FIELD_HELP = {
     "task_responsibles": "ответственные этой задачи",
     "delivery_status": "кому включены личные уведомления",
     "confirmation_status": "ответы «Принял» / «Не смогу»",
+    "month": "месяц опроса (ноябрь 2026)",
+    "deadline": "срок ответа (дд.мм чч:мм)",
+    "people": "упоминания опрашиваемых",
 }
 GROUP_FIELDS = ("service_name", "sunday_date", "task_assignments",
                 "informational_notes")
 REPORT_FIELDS = ("service_name", "sunday_date", "task_assignments",
                  "delivery_status", "confirmation_status")
+READINESS_INTRO_HELP = ("service_name", "month", "deadline", "people")
+READINESS_REMINDER_HELP = ("service_name", "month", "deadline")
 
 
 def template_fields_help(fields) -> str:
@@ -359,6 +365,33 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             nav_state[chat_id]["shown"] = False
         return await make_request(bot, method)
 
+    async def trace_callback(handler, event, data):
+        """Отладка навигации: что нажал пользователь."""
+        debug.log(
+            TRACE, "Нажатие %s: %s",
+            getattr(getattr(event, "from_user", None), "id", None),
+            getattr(event, "data", None),
+        )
+        return await handler(event, data)
+
+    async def trace_message(handler, event, data):
+        """Отладка навигации: команды и кнопки навигации — текстом,
+        остальное — только длиной (личный текст в лог не пишется)."""
+        text = getattr(event, "text", None) or ""
+        shown = text.split()[0] if text.startswith("/") else text if (
+            text in NAV_TEXTS
+        ) else (
+            f"текст ({len(text)} симв.)" if text else "не текст"
+        )
+        debug.log(
+            TRACE, "Сообщение %s: %s",
+            getattr(getattr(event, "from_user", None), "id", None), shown,
+        )
+        return await handler(event, data)
+
+    admin_router.callback_query.outer_middleware(trace_callback)
+    admin_router.message.outer_middleware(trace_message)
+
     session_middleware = getattr(
         getattr(getattr(context, "bot", None), "session", None),
         "middleware",
@@ -389,11 +422,30 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         async with nav_locks.setdefault(actor_id, asyncio.Lock()):
             await _hide_nav_keyboard(chat_id, actor_id)
 
+    def stored_hints(actor_id: int) -> list[int]:
+        registry = service_registry()
+        try:
+            return registry.get_nav_hints(actor_id) if registry else []
+        except sqlite3.Error:
+            debug.debug("Не удалось прочитать подсказки навигации", exc_info=True)
+            return []
+
+    def store_hints(actor_id: int, message_ids: list[int]) -> None:
+        """ID подсказок — в базе: после перезапуска бота старая подсказка
+        всё равно удаляется, а не остаётся второй в чате."""
+        registry = service_registry()
+        if registry is None:
+            return
+        try:
+            registry.set_nav_hints(actor_id, message_ids)
+        except sqlite3.Error:
+            debug.debug("Не удалось сохранить подсказки навигации", exc_info=True)
+
     async def _show_nav_keyboard(target: Message, actor_id: int) -> None:
         state = nav_state.setdefault(actor_id, {"shown": False, "helpers": []})
         if state["shown"]:
             return
-        stale = state["helpers"]
+        stale = list(dict.fromkeys([*state["helpers"], *stored_hints(actor_id)]))
         state["helpers"] = []
         try:
             hint = await target.answer(
@@ -404,6 +456,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         state["shown"] = True
         state["helpers"] = [hint.message_id]
+        if isinstance(hint.message_id, int):
+            store_hints(actor_id, [hint.message_id])
         await delete_quietly(target.chat.id, stale)
 
     async def _hide_nav_keyboard(chat_id: int, actor_id: int) -> None:
@@ -421,8 +475,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             state["shown"] = True
             return
         state["shown"] = False
-        helpers = state["helpers"]
+        helpers = list(dict.fromkeys([*state["helpers"], *stored_hints(actor_id)]))
         state["helpers"] = []
+        store_hints(actor_id, [])
         await delete_quietly(chat_id, [*helpers, removed.message_id])
     pending_personal_actions: dict[
         str, tuple[int, str, str, str, dict[str, Any]]
@@ -484,7 +539,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "🔧", "🧹", "🔄", "⬅️", "➡️", "🏠", "✖️", "➕",
                         "➖", "🗑", "✏️", "1️⃣", "2️⃣", "3️⃣", "4️⃣",
                         "📤", "🔁", "🗓", "🧵", "🚫", "📆", "♾", "▶️", "⏸",
-                        "🗳", "⏹", "⏭", "↩️", "🏁",
+                        "🗳", "⏹", "⏭", "↩️", "🏁", "💬",
                     )
                 ):
                     button.text = f"📋 {label}"
@@ -566,13 +621,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             else None
         )
         nav_back = None
+        nav_action = "без изменений"
         if nav_actor is not None and isinstance(markup, InlineKeyboardMarkup):
             # Со второго уровня (есть «⬅️ …») — навигация внизу,
             # на корневых экранах она убирается.
             nav_back = back_callback(markup)
             if nav_back is not None:
+                nav_action = "показать"
                 await show_nav_keyboard(target, nav_actor)
             else:
+                nav_action = "убрать"
                 await hide_nav_keyboard(target.chat.id, nav_actor)
         elif nav_actor in nav_state and isinstance(
             markup, (ReplyKeyboardMarkup, ReplyKeyboardRemove)
@@ -602,6 +660,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             state["back"] = nav_back
             state["screen"] = sent_message.message_id
+            debug.log(
+                TRACE,
+                "Экран %s → %s: назад=%s, клавиатура: %s (показана: %s)",
+                sent_message.message_id, nav_actor, nav_back, nav_action,
+                state["shown"],
+            )
         return sent_message
 
     @admin_router.callback_query(F.data.startswith("ui_page:"))
@@ -3056,6 +3120,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "toggle", service_id,
             ),
         ])
+        rows.append([
+            readiness_button("📝 Текст опроса", "tpl", service_id, "intro"),
+            readiness_button("💬 Текст напоминания", "tpl", service_id, "rem"),
+        ])
         rows.append([InlineKeyboardButton(
             text="⬅️ К карточке служения",
             callback_data=f"service:service_settings:{service_id}",
@@ -3068,6 +3136,88 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             _dialog_keyboard_limit=sum(len(row) for row in rows),
             _dialog_keep_rows=True,
+            parse_mode=None,
+        )
+
+    READINESS_TEXTS = {
+        "intro": (
+            "intro_template", "📝 Текст опроса",
+            "Сообщение в чате служения перед опросом.", READINESS_INTRO_HELP,
+        ),
+        "rem": (
+            "reminder_template", "💬 Текст напоминания",
+            "Личное сообщение тем, кто не ответил, за «Напоминание» дней "
+            "до срока.", READINESS_REMINDER_HELP,
+        ),
+    }
+
+    async def show_readiness_text(
+        message: Message, service_id: str, kind: str,
+        notice: str | None = None,
+    ) -> None:
+        registry = service_registry()
+        service = registry.get_service(service_id) if registry else None
+        if service is None or kind not in READINESS_TEXTS:
+            await _send_dialog(message, "Настройка устарела.", parse_mode=None)
+            return
+        field, title, about, _ = READINESS_TEXTS[kind]
+        template = registry.get_readiness_settings(service_id)[field]
+        default = (
+            readiness.DEFAULT_READINESS_INTRO if kind == "intro"
+            else readiness.DEFAULT_READINESS_REMINDER
+        )
+        lines = [
+            f"{title} · {service_label(service)}",
+            "",
+            f"ℹ️ {about}",
+            "",
+            "Текущий текст:" if template else "Используется встроенный текст:",
+            template or default,
+        ]
+        if notice:
+            lines = [notice, ""] + lines
+        rows = [[
+            readiness_button("✏️ Изменить", "tpledit", service_id, kind),
+        ]]
+        if template:
+            rows[0].append(
+                readiness_button("🔄 Вернуть встроенный", "tplreset",
+                                 service_id, kind)
+            )
+        rows.append([readiness_button("⬅️ К опросу", "open", service_id)])
+        await _send_dialog(
+            message, "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keep_rows=True,
+            _dialog_text_limit=TELEGRAM_TEXT_LIMIT,
+            parse_mode=None,
+        )
+
+    async def ask_readiness_text(
+        message: Message, actor_id: int, service_id: str, kind: str,
+        notice: str | None = None,
+    ) -> None:
+        _, title, _, fields = READINESS_TEXTS[kind]
+        pending_inputs[actor_id] = {
+            "operation": "readiness_text",
+            "service_id": service_id,
+            "kind": kind,
+            "step": "readiness_text",
+            "session_id": secrets.token_urlsafe(9),
+        }
+        text = (
+            f"{title}: введите новый текст.\n\n"
+            + template_fields_help(fields)
+        )
+        if notice:
+            text = f"{notice}\n\n{text}"
+        await _send_dialog(
+            message, text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                readiness_button(
+                    "⬅️ Назад без изменения", "tpl", service_id, kind
+                )
+            ]]),
             parse_mode=None,
         )
 
@@ -3286,6 +3436,26 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         for days in range(1, settings["duration_days"])
                     ],
                     "rem", str(settings["remind_days"]),
+                )
+                await _answer_callback(callback)
+                return
+            elif action == "tpl" and arg in READINESS_TEXTS:
+                await show_readiness_text(callback.message, service_id, arg)
+                await _answer_callback(callback)
+                return
+            elif action == "tpledit" and arg in READINESS_TEXTS:
+                await ask_readiness_text(
+                    callback.message, actor_id, service_id, arg
+                )
+                await _answer_callback(callback)
+                return
+            elif action == "tplreset" and arg in READINESS_TEXTS:
+                registry.set_readiness_settings(
+                    actor_id, service_id, **{READINESS_TEXTS[arg][0]: None}
+                )
+                await show_readiness_text(
+                    callback.message, service_id, arg,
+                    "🔄 Возвращён встроенный текст",
                 )
                 await _answer_callback(callback)
                 return
@@ -8864,6 +9034,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 # Экран не сменился — «Отмена» можно повторить.
                 state["back"] = back
             raise
+        debug.log(
+            TRACE, "Отмена %s: повтор %s, новых экранов: %s", actor_id, back,
+            screen.sent,
+        )
         if not screen.sent:
             # Кнопка устарела и нового экрана нет — не оставлять пустоту.
             await drop_screen(message, actor_id, screen.message_id)
@@ -9001,6 +9175,40 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             return
         text = message.text.strip()
+        if operation == "readiness_text":
+            kind = pending.get("kind")
+            if kind not in READINESS_TEXTS:
+                pending_inputs.pop(message.from_user.id, None)
+                return
+            try:
+                registry.set_readiness_settings(
+                    message.from_user.id, service_id,
+                    **{READINESS_TEXTS[kind][0]: text},
+                )
+            except PermissionError as exc:
+                pending_inputs.pop(message.from_user.id, None)
+                await _send_dialog(
+                    message, _status_text(str(exc), "❌"), parse_mode=None
+                )
+                return
+            except ValueError as exc:
+                await ask_readiness_text(
+                    message, message.from_user.id, service_id, kind,
+                    _status_text(str(exc), "⚠️"),
+                )
+                return
+            except sqlite3.Error:
+                debug.exception("Не удалось сохранить текст опроса готовности")
+                await _send_dialog(
+                    message, "❌ Не удалось сохранить текст. Попробуйте позже.",
+                    parse_mode=None,
+                )
+                return
+            await clean_and_clear_pending_actor(message.from_user.id)
+            await show_readiness_text(
+                message, service_id, kind, "✅ Текст сохранён"
+            )
+            return
         try:
             if operation == "service_tasks":
                 if pending.get("step") != "add_task":

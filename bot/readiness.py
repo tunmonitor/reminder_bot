@@ -23,6 +23,10 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from .group_send import send_to_service_group
 from .month_summary import month_end, month_key, month_title, next_month
 from .schedule_planner import Plan, PlanInput, build_plan
+from .service_registry import (  # noqa: F401 — шаблоны для экранов
+    DEFAULT_READINESS_INTRO,
+    DEFAULT_READINESS_REMINDER,
+)
 from .ui import send_telegram_screen, user_link
 
 CANT_OPTION = "❌ Не смогу в этом месяце"
@@ -224,21 +228,44 @@ def progress_text(service_label: str, run: dict, summary: Summary, tz) -> str:
     return "\n".join(lines)
 
 
+class _Values(dict):
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+def render_template(template: str, **values: str) -> str:
+    """Подстановка полей; строка «👥 » без людей не остаётся пустой."""
+    text = template.format_map(_Values(values))
+    return "\n".join(
+        line for line in text.splitlines() if line.strip() != "👥"
+    ).strip()
+
+
 def intro_text(service: dict, people: list[dict], year: int, month: int,
-               deadline: datetime, tz) -> str:
+               deadline: datetime, tz, template: str | None = None) -> str:
     mentions = [
         user_link(person["telegram_id"], person["name"])
         if person["telegram_id"] else person["name"]
         for person in people if person["tasks"]
     ]
-    return "\n".join([
-        f"🗳 График {service['name']} на {month_title(year, month)}",
-        "Отметь воскресенья, когда можешь служить. Ответ можно менять "
-        f"до {local_text(deadline, tz)}.",
-        "Постараемся составить график, удобный для всех. Спасибо за твое "
-        "служение в церкви! ❤️",
-        *(["👥 " + ", ".join(mentions)] if mentions else []),
-    ])
+    return render_template(
+        template or DEFAULT_READINESS_INTRO,
+        service_name=service["name"],
+        month=month_title(year, month),
+        deadline=local_text(deadline, tz),
+        people=", ".join(mentions),
+    )
+
+
+def reminder_text(service: dict, run: dict, tz,
+                  template: str | None = None) -> str:
+    year, month = month_of(run)
+    return render_template(
+        template or DEFAULT_READINESS_REMINDER,
+        service_name=service["name"],
+        month=month_title(year, month),
+        deadline=local_text(run["deadline"], tz),
+    )
 
 
 async def launch_run(
@@ -263,12 +290,16 @@ async def launch_run(
         raise ValueError("Опрос на этот месяц уже есть.")
     dates = [day.isoformat() for day in month_sundays(year, month)]
     people = registry.readiness_people(service["id"])
+    settings = registry.get_readiness_settings(service["id"])
     intro = await send_to_service_group(
         lambda chat, text, **kwargs: send_telegram_screen(
             bot.send_message, chat, text, limit=text_limit, **kwargs
         ),
         chat_id,
-        intro_text(service, people, year, month, deadline, tz),
+        intro_text(
+            service, people, year, month, deadline, tz,
+            settings.get("intro_template"),
+        ),
         service, registry=registry, logger=logger,
     )
     try:
@@ -347,16 +378,14 @@ async def send_reminders(
     bot, registry, run: dict, service: dict, tz, logger: logging.Logger
 ) -> int:
     """Лично не ответившим из состава; кто не писал боту — пропускается."""
-    year, month = map(int, run["month"].split("-"))
     summary = summarize(registry, run, with_plan=False)
     link = poll_link(run)
     markup = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="📡 Открыть опрос", url=link)
     ]]) if link else None
-    text = (
-        f"🗳 {service['name']} · график на {month_title(year, month)}\n"
-        "Ты ещё не отметил(а), когда можешь служить. Опрос в чате служения "
-        f"открыт до {local_text(run['deadline'], tz)}."
+    text = reminder_text(
+        service, run, tz,
+        registry.get_readiness_settings(service["id"]).get("reminder_template"),
     )
     sent = 0
     reminded = registry.reminded_readiness_ids(run["id"])

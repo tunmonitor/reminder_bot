@@ -338,6 +338,20 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   `readiness_reminders` after delivery (Forbidden/BadRequest count as done).
   `readiness_people` keys people by Telegram ID (`key` is unique even for
   equal names; planner uses `key`).
+- Readiness texts: `intro_template` / `reminder_template` in
+  `readiness_settings` (NULL = `DEFAULT_READINESS_INTRO` /
+  `DEFAULT_READINESS_REMINDER`, fields `READINESS_INTRO_FIELDS` /
+  `READINESS_REMINDER_FIELDS`), rendered by `readiness.render_template`
+  (drops an empty «👥» line). UI `rdy:tpl|tpledit|tplreset:<service>:intro|rem`;
+  text input is pending operation `readiness_text` in `on_service_parameter`.
+- Navigation trace: level `TRACE` (5) in `bot/logger.py`, enabled by
+  `--trace` / `manage.sh trace on` (flag `.runtime/trace_enabled`).
+  `admin_router` outer middlewares `trace_callback` / `trace_message` and
+  `_send_dialog` / `on_nav_button` log with `debug.log(TRACE, ...)` — never
+  free text of user messages. `back_callback` falls back to the last «✖️ …»
+  button when a screen has no «⬅️ …». The nav hint id is persisted in
+  `nav_hints` (`get_nav_hints` / `set_nav_hints`) so a restart still
+  deletes the old hint.
 - `service_tasks.people_needed` (1–5, default 1, migrated with ALTER) is set
   by the super admin in «📋 Задачи служения» → «👥 Нужно людей»
   (`svc_tasks:people|ppick|pset`), `set_service_task_people_needed`.

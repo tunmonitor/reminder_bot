@@ -61,6 +61,23 @@ DEFAULT_ADMIN_REPORT_TEMPLATE = (
     "📨 Личные уведомления:\n{delivery_status}\n\n"
     "✅ Подтверждения:\n{confirmation_status}"
 )
+# Опрос готовности (этап 5): вступление к опросу в чате служения и личное
+# напоминание не ответившим; NULL в настройках — встроенный текст.
+READINESS_INTRO_FIELDS = frozenset({"service_name", "month", "deadline", "people"})
+READINESS_REMINDER_FIELDS = frozenset({"service_name", "month", "deadline"})
+DEFAULT_READINESS_INTRO = (
+    "🗳 График {service_name} на {month}\n"
+    "Отметь воскресенья, когда можешь служить. Ответ можно менять "
+    "до {deadline}.\n"
+    "Постараемся составить график, удобный для всех. Спасибо за твое "
+    "служение в церкви! ❤️\n"
+    "👥 {people}"
+)
+DEFAULT_READINESS_REMINDER = (
+    "🗳 {service_name} · график на {month}\n"
+    "Ты ещё не отметил(а), когда можешь служить. Опрос в чате служения "
+    "открыт до {deadline}."
+)
 # Шаблон по умолчанию для напоминания одной задачи (этап 3.1).
 DEFAULT_TASK_TEMPLATE = (
     "Напоминание о служении «{service_name}» в воскресенье {sunday_date}.\n"
@@ -232,7 +249,16 @@ class ServiceRegistry:
                     remind_days INTEGER NOT NULL DEFAULT 1
                         CHECK (remind_days BETWEEN 0 AND 5),
                     enabled_at TEXT,
+                    intro_template TEXT,
+                    reminder_template TEXT,
                     updated_at TEXT NOT NULL
+                );
+
+                -- Подсказка нижней клавиатуры навигации: ID сообщений
+                -- переживают перезапуск бота, старая подсказка удаляется.
+                CREATE TABLE IF NOT EXISTS nav_hints (
+                    telegram_id INTEGER PRIMARY KEY,
+                    message_ids_json TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS readiness_runs (
@@ -692,6 +718,8 @@ class ServiceRegistry:
             # первого развёртывания.
             for table, column, ddl in (
                 ("readiness_settings", "enabled_at", "TEXT"),
+                ("readiness_settings", "intro_template", "TEXT"),
+                ("readiness_settings", "reminder_template", "TEXT"),
                 ("readiness_runs", "poll_stopped", "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "result_sent", "INTEGER NOT NULL DEFAULT 0"),
             ):
@@ -4500,14 +4528,16 @@ class ServiceRegistry:
         "duration_days": 3,
         "deadline_time": "20:00",
         "remind_days": 1,
+        "intro_template": None,
+        "reminder_template": None,
     }
 
     def get_readiness_settings(self, service_id: str) -> dict:
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT enabled, start_time, duration_days, deadline_time, "
-                "remind_days, enabled_at FROM readiness_settings "
-                "WHERE service_id = ?",
+                "remind_days, enabled_at, intro_template, reminder_template "
+                "FROM readiness_settings WHERE service_id = ?",
                 (service_id,),
             ).fetchone()
         if row is None:
@@ -4538,6 +4568,19 @@ class ServiceRegistry:
                 raise ValueError(f"Значение должно быть от {low} до {high}.")
         if new["remind_days"] >= new["duration_days"]:
             new["remind_days"] = new["duration_days"] - 1
+        for key, fields, label in (
+            ("intro_template", READINESS_INTRO_FIELDS, "Текст опроса"),
+            ("reminder_template", READINESS_REMINDER_FIELDS,
+             "Текст напоминания"),
+        ):
+            value = new[key]
+            if value is None:
+                continue
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{label} не может быть пустым.")
+            if len(value) > 1500:
+                raise ValueError(f"{label}: не больше 1500 символов.")
+            validate_notification_template(value, fields, label)
         with self._connection() as connection:
             self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
@@ -4549,18 +4592,22 @@ class ServiceRegistry:
             connection.execute(
                 "INSERT INTO readiness_settings (service_id, enabled, "
                 "start_time, duration_days, deadline_time, remind_days, "
-                "enabled_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "enabled_at, intro_template, reminder_template, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id) DO UPDATE SET "
                 "enabled = excluded.enabled, start_time = excluded.start_time, "
                 "duration_days = excluded.duration_days, "
                 "deadline_time = excluded.deadline_time, "
                 "remind_days = excluded.remind_days, "
                 "enabled_at = excluded.enabled_at, "
+                "intro_template = excluded.intro_template, "
+                "reminder_template = excluded.reminder_template, "
                 "updated_at = excluded.updated_at",
                 (
                     service_id, int(new["enabled"]), new["start_time"],
                     new["duration_days"], new["deadline_time"],
-                    new["remind_days"], new["enabled_at"], now,
+                    new["remind_days"], new["enabled_at"],
+                    new["intro_template"], new["reminder_template"], now,
                 ),
             )
             self._audit(
@@ -4645,6 +4692,30 @@ class ServiceRegistry:
                 key = f"{key} · {person['telegram_id'] or 'без Telegram'}"
             result.append({**person, "key": key, "tasks": sorted(person["tasks"])})
         return result
+
+    def get_nav_hints(self, telegram_id: int) -> list[int]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT message_ids_json FROM nav_hints WHERE telegram_id = ?",
+                (telegram_id,),
+            ).fetchone()
+        return json.loads(row["message_ids_json"]) if row else []
+
+    def set_nav_hints(self, telegram_id: int, message_ids: list[int]) -> None:
+        # Служебное состояние интерфейса — не повод для резервной копии.
+        with self._connection(notify=False) as connection:
+            if message_ids:
+                connection.execute(
+                    "INSERT INTO nav_hints (telegram_id, message_ids_json) "
+                    "VALUES (?, ?) ON CONFLICT(telegram_id) DO UPDATE SET "
+                    "message_ids_json = excluded.message_ids_json",
+                    (telegram_id, json.dumps(list(message_ids))),
+                )
+            else:
+                connection.execute(
+                    "DELETE FROM nav_hints WHERE telegram_id = ?",
+                    (telegram_id,),
+                )
 
     def get_readiness_run(self, service_id: str, month: str) -> dict | None:
         with self._connection() as connection:

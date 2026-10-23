@@ -47,22 +47,23 @@ def nav_keyboard() -> ReplyKeyboardMarkup:
 
 
 def back_callback(markup: InlineKeyboardMarkup) -> str | None:
-    """callback_data последней кнопки «⬅️ …»/«↩️ …» экрана."""
-    back = None
+    """callback_data последней кнопки «⬅️ К …»/«⬅️ Назад»; если таких нет —
+    последней «✖️ …» (закрыть настройку, отмена): с такого экрана тоже
+    есть куда вернуться, это не корневой экран."""
+    back = close = None
     for row in markup.inline_keyboard:
         for button in row:
             data = button.callback_data
-            if (
-                data
-                and not data.startswith(_PAGE_PREFIXES)
-                and button.text.startswith(_BACK_PREFIXES)
-                and not (
-                    data.startswith(_CONTACT_NAV_PREFIX)
-                    and not button.text.startswith("⬅️ К ")
-                )
+            if not data or data.startswith(_PAGE_PREFIXES):
+                continue
+            if button.text.startswith(_BACK_PREFIXES) and not (
+                data.startswith(_CONTACT_NAV_PREFIX)
+                and not button.text.startswith("⬅️ К ")
             ):
                 back = data
-    return back
+            elif button.text.startswith("✖️"):
+                close = data
+    return back or close
 
 
 def is_nav_keyboard(markup: Any) -> bool:
