@@ -76,7 +76,7 @@ DEFAULT_READINESS_INTRO = (
 READINESS_CLOSED_FIELDS = frozenset({"service_name", "month"})
 DEFAULT_READINESS_CLOSED = (
     "🗳 Опрос «График {service_name} на {month}» завершён. Спасибо всем, "
-    "кто ответил! ❤️ График появится после утверждения."
+    "кто ответил! ❤️ График появится вскоре."
 )
 DEFAULT_READINESS_REMINDER = (
     "🗳 {service_name} · график на {month}\n"
@@ -284,6 +284,7 @@ class ServiceRegistry:
                     closed_at TEXT,
                     poll_stopped INTEGER NOT NULL DEFAULT 0,
                     result_sent INTEGER NOT NULL DEFAULT 0,
+                    closed_announced INTEGER NOT NULL DEFAULT 0,
                     UNIQUE (service_id, month)
                 );
 
@@ -405,6 +406,7 @@ class ServiceRegistry:
                         CHECK (source IN ('catalog', 'admin')),
                     people_needed INTEGER NOT NULL DEFAULT 1
                         CHECK (people_needed BETWEEN 1 AND 5),
+                    people_max INTEGER,
                     PRIMARY KEY (service_id, name)
                 );
 
@@ -723,12 +725,15 @@ class ServiceRegistry:
             # Опрос готовности (этап 5): колонки, добавленные после
             # первого развёртывания.
             for table, column, ddl in (
+                ("service_tasks", "people_max", "INTEGER"),
                 ("readiness_settings", "enabled_at", "TEXT"),
                 ("readiness_settings", "intro_template", "TEXT"),
                 ("readiness_settings", "reminder_template", "TEXT"),
                 ("readiness_settings", "closed_template", "TEXT"),
                 ("readiness_runs", "poll_stopped", "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "result_sent", "INTEGER NOT NULL DEFAULT 0"),
+                ("readiness_runs", "closed_announced",
+                 "INTEGER NOT NULL DEFAULT 0"),
             ):
                 columns = {
                     row["name"]
@@ -1385,8 +1390,8 @@ class ServiceRegistry:
         with self._connection() as connection:
             rows = connection.execute(
                 "SELECT name, position, enabled, aliases_json, source, "
-                "people_needed FROM service_tasks WHERE service_id = ? "
-                "ORDER BY position, name",
+                "people_needed, people_max FROM service_tasks "
+                "WHERE service_id = ? ORDER BY position, name",
                 (service_id,),
             ).fetchall()
         return [
@@ -1397,6 +1402,11 @@ class ServiceRegistry:
                 "aliases": json.loads(row["aliases_json"]),
                 "source": row["source"],
                 "people_needed": row["people_needed"],
+                # NULL — ровно people_needed.
+                "people_max": max(
+                    row["people_max"] or row["people_needed"],
+                    row["people_needed"],
+                ),
             }
             for row in rows
         ]
@@ -1460,23 +1470,28 @@ class ServiceRegistry:
             )
 
     def set_service_task_people_needed(
-        self, actor_id: int, service_id: str, task: str, count: int
+        self, actor_id: int, service_id: str, task: str, count: int,
+        maximum: int | None = None,
     ) -> None:
-        """«👥 Нужно людей» в задаче для распределения графика (этап 5.4)."""
+        """«👥 Нужно людей» в задаче для распределения графика (этап 5.4):
+        минимум и, если больше, максимум на одно воскресенье. Доступно
+        суперадмину и админу служения."""
         _validate_positive_id(actor_id, "actor_id")
-        if (
-            not isinstance(count, int)
-            or isinstance(count, bool)
-            or not 1 <= count <= 5
-        ):
-            raise ValueError("Нужно людей: от 1 до 5.")
+        maximum = count if maximum is None else maximum
+        for value in (count, maximum):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError("Нужно людей: число.")
+        if not 1 <= count <= 5 or not count <= maximum <= 6:
+            raise ValueError("Нужно людей: от 1 до 5, максимум — до 6.")
+        stored_max = maximum if maximum > count else None
         with self._connection() as connection:
-            self._require_super_admin(connection, actor_id)
+            self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
             cursor = connection.execute(
-                "UPDATE service_tasks SET people_needed = ? "
-                "WHERE service_id = ? AND name = ? AND people_needed != ?",
-                (count, service_id, task, count),
+                "UPDATE service_tasks SET people_needed = ?, people_max = ? "
+                "WHERE service_id = ? AND name = ? "
+                "AND (people_needed != ? OR people_max IS NOT ?)",
+                (count, stored_max, service_id, task, count, stored_max),
             )
             if cursor.rowcount == 0:
                 exists = connection.execute(
@@ -1489,7 +1504,7 @@ class ServiceRegistry:
                 return
             self._audit(
                 connection, actor_id, "service_task_updated", service_id,
-                {"task": task, "people_needed": count},
+                {"task": task, "people_needed": count, "people_max": maximum},
             )
 
     def add_service_task(
@@ -3504,9 +3519,18 @@ class ServiceRegistry:
                 "WHERE service_id = ? AND name = ?",
                 (service_id, name),
             ).fetchone()
-            if from_readiness and member is not None and member[
-                "telegram_id"
-            ] not in (None, telegram_id):
+            # Имя уже у другого Telegram — в составе или в привязках
+            # «👥 Ответственные»: чужие привязки не перезаписываются.
+            if from_readiness and (
+                (member is not None and member["telegram_id"] not in (
+                    None, telegram_id,
+                ))
+                or connection.execute(
+                    "SELECT 1 FROM responsible_contacts WHERE service_id = ? "
+                    "AND name = ? AND telegram_id != ?",
+                    (service_id, name, telegram_id),
+                ).fetchone() is not None
+            ):
                 raise ValueError(
                     f"«{name}» в составе уже привязан к другому Telegram — "
                     "добавьте через «👥 Ответственные»."
@@ -4837,6 +4861,24 @@ class ServiceRegistry:
             ).fetchall()
         return [self._readiness_run(row) for row in rows]
 
+    def attach_readiness_poll(
+        self,
+        run_id: int,
+        *,
+        poll_id: str,
+        chat_id: int,
+        message_id: int,
+        intro_message_id: int | None,
+    ) -> dict:
+        """Опрос в чате отправлен — привязать его к записи месяца."""
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE readiness_runs SET poll_id = ?, chat_id = ?, "
+                "message_id = ?, intro_message_id = ? WHERE id = ?",
+                (poll_id, chat_id, message_id, intro_message_id, run_id),
+            )
+        return self.get_readiness_run_by_id(run_id)
+
     def move_readiness_run(self, run_id: int, month: str) -> None:
         """Переносит опрос под другой ключ месяца: при перезапуске старый
         откладывается, пока не отправлен новый (при сбое — возвращается)."""
@@ -4857,9 +4899,10 @@ class ServiceRegistry:
         return cursor.rowcount > 0
 
     def mark_readiness_run(self, run_id: int, **flags: bool) -> None:
-        """poll_stopped / result_sent — шаги закрытия, которые удались."""
+        """poll_stopped / result_sent / closed_announced — шаги закрытия,
+        которые удались."""
         for name in flags:
-            if name not in {"poll_stopped", "result_sent"}:
+            if name not in {"poll_stopped", "result_sent", "closed_announced"}:
                 raise ValueError(f"Неизвестный шаг: {name}")
         with self._connection(notify=False) as connection:
             for name, value in flags.items():
@@ -4873,8 +4916,8 @@ class ServiceRegistry:
         with self._connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM readiness_runs WHERE status = 'closed' "
-                "AND month NOT LIKE '%#%' "
-                "AND (poll_stopped = 0 OR result_sent = 0) ORDER BY id"
+                "AND month NOT LIKE '%#%' AND (poll_stopped = 0 "
+                "OR result_sent = 0 OR closed_announced = 0) ORDER BY id"
             ).fetchall()
         return [self._readiness_run(row) for row in rows]
 

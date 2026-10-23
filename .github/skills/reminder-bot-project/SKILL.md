@@ -386,9 +386,25 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - Reminder sends treat any Forbidden/BadRequest as final (marked reminded). Preview:
   `rdy:tplprev:<service>:intro|rem`. `launch_run` records all intro chunk
   ids and deletes them all if the poll fails.
-- `service_tasks.people_needed` (1–5, default 1, migrated with ALTER) is set
-  by the super admin in «📋 Задачи служения» → «👥 Нужно людей»
-  (`svc_tasks:people|ppick|pset`), `set_service_task_people_needed`.
+- `service_tasks.people_needed` (minimum 1–5, default 1) and `people_max`
+  (NULL = minimum, up to 6) — «👥 Нужно людей», set by service admins too
+  (`set_service_task_people_needed(actor, service, task, low, high)`) from
+  «🗳 Опрос готовности» or «📋 Задачи служения» (`rdy:people|ppick|pset`).
+- Planner: `PlanInput.extra` (optional seats above the minimum) and
+  `reluctant` (non-respondents: free on all dates, `RELUCTANT_WEIGHT` per
+  service). Per date two passes: required seats for everyone, then optional
+  seats for remaining respondents only; improvement never puts a reluctant
+  person beyond `needed`. `summarize` adds non-respondents (incl. no
+  Telegram) as reluctant; `progress_text` lists respondents with dates and
+  the plan per Sunday and task («*» = non-respondent).
+- Launch reserves the run row before sending (`attach_readiness_poll`
+  after), deletes it on failure. Closing notice is tracked by
+  `closed_announced` and retried; the admin result is fitted into one
+  message (`fit_one_screen`). `settle_parked_run` re-reads under the lock,
+  restores over a skipped marker, keeps the result decision; skip is
+  refused while a run is parked. «➕ В состав» buttons carry a pending
+  token; `bind_service_member(from_readiness=True)` refuses names bound to
+  another Telegram in `service_members` or `responsible_contacts`.
 
 ### Rich text, mentions, and message length
 

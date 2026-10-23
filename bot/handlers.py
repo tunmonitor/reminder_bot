@@ -2963,8 +2963,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
                 off = "" if task["enabled"] else " · выключена"
                 people = (
-                    f" · 👥 {task['people_needed']}"
-                    if task["people_needed"] > 1 else ""
+                    f" · 👥 {people_label(task)}"
+                    if task["people_max"] > 1 else ""
                 )
                 lines.append(
                     f"{status} {task_emoji(task['name'])} {task['name']}"
@@ -3002,7 +3002,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if any(task["enabled"] for task in tasks):
             add_row.append(InlineKeyboardButton(
                 text="👥 Нужно людей",
-                callback_data=f"svc_tasks:people:{service_id}:{session_id}",
+                callback_data=f"rdy:people:{service_id}:t",
             ))
         rows.append(add_row)
         rows.append([
@@ -3019,12 +3019,23 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             parse_mode=None,
         )
 
+    def people_label(task: dict) -> str:
+        low, high = task["people_needed"], task["people_max"]
+        return str(low) if high == low else f"{low}–{high}"
+
+    PEOPLE_CHOICES = (
+        (1, 1), (2, 2), (3, 3), (4, 4), (5, 5),
+        (1, 2), (2, 3), (3, 4), (4, 5),
+    )
+
     async def show_task_people(
-        message: Message, service_id: str, session_id: str,
+        message: Message, service_id: str, back: str = "o",
         notice: str | None = None,
     ) -> None:
-        """«👥 Нужно людей»: сколько человек ставить в задачу при
-        распределении графика по опросу (этап 5)."""
+        """«👥 Нужно людей»: сколько человек ставить в задачу на одно
+        воскресенье при распределении графика по опросу (этап 5) — число
+        или диапазон «минимум–максимум». back: «o» — к опросу, «t» — к
+        задачам служения."""
         registry = service_registry()
         service = service_by_id(registry, service_id) if registry else None
         if service is None:
@@ -3037,32 +3048,33 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         lines = [
             f"👥 {service_label(service)} · нужно людей",
             "",
-            "ℹ️ Сколько человек бот ставит в задачу на одно воскресенье "
-            "при составлении графика по опросу.",
+            "ℹ️ Сколько человек бот ставит в задачу на одно воскресенье при "
+            "составлении графика. Диапазон «3–4»: минимум обязателен (иначе "
+            "⚠️), сверх него — если есть кем.",
             "",
             *(
                 f"{task_emoji(task['name'])} {task['name']} — "
-                f"{task['people_needed']}"
+                f"{people_label(task)}"
                 for task in tasks
             ),
         ]
         if notice:
             lines = [notice, ""] + lines
         buttons = [
-            InlineKeyboardButton(
-                text=f"👥 {task['name']} · {task['people_needed']}"[:60],
-                callback_data=(
-                    f"svc_tasks:ppick:{service_id}:{task['position']}:"
-                    f"{session_id}"
-                ),
+            readiness_button(
+                f"👥 {task['name']} · {people_label(task)}"[:60],
+                "ppick", service_id, f"{task['position']}.{back}",
             )
             for task in tasks
         ]
         rows = layout_buttons(buttons) if buttons else []
-        rows.append([InlineKeyboardButton(
-            text="⬅️ К задачам",
-            callback_data=f"svc_tasks:open:{service_id}",
-        )])
+        rows.append([
+            readiness_button("⬅️ К опросу", "open", service_id)
+            if back == "o" else InlineKeyboardButton(
+                text="⬅️ К задачам",
+                callback_data=f"svc_tasks:open:{service_id}",
+            )
+        ])
         await _send_dialog(
             message,
             "\n".join(lines),
@@ -3073,34 +3085,29 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         )
 
     async def show_task_people_choice(
-        message: Message, service_id: str, task: dict, session_id: str
+        message: Message, service_id: str, task: dict, back: str
     ) -> None:
-        counts = [
-            InlineKeyboardButton(
-                text=f"{'✅' if count == task['people_needed'] else '👥'} {count}",
-                callback_data=(
-                    f"svc_tasks:pset:{service_id}:{task['position']}:"
-                    f"{count}:{session_id}"
-                ),
+        current = (task["people_needed"], task["people_max"])
+        buttons = [
+            readiness_button(
+                f"{'✅' if (low, high) == current else '👥'} "
+                + (str(low) if low == high else f"{low}–{high}"),
+                "pset", service_id, f"{task['position']}.{low}.{high}.{back}",
             )
-            for count in range(1, 6)
+            for low, high in PEOPLE_CHOICES
         ]
+        rows = [buttons[index:index + 3] for index in range(0, len(buttons), 3)]
+        rows.append([readiness_button(
+            "⬅️ К списку", "people", service_id, back
+        )])
         await _send_dialog(
             message,
             f"👥 {task_emoji(task['name'])} {task['name']}\n\n"
-            f"Сейчас: {task['people_needed']}. Сколько человек нужно "
-            "на одно воскресенье?",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                counts[:3],
-                counts[3:],
-                [InlineKeyboardButton(
-                    text="⬅️ К списку",
-                    callback_data=(
-                        f"svc_tasks:people:{service_id}:{session_id}"
-                    ),
-                )],
-            ]),
+            f"Сейчас: {people_label(task)}. Сколько человек нужно на одно "
+            "воскресенье? Диапазон — минимум и максимум.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             _dialog_keep_rows=True,
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
             parse_mode=None,
         )
 
@@ -3199,6 +3206,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         ])
         rows.append([
             readiness_button("🔔 Напоминание", "rem", service_id),
+            readiness_button("👥 Нужно людей", "people", service_id, "o"),
             readiness_button(
                 "🔕 Выключить" if settings["enabled"] else "🟢 Включить",
                 "toggle", service_id,
@@ -3366,15 +3374,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         ]
         if notice:
             lines = [notice, ""] + lines
+        token = pending.get("token", "")
         buttons = [
             readiness_button(
                 f"{'☑️' if task in selected else '⬜'} {task}"[:60],
-                "addmt", service_id, str(index),
+                "addmt", service_id, f"{token}.{index}",
             )
             for index, task in enumerate(tasks)
         ]
         rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
-        rows.append([readiness_button("✅ Сохранить", "addms", service_id)])
+        rows.append([readiness_button("✅ Сохранить", "addms", service_id, token)])
         rows.append([readiness_button("⬅️ К опросу", "open", service_id)])
         await _send_dialog(
             message, "\n".join(lines),
@@ -3440,6 +3449,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 member_pending
                 and member_pending.get("operation") == "readiness_member"
                 and member_pending.get("service_id") == service_id
+                and (arg or "").split(".")[0] == member_pending.get("token")
             ):
                 await answer_quietly(callback, "⚠️ Этот экран уже устарел.")
                 return
@@ -3587,15 +3597,29 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 # Под той же блокировкой, что и автозапуск: пропуск либо
                 # успевает раньше запуска, либо видит идущий опрос.
                 async with readiness.service_lock(service_id):
-                    try:
-                        registry.create_readiness_run(
-                            service_id, key, status="skipped"
-                        )
+                    parked = any(
+                        item["service_id"] == service_id
+                        and item["month"].split("#")[0] == key
+                        for item in registry.list_parked_readiness_runs()
+                    )
+                    if parked:
+                        # Прерванный перезапуск ещё не разобран — пропуск
+                        # стёр бы ответы прежнего опроса.
                         notice = (
-                            f"⏭ {month_title(year, month)}: опрос не запустится"
+                            "⚠️ Опрос этого месяца восстанавливается после "
+                            "перезапуска — попробуйте через минуту"
                         )
-                    except ValueError as exc:
-                        notice = f"⚠️ {exc}"
+                    else:
+                        try:
+                            registry.create_readiness_run(
+                                service_id, key, status="skipped"
+                            )
+                            notice = (
+                                f"⏭ {month_title(year, month)}: опрос не "
+                                "запустится"
+                            )
+                        except ValueError as exc:
+                            notice = f"⚠️ {exc}"
             elif action == "unskip":
                 async with readiness.service_lock(service_id):
                     run = registry.get_readiness_run(service_id, key)
@@ -3755,17 +3779,20 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         ],
                         "selected": [],
                         "step": "readiness_member",
+                        # Кнопки экрана — только для этого человека.
+                        "token": secrets.token_urlsafe(6),
                     }
                     await show_readiness_member(
                         callback.message, actor_id, service_id
                     )
                     await _answer_callback(callback)
                     return
-            elif action == "addmt" and arg and arg.isdigit():
+            elif action == "addmt" and arg and arg.split(".")[-1].isdigit():
                 tasks = pending_inputs[actor_id]["tasks"]
                 selected = pending_inputs[actor_id]["selected"]
-                if int(arg) < len(tasks):
-                    task = tasks[int(arg)]
+                index = int(arg.split(".")[-1])
+                if index < len(tasks):
+                    task = tasks[index]
                     if task in selected:
                         selected.remove(task)
                     else:
@@ -3802,6 +3829,39 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     )
                     await _answer_callback(callback)
                     return
+            elif action == "people" and arg in {"o", "t"}:
+                await show_task_people(callback.message, service_id, arg)
+                await _answer_callback(callback)
+                return
+            elif action in {"ppick", "pset"} and arg:
+                parts_arg = arg.split(".")
+                position = int(parts_arg[0])
+                back = parts_arg[-1] if parts_arg[-1] in {"o", "t"} else "o"
+                task = next(
+                    (
+                        item for item in registry.list_service_tasks(service_id)
+                        if item["position"] == position and item["enabled"]
+                    ),
+                    None,
+                )
+                if task is None:
+                    raise ValueError("Задача больше не существует.")
+                if action == "ppick":
+                    await show_task_people_choice(
+                        callback.message, service_id, task, back
+                    )
+                else:
+                    low, high = int(parts_arg[1]), int(parts_arg[2])
+                    registry.set_service_task_people_needed(
+                        actor_id, service_id, task["name"], low, high
+                    )
+                    await show_task_people(
+                        callback.message, service_id, back,
+                        f"✅ «{task['name']}»: нужно людей — "
+                        + (str(low) if low == high else f"{low}–{high}"),
+                    )
+                await _answer_callback(callback)
+                return
             elif action == "tplprev" and arg in READINESS_TEXTS:
                 # Как сообщение будет выглядеть: месяц и срок опроса этого
                 # месяца (идущего или по расписанию), упоминания состава.
@@ -3977,37 +4037,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     f"✅ «{task['name']}» "
                     f"{'выключена' if task['enabled'] else 'включена'}",
                 )
-            elif action == "people" and len(parts) == 4:
-                # Ввод названия новой задачи (шаг add_task) отменяется.
-                pending["step"] = "tasks"
-                await show_task_people(callback.message, service_id, session_id)
-            elif action in {"ppick", "pset"} and len(parts) in {5, 6}:
-                pending["step"] = "tasks"
-                position = int(parts[3])
-                task = next(
-                    (
-                        item for item in registry.list_service_tasks(service_id)
-                        if item["position"] == position and item["enabled"]
-                    ),
-                    None,
-                )
-                if task is None:
-                    raise ValueError("Задача больше не существует.")
-                if action == "ppick" and len(parts) == 5:
-                    await show_task_people_choice(
-                        callback.message, service_id, task, session_id
-                    )
-                elif action == "pset" and len(parts) == 6:
-                    registry.set_service_task_people_needed(
-                        actor_id, service_id, task["name"], int(parts[4])
-                    )
-                    await show_task_people(
-                        callback.message, service_id, session_id,
-                        f"✅ «{task['name']}»: нужно людей — {parts[4]}",
-                    )
-                else:
-                    await _answer_callback(callback, "⚠️ Неизвестное действие.")
-                    return
             elif action == "add" and len(parts) == 4:
                 pending["step"] = "add_task"
                 await _send_dialog(

@@ -415,11 +415,62 @@ class ReadinessFlowTest(unittest.TestCase):
         restored = self.registry.get_readiness_run("sound", "2026-11")
         self.assertEqual(restored["id"], run["id"])
         self.assertEqual(restored["status"], "closed")
-        # Новый опрос уже есть — отложенный удаляется.
+        # Пропуск месяца не стирает ответы отложенного опроса.
         self.registry.move_readiness_run(run["id"], f"2026-11#{run['id']}")
         self.registry.create_readiness_run("sound", "2026-11", status="skipped")
         self.tick(fake_bot(), datetime(2026, 10, 20, 9, 1, tzinfo=TZ))
+        self.assertEqual(
+            self.registry.get_readiness_run("sound", "2026-11")["id"], run["id"]
+        )
+        # Запись нового опроса без опроса в чате — не новый опрос.
+        self.registry.move_readiness_run(run["id"], f"2026-11#{run['id']}")
+        orphan = self.registry.create_readiness_run(
+            "sound", "2026-11", status="open"
+        )
+        self.tick(fake_bot(), datetime(2026, 10, 20, 9, 2, tzinfo=TZ))
+        self.assertEqual(
+            self.registry.get_readiness_run("sound", "2026-11")["id"], run["id"]
+        )
+        self.assertIsNone(self.registry.get_readiness_run_by_id(orphan["id"]))
+        # Новый опрос уже есть — отложенный удаляется.
+        self.registry.move_readiness_run(run["id"], f"2026-11#{run['id']}")
+        new = self.registry.create_readiness_run(
+            "sound", "2026-11", status="open"
+        )
+        self.registry.attach_readiness_poll(
+            new["id"], poll_id="p2", chat_id=-1005555, message_id=20,
+            intro_message_id=None,
+        )
+        self.tick(fake_bot(), datetime(2026, 10, 20, 9, 3, tzinfo=TZ))
         self.assertIsNone(self.registry.get_readiness_run_by_id(run["id"]))
+
+    def test_add_member_does_not_take_over_bound_name(self):
+        # «Глеб» привязан через «👥 Ответственные» к 503.
+        with self.assertRaises(ValueError):
+            self.registry.bind_service_member(
+                1001, "sound", "Глеб", 777, tasks=["звук"], from_readiness=True
+            )
+        self.assertEqual(
+            {
+                person["telegram_id"]
+                for person in self.registry.readiness_people("sound")
+                if person["name"] == "Глеб"
+            },
+            {503},
+        )
+
+    def test_reserved_run_without_poll_is_cleaned(self):
+        orphan = self.registry.create_readiness_run(
+            "sound", "2026-11", status="open",
+            deadline=datetime(2026, 10, 22, 17, 0, tzinfo=timezone.utc).isoformat(),
+        )
+        created = datetime.fromisoformat(orphan["created_at"])
+        bot = fake_bot()
+        self.tick(bot, created.astimezone(TZ) + timedelta(minutes=1))
+        self.assertIsNotNone(self.registry.get_readiness_run_by_id(orphan["id"]))
+        self.tick(bot, created.astimezone(TZ) + timedelta(minutes=6))
+        self.assertIsNone(self.registry.get_readiness_run_by_id(orphan["id"]))
+        bot.send_message.assert_not_awaited()
 
     def test_same_names_stay_distinct(self):
         self.registry.set_responsible_contact(

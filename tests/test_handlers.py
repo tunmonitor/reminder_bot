@@ -2021,6 +2021,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             handler_name = "on_notification_edit_back"
         elif button.callback_data.startswith("svc_tasks:"):
             handler_name = "on_service_tasks"
+        elif button.callback_data.startswith("rdy:"):
+            handler_name = "on_readiness"
         else:
             handler_name = "on_group_reminder_action"
         await self.callback_handler(handler_name)(callback)
@@ -5862,24 +5864,24 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             saved = await self._click(
                 choice.message,
-                lambda button: button.text == "👥 2",
+                lambda button: button.text == "👥 3–4",
                 actor_id=67890,
             )
             self.assertIn(
-                "✅ «звук»: нужно людей — 2",
+                "✅ «звук»: нужно людей — 3–4",
                 saved.message.answer.await_args.args[0],
             )
             task = next(
                 item for item in self.registry.list_service_tasks("sound")
                 if item["name"] == "звук"
             )
-            self.assertEqual(task["people_needed"], 2)
+            self.assertEqual((task["people_needed"], task["people_max"]), (3, 4))
             back = await self._click(
                 saved.message,
                 lambda button: button.text == "⬅️ К задачам",
                 actor_id=67890,
             )
-            self.assertIn("👥 2", back.message.answer.await_args.args[0])
+            self.assertIn("👥 3–4", back.message.answer.await_args.args[0])
 
         asyncio.run(run())
 
@@ -6014,12 +6016,22 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.registry.bind_service_member(
                 67890, "sound", "Алексей из Списков", 12345
             )
-            await press(add_button)
-            empty = await press("rdy:addms:sound")
+            member_screen = await press(add_button)
+            token = next(
+                button.callback_data.split(":")[-1]
+                for row in member_screen.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith("rdy:addms:")
+            )
+            stale = await press("rdy:addms:sound:old")
+            self.assertIn("устарел", stale.answer.await_args.args[0])
+            empty = await press(f"rdy:addms:sound:{token}")
             self.assertIn("хотя бы одну задачу",
                           empty.message.answer.await_args.args[0])
-            await press("rdy:addmt:sound:0")
-            saved = await press("rdy:addms:sound")
+            await press(f"rdy:addmt:sound:{token}.0")
+            saved = await press(f"rdy:addms:sound:{token}")
             self.assertIn("Алексей из Списков в составе",
                           saved.message.answer.await_args.args[0])
             self.assertEqual(

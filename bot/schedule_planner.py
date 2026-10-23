@@ -18,7 +18,14 @@
    но уменьшают общую стоимость.
 
 Общая стоимость плана: Σ LOAD_WEIGHT × нагрузка² по людям + штрафы за
-близкие служения (неделя, две) подряд у одного человека.
+близкие служения (неделя, две) подряд у одного человека + RELUCTANT_WEIGHT
+за каждое служение не ответившего (его ставят, только если ответивших не
+хватает).
+
+У задачи — минимум людей (`needed`, недобор — ⚠️) и сверх него до
+максимума (`extra`). На каждую дату два прохода: сначала обязательные
+места всех задач (ответившие дешевле не ответивших), затем места сверх
+минимума — только оставшимися ответившими.
 """
 from __future__ import annotations
 
@@ -27,6 +34,8 @@ from dataclasses import dataclass, field
 from datetime import date
 
 LOAD_WEIGHT = 3
+# Не ответивший на опрос свободен во все даты, но ставится после ответивших.
+RELUCTANT_WEIGHT = 20
 # Штраф за интервал между служениями человека, в неделях.
 GAP_PENALTY = {1: 6, 2: 2}
 # Предел проходов улучшения: план маленький, улучшения быстро кончаются.
@@ -44,6 +53,10 @@ class PlanInput:
     tasks: Mapping[str, frozenset[str]]
     # Человек → последнее служение до месяца (из прошлого месяца).
     last_served: Mapping[str, date] = field(default_factory=dict)
+    # Задача → сколько ещё людей сверх минимума можно поставить.
+    extra: Mapping[str, int] = field(default_factory=dict)
+    # Не ответившие на опрос: ставятся после ответивших.
+    reluctant: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -64,6 +77,13 @@ class Plan:
 
     def required(self) -> int:
         return sum(self.needed[task] for _, task in self.slots)
+
+    def covered_required(self) -> int:
+        """Закрытые обязательные места (минимум задачи)."""
+        return sum(
+            min(len(people), self.needed[task])
+            for (_, task), people in self.slots.items()
+        )
 
     def gaps(self) -> list[tuple[date, str, int]]:
         """Незакрытые места: (дата, задача, сколько не хватает)."""
@@ -89,14 +109,9 @@ def plan_cost(plan: Plan, data: PlanInput) -> int:
     for (event_date, _), people in plan.slots.items():
         for person in people:
             served.setdefault(person, []).append(event_date)
-    total = 0
-    for person, dates in served.items():
-        total += LOAD_WEIGHT * len(dates) ** 2
-        previous = data.last_served.get(person)
-        for event_date in sorted(dates):
-            total += _gap_penalty(previous, event_date)
-            previous = event_date
-    return total
+    return sum(
+        _person_cost(data, person, dates) for person, dates in served.items()
+    )
 
 
 def _can_serve(data: PlanInput, person: str, event_date: date, task: str) -> bool:
@@ -171,16 +186,20 @@ def _min_cost_matching(
     return result
 
 
-def _seats(data: PlanInput) -> list[str]:
-    return [
-        task
-        for task, count in data.needed.items()
-        for _ in range(max(0, count))
+def _seats(data: PlanInput) -> tuple[list[str], list[str]]:
+    """Места на дату: обязательные (минимум задачи) и сверх минимума."""
+    required = [
+        task for task, count in data.needed.items() for _ in range(max(0, count))
     ]
+    optional = [
+        task for task, count in data.extra.items()
+        if task in data.needed for _ in range(max(0, count))
+    ]
+    return required, optional
 
 
 def build_plan(data: PlanInput) -> Plan:
-    seats = _seats(data)
+    required, optional = _seats(data)
     plan = Plan(
         slots={
             (event_date, task): []
@@ -191,10 +210,8 @@ def build_plan(data: PlanInput) -> Plan:
     )
     load: dict[str, int] = {}
     last: dict[str, date] = dict(data.last_served)
-    for event_date in sorted(set(data.dates)):
-        people = sorted(
-            person for person in data.free if event_date in data.free[person]
-        )
+
+    def assign(event_date: date, people: list[str], seats: list[str]) -> set[str]:
         allowed = {
             person: {
                 index for index, task in enumerate(seats)
@@ -206,6 +223,7 @@ def build_plan(data: PlanInput) -> Plan:
         cost = {
             person: LOAD_WEIGHT * (2 * load.get(person, 0) + 1)
             + _gap_penalty(last.get(person), event_date)
+            + (RELUCTANT_WEIGHT if person in data.reluctant else 0)
             for person in people
         }
         matching = _min_cost_matching(people, seats, allowed, cost)
@@ -213,6 +231,23 @@ def build_plan(data: PlanInput) -> Plan:
             plan.slots[(event_date, seats[seat])].append(person)
             load[person] = load.get(person, 0) + 1
             last[person] = event_date
+        return set(matching.values())
+
+    for event_date in sorted(set(data.dates)):
+        people = sorted(
+            person for person in data.free if event_date in data.free[person]
+        )
+        # Сначала минимум задач — все (ответившие дешевле); затем места
+        # сверх минимума — только оставшиеся ответившие.
+        busy = assign(event_date, people, required)
+        assign(
+            event_date,
+            [
+                person for person in people
+                if person not in busy and person not in data.reluctant
+            ],
+            optional,
+        )
     improve_plan(plan, data)
     for people in plan.slots.values():
         people.sort()
@@ -223,6 +258,8 @@ def _person_cost(data: PlanInput, person: str, dates: Iterable[date]) -> int:
     """Вклад человека в стоимость плана: нагрузка² и штрафы интервала."""
     ordered = sorted(dates)
     total = LOAD_WEIGHT * len(ordered) ** 2
+    if person in data.reluctant:
+        total += RELUCTANT_WEIGHT * len(ordered)
     previous = data.last_served.get(person)
     for event_date in ordered:
         total += _gap_penalty(previous, event_date)
@@ -266,7 +303,7 @@ def improve_plan(plan: Plan, data: PlanInput) -> None:
             for other in people_all:
                 if other in busy[event_date] or not _can_serve(
                     data, other, event_date, task
-                ):
+                ) or (other in data.reluctant and index >= plan.needed[task]):
                     continue
                 theirs = served.get(other, set())
                 delta = (
@@ -287,6 +324,10 @@ def improve_plan(plan: Plan, data: PlanInput) -> None:
                     b in busy[date_a] or a in busy[date_b]
                     or not _can_serve(data, b, date_a, key_a[1])
                     or not _can_serve(data, a, date_b, key_b[1])
+                    or (b in data.reluctant
+                        and index_a >= plan.needed[key_a[1]])
+                    or (a in data.reluctant
+                        and index_b >= plan.needed[key_b[1]])
                 ):
                     continue
                 dates_a, dates_b = served[a], served[b]

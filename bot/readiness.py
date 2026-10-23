@@ -24,8 +24,10 @@ from aiogram.types import (
     ReplyParameters,
 )
 
+from .admin_report import fit_one_screen
 from .group_send import send_to_service_group
 from .month_summary import month_end, month_key, month_title, next_month
+from .presentation import task_emoji
 from .schedule_planner import Plan, PlanInput, build_plan
 from .service_registry import (  # noqa: F401 — шаблоны для экранов
     DEFAULT_READINESS_CLOSED,
@@ -153,19 +155,29 @@ def summarize(registry, run: dict, *, with_plan: bool = True) -> Summary:
     }
     if with_plan:
         tasks = {person["key"]: person["tasks"] for person in people}
-        needed = {
-            task["name"]: task["people_needed"]
-            for task in registry.list_service_tasks(run["service_id"])
+        catalog = [
+            task for task in registry.list_service_tasks(run["service_id"])
             if task["enabled"]
+        ]
+        all_dates = frozenset(date.fromisoformat(day) for day in run["dates"])
+        free = {
+            name: frozenset(date.fromisoformat(day) for day in dates)
+            for name, dates in summary.answered.items()
         }
+        # Не ответившие (и люди без Telegram) — по общей логике: свободны
+        # во все даты, но ставятся после ответивших.
+        silent = {person["key"] for person in summary.not_answered}
+        free.update({name: all_dates for name in silent})
         summary.plan = build_plan(PlanInput(
-            dates=tuple(date.fromisoformat(day) for day in run["dates"]),
-            needed=needed,
-            free={
-                name: frozenset(date.fromisoformat(day) for day in dates)
-                for name, dates in summary.answered.items()
+            dates=tuple(sorted(all_dates)),
+            needed={task["name"]: task["people_needed"] for task in catalog},
+            extra={
+                task["name"]: task["people_max"] - task["people_needed"]
+                for task in catalog
             },
-            tasks={name: frozenset(tasks[name]) for name in summary.answered},
+            free=free,
+            tasks={name: frozenset(tasks[name]) for name in free},
+            reluctant=frozenset(silent),
         ))
     return summary
 
@@ -199,19 +211,38 @@ def progress_text(service_label: str, run: dict, summary: Summary, tz) -> str:
             for day in run["dates"]
         ),
     ]
+    names = {person["key"]: person["name"] for person in summary.people}
+    if summary.answered:
+        lines += ["", "✅ Ответили: " + "; ".join(
+            f"{names.get(key, key)} ("
+            + (", ".join(_short(day) for day in dates) or "не сможет")
+            + ")"
+            for key, dates in summary.answered.items()
+        )]
     if summary.plan is not None:
-        gaps = summary.plan.gaps()
+        silent = {person["key"] for person in summary.not_answered}
         lines += ["", "Предварительно:"]
-        if gaps:
-            for event_date, task, missing in gaps:
-                needed = summary.plan.needed[task]
-                lines.append(
-                    f"⚠️ {event_date:%d.%m} «{task}» — "
-                    + ("некого поставить" if missing == needed
-                       else f"{needed - missing} из {needed}")
+        used_silent = False
+        for day in run["dates"]:
+            event_date = date.fromisoformat(day)
+            lines.append(f"🗓 {event_date:%d.%m}")
+            for task, needed in summary.plan.needed.items():
+                people = summary.plan.slots.get((event_date, task), [])
+                used_silent |= any(person in silent for person in people)
+                shown = ", ".join(
+                    names.get(person, person) + ("*" if person in silent else "")
+                    for person in people
                 )
-        else:
-            lines.append("✅ все задачи закрыты")
+                if not people:
+                    shown = "⚠️ некого поставить"
+                elif len(people) < needed:
+                    shown += f" · ⚠️ {len(people)} из {needed}"
+                lines.append(f"   {task_emoji(task)} {task} — {shown}")
+        if used_silent:
+            lines.append(
+                "* не ответил(а) — поставлен(а) по общей логике, после "
+                "ответивших"
+            )
     for answer in summary.outside:
         days = ", ".join(_short(day) for day in answer["dates"]) or "не сможет"
         lines.append(
@@ -305,6 +336,14 @@ async def launch_run(
     dates = [day.isoformat() for day in month_sundays(year, month)]
     people = registry.readiness_people(service["id"])
     settings = registry.get_readiness_settings(service["id"])
+    # Запись — до отправки: месяц занят (перезапуск, прерванный между
+    # отправкой и записью, не вернёт старый опрос поверх нового).
+    run = registry.create_readiness_run(
+        service["id"], key,
+        status="open",
+        dates=dates,
+        deadline=deadline.astimezone(timezone.utc).isoformat(),
+    )
     # Вступление может уйти несколькими сообщениями (длинный шаблон,
     # много упоминаний) — запоминаются все, чтобы убрать при сбое опроса.
     intro_ids: list[int] = []
@@ -314,18 +353,19 @@ async def launch_run(
         intro_ids.append(message.message_id)
         return message
 
-    intro = await send_to_service_group(
-        lambda chat, text, **kwargs: send_telegram_screen(
-            send_chunk, chat, text, limit=text_limit, **kwargs
-        ),
-        chat_id,
-        intro_text(
-            service, people, year, month, deadline, tz,
-            settings.get("intro_template"),
-        ),
-        service, registry=registry, logger=logger,
-    )
+    poll_message = None
     try:
+        intro = await send_to_service_group(
+            lambda chat, text, **kwargs: send_telegram_screen(
+                send_chunk, chat, text, limit=text_limit, **kwargs
+            ),
+            chat_id,
+            intro_text(
+                service, people, year, month, deadline, tz,
+                settings.get("intro_template"),
+            ),
+            service, registry=registry, logger=logger,
+        )
         poll_message = await send_to_service_group(
             bot.send_poll, chat_id,
             POLL_QUESTION.format(month=MONTHS_IN[month - 1]),
@@ -337,35 +377,35 @@ async def launch_run(
             is_anonymous=False,
             allows_multiple_answers=True,
         )
-    except Exception:
-        # Без опроса вступление в чате лишнее: повторный запуск прислал бы
-        # второе.
-        for message_id in intro_ids:
-            try:
-                await bot.delete_message(chat_id, message_id)
-            except Exception:  # noqa: BLE001
-                logger.info("Вступление опроса не удалено", exc_info=True)
-        raise
-    try:
-        return registry.create_readiness_run(
-            service["id"], key,
-            status="open",
-            dates=dates,
+        return registry.attach_readiness_poll(
+            run["id"],
             poll_id=poll_message.poll.id,
             chat_id=chat_id,
             message_id=poll_message.message_id,
             intro_message_id=intro_ids[0] if intro_ids else getattr(
                 intro, "message_id", None
             ),
-            deadline=deadline.astimezone(timezone.utc).isoformat(),
         )
-    except Exception:
-        # Опрос без записи нельзя подсчитать — останавливаем его.
-        logger.exception("Не удалось сохранить опрос готовности")
-        try:
-            await bot.stop_poll(chat_id, poll_message.message_id)
-        except Exception:  # noqa: BLE001
-            logger.warning("Не удалось остановить опрос готовности", exc_info=True)
+    except BaseException:
+        # BaseException — и при отмене задачи запись не остаётся без опроса.
+        if poll_message is not None:
+            # Опрос без записи нельзя подсчитать — останавливаем его.
+            logger.exception("Не удалось сохранить опрос готовности")
+            try:
+                await bot.stop_poll(chat_id, poll_message.message_id)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Не удалось остановить опрос готовности", exc_info=True
+                )
+        else:
+            # Без опроса вступление в чате лишнее: повторный запуск
+            # прислал бы второе.
+            for message_id in intro_ids:
+                try:
+                    await bot.delete_message(chat_id, message_id)
+                except Exception:  # noqa: BLE001
+                    logger.info("Вступление опроса не удалено", exc_info=True)
+        registry.delete_readiness_run(run["id"])
         raise
 
 
@@ -551,10 +591,11 @@ async def close_run(
 
 async def announce_closed(
     bot, registry, run: dict, service: dict, logger: logging.Logger
-) -> None:
-    """Сообщение в чат служения, что опрос завершён (ответом на опрос)."""
+) -> bool:
+    """Сообщение в чат служения, что опрос завершён (ответом на опрос).
+    True — отправлено или отправлять некуда; False — временный сбой."""
     if not run.get("chat_id") or not run.get("message_id"):
-        return
+        return True
     try:
         await send_to_service_group(
             bot.send_message, run["chat_id"],
@@ -569,8 +610,15 @@ async def announce_closed(
                 message_id=run["message_id"], allow_sending_without_reply=True,
             ),
         )
-    except Exception:  # noqa: BLE001
-        logger.info("Сообщение о завершении опроса не отправлено", exc_info=True)
+    except Exception as exc:  # noqa: BLE001
+        if unreachable(exc):
+            logger.info("Сообщение о завершении опроса не доставлено: %s", exc)
+            return True
+        logger.warning(
+            "Сообщение о завершении опроса не отправлено", exc_info=True
+        )
+        return False
+    return True
 
 
 async def finish_run(
@@ -581,7 +629,12 @@ async def finish_run(
     удалось, повторяет следующая проверка (без повтора удавшегося)."""
     if not run["poll_stopped"] and await stop_run_poll(bot, run, logger):
         registry.mark_readiness_run(run["id"], poll_stopped=True)
+        run = {**run, "poll_stopped": 1}
+    # Сообщение в чат — после остановки опроса; не дошло — повтор.
+    if run["poll_stopped"] and not run.get("closed_announced") and (
         await announce_closed(bot, registry, run, service, logger)
+    ):
+        registry.mark_readiness_run(run["id"], closed_announced=True)
     if run["result_sent"]:
         return
     try:
@@ -593,9 +646,11 @@ async def finish_run(
             f"⚠️ {service['name']}: итог посчитать не удалось — откройте "
             "«📊 Итог опроса»."
         )
+    # Одно сообщение: доставка отмечается на получателя целиком (длинный
+    # итог сокращается, полностью — «📊 Итог опроса»).
+    text = fit_one_screen("🗳 Опрос завершён\n\n" + text, text_limit)
     if await notify_admins(
-        bot, registry, service["id"], admin_id,
-        "🗳 Опрос завершён\n\n" + text, logger, text_limit,
+        bot, registry, service["id"], admin_id, text, logger, text_limit,
         reply_markup=admin_keyboard(service["id"]),
         delivery_key=f"result-{run['id']}", month=run["month"],
     ):
@@ -717,6 +772,16 @@ async def _tick_run(
         current = registry.get_readiness_run_by_id(run["id"])
         if current is None or current["status"] != "open":
             return
+        if not current["poll_id"]:
+            # Запись без опроса в чате: запуск прервался между записью и
+            # отправкой. Через 5 минут — убрать, месяц снова свободен.
+            created = datetime.fromisoformat(current["created_at"])
+            if now - created > timedelta(minutes=5):
+                registry.delete_readiness_run(current["id"])
+                logger.warning(
+                    "Удалена запись опроса %s без опроса в чате", current["id"]
+                )
+            return
         if now >= deadline_of(current):
             await close_run(
                 bot, registry, current, service, tz, admin_id, logger,
@@ -728,16 +793,37 @@ async def _tick_run(
 
 
 def settle_parked_run(registry, parked: dict, logger: logging.Logger) -> None:
-    """Перезапуск прервался: новый опрос есть — старый удаляется, нет —
-    старый возвращается закрытым (опрос в чате уже остановлен)."""
+    """Перезапуск прервался. Вызывать под service_lock: снимок отложенного
+    опроса перечитывается — перезапуск мог уже вернуть его на место."""
+    parked = registry.get_readiness_run_by_id(parked["id"])
+    if parked is None or "#" not in parked["month"]:
+        return
     key = parked["month"].split("#")[0]
-    if registry.get_readiness_run(parked["service_id"], key) is not None:
+    current = registry.get_readiness_run(parked["service_id"], key)
+    if current is not None and current["status"] == "open" and not (
+        current["poll_id"]
+    ):
+        # Запись нового опроса без опроса в чате (бот упал до отправки) —
+        # нового опроса нет.
+        registry.delete_readiness_run(current["id"])
+        current = None
+    if current is not None and current["id"] != parked["id"] and (
+        current["status"] != "skipped"
+    ):
+        # Новый опрос есть — старый с ответами больше не нужен.
         registry.delete_readiness_run(parked["id"])
         logger.info("Удалён опрос %s, отложенный перезапуском", parked["id"])
         return
+    if current is not None and current["status"] == "skipped":
+        # Пропуск месяца не должен стереть ответы отложенного опроса.
+        registry.delete_readiness_run(current["id"])
+    was_open = parked["status"] == "open"
     registry.move_readiness_run(parked["id"], key)
     registry.close_readiness_run(parked["id"])
-    registry.mark_readiness_run(parked["id"], poll_stopped=True)
+    # Как при неудачном перезапуске: итог прежнего опроса не повторяется.
+    registry.mark_readiness_run(
+        parked["id"], poll_stopped=True, **({"result_sent": True} if was_open else {}),
+    )
     logger.info("Возвращён опрос %s после прерванного перезапуска", parked["id"])
 
 
@@ -774,7 +860,8 @@ async def run_readiness_tick(
             # Сутки без успеха (админы недоступны, опрос не остановить) —
             # больше не пытаться каждую минуту; итог есть в «📊 Итог опроса».
             registry.mark_readiness_run(
-                run["id"], poll_stopped=True, result_sent=True
+                run["id"], poll_stopped=True, result_sent=True,
+                closed_announced=True,
             )
             continue
         try:
@@ -784,6 +871,7 @@ async def run_readiness_tick(
                 current = registry.get_readiness_run_by_id(run["id"])
                 if current is None or (
                     current["poll_stopped"] and current["result_sent"]
+                    and current["closed_announced"]
                 ):
                     continue
                 await finish_run(
