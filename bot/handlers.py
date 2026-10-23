@@ -15,7 +15,9 @@ from typing import Any
 from aiogram import F, Dispatcher, Router
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramAPIError
+from aiogram.dispatcher.event.bases import UNHANDLED
 from aiogram.filters import Command
+from aiogram.methods import SendMessage
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -37,6 +39,18 @@ from .commands import (
 )
 from .admin_report import notify_admins_declined, refresh_admin_reports
 from .group_send import send_to_service_group, thread_kwargs
+from .navigation import (
+    NAV_CALLBACK_ID,
+    NAV_CANCEL_TEXT,
+    NAV_HINT,
+    NAV_HOME_TEXT,
+    NAV_REMOVED_TEXT,
+    NAV_TEXTS,
+    ScreenMessage,
+    back_callback,
+    nav_keyboard,
+    replaces_nav_keyboard,
+)
 from .replacement import (
     assign_replacement,
     finish_replacement,
@@ -101,6 +115,12 @@ async def _answer_callback(
     callback: CallbackQuery, text: str | None = None, **kwargs
 ) -> None:
     normalized = callback_text(text)
+    if getattr(callback, "id", None) == NAV_CALLBACK_ID:
+        # Нажатие «↩️ Отмена» имитирует бот: всплывающего ответа нет,
+        # поэтому предупреждения приходят обычным сообщением.
+        if text and str(text).startswith(("⚠️", "❌")):
+            await callback.message.notify(str(text))
+        return
     if normalized is None:
         await callback.answer(**kwargs)
     else:
@@ -327,6 +347,73 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     pending_contact_navigation: dict[str, tuple[int, str, str]] = {}
     pending_notify_task_choices: dict[str, tuple[int, str, str | None]] = {}
     pending_dialog_pages: dict[str, tuple[int, str, InlineKeyboardMarkup, int]] = {}
+    # Клавиатура навигации: shown, helpers (подсказки), back и screen
+    # (кнопка «⬅️ …» и ID последнего экрана).
+    nav_state: dict[int, dict[str, Any]] = {}
+
+    async def track_reply_keyboards(make_request, bot, method):
+        chat_id = replaces_nav_keyboard(method)
+        if chat_id in nav_state:
+            # Другая нижняя клавиатура заменила или убрала навигацию.
+            nav_state[chat_id]["shown"] = False
+        if isinstance(method, SendMessage) and method.chat_id in nav_state:
+            # Сообщение не из _send_dialog: прежняя «⬅️ …» уже не текущая;
+            # _send_dialog запишет свою кнопку после отправки экрана.
+            nav_state[method.chat_id]["back"] = None
+        return await make_request(bot, method)
+
+    session_middleware = getattr(
+        getattr(getattr(context, "bot", None), "session", None),
+        "middleware",
+        None,
+    )
+    if callable(getattr(session_middleware, "register", None)):
+        session_middleware.register(track_reply_keyboards)
+
+    async def delete_quietly(chat_id: int, message_ids: list[int]) -> None:
+        for message_id in message_ids:
+            try:
+                await context.bot.delete_message(
+                    chat_id=chat_id, message_id=message_id
+                )
+            except TelegramAPIError:
+                debug.debug(
+                    "Не удалось удалить сообщение навигации %s", message_id
+                )
+
+    async def show_nav_keyboard(target: Message, actor_id: int) -> None:
+        state = nav_state.setdefault(actor_id, {"shown": False, "helpers": []})
+        if state["shown"]:
+            return
+        stale = state["helpers"]
+        state["helpers"] = []
+        try:
+            hint = await target.answer(
+                NAV_HINT, reply_markup=nav_keyboard(), parse_mode=None
+            )
+        except TelegramAPIError:
+            debug.warning("Не удалось показать клавиатуру навигации %s", actor_id)
+            return
+        state["shown"] = True
+        state["helpers"] = [hint.message_id]
+        await delete_quietly(target.chat.id, stale)
+
+    async def hide_nav_keyboard(chat_id: int, actor_id: int) -> None:
+        state = nav_state.get(actor_id)
+        if state is None or not state["shown"]:
+            return
+        helpers = state["helpers"]
+        state["shown"] = False
+        state["helpers"] = []
+        try:
+            removed = await context.bot.send_message(
+                chat_id, NAV_REMOVED_TEXT, reply_markup=ReplyKeyboardRemove()
+            )
+        except TelegramAPIError:
+            debug.warning("Не удалось убрать клавиатуру навигации %s", actor_id)
+            state["helpers"] = helpers
+            return
+        await delete_quietly(chat_id, [*helpers, removed.message_id])
     pending_personal_actions: dict[
         str, tuple[int, str, str, str, dict[str, Any]]
     ] = {}
@@ -462,6 +549,26 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
 
+        nav_actor = (
+            actor_id
+            if chat_type == ChatType.PRIVATE and actor_id is not None
+            else None
+        )
+        nav_back = None
+        if nav_actor is not None and isinstance(markup, InlineKeyboardMarkup):
+            # Со второго уровня (есть «⬅️ …») — навигация внизу,
+            # на корневых экранах она убирается.
+            nav_back = back_callback(markup)
+            if nav_back is not None:
+                await show_nav_keyboard(target, nav_actor)
+            else:
+                await hide_nav_keyboard(target.chat.id, nav_actor)
+        elif nav_actor in nav_state and isinstance(
+            markup, (ReplyKeyboardMarkup, ReplyKeyboardRemove)
+        ):
+            # Своя нижняя клавиатура экрана заменяет навигацию.
+            nav_state[nav_actor]["shown"] = False
+
         chunks = render_screen_chunks(text, limit=text_limit)
         sent_message = None
         for index, chunk in enumerate(chunks):
@@ -478,6 +585,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if sent_message is not None and pending is not None:
             pending["menu_message_id"] = sent_message.message_id
             pending["menu_chat_id"] = target.chat.id
+        if nav_actor is not None and sent_message is not None:
+            state = nav_state.setdefault(
+                nav_actor, {"shown": False, "helpers": []}
+            )
+            state["back"] = nav_back
+            state["screen"] = sent_message.message_id
         return sent_message
 
     @admin_router.callback_query(F.data.startswith("ui_page:"))
@@ -5020,6 +5133,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if linked:
             text += "\n\n" + notifications_hint(actor_id)
         operations = start_menu_operations(actor_id, role, linked)
+        # После перезапуска бота нижняя клавиатура могла остаться у
+        # клиента: /start убирает её, даже если бот о ней не знает.
+        nav_state.setdefault(actor_id, {"shown": True, "helpers": []})
         await _send_dialog(
             message,
             text,
@@ -8137,6 +8253,53 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             return
         await _answer_callback(callback, notice)
+
+    @admin_router.message(F.text.in_(NAV_TEXTS))
+    async def on_nav_button(message: Message) -> None:
+        """«↩️ Отмена» — кнопка «⬅️ …» последнего экрана, «🏠 В начало» —
+        /start. Срабатывает и на шаге ввода текста."""
+        if not message.from_user or message.chat.type != ChatType.PRIVATE:
+            return
+        actor_id = message.from_user.id
+        delete = getattr(message, "delete", None)
+        if callable(delete):
+            try:
+                await delete()
+            except TelegramAPIError:
+                debug.debug("Не удалось удалить нажатие навигации")
+        state = nav_state.get(actor_id) or {}
+        back = state.get("back")
+        if message.text == NAV_HOME_TEXT or back is None:
+            await clean_previous_menu_by_id(
+                context.bot, message.chat.id, state.get("screen"), debug
+            )
+            await show_start(message, message.from_user)
+            return
+        interaction.info("Навигация «Отмена» %s: %s", actor_id, back)
+        screen = ScreenMessage(
+            message, state.get("screen"), context.bot,
+            datetime.now().astimezone(),
+        )
+        callback = CallbackQuery.model_construct(
+            id=NAV_CALLBACK_ID,
+            from_user=message.from_user,
+            chat_instance=NAV_CALLBACK_ID,
+            message=screen,
+            data=back,
+        )
+        state["back"] = None
+        for target_router in (admin_router, router):
+            result = await target_router.propagate_event(
+                "callback_query", callback
+            )
+            if result is not UNHANDLED:
+                break
+        if not screen.sent:
+            # Кнопка устарела и нового экрана нет — не оставлять пустоту.
+            await clean_previous_menu_by_id(
+                context.bot, message.chat.id, screen.message_id, debug
+            )
+            await show_start(message, message.from_user)
 
     @admin_router.message(F.text & ~F.text.startswith("/"))
     async def on_service_parameter(message: Message) -> None:

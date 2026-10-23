@@ -403,6 +403,28 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   ordering when changing layouts.
 - Conversation handlers must reject stale sessions and enforce service/admin
   permissions before mutating state. Keep callback toasts short and plain.
+- Bottom reply keyboard «↩️ Отмена» / «🏠 В начало» (`bot/navigation.py`):
+  `_send_dialog` shows it (with a `NAV_HINT` message) for private screens
+  whose inline markup has a back button (`back_callback`: last «⬅️/↩️»
+  button, paging `ui_page:` excluded) and hides it on screens without one
+  (send `ReplyKeyboardRemove`, then delete it and the hint). Per-actor
+  `nav_state` keeps `shown`, `helpers`, `back`, `screen`. Any other reply
+  keyboard (contact/chat pickers, `ReplyKeyboardRemove`) resets `shown`
+  — via `_send_dialog` and the bot session middleware
+  `track_reply_keyboards` (`replaces_nav_keyboard`). `on_nav_button` is
+  registered before the generic text handler: «Отмена» replays the stored
+  back `callback_data` as a synthetic `CallbackQuery` (`id=NAV_CALLBACK_ID`,
+  message = `ScreenMessage` of the last screen) through
+  `admin_router`/`router.propagate_event`; `_answer_callback` sends only
+  ⚠️/❌ answers for it (`ScreenMessage.notify`). No back button, «В начало»,
+  or a replay that sent no screen (`ScreenMessage.sent == 0`) →
+  `show_start`. Back buttons are recognised by `_BACK_PREFIXES` («⬅️ К »,
+  «↩️ К », «⬅️ Назад», «⬅️ Отмена»); paging («⬅️ Стр. N», `ui_page:`,
+  `task_page:`, «⬅️ Назад» on `contact_nav:`,
+  «⬅️ Предыдущее», dates) are not. The middleware also clears `back` on
+  any `SendMessage` to the chat outside `_send_dialog`, and `/start`
+  removes the keyboard for users unknown after a restart. New screens must
+  keep a «⬅️ К …» back button for this to work.
 
 ### SQLite, backups, and restore
 

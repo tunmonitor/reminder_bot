@@ -10,9 +10,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from aiogram.exceptions import TelegramAPIError
+from aiogram.types import ReplyKeyboardRemove
 
 from bot.excel_parser import ServiceAssignment, ServiceEvent
 from bot.handlers import register, router
+from bot.navigation import NAV_CANCEL_TEXT, NAV_HINT, NAV_HOME_TEXT
 from bot.service_registry import ServiceRegistry
 
 
@@ -866,6 +868,93 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_nav_keyboard_cancel_steps_back_and_home_opens_start(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 12345)
+            await self.admin_router.message.handlers[6].callback(
+                self.message(12345, "/service_notify")
+            )
+            nav = next(
+                item.callback for item in self.admin_router.message.handlers
+                if item.callback.__name__ == "on_nav_button"
+            )
+
+            async def press(data):
+                callback = SimpleNamespace(
+                    data=data,
+                    from_user=SimpleNamespace(id=12345),
+                    message=self.message(12345, ""),
+                    answer=AsyncMock(),
+                )
+                callback.message.answer.return_value = SimpleNamespace(
+                    message_id=700
+                )
+                handler = (
+                    "on_service_selected" if data.startswith("service:")
+                    else "on_group_reminder_action"
+                )
+                await self.callback_handler(handler)(callback)
+                return callback.message.answer
+
+            def buttons(answer):
+                return [
+                    item.callback_data
+                    for row in answer.await_args.kwargs[
+                        "reply_markup"
+                    ].inline_keyboard
+                    for item in row
+                ]
+
+            async def tap(text):
+                message = self.message(12345, text)
+                message.answer.return_value = SimpleNamespace(message_id=800)
+                await nav(message)
+                return message.answer
+
+            root = await press("service:service_notify:sound")
+            default = next(
+                data for data in buttons(root)
+                if data.startswith("group_reminder:default:")
+            )
+            screen = await press(default)
+            # Экран второго уровня: сначала подсказка с нижней клавиатурой.
+            hint = screen.await_args_list[0]
+            self.assertEqual(hint.args[0], NAV_HINT)
+            self.assertEqual(
+                [b.text for b in hint.kwargs["reply_markup"].keyboard[0]],
+                [NAV_CANCEL_TEXT, NAV_HOME_TEXT],
+            )
+            # На шаге ввода «Отмена» — как «Назад без изменения».
+            edit = next(
+                data for data in buttons(screen)
+                if data.startswith("group_reminder:edit_default:")
+            )
+            await press(edit)
+            back = await tap(NAV_CANCEL_TEXT)
+            self.assertIn("шаблон по умолчанию", back.await_args.args[0])
+            self.assertIsNone(
+                next(
+                    service for service in self.registry.list_services()
+                    if service["id"] == "sound"
+                )["group_template"]
+            )
+            # Ещё раз «Отмена» — «⬅️ К настройкам».
+            menu = await tap(NAV_CANCEL_TEXT)
+            self.assertTrue(any(
+                data.startswith("group_reminder:default:")
+                for data in buttons(menu)
+            ))
+            home = await tap(NAV_HOME_TEXT)
+            self.assertTrue(any(
+                data.startswith("menu:") for data in buttons(home)
+            ))
+            removal = self.context.bot.send_message.await_args_list[-1]
+            self.assertIsInstance(
+                removal.kwargs["reply_markup"], ReplyKeyboardRemove
+            )
+
+        asyncio.run(run())
+
     def test_template_screens_offer_preview_and_field_help(self):
         async def run():
             self.registry.add_service_admin(67890, "sound", 12345)
@@ -1079,12 +1168,15 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 len(result_markup.inline_keyboard),
                 2,
             )
+            # Второе 502 — подсказка навигации (тот же мок ответа): итоговый
+            # экран без «⬅️ …» убирает нижнюю клавиатуру вместе с ней.
             self.assertEqual(
                 [
                     call.kwargs["message_id"]
                     for call in self.context.bot.delete_message.await_args_list
+                    if isinstance(call.kwargs["message_id"], int)
                 ],
-                [501, 502, 502, 503, 503],
+                [501, 502, 502, 503, 502, 503],
             )
 
         asyncio.run(run())
@@ -3881,8 +3973,11 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
             await self.admin_router.message.handlers[1].callback(message)
 
-            self.assertEqual(message.answer.await_count, 1)
-            chunks = [call.args[0] for call in message.answer.await_args_list]
+            chunks = [
+                call.args[0] for call in message.answer.await_args_list
+                if call.args[0] != NAV_HINT
+            ]
+            self.assertEqual(len(chunks), 1)
             self.assertTrue(
                 all(len(chunk.encode("utf-16-le")) // 2 <= 500 for chunk in chunks)
             )
