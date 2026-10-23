@@ -46,9 +46,18 @@ from .replacement import (
     start_replacement_search,
 )
 from .notifier import CONFIRM_PREFIX, TELEGRAM_TEXT_LIMIT, _notify_admin
+from .month_summary import (
+    linked_assignments,
+    month_summary_text,
+    month_title,
+    next_month,
+    month_end,
+    service_labels,
+)
 from .presentation import (
     format_task_assignments,
     informational_label,
+    personal_schedule_lines,
     task_assignment_names,
     task_emoji,
     task_is_informational,
@@ -65,7 +74,11 @@ from .service_registry import (
     normalize_member_name,
     validate_notification_template,
 )
-from .scheduler import next_reminder_occurrence
+from .scheduler import (
+    periods_overlap,
+    reminder_occurrence,
+    reminder_period_status,
+)
 from .services import SERVICES, normalized_name
 from .ui import (
     callback_text,
@@ -181,6 +194,56 @@ def _parse_reminder_time(text: str) -> str:
     if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", text):
         raise ValueError("Укажите время в формате HH:MM, например 17:15.")
     return text
+
+
+def _parse_period(text: str) -> tuple[date | None, date | None]:
+    """«01.11.2026 27.12.2026»; «-» вместо даты — без этой границы."""
+    fields = text.replace("—", " ").replace("–", " ").split()
+    if len(fields) != 2:
+        raise ValueError(
+            "Введите две даты воскресений через пробел, например: "
+            "01.11.2026 27.12.2026 («-» — без границы)."
+        )
+    bounds = []
+    for field in fields:
+        if field == "-":
+            bounds.append(None)
+            continue
+        try:
+            bounds.append(datetime.strptime(field, "%d.%m.%Y").date())
+        except ValueError:
+            raise ValueError(f"Не понял дату «{field}», нужно ДД.ММ.ГГГГ.") from None
+    return bounds[0], bounds[1]
+
+
+PERIOD_CHOICE_BASE = 100
+PERIOD_STATUS_LABELS = {
+    "active": "🟢 активно",
+    "pending": "⏳ ещё не началось",
+    "ended": "⏸ период завершён",
+}
+
+
+def period_text(reminder: dict, today: date) -> str:
+    """«с 01.11.2026 по 27.12.2026 · 🟢 активно» или «без ограничений»."""
+    status = reminder_period_status(reminder, today)
+    if status is None:
+        return "без ограничений"
+    bounds = []
+    if reminder.get("active_from"):
+        bounds.append(f"с {date.fromisoformat(reminder['active_from']):%d.%m.%Y}")
+    if reminder.get("active_until"):
+        bounds.append(f"по {date.fromisoformat(reminder['active_until']):%d.%m.%Y}")
+    return f"{' '.join(bounds)} · {PERIOD_STATUS_LABELS[status]}"
+
+
+def month_summary_label(setting: dict) -> str:
+    days = setting["reminder_days"]
+    when = (
+        "в первое воскресенье" if days == 0
+        else f"за {days} дн. до первого воскресенья"
+    )
+    return f"{when} в {setting['reminder_time']}"
 
 
 def _rule_label(days: int, reminder_time: str) -> str:
@@ -300,7 +363,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "🍽️", "☕", "📌", "🔕",
                         "🔧", "🧹", "🔄", "⬅️", "➡️", "🏠", "✖️", "➕",
                         "➖", "🗑", "✏️", "1️⃣", "2️⃣", "3️⃣", "4️⃣",
-                        "📤", "🔁", "🗓", "🧵", "🚫",
+                        "📤", "🔁", "🗓", "🧵", "🚫", "📆", "♾", "▶️", "⏸",
                     )
                 ):
                     button.text = f"📋 {label}"
@@ -575,15 +638,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 else "🧵 Тема · общая (/here в нужной теме — сменить)"
             )
         lines.append(f"⏰ Напоминания групп · {reminders_status}")
-        if enabled_reminders:
-            now = datetime.now(context.timezone)
+        now = datetime.now(context.timezone)
+        upcoming = [
+            (*occurrence, item)
+            for item in enabled_reminders
+            if (occurrence := reminder_occurrence(now, item)) is not None
+        ]
+        if upcoming:
             event_date, send_date, reminder = min(
-                (
-                    (*next_reminder_occurrence(
-                        now, item["reminder_days"], item["reminder_time"]
-                    ), item)
-                    for item in enabled_reminders
-                ),
+                upcoming,
                 key=lambda entry: (entry[1], entry[2]["reminder_time"]),
             )
             schedule = (
@@ -1859,8 +1922,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             return
         rows = []
+        today = datetime.now(context.timezone).date()
         for reminder in registry.list_group_reminders(service_id):
-            label = (
+            period_mark = {"pending": "⏳ ", "ended": "⏸ "}.get(
+                reminder_period_status(reminder, today), ""
+            )
+            label = period_mark + (
                 f"{reminder['reminder_days']} дн. · "
                 f"{reminder['reminder_time']} · "
                 + (
@@ -1940,10 +2007,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         pending.pop("preview_request_id", None)
         pending["step"] = "group_reminder_card"
         pending["reminder_id"] = reminder_id
-        event_date, send_date = next_reminder_occurrence(
-            datetime.now(context.timezone),
-            reminder["reminder_days"],
-            reminder["reminder_time"],
+        now = datetime.now(context.timezone)
+        occurrence = reminder_occurrence(now, reminder)
+        send_text = (
+            f"{occurrence[1]:%d.%m.%Y} в {reminder['reminder_time']}"
+            if occurrence else "— (период завершён)"
         )
         body_status = (
             "собственный" if reminder["body"] else
@@ -1959,8 +2027,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             f"📝 Напоминание · {service_label(service)}\n\n"
             f"📌 Задача: {task_status}\n"
             f"📅 Срок: за {reminder['reminder_days']} дн.\n"
-            f"✉️ Отправка: {send_date:%d.%m.%Y} "
-            f"в {reminder['reminder_time']}\n"
+            f"🗓 Период: {period_text(reminder, now.date())}\n"
+            f"✉️ Отправка: {send_text}\n"
             f"📝 Текст: {body_status}\n"
             f"🔔 Статус: {'включено' if reminder['enabled'] else 'выключено'}"
             f"\n\nТекущий текст напоминания:\n{current_text}"
@@ -2010,6 +2078,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     text="🔄 Выключить" if reminder["enabled"] else "🔄 Включить",
                     callback_data=(
                         f"group_reminder:toggle:{service_id}:"
+                        f"{reminder_id}:{pending['session_id']}"
+                    ),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🗓 Период",
+                    callback_data=(
+                        f"group_reminder:period_menu:{service_id}:"
                         f"{reminder_id}:{pending['session_id']}"
                     ),
                 ),
@@ -2096,13 +2173,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     def send_now_snapshot(reminder: dict | None):
         """Что должно не измениться между предпросмотром и отправкой:
-        напоминание и чат (тема) служения."""
+        напоминание (с периодом) и чат (тема) служения."""
         if reminder is None:
             return None
         service = service_registry().get_service(reminder["service_id"]) or {}
         return (
             reminder["service_id"], reminder["body"], reminder.get("task"),
             reminder["reminder_days"], reminder["reminder_time"],
+            reminder.get("active_from"), reminder.get("active_until"),
             service.get("group_chat_id"), service.get("group_thread_id"),
         )
 
@@ -2122,7 +2200,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ),
         )
         result = None
-        if callable(loader):
+        current = registry.get_group_reminder(reminder_id) if registry else None
+        period_ended = current is not None and reminder_occurrence(
+            datetime.now(context.timezone), current
+        ) is None
+        if callable(loader) and not period_ended:
             try:
                 result = await loader(reminder_id)
             except Exception:  # noqa: BLE001
@@ -2139,6 +2221,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         elif service is None or not service.get("group_chat_id"):
             text, rows = (
                 "⚠️ У служения не привязан групповой чат — отправлять некуда.",
+                [[back]],
+            )
+        elif period_ended:
+            text, rows = (
+                "⚠️ Период напоминания завершён — задайте новый период "
+                "в «🗓 Период».",
                 [[back]],
             )
         elif not result or not result.get("has_data"):
@@ -2176,6 +2264,90 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             _dialog_text_limit=4096,
             parse_mode=None,
+        )
+
+    async def show_group_reminder_period(
+        message: Message, actor_id: int, service_id: str, reminder_id: int,
+        active_from: date | None = None, *, pick_until: bool = False,
+    ) -> None:
+        """Период напоминания: сначала воскресенье начала, затем окончания."""
+        pending = pending_inputs.get(actor_id)
+        registry = service_registry()
+        if pending is None or registry is None:
+            await _send_dialog(message, "Настройка устарела.", parse_mode=None)
+            return
+        reminder = registry.get_group_reminder(reminder_id)
+        if reminder is None or reminder["service_id"] != service_id:
+            raise ValueError("Групповое напоминание больше не существует.")
+        today = datetime.now(context.timezone).date()
+        first = today + timedelta(days=(6 - today.weekday()) % 7)
+        if pick_until:
+            start = max(first, active_from or first)
+            choices = [start + timedelta(weeks=week) for week in range(12)]
+            title = (
+                f"🗓 Период · по какое воскресенье?\n"
+                f"Начало: {f'{active_from:%d.%m.%Y}' if active_from else 'сразу'}"
+            )
+            open_label = "♾ Без окончания"
+        else:
+            choices = [first + timedelta(weeks=week) for week in range(9)]
+            title = (
+                f"🗓 Период напоминания\nСейчас: {period_text(reminder, today)}"
+                "\n\nС какого воскресенья отправлять?"
+            )
+            open_label = "▶️ Сразу"
+        pending["step"] = "group_reminder_period"
+        pending["reminder_id"] = reminder_id
+        pending["period_choices"] = choices
+        pending["period_from"] = active_from
+        pending["period_pick_until"] = pick_until
+        action = "period_until" if pick_until else "period_from"
+        session = pending["session_id"]
+        # Номер воскресенья вместе с напоминанием: кнопка с экрана другого
+        # напоминания не изменит текущее.
+        def choice_data(index: int) -> str:
+            value = reminder_id * PERIOD_CHOICE_BASE + index
+            return f"group_reminder:{action}:{service_id}:{value}:{session}"
+
+        buttons = [
+            InlineKeyboardButton(text=f"🗓 {day:%d.%m}", callback_data=choice_data(index))
+            for index, day in enumerate(choices, start=1)
+        ]
+        rows = [[
+            InlineKeyboardButton(text=open_label, callback_data=choice_data(0))
+        ]]
+        rows.extend(buttons[index:index + 3] for index in range(0, len(buttons), 3))
+        rows.append([
+            InlineKeyboardButton(
+                text="✏️ Ввести вручную",
+                callback_data=(
+                    f"group_reminder:period_input:{service_id}:"
+                    f"{reminder_id}:{session}"
+                ),
+            ),
+            InlineKeyboardButton(
+                text="♾ Без периода",
+                callback_data=(
+                    f"group_reminder:period_clear:{service_id}:"
+                    f"{reminder_id}:{session}"
+                ),
+            ),
+        ])
+        rows.append([
+            InlineKeyboardButton(
+                text="⬅️ К напоминанию",
+                callback_data=f"group_reminder:back:{service_id}:{session}",
+            )
+        ])
+        # Даты — сетка по 3 в ряд на одном экране, без страниц.
+        await _send_dialog(
+            message,
+            title + "\nℹ️ Вне периода напоминание не отправляется, после "
+            "окончания выключается.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            parse_mode=None,
+            _dialog_keep_rows=True,
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
         )
 
     async def show_group_reminder_tasks(
@@ -2585,8 +2757,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         *,
         excluding_id: int | None = None,
         task: str | None = None,
+        period: dict | None = None,
     ) -> dict | None:
-        """Включённое напоминание служения с тем же сроком, временем и задачей."""
+        """Включённое напоминание служения с тем же сроком, временем и
+        задачей, чей период пересекается с period (None — без периода)."""
         return next(
             (
                 item
@@ -2596,6 +2770,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 and item["reminder_days"] == days
                 and item["reminder_time"] == reminder_time
                 and item.get("task") == task
+                and periods_overlap(item, period or {})
             ),
             None,
         )
@@ -2647,6 +2822,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         body: str | None,
         source_id: int | None,
         source_slot: tuple[int, str] | None = None,
+        period: dict | None = None,
     ) -> None:
         """Offer to merge a reminder into an existing one with the same slot.
 
@@ -2707,6 +2883,27 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
         slot = _rule_label(days, time)
         cancel_row = [merge_button("✖️ Отмена", "mrg_no")]
+        period = period or {}
+        if (target.get("active_from"), target.get("active_until")) != (
+            period.get("active_from"), period.get("active_until")
+        ):
+            # Напоминания с разными периодами не объединяются (этап 4.2).
+            today = datetime.now(context.timezone).date()
+            await _send_dialog(
+                message,
+                f"⚠️ На «{slot}» уже есть напоминание с периодом "
+                f"{period_text(target, today)}.\n"
+                f"Период этого напоминания: {period_text(period, today)}.\n\n"
+                "Напоминания с разными периодами не объединяются. Сохраните "
+                "отдельно и задайте периоды в «🗓 Период» так, чтобы они не "
+                "пересекались, — иначе в общие воскресенья уйдут оба.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [merge_button("➕ Отдельно", "mrg_sep")],
+                    cancel_row,
+                ]),
+                parse_mode=None,
+            )
+            return
         if same_text:
             await _send_dialog(
                 message,
@@ -2996,11 +3193,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 service = registry.get_service(service_id)
                 if service is None:
                     raise ValueError("Служение не найдено.")
-                event_date, send_date = next_reminder_occurrence(
-                    datetime.now(context.timezone),
-                    reminder["reminder_days"],
-                    reminder["reminder_time"],
+                occurrence = reminder_occurrence(
+                    datetime.now(context.timezone), reminder
                 )
+                if occurrence is None:
+                    raise ValueError("Период напоминания завершён.")
+                event_date, send_date = occurrence
                 preview_dates = {
                     "date": event_date.strftime("%d.%m.%Y"),
                     "send_date": send_date.strftime("%d.%m.%Y"),
@@ -3277,6 +3475,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     "group_reminder_delete",
                     "group_reminder_preview",
                     "group_reminder_task",
+                    "group_reminder_period",
+                    "group_reminder_period_input",
                 }:
                     await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
                     return
@@ -3284,6 +3484,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     "group_reminder_delete",
                     "group_reminder_preview",
                     "group_reminder_task",
+                    "group_reminder_period",
+                    "group_reminder_period_input",
                 }:
                     await enter_group_reminder_card(
                         callback.message,
@@ -3295,6 +3497,82 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     await show_reminder_rules_menu(
                         callback.message, actor_id, service_id
                     )
+            elif action == "period_menu":
+                if (
+                    pending.get("step") != "group_reminder_card"
+                    or reminder_id != pending.get("reminder_id")
+                ):
+                    await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
+                    return
+                await show_group_reminder_period(
+                    callback.message, actor_id, service_id, reminder_id
+                )
+            elif action in {"period_from", "period_until"}:
+                # reminder_id здесь — напоминание × PERIOD_CHOICE_BASE + номер
+                # воскресенья (0 — без границы).
+                target_id, index = divmod(reminder_id, PERIOD_CHOICE_BASE)
+                choices = pending.get("period_choices", [])
+                if (
+                    pending.get("step") != "group_reminder_period"
+                    or target_id != pending.get("reminder_id")
+                    or pending.get("period_pick_until") != (action == "period_until")
+                    or not 0 <= index <= len(choices)
+                ):
+                    await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
+                    return
+                picked = choices[index - 1] if index else None
+                if action == "period_from":
+                    await show_group_reminder_period(
+                        callback.message, actor_id, service_id,
+                        pending["reminder_id"], picked, pick_until=True,
+                    )
+                else:
+                    registry.set_group_reminder_period(
+                        actor_id, pending["reminder_id"],
+                        pending.get("period_from"), picked,
+                        today=datetime.now(context.timezone).date(),
+                    )
+                    await refresh_jobs()
+                    await enter_group_reminder_card(
+                        callback.message, actor_id, service_id,
+                        pending["reminder_id"],
+                    )
+            elif action == "period_clear":
+                if (
+                    pending.get("step") != "group_reminder_period"
+                    or reminder_id != pending.get("reminder_id")
+                ):
+                    await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
+                    return
+                registry.set_group_reminder_period(
+                    actor_id, pending["reminder_id"], None, None,
+                    today=datetime.now(context.timezone).date(),
+                )
+                await refresh_jobs()
+                await enter_group_reminder_card(
+                    callback.message, actor_id, service_id, pending["reminder_id"]
+                )
+            elif action == "period_input":
+                if (
+                    pending.get("step") != "group_reminder_period"
+                    or reminder_id != pending.get("reminder_id")
+                ):
+                    await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
+                    return
+                pending["step"] = "group_reminder_period_input"
+                pending["group_reminder_input"] = {
+                    "reminder_id": pending["reminder_id"], "field": "period",
+                }
+                await _send_dialog(
+                    callback.message,
+                    "Введите даты воскресений «с — по», например: "
+                    "01.11.2026 27.12.2026. Без начала: «- 27.12.2026», "
+                    "без окончания: «01.11.2026 -».",
+                    reply_markup=notification_edit_controls(
+                        service_id, session_id
+                    ),
+                    parse_mode=None,
+                )
             elif action == "task_menu":
                 if pending.get("step") != "group_reminder_card":
                     await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
@@ -3374,6 +3652,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 if reminder is None or reminder["service_id"] != service_id:
                     raise ValueError("Групповое напоминание больше не существует.")
                 if action == "toggle":
+                    if not reminder["enabled"] and reminder_period_status(
+                        reminder, datetime.now(context.timezone).date()
+                    ) == "ended":
+                        raise ValueError(
+                            "Период напоминания завершён — задайте новый "
+                            "период в «🗓 Период»."
+                        )
                     registry.update_group_reminder(
                         actor_id, reminder_id,
                         enabled=not reminder["enabled"],
@@ -4464,6 +4749,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         "service_admin_remove": "➖ Снять админа",
         "test_notify": "🧪 Проверка доставки",
         "my_schedule": "📅 Мои служения",
+        "my_month": "📆 На месяц",
         "my_notifications": "⏰ Мои уведомления",
         "start": "🏠 Главное меню",
     }
@@ -4487,7 +4773,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if actor_id == context.admin_id:
             operations.append("test_notify")
         if linked:
-            operations.extend(["my_schedule", "my_notifications"])
+            operations.extend(["my_schedule", "my_month", "my_notifications"])
         return operations
 
     def start_menu_keyboard(
@@ -4630,6 +4916,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await open_my_notifications(callback.message, actor_id)
         elif operation == "my_schedule":
             await open_my_schedule(callback.message, actor_id)
+        elif operation == "my_month":
+            await open_my_month(callback.message, actor_id)
         elif operation == "start":
             await show_start(callback.message, callback.from_user)
         elif operation == "test_notify":
@@ -5097,6 +5385,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "group_reminder_days",
             "group_reminder_time",
             "group_reminder_text",
+            "group_reminder_period_input",
         }:
             input_info = pending.get("group_reminder_input")
             if input_info is None:
@@ -6104,6 +6393,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         service_id=item["service_id"],
                     )
                 ])
+            month = registry.get_month_summary(actor_id)
+            items.append([
+                personal_action_button(
+                    actor_id, state,
+                    "📆 Сводка на месяц: " + (
+                        f"🟢 {month_summary_label(month)}"
+                        if month["enabled"] else "⚪ выключена"
+                    ),
+                    "open_month",
+                )
+            ])
             text = "\n".join(lines)
             if not services:
                 text = (
@@ -6296,6 +6596,41 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             navigation.append(
                 personal_action_button(actor_id, state, "⬅️ Назад", "back")
             )
+        elif name == "month":
+            month = registry.get_month_summary(actor_id)
+            text = (
+                "📆 Сводка на месяц\n\n"
+                f"Статус: {'🟢 включена' if month['enabled'] else '⚪ выключена'}\n"
+                f"⏰ Когда: {month_summary_label(month)}\n\n"
+                "ℹ️ Один раз в месяц, перед первым воскресеньем, бот пришлёт "
+                "все ваши служения на этот месяц. Посмотреть сразу — "
+                "«📆 На месяц» в /start или /my_schedule."
+            )
+            for days, reminder_time in PERSONAL_RULE_PRESETS:
+                current = (days, reminder_time) == (
+                    month["reminder_days"], month["reminder_time"]
+                )
+                items.append([
+                    personal_action_button(
+                        actor_id, state,
+                        f"{'✅' if current else '⏰'} "
+                        f"{month_summary_label({'reminder_days': days, 'reminder_time': reminder_time})}",
+                        "month_time_pick", days=days, reminder_time=reminder_time,
+                    )
+                ])
+            actions = [
+                personal_action_button(
+                    actor_id, state,
+                    "🔕 Выключить" if month["enabled"] else "🔔 Включить",
+                    "toggle_month",
+                ),
+                personal_action_button(
+                    actor_id, state, "✏️ Ввести вручную", "month_time_input"
+                ),
+            ]
+            navigation.append(
+                personal_action_button(actor_id, state, "⬅️ Назад", "back")
+            )
         elif name == "add_time":
             service_id, task = level["service_id"], level["task"]
             text = (
@@ -6357,47 +6692,108 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             state["menu_chat_id"] = target.chat.id
 
     def upcoming_text(registry: Any, actor_id: int, events: list) -> str:
-        linked = {
-            (item["service_id"], item["task"], item["name"])
-            for item in registry.list_user_assignments(actor_id)
-        }
         lines = [f"📅 Мои служения · ближайшие {UPCOMING_WEEKS} недель", ""]
-        for event in events:
-            tasks = sorted(
-                {
-                    assignment.task
-                    for assignment in event.assignments
-                    if not assignment.is_informational
-                    and (event.service_id, assignment.task, assignment.name)
-                    in linked
-                }
-            )
-            if not tasks:
-                continue
-            service = service_by_id(registry, event.service_id)
-            label = service_label(service) if service else event.service_id
-            day = (
-                f"{event.event_date:%d.%m.%Y}, "
-                f"{_WEEKDAYS[event.event_date.weekday()]}"
-            )
-            if f"🗓 {day}" not in lines:
-                if len(lines) > 2:
-                    lines.append("")
-                lines.append(f"🗓 {day}")
-            lines.extend(
-                f"{task_emoji(task)} {label} · {task}" for task in tasks
-            )
-        if len(lines) == 2:
-            lines.append(
-                f"ℹ️ В ближайшие {UPCOMING_WEEKS} недель назначений в графике нет."
-            )
+        body = personal_schedule_lines(
+            events, linked_assignments(registry, actor_id),
+            service_labels(registry),
+        )
+        lines.extend(body or [
+            f"ℹ️ В ближайшие {UPCOMING_WEEKS} недель назначений в графике нет."
+        ])
         return "\n".join(lines)
+
+    async def open_my_month(
+        message: Message, actor_id: int, year: int | None = None,
+        month: int | None = None,
+    ) -> None:
+        """«📆 На месяц» (этап 4.1): назначения человека за месяц."""
+        registry = service_registry()
+        loader = getattr(context, "load_upcoming_service_events", None)
+        today = datetime.now(context.timezone).date()
+        current = (today.year, today.month)
+        following = next_month(*current)
+        year, month = (year, month) if year else current
+        other, arrow = (
+            (following, "➡️") if (year, month) == current else (current, "⬅️")
+        )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"{arrow} {month_title(*other).capitalize()}",
+                callback_data=f"mymonth:{other[0]:04d}{other[1]:02d}",
+            )],
+            [InlineKeyboardButton(
+                text=start_menu_items["my_schedule"],
+                callback_data="menu:my_schedule",
+            )],
+            [InlineKeyboardButton(
+                text=start_menu_items["start"], callback_data="menu:start",
+            )],
+        ])
+        if registry is None or loader is None:
+            await _send_dialog(
+                message, "⚠️ График сейчас недоступен. Попробуйте позже.",
+                parse_mode=None,
+            )
+            return
+        try:
+            linked = linked_assignments(registry, actor_id)
+            if not linked:
+                await _send_dialog(
+                    message,
+                    "ℹ️ Вы пока не привязаны ни к одной задаче. "
+                    "Обратитесь к администратору служения.",
+                    parse_mode=None,
+                )
+                return
+            events = await loader(
+                since=date(year, month, 1), until=month_end(year, month)
+            )
+            text = month_summary_text(
+                events, linked, service_labels(registry), year, month
+            )
+        except sqlite3.Error:
+            debug.exception("Не удалось прочитать назначения пользователя")
+            text = "❌ Не удалось прочитать ваши назначения. Попробуйте позже."
+        except (OSError, RuntimeError, ValueError):
+            debug.exception("Не удалось загрузить график для «На месяц»")
+            text = "⚠️ Не удалось загрузить график. Попробуйте позже."
+        await _send_dialog(message, text, reply_markup=keyboard)
+
+    @admin_router.callback_query(F.data.startswith("mymonth:"))
+    async def on_my_month(callback: CallbackQuery) -> None:
+        if (
+            not callback.from_user
+            or not callback.message
+            or callback.message.chat.type != ChatType.PRIVATE
+        ):
+            await _answer_callback(callback)
+            return
+        raw = callback.data.partition(":")[2]
+        today = datetime.now(context.timezone).date()
+        allowed = {
+            (today.year, today.month), next_month(today.year, today.month)
+        }
+        try:
+            year, month = int(raw[:4]), int(raw[4:])
+        except ValueError:
+            year = month = 0
+        if len(raw) != 6 or (year, month) not in allowed:
+            await _answer_callback(callback, "⚠️ Экран устарел. Откройте /my_schedule.")
+            return
+        await _answer_callback(callback)
+        await open_my_month(callback.message, callback.from_user.id, year, month)
 
     async def open_my_schedule(message: Message, actor_id: int) -> None:
         registry = service_registry()
         loader = getattr(context, "load_upcoming_service_events", None)
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=start_menu_items["my_month"],
+                        callback_data="menu:my_month",
+                    )
+                ],
                 [
                     InlineKeyboardButton(
                         text=start_menu_items["my_notifications"],
@@ -7427,6 +7823,23 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             f"{PERSONAL_PROBLEM_SHORT.get(problem, problem)}"
                             for problem, labels in failed.items()
                         ) + "."
+            elif action_name == "open_month":
+                push_personal_level(state, {"name": "month"})
+            elif action_name == "toggle_month":
+                month = registry.get_month_summary(actor_id)
+                registry.set_month_summary(
+                    actor_id, enabled=not month["enabled"]
+                )
+                notice = (
+                    "Сводка на месяц выключена" if month["enabled"]
+                    else "Сводка на месяц включена"
+                )
+            elif action_name == "month_time_pick":
+                registry.set_month_summary(
+                    actor_id, enabled=True, days=payload["days"],
+                    time=payload["reminder_time"],
+                )
+                notice = "Время сводки сохранено"
             elif action_name == "open_rule":
                 personal_rule(
                     registry, actor_id, payload["service_id"],
@@ -7492,8 +7905,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     pop_personal_level(state)
                 else:
                     registry.update_schedule(rule["id"], body=None)
-            elif action_name in {"rule_time", "rule_text", "add_time_input"}:
-                if action_name != "add_time_input":
+            elif action_name in {
+                "rule_time", "rule_text", "add_time_input", "month_time_input",
+            }:
+                if action_name not in {"add_time_input", "month_time_input"}:
                     rule = personal_rule(
                         registry, actor_id, payload["service_id"],
                         payload["schedule_id"],
@@ -7512,6 +7927,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     "{name}, {task}, {service_name}, {sunday_date}, "
                     "{telegram_id}, {username}."
                     if action_name == "rule_text"
+                    else "Введите, за сколько дней до первого воскресенья "
+                    "месяца (0–6) и во сколько прислать сводку, например: 2 18:30."
+                    if action_name == "month_time_input"
                     else "Введите, за сколько дней до служения (0–6) и во "
                     "сколько напомнить, например: 1 18:30."
                 )
@@ -7657,6 +8075,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             "name": "rule", "service_id": service_id,
                             "schedule_id": rule["id"],
                         })
+                    elif kind == "month_time_input":
+                        registry.set_month_summary(
+                            actor_id, enabled=True, days=days, time=time_text
+                        )
                     elif kind == "rule_time":
                         rule = personal_rule(
                             registry, actor_id, service_id,
@@ -7856,6 +8278,29 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             message, message.from_user.id, service_id
                         )
                     return
+                if step == "group_reminder_period_input":
+                    input_info = pending.get("group_reminder_input")
+                    if input_info is None:
+                        raise ValueError(
+                            "Ввод устарел. Откройте напоминание заново."
+                        )
+                    active_from, active_until = _parse_period(text)
+                    registry.set_group_reminder_period(
+                        message.from_user.id, input_info["reminder_id"],
+                        active_from, active_until,
+                        today=datetime.now(context.timezone).date(),
+                    )
+                    pending.pop("group_reminder_input", None)
+                    refresh = getattr(
+                        context, "refresh_service_reminder_jobs", None
+                    )
+                    if callable(refresh):
+                        await refresh()
+                    await enter_group_reminder_card(
+                        message, message.from_user.id, service_id,
+                        input_info["reminder_id"],
+                    )
+                    return
                 if step in {
                     "group_reminder_days",
                     "group_reminder_time",
@@ -7923,6 +8368,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                                 updated_time,
                                 excluding_id=reminder["id"],
                                 task=reminder.get("task"),
+                                period=reminder,
                             )
                             if reminder["enabled"]
                             else None
@@ -7951,6 +8397,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                                     reminder["reminder_days"],
                                     reminder["reminder_time"],
                                 ),
+                                period=reminder,
                             )
                             return
                     has_schedule_change = bool(
