@@ -6010,7 +6010,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 for button in row
                 if button.text.startswith("➕")
             )
-            self.assertEqual(add_button, "rdy:addm:sound:12345")
+            self.assertEqual(add_button, f"rdy:addm:sound:{month_arg}.12345")
+            old_month = await press("rdy:addm:sound:200001.12345")
+            self.assertIn("Экран устарел",
+                          old_month.message.answer.await_args.args[0])
             # Уже в составе без задач — задачи привязываются к нему, а не
             # ко второму участнику с именем из Telegram.
             self.registry.bind_service_member(
@@ -6072,6 +6075,22 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             run = self.registry.list_open_readiness_runs()[0]
             self.assertEqual(run["poll_id"], "ready-poll-2")
             self.assertEqual(self.registry.list_readiness_answers(run["id"]), [])
+            # Ответ Telegram потерян при перезапуске — месяц за новой
+            # записью, админ видит, что проверить.
+            from aiogram.exceptions import TelegramNetworkError
+
+            self.context.bot.send_poll.side_effect = TelegramNetworkError(
+                method=SimpleNamespace(), message="timeout"
+            )
+            lost = await press(f"rdy:restartok:sound:{month_arg}")
+            self.assertIn("проверьте", lost.message.answer.await_args.args[0])
+            self.assertIsNone(self.registry.get_readiness_run_by_id(run["id"]))
+            self.assertEqual(
+                self.registry.get_readiness_run(
+                    "sound", f"{year:04d}-{month:02d}"
+                )["status"],
+                "closed",
+            )
 
         self.context.bot.stop_poll = AsyncMock()
         asyncio.run(run())

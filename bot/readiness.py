@@ -14,10 +14,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time as time_module
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+)
 from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -346,26 +351,31 @@ async def launch_run(
     )
     # Вступление может уйти несколькими сообщениями (длинный шаблон,
     # много упоминаний) — запоминаются все, чтобы убрать при сбое опроса.
+    # Переход в общую тему (тема удалена или закрыта) — на каждую часть
+    # отдельно, иначе отправленные части повторились бы.
     intro_ids: list[int] = []
 
     async def send_chunk(chat, text, **kwargs):
-        message = await bot.send_message(chat, text, **kwargs)
+        message = await send_to_service_group(
+            bot.send_message, chat, text, service,
+            registry=registry, logger=logger, **kwargs,
+        )
         intro_ids.append(message.message_id)
         return message
 
     poll_message = None
+    sending_poll = False
+    _LAUNCHING[0] += 1
     try:
-        intro = await send_to_service_group(
-            lambda chat, text, **kwargs: send_telegram_screen(
-                send_chunk, chat, text, limit=text_limit, **kwargs
-            ),
-            chat_id,
+        intro = await send_telegram_screen(
+            send_chunk, chat_id,
             intro_text(
                 service, people, year, month, deadline, tz,
                 settings.get("intro_template"),
             ),
-            service, registry=registry, logger=logger,
+            limit=text_limit,
         )
+        sending_poll = True
         poll_message = await send_to_service_group(
             bot.send_poll, chat_id,
             POLL_QUESTION.format(month=MONTHS_IN[month - 1]),
@@ -377,7 +387,7 @@ async def launch_run(
             is_anonymous=False,
             allows_multiple_answers=True,
         )
-        return registry.attach_readiness_poll(
+        attached = registry.attach_readiness_poll(
             run["id"],
             poll_id=poll_message.poll.id,
             chat_id=chat_id,
@@ -386,17 +396,27 @@ async def launch_run(
                 intro, "message_id", None
             ),
         )
-    except BaseException:
+    except BaseException as exc:
         # BaseException — и при отмене задачи запись не остаётся без опроса.
         if poll_message is not None:
-            # Опрос без записи нельзя подсчитать — останавливаем его.
+            # Опрос в чате есть, но без записи его не подсчитать.
             logger.exception("Не удалось сохранить опрос готовности")
-            try:
-                await bot.stop_poll(chat_id, poll_message.message_id)
-            except Exception:  # noqa: BLE001
-                logger.warning(
-                    "Не удалось остановить опрос готовности", exc_info=True
-                )
+            await _abandon_poll(bot, registry, run, poll_message, chat_id, logger)
+        elif sending_poll and isinstance(exc, (TelegramNetworkError,
+                                               asyncio.TimeoutError)):
+            # Ответ Telegram потерян: опрос мог появиться в чате. Месяц
+            # остаётся занятым (без автоповтора), админ проверяет чат.
+            registry.close_readiness_run(run["id"])
+            registry.mark_readiness_run(
+                run["id"], poll_stopped=True, result_sent=True,
+                closed_announced=True,
+            )
+            raise ValueError(
+                "Связь с Telegram прервалась при отправке опроса — проверьте "
+                "чат служения: опрос мог появиться. Если он есть — "
+                "остановите его вручную (голоса в нём не учитываются), "
+                "затем «▶️ Запустить заново»."
+            ) from exc
         else:
             # Без опроса вступление в чате лишнее: повторный запуск
             # прислал бы второе.
@@ -405,8 +425,109 @@ async def launch_run(
                     await bot.delete_message(chat_id, message_id)
                 except Exception:  # noqa: BLE001
                     logger.info("Вступление опроса не удалено", exc_info=True)
-        registry.delete_readiness_run(run["id"])
+            registry.delete_readiness_run(run["id"])
         raise
+    finally:
+        _LAUNCHING[0] -= 1
+    # Опрос записан — ранние голоса учитываются; сбой здесь опрос не отменяет.
+    await replay_early_answers(registry, poll_message.poll.id, logger)
+    return attached
+
+
+# Отправленные опросы, которые не удалось ни остановить, ни сохранить в
+# базе: ежеминутная проверка пробует остановить их снова (до перезапуска).
+_ORPHAN_POLLS: list[tuple[int, int]] = []
+# Идёт отправка опроса — только тогда ответы на неизвестный опрос
+# придерживаются (иначе чужие опросы заполняли бы буфер).
+_LAUNCHING = [0]
+
+
+async def stop_orphan_polls(bot, logger: logging.Logger) -> None:
+    for chat_id, message_id in list(_ORPHAN_POLLS):
+        if await stop_run_poll(
+            bot, {"id": "orphan", "chat_id": chat_id, "message_id": message_id},
+            logger,
+        ):
+            _ORPHAN_POLLS.remove((chat_id, message_id))
+
+
+async def _abandon_poll(bot, registry, run: dict, poll_message, chat_id: int,
+                        logger: logging.Logger) -> None:
+    """Опрос отправлен, но не привязан к записи. Остановлен — запись не
+    нужна; не остановлен — запись остаётся закрытой с ID опроса, и
+    ежеминутная проверка остановит его позже."""
+    try:
+        await bot.stop_poll(chat_id, poll_message.message_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("Не удалось остановить опрос готовности", exc_info=True)
+        try:
+            registry.attach_readiness_poll(
+                run["id"], poll_id=poll_message.poll.id, chat_id=chat_id,
+                message_id=poll_message.message_id, intro_message_id=None,
+            )
+            registry.close_readiness_run(run["id"])
+            registry.mark_readiness_run(
+                run["id"], result_sent=True, closed_announced=True,
+            )
+            return
+        except Exception:  # noqa: BLE001
+            logger.exception("Опрос готовности %s не сохранён", run["id"])
+            _ORPHAN_POLLS.append((chat_id, poll_message.message_id))
+    registry.delete_readiness_run(run["id"])
+
+
+# Голоса, пришедшие между отправкой опроса и записью его ID (доли секунды):
+# придерживаются и учитываются сразу после записи.
+_EARLY_ANSWERS: dict[str, list[tuple[float, tuple]]] = {}
+_EARLY_TTL = 120
+_EARLY_LIMIT = 2000
+
+
+def hold_early_answer(poll_id: str, *answer) -> bool:
+    """False — не придержан: опрос сейчас не отправляется или буфер полон."""
+    if not _LAUNCHING[0]:
+        return False
+    now = time_module.monotonic()
+    for key in list(_EARLY_ANSWERS):
+        _EARLY_ANSWERS[key] = [
+            item for item in _EARLY_ANSWERS[key] if now - item[0] < _EARLY_TTL
+        ]
+        if not _EARLY_ANSWERS[key]:
+            del _EARLY_ANSWERS[key]
+    if sum(len(items) for items in _EARLY_ANSWERS.values()) >= _EARLY_LIMIT:
+        # Переполнение (за доли секунды отправки — практически невозможно):
+        # вытесняется самый старый ответ, а не новый, и это видно в логе.
+        oldest = min(_EARLY_ANSWERS, key=lambda key: _EARLY_ANSWERS[key][0][0])
+        _EARLY_ANSWERS[oldest].pop(0)
+        if not _EARLY_ANSWERS[oldest]:
+            del _EARLY_ANSWERS[oldest]
+        logging.getLogger("reminder_bot.debug").warning(
+            "Буфер ранних ответов опроса полон — вытеснен самый старый"
+        )
+    _EARLY_ANSWERS.setdefault(poll_id, []).append((now, answer))
+    return True
+
+
+async def replay_early_answers(registry, poll_id: str,
+                               logger: logging.Logger) -> None:
+    held = _EARLY_ANSWERS.pop(poll_id, [])
+    if not held:
+        return
+    try:
+        run = registry.get_readiness_run_by_poll(poll_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("Не удалось учесть ранние ответы в опросе")
+        return
+    if run is None:
+        return
+    for _, (telegram_id, username, full_name, option_ids) in held:
+        try:
+            registry.record_readiness_answer(
+                poll_id, telegram_id, username, full_name,
+                answer_dates(option_ids, run["dates"]),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Не удалось учесть ранний ответ в опросе")
 
 
 _POLL_GONE = (
@@ -696,19 +817,26 @@ async def _tick_service(
     if not settings["enabled"] or not service.get("enabled", True):
         return
 
-    async def tell(text: str) -> None:
-        await notify_admins(
+    async def tell(text: str, kind: str | None = None,
+                   key: str | None = None) -> bool:
+        # С kind доставка отмечается на получателя: повтор — только тем,
+        # кому не дошло.
+        return await notify_admins(
             bot, registry, service["id"], admin_id, text, logger, text_limit,
             reply_markup=admin_keyboard(service["id"]),
+            delivery_key=kind, month=key,
         )
 
     async def tell_missed(year: int, month: int, key: str) -> None:
         if registry.claim_readiness_notice(service["id"], key, "missed"):
-            await tell(
+            # Не дошло из-за временного сбоя — следующая проверка повторит.
+            if not await tell(
                 f"⚠️ Опрос готовности {service['name']} на "
                 f"{month_title(year, month)} не был запущен вовремя — "
-                "бот не работал. Запустите вручную или пропустите месяц."
-            )
+                "бот не работал. Запустите вручную или пропустите месяц.",
+                "missed", key,
+            ):
+                registry.release_readiness_notice(service["id"], key, "missed")
 
     async with service_lock(service["id"]):
         # Опрос о текущем месяце: если бот пролежал до его начала, его
@@ -728,7 +856,13 @@ async def _tick_service(
         if start - timedelta(days=1) <= now < start:
             if registry.claim_readiness_notice(service["id"], key, "preview"):
                 people = registry.readiness_people(service["id"])
-                await tell(preview_text(service, people, year, month, start, tz))
+                if not await tell(
+                    preview_text(service, people, year, month, start, tz),
+                    "preview", key,
+                ):
+                    registry.release_readiness_notice(
+                        service["id"], key, "preview"
+                    )
         elif start <= now < deadline:
             # Автозапуск — одна попытка: после сбоя (нет прав на опрос,
             # чат недоступен) бот не повторяет вступление каждую минуту,
@@ -817,13 +951,11 @@ def settle_parked_run(registry, parked: dict, logger: logging.Logger) -> None:
     if current is not None and current["status"] == "skipped":
         # Пропуск месяца не должен стереть ответы отложенного опроса.
         registry.delete_readiness_run(current["id"])
-    was_open = parked["status"] == "open"
     registry.move_readiness_run(parked["id"], key)
     registry.close_readiness_run(parked["id"])
-    # Как при неудачном перезапуске: итог прежнего опроса не повторяется.
-    registry.mark_readiness_run(
-        parked["id"], poll_stopped=True, **({"result_sent": True} if was_open else {}),
-    )
+    # Опрос в чате уже остановлен; итог и сообщение о завершении — обычным
+    # порядком (если ещё не были).
+    registry.mark_readiness_run(parked["id"], poll_stopped=True)
     logger.info("Возвращён опрос %s после прерванного перезапуска", parked["id"])
 
 
@@ -833,6 +965,8 @@ async def run_readiness_tick(
 ) -> None:
     """Раз в минуту: превью накануне, автозапуск, напоминание, срок.
     Сбой одного служения не мешает остальным."""
+    if _ORPHAN_POLLS:
+        await stop_orphan_polls(bot, logger)
     for parked in registry.list_parked_readiness_runs():
         try:
             async with service_lock(parked["service_id"]):

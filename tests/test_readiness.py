@@ -7,7 +7,7 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
 from bot import readiness
@@ -471,6 +471,67 @@ class ReadinessFlowTest(unittest.TestCase):
         self.tick(bot, created.astimezone(TZ) + timedelta(minutes=6))
         self.assertIsNone(self.registry.get_readiness_run_by_id(orphan["id"]))
         bot.send_message.assert_not_awaited()
+
+    def test_early_answer_is_replayed_after_attach(self):
+        # Вне отправки опроса ответы на неизвестный опрос не придерживаются.
+        self.assertFalse(
+            readiness.hold_early_answer("other", 501, "", "", [0])
+        )
+        bot = fake_bot()
+
+        async def send_poll(*args, **kwargs):
+            # Буфер полон чужим ответом — вытесняется он, а не новый.
+            readiness.hold_early_answer("foreign", 9, "", "", [0])
+            # Голос пришёл раньше, чем бот записал ID опроса.
+            self.assertTrue(readiness.hold_early_answer(
+                "poll-1", 501, "alex", "Алексей", [0, 1]
+            ))
+            return SimpleNamespace(
+                message_id=12, poll=SimpleNamespace(id="poll-1")
+            )
+
+        bot.send_poll = AsyncMock(side_effect=send_poll)
+        with patch.object(readiness, "_EARLY_LIMIT", 1):
+            run = self.launch(bot)
+        answers = self.registry.list_readiness_answers(run["id"])
+        self.assertEqual(answers[0]["dates"], run["dates"][:2])
+
+    def test_lost_poll_response_keeps_month_and_asks_to_check(self):
+        from aiogram.exceptions import TelegramNetworkError
+
+        bot = fake_bot()
+        bot.send_poll.side_effect = TelegramNetworkError(
+            method=SimpleNamespace(), message="timeout"
+        )
+        with self.assertRaises(ValueError) as caught:
+            self.launch(bot)
+        self.assertIn("проверьте", str(caught.exception))
+        run = self.registry.get_readiness_run("sound", "2026-11")
+        self.assertEqual(run["status"], "closed")
+        self.assertEqual(self.registry.list_unfinished_readiness_runs(), [])
+
+    def test_unattached_poll_that_cannot_be_stopped_is_kept(self):
+        bot = fake_bot()
+        bot.stop_poll.side_effect = RuntimeError("network")
+        original = self.registry.attach_readiness_poll
+        calls = []
+
+        def attach(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("disk")
+            return original(*args, **kwargs)
+
+        self.registry.attach_readiness_poll = attach
+        with self.assertRaises(RuntimeError):
+            self.launch(bot)
+        run = self.registry.get_readiness_run("sound", "2026-11")
+        self.assertEqual((run["status"], run["poll_id"]), ("closed", "poll-1"))
+        # Ежеминутная проверка ещё раз попробует остановить опрос.
+        self.assertEqual(
+            [item["id"] for item in self.registry.list_unfinished_readiness_runs()],
+            [run["id"]],
+        )
 
     def test_same_names_stay_distinct(self):
         self.registry.set_responsible_contact(
