@@ -349,6 +349,19 @@ class ReadinessFlowTest(unittest.TestCase):
         self.assertEqual(self.registry.list_unfinished_readiness_runs(), [])
         self.assertIn("Опрос завершён", bot.send_message.await_args.args[1])
 
+    def test_unreachable_admin_is_not_retried(self):
+        from aiogram.exceptions import TelegramBadRequest
+
+        bot = fake_bot()
+        run = self.launch(bot)
+        bot.send_message.side_effect = TelegramBadRequest(
+            method=SimpleNamespace(), message="Bad Request: chat not found"
+        )
+        asyncio.run(readiness.close_run(
+            bot, self.registry, run, self.service(), TZ, 1001, LOG, 4096,
+        ))
+        self.assertEqual(self.registry.list_unfinished_readiness_runs(), [])
+
     def test_same_names_stay_distinct(self):
         self.registry.set_responsible_contact(
             1001, "sound", "сборка", "Глеб", 503

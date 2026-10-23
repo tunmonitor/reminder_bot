@@ -470,23 +470,31 @@ async def notify_admins(
     bot, registry, service_id: str, admin_id: int, text: str,
     logger: logging.Logger, text_limit: int, reply_markup=None,
 ) -> bool:
-    """True — уведомление дошло хотя бы до одного админа."""
+    """True — повторять не нужно: каждому админу уведомление доставлено или
+    не может быть доставлено в принципе (не писал боту, заблокировал).
+    False — был временный сбой, следующая проверка повторит."""
     from .admin_report import report_recipients
 
-    delivered = False
+    done = True
     for recipient in report_recipients(registry, service_id, admin_id):
         try:
             await send_telegram_screen(
                 bot.send_message, recipient, text, limit=text_limit,
                 reply_markup=reply_markup,
             )
-            delivered = True
-        except Exception:  # noqa: BLE001
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            # Повтор не поможет — без трассировки и без повторов.
             logger.info(
-                "Уведомление об опросе готовности не доставлено %s", recipient,
+                "Уведомление об опросе готовности не доставлено %s: %s",
+                recipient, exc,
+            )
+        except Exception:  # noqa: BLE001
+            done = False
+            logger.info(
+                "Уведомление об опросе готовности не отправлено %s", recipient,
                 exc_info=True,
             )
-    return delivered
+    return done
 
 
 async def close_run(
