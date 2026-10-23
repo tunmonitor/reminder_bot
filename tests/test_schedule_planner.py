@@ -152,6 +152,31 @@ class SchedulePlannerTest(unittest.TestCase):
         ))
         self.assertEqual(plan.slots[(day, "звук")], ["Алексей"])
 
+    def test_respondent_always_before_non_respondent(self):
+        # Ответивший свободен все воскресенья — он и служит, даже подряд.
+        plan = build_plan(plan_input(
+            {"Алексей": set(SUNDAYS[:4]), "Борис": set(SUNDAYS[:4])},
+            {"Алексей": {"звук"}, "Борис": {"звук"}},
+            needed={"звук": 1}, dates=SUNDAYS[:4], reluctant={"Борис"},
+        ))
+        self.assertEqual(
+            [plan.slots[(day, "звук")] for day in SUNDAYS[:4]],
+            [["Алексей"]] * 4,
+        )
+        # Ответивший не может 15.11 — только тогда не ответивший.
+        plan = build_plan(plan_input(
+            {
+                "Алексей": {SUNDAYS[0], SUNDAYS[1], SUNDAYS[3]},
+                "Борис": set(SUNDAYS[:4]),
+            },
+            {"Алексей": {"звук"}, "Борис": {"звук"}},
+            needed={"звук": 1}, dates=SUNDAYS[:4], reluctant={"Борис"},
+        ))
+        self.assertEqual(
+            [plan.slots[(day, "звук")] for day in SUNDAYS[:4]],
+            [["Алексей"], ["Алексей"], ["Борис"], ["Алексей"]],
+        )
+
     def test_range_fills_minimum_first_then_up_to_maximum(self):
         day = SUNDAYS[0]
         people = {name: {day} for name in ("А", "Б", "В", "Г", "Д")}
