@@ -866,6 +866,79 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_template_screens_offer_preview_and_field_help(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 12345)
+            self.registry.set_service_default_template(
+                67890, "sound", "Свой {sunday_date}"
+            )
+            await self.admin_router.message.handlers[6].callback(
+                self.message(12345, "/service_notify")
+            )
+            self.context.get_template_preview = AsyncMock(return_value={
+                "date": "25.10.2026", "text": "Готовый текст",
+                "has_data": True, "error": None,
+            })
+            action = self.callback_handler("on_group_reminder_action")
+
+            async def press(data):
+                callback = SimpleNamespace(
+                    data=data,
+                    from_user=SimpleNamespace(id=12345),
+                    message=self.message(12345, ""),
+                    answer=AsyncMock(),
+                )
+                callback.message.answer.return_value = SimpleNamespace(
+                    message_id=600
+                )
+                if data.startswith("service:"):
+                    await self.callback_handler("on_service_selected")(callback)
+                elif data.startswith("notify_back:"):
+                    await self.callback_handler(
+                        "on_notification_edit_back"
+                    )(callback)
+                else:
+                    await action(callback)
+                return callback.message.answer.await_args
+
+            def button(call, prefix):
+                return next(
+                    item.callback_data
+                    for row in call.kwargs["reply_markup"].inline_keyboard
+                    for item in row
+                    if item.callback_data.startswith(prefix)
+                )
+
+            root = await press("service:service_notify:sound")
+            for screen, edit, kind, fields in (
+                ("group_reminder:default:", "group_reminder:edit_default:",
+                 "default", "{informational_notes} — "),
+                ("group_reminder:report:", "group_reminder:edit_report:",
+                 "report", "{confirmation_status} — "),
+            ):
+                template_screen = await press(button(root, screen))
+                preview = await press(
+                    button(template_screen, "group_reminder:tpl_preview:")
+                )
+                self.assertIn("Готовый текст", preview.args[0])
+                self.assertIn("25.10.2026", preview.args[0])
+                self.assertEqual(
+                    self.context.get_template_preview.await_args.args,
+                    ("sound", kind,
+                     "Свой {sunday_date}" if kind == "default" else None),
+                )
+                back = await press(button(preview, "group_reminder:tpl_back:"))
+                prompt = await press(button(back, edit))
+                self.assertIn("\n• {service_name} — ", prompt.args[0])
+                self.assertIn(fields, prompt.args[0])
+                template_screen = await press(button(prompt, "notify_back:"))
+                button(template_screen, "group_reminder:tpl_preview:")
+                root = await press(
+                    button(template_screen, "group_reminder:root_back:")
+                )
+
+        asyncio.run(run())
+
     def test_notification_step_back_keeps_session_and_root_close_has_navigation(self):
         async def run():
             self.registry.add_service_admin(67890, "sound", 12345)

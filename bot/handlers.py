@@ -237,6 +237,29 @@ def period_text(reminder: dict, today: date) -> str:
     return f"{' '.join(bounds)} · {PERIOD_STATUS_LABELS[status]}"
 
 
+TEMPLATE_FIELD_HELP = {
+    "service_name": "название служения",
+    "sunday_date": "дата собрания (воскресенье)",
+    "task_assignments": "задачи и ответственные",
+    "informational_notes": "информационные заметки графика",
+    "task": "задача напоминания",
+    "task_responsibles": "ответственные этой задачи",
+    "delivery_status": "кому включены личные уведомления",
+    "confirmation_status": "ответы «Принял» / «Не смогу»",
+}
+GROUP_FIELDS = ("service_name", "sunday_date", "task_assignments",
+                "informational_notes")
+REPORT_FIELDS = ("service_name", "sunday_date", "task_assignments",
+                 "delivery_status", "confirmation_status")
+
+
+def template_fields_help(fields) -> str:
+    """Поля шаблона — каждое с новой строки и с пояснением."""
+    return "Доступные поля:\n" + "\n".join(
+        f"• {{{field}}} — {TEMPLATE_FIELD_HELP[field]}" for field in fields
+    )
+
+
 def month_summary_label(setting: dict) -> str:
     days = setting["reminder_days"]
     when = (
@@ -2436,6 +2459,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         ),
                     ),
                     InlineKeyboardButton(
+                        text="👁 Предпросмотр",
+                        callback_data=(
+                            f"group_reminder:tpl_preview:{service_id}:"
+                            f"{pending['session_id']}"
+                        ),
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
                         text="🔄 Вернуть встроенный",
                         callback_data=(
                             f"group_reminder:reset_default:{service_id}:"
@@ -2495,6 +2527,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         ),
                     ),
                     InlineKeyboardButton(
+                        text="👁 Предпросмотр",
+                        callback_data=(
+                            f"group_reminder:tpl_preview:{service_id}:"
+                            f"{session_id}"
+                        ),
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
                         text="🔄 Вернуть встроенный",
                         callback_data=(
                             f"group_reminder:reset_report:{service_id}:"
@@ -2521,6 +2562,89 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "«Принял» или «Не смогу».\n\n"
             f"Текущий текст:\n{current}",
             reply_markup=keyboard,
+            parse_mode=None,
+        )
+
+    async def show_template_preview(
+        callback: CallbackQuery, actor_id: int, service_id: str,
+        session_id: str,
+    ) -> None:
+        """Шаблон по умолчанию или отчёт админам на ближайшее воскресенье;
+        несохранённый черновик показывается так, как будет отправлен."""
+        pending = pending_inputs.get(actor_id)
+        step = pending.get("step") if pending else None
+        if step not in {"default_template", "admin_report"}:
+            await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
+            return
+        await _answer_callback(callback)
+        registry = service_registry()
+        service = registry.get_service(service_id) if registry else None
+        if service is None:
+            await _send_dialog(
+                callback.message, "Служение не найдено.", parse_mode=None
+            )
+            return
+        if step == "admin_report":
+            kind, title = "report", "отчёт админам"
+            template = pending.get("admin_report_template")
+        else:
+            kind, title = "default", "шаблон по умолчанию"
+            template = pending.get("group_template", service["group_template"])
+        request_id = secrets.token_urlsafe(12)
+        pending["step"] = "template_preview"
+        pending["template_preview_kind"] = kind
+        pending["preview_request_id"] = request_id
+
+        def is_current() -> bool:
+            active = pending_inputs.get(actor_id)
+            return (
+                active is pending
+                and active.get("session_id") == session_id
+                and active.get("step") == "template_preview"
+                and active.get("preview_request_id") == request_id
+            )
+
+        await _send_dialog(
+            callback.message,
+            "⏳ Загружаю данные графика для предпросмотра...",
+            parse_mode=None,
+        )
+        loader = getattr(context, "get_template_preview", None)
+        result = None
+        if callable(loader):
+            try:
+                result = await loader(service_id, kind, template)
+            except Exception:
+                debug.exception("Не удалось подготовить предпросмотр шаблона")
+        if not is_current():
+            return
+        if result is None:
+            result = {"error": "Не удалось загрузить график. Попробуйте позже."}
+        text = (
+            f"👁 Предпросмотр · {service_label(service)} · {title}\n\n"
+            f"📅 Собрание: {result.get('date', '—')}\n\n"
+            "──────────────────\n\n"
+        )
+        if result.get("error"):
+            text += f"⚠️ {result['error']}"
+        else:
+            preview_text = result.get("text") or "⚪ Текст пуст."
+            chunks = _telegram_text_chunks(preview_text, limit=3800)
+            if len(chunks) > 1:
+                preview_text = chunks[0] + "\n... (текст обрезан)"
+            text += preview_text
+        await _send_dialog(
+            callback.message,
+            text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="⬅️ К шаблону",
+                    callback_data=(
+                        f"group_reminder:tpl_back:{service_id}:{session_id}"
+                    ),
+                )
+            ]]),
+            _dialog_text_limit=4096,
             parse_mode=None,
         )
 
@@ -3094,14 +3218,30 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 pending["step"] = "admin_report_text"
                 await _send_dialog(
                     callback.message,
-                    "Введите шаблон отчёта админам. Доступные поля: "
-                    "{service_name}, {sunday_date}, {task_assignments}, "
-                    "{delivery_status}, {confirmation_status}.",
+                    "Введите шаблон отчёта админам.\n\n"
+                    + template_fields_help(REPORT_FIELDS),
                     reply_markup=notification_edit_controls(
                         service_id, session_id
                     ),
                     parse_mode=None,
                 )
+            elif action == "tpl_preview":
+                await show_template_preview(
+                    callback, actor_id, service_id, session_id
+                )
+                callback_answered = True
+            elif action == "tpl_back":
+                if pending.get("step") != "template_preview":
+                    await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
+                    return
+                if pending.get("template_preview_kind") == "report":
+                    await enter_admin_report_template(
+                        callback.message, actor_id, service_id
+                    )
+                else:
+                    await enter_default_template(
+                        callback.message, actor_id, service_id
+                    )
             elif action == "reset_report":
                 if pending.get("step") != "admin_report":
                     await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
@@ -3371,9 +3511,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 pending["step"] = "group_default_text"
                 await _send_dialog(
                     callback.message,
-                    "Введите шаблон по умолчанию. Доступные поля: "
-                    "{service_name}, {sunday_date}, {task_assignments}, "
-                    "{informational_notes}.",
+                    "Введите шаблон по умолчанию.\n\n"
+                    + template_fields_help(GROUP_FIELDS),
                     reply_markup=notification_edit_controls(
                         service_id, session_id
                     ),
@@ -3626,14 +3765,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     f"{reminder['reminder_days']}.",
                     "time": f"Введите локальное время HH:MM. Сейчас: "
                     f"{reminder['reminder_time']}.",
-                    "text": "Введите собственный текст напоминания. "
-                    "Можно использовать {service_name}, {sunday_date}, "
-                    "{task_assignments}, {informational_notes}"
-                    + (
-                        ", {task}, {task_responsibles} (ответственные "
-                        "задачи напоминания)."
+                    "text": "Введите собственный текст напоминания.\n\n"
+                    + template_fields_help(
+                        GROUP_FIELDS + ("task", "task_responsibles")
                         if reminder.get("task")
-                        else "."
+                        else GROUP_FIELDS
                     ),
                 }
                 await _send_dialog(
@@ -3953,12 +4089,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 f"Текущее значение: {pending['reminder_time']}."
             ),
             "group_template": (
-                "Введите новый текст для группы. Доступные поля:\n"
-                "• {service_name} — название служения\n"
-                "• {sunday_date} — дата воскресенья\n"
-                "• {task_assignments} — список задач и ответственных\n"
-                "• {informational_notes} — информационные заметки графика.\n"
-                "Пустое значение не меняет текущий текст."
+                "Введите новый текст для группы.\n\n"
+                + template_fields_help(GROUP_FIELDS)
+                + "\n\nПустое значение не меняет текущий текст."
             ),
         }
         if field not in prompts:
