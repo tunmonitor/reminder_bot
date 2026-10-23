@@ -473,8 +473,23 @@ class ReadinessFlowTest(unittest.TestCase):
         bot.send_message.assert_not_awaited()
 
     def test_early_answer_is_replayed_after_attach(self):
-        readiness.hold_early_answer("poll-1", 501, "alex", "Алексей", [0, 1])
-        run = self.launch(fake_bot())
+        # Вне отправки опроса ответы на неизвестный опрос не придерживаются.
+        self.assertFalse(
+            readiness.hold_early_answer("other", 501, "", "", [0])
+        )
+        bot = fake_bot()
+
+        async def send_poll(*args, **kwargs):
+            # Голос пришёл раньше, чем бот записал ID опроса.
+            self.assertTrue(readiness.hold_early_answer(
+                "poll-1", 501, "alex", "Алексей", [0, 1]
+            ))
+            return SimpleNamespace(
+                message_id=12, poll=SimpleNamespace(id="poll-1")
+            )
+
+        bot.send_poll = AsyncMock(side_effect=send_poll)
+        run = self.launch(bot)
         answers = self.registry.list_readiness_answers(run["id"])
         self.assertEqual(answers[0]["dates"], run["dates"][:2])
 

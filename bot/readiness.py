@@ -365,6 +365,7 @@ async def launch_run(
 
     poll_message = None
     sending_poll = False
+    _LAUNCHING[0] += 1
     try:
         intro = await send_telegram_screen(
             send_chunk, chat_id,
@@ -395,8 +396,6 @@ async def launch_run(
                 intro, "message_id", None
             ),
         )
-        await replay_early_answers(registry, poll_message.poll.id, logger)
-        return attached
     except BaseException as exc:
         # BaseException — и при отмене задачи запись не остаётся без опроса.
         if poll_message is not None:
@@ -414,8 +413,9 @@ async def launch_run(
             )
             raise ValueError(
                 "Связь с Telegram прервалась при отправке опроса — проверьте "
-                "чат служения: опрос мог появиться. Если его нет — «▶️ "
-                "Запустить заново»."
+                "чат служения: опрос мог появиться. Если он есть — "
+                "остановите его вручную (голоса в нём не учитываются), "
+                "затем «▶️ Запустить заново»."
             ) from exc
         else:
             # Без опроса вступление в чате лишнее: повторный запуск
@@ -427,6 +427,28 @@ async def launch_run(
                     logger.info("Вступление опроса не удалено", exc_info=True)
             registry.delete_readiness_run(run["id"])
         raise
+    finally:
+        _LAUNCHING[0] -= 1
+    # Опрос записан — ранние голоса учитываются; сбой здесь опрос не отменяет.
+    await replay_early_answers(registry, poll_message.poll.id, logger)
+    return attached
+
+
+# Отправленные опросы, которые не удалось ни остановить, ни сохранить в
+# базе: ежеминутная проверка пробует остановить их снова (до перезапуска).
+_ORPHAN_POLLS: list[tuple[int, int]] = []
+# Идёт отправка опроса — только тогда ответы на неизвестный опрос
+# придерживаются (иначе чужие опросы заполняли бы буфер).
+_LAUNCHING = [0]
+
+
+async def stop_orphan_polls(bot, logger: logging.Logger) -> None:
+    for chat_id, message_id in list(_ORPHAN_POLLS):
+        if await stop_run_poll(
+            bot, {"id": "orphan", "chat_id": chat_id, "message_id": message_id},
+            logger,
+        ):
+            _ORPHAN_POLLS.remove((chat_id, message_id))
 
 
 async def _abandon_poll(bot, registry, run: dict, poll_message, chat_id: int,
@@ -450,6 +472,7 @@ async def _abandon_poll(bot, registry, run: dict, poll_message, chat_id: int,
             return
         except Exception:  # noqa: BLE001
             logger.exception("Опрос готовности %s не сохранён", run["id"])
+            _ORPHAN_POLLS.append((chat_id, poll_message.message_id))
     registry.delete_readiness_run(run["id"])
 
 
@@ -459,7 +482,10 @@ _EARLY_ANSWERS: dict[str, list[tuple[float, tuple]]] = {}
 _EARLY_TTL = 120
 
 
-def hold_early_answer(poll_id: str, *answer) -> None:
+def hold_early_answer(poll_id: str, *answer) -> bool:
+    """False — не придержан: опрос сейчас не отправляется или буфер полон."""
+    if not _LAUNCHING[0]:
+        return False
     now = time_module.monotonic()
     for key in list(_EARLY_ANSWERS):
         _EARLY_ANSWERS[key] = [
@@ -467,18 +493,25 @@ def hold_early_answer(poll_id: str, *answer) -> None:
         ]
         if not _EARLY_ANSWERS[key]:
             del _EARLY_ANSWERS[key]
-    if sum(len(items) for items in _EARLY_ANSWERS.values()) < 500:
-        _EARLY_ANSWERS.setdefault(poll_id, []).append((now, answer))
+    if sum(len(items) for items in _EARLY_ANSWERS.values()) >= 2000:
+        return False
+    _EARLY_ANSWERS.setdefault(poll_id, []).append((now, answer))
+    return True
 
 
 async def replay_early_answers(registry, poll_id: str,
                                logger: logging.Logger) -> None:
-    for _, (telegram_id, username, full_name, option_ids) in _EARLY_ANSWERS.pop(
-        poll_id, []
-    ):
+    held = _EARLY_ANSWERS.pop(poll_id, [])
+    if not held:
+        return
+    try:
         run = registry.get_readiness_run_by_poll(poll_id)
-        if run is None:
-            return
+    except Exception:  # noqa: BLE001
+        logger.exception("Не удалось учесть ранние ответы в опросе")
+        return
+    if run is None:
+        return
+    for _, (telegram_id, username, full_name, option_ids) in held:
         try:
             registry.record_readiness_answer(
                 poll_id, telegram_id, username, full_name,
@@ -775,10 +808,14 @@ async def _tick_service(
     if not settings["enabled"] or not service.get("enabled", True):
         return
 
-    async def tell(text: str) -> bool:
+    async def tell(text: str, kind: str | None = None,
+                   key: str | None = None) -> bool:
+        # С kind доставка отмечается на получателя: повтор — только тем,
+        # кому не дошло.
         return await notify_admins(
             bot, registry, service["id"], admin_id, text, logger, text_limit,
             reply_markup=admin_keyboard(service["id"]),
+            delivery_key=kind, month=key,
         )
 
     async def tell_missed(year: int, month: int, key: str) -> None:
@@ -787,7 +824,8 @@ async def _tick_service(
             if not await tell(
                 f"⚠️ Опрос готовности {service['name']} на "
                 f"{month_title(year, month)} не был запущен вовремя — "
-                "бот не работал. Запустите вручную или пропустите месяц."
+                "бот не работал. Запустите вручную или пропустите месяц.",
+                "missed", key,
             ):
                 registry.release_readiness_notice(service["id"], key, "missed")
 
@@ -810,7 +848,8 @@ async def _tick_service(
             if registry.claim_readiness_notice(service["id"], key, "preview"):
                 people = registry.readiness_people(service["id"])
                 if not await tell(
-                    preview_text(service, people, year, month, start, tz)
+                    preview_text(service, people, year, month, start, tz),
+                    "preview", key,
                 ):
                     registry.release_readiness_notice(
                         service["id"], key, "preview"
@@ -917,6 +956,8 @@ async def run_readiness_tick(
 ) -> None:
     """Раз в минуту: превью накануне, автозапуск, напоминание, срок.
     Сбой одного служения не мешает остальным."""
+    if _ORPHAN_POLLS:
+        await stop_orphan_polls(bot, logger)
     for parked in registry.list_parked_readiness_runs():
         try:
             async with service_lock(parked["service_id"]):

@@ -8294,11 +8294,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ) is None:
                 # Опрос готовности только что отправлен и ещё не записан —
                 # ответ учтётся сразу после записи.
-                readiness.hold_early_answer(
+                if readiness.hold_early_answer(
                     poll_answer.poll_id, user.id, user.username or "",
                     full_name, list(poll_answer.option_ids or ()),
-                )
-                return
+                ):
+                    return
             if run is not None:
                 # Опрос готовности (этап 5): варианты — даты месяца.
                 registry.record_readiness_answer(
