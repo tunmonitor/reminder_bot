@@ -5999,12 +5999,48 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIn(
                 "Ход опроса", progress.message.answer.await_args.args[0]
             )
+            # Ответивший вне состава — «➕ В состав» с выбором задач.
+            add_button = next(
+                button.callback_data
+                for row in progress.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.text.startswith("➕")
+            )
+            self.assertEqual(add_button, "rdy:addm:sound:12345")
+            # Уже в составе без задач — задачи привязываются к нему, а не
+            # ко второму участнику с именем из Telegram.
+            self.registry.bind_service_member(
+                67890, "sound", "Алексей из Списков", 12345
+            )
+            await press(add_button)
+            empty = await press("rdy:addms:sound")
+            self.assertIn("хотя бы одну задачу",
+                          empty.message.answer.await_args.args[0])
+            await press("rdy:addmt:sound:0")
+            saved = await press("rdy:addms:sound")
+            self.assertIn("Алексей из Списков в составе",
+                          saved.message.answer.await_args.args[0])
+            self.assertEqual(
+                [
+                    member["name"]
+                    for member in self.registry.list_service_members("sound")
+                    if member["telegram_id"] == 12345
+                ],
+                ["Алексей из Списков"],
+            )
+            self.assertIn(12345, {
+                person["telegram_id"]
+                for person in self.registry.readiness_people("sound")
+                if person["tasks"]
+            })
             finished = await press(f"rdy:finish:sound:{month_arg}")
             self.assertIn("Опрос завершён",
                           finished.message.answer.await_args.args[0])
             self.context.bot.stop_poll.assert_awaited_once()
             confirm = await press(f"rdy:restart:sound:{month_arg}")
-            self.assertIn("ответы удалены",
+            self.assertIn("будут удалены",
                           confirm.message.answer.await_args.args[0])
             # Сбой отправки нового опроса — прежние ответы на месте.
             self.context.bot.send_poll.side_effect = RuntimeError("network")

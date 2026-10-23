@@ -362,7 +362,28 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   `service_lock`: stop the open poll (abort if that fails), park the old run
   under month `KEY#id` (`move_readiness_run`), `launch_run` with
   `manual_deadline`; on success `delete_readiness_run` (answers and reminder
-  marks too), on failure move it back as closed with both flags set. Preview:
+  marks too, outside the rollback `try`); on failure move it back as closed.
+  The old poll is stopped whenever `poll_stopped` is false (abort if that
+  fails). Parked runs (`month` with `#`) are excluded from open/unfinished
+  lists and settled each tick by `settle_parked_run` (new run exists →
+  delete, else restore closed).
+- Telegram delivery: `readiness.unreachable` (Forbidden, or BadRequest with
+  «chat not found» / «user is deactivated» / «bot was blocked») = final, no
+  retry; other errors retry. The result notice is marked per recipient
+  (`readiness_notices` kind `result-<run>:<admin>`), so retries go only to
+  admins who did not get it. Nav hint deletes: any BadRequest/Forbidden is
+  final; at most 10 failed ids are kept.
+- When the poll is stopped, `announce_closed` replies to the poll in the
+  service chat once. «➕ В состав»: `rdy:addm:<service>:<telegram_id>` →
+  pending `readiness_member` (selected tasks, not cleared by `addmt`/`addms`)
+  → `bind_service_member(..., from_readiness=True)` (service editor allowed;
+  refuses a name bound to another Telegram id) → progress re-shown. The name
+  is the roster name when `readiness_people` already has that Telegram id,
+  else the Telegram name; the task list is frozen in pending (`tasks`).
+- Third readiness text: `closed_template` (`DEFAULT_READINESS_CLOSED`,
+  fields `READINESS_CLOSED_FIELDS`), kind `done` in `READINESS_TEXTS`,
+  rendered by `readiness.closed_text` in `announce_closed`.
+- Reminder sends treat any Forbidden/BadRequest as final (marked reminded). Preview:
   `rdy:tplprev:<service>:intro|rem`. `launch_run` records all intro chunk
   ids and deletes them all if the poll fails.
 - `service_tasks.people_needed` (1–5, default 1, migrated with ALTER) is set

@@ -73,6 +73,11 @@ DEFAULT_READINESS_INTRO = (
     "служение в церкви! ❤️\n"
     "👥 {people}"
 )
+READINESS_CLOSED_FIELDS = frozenset({"service_name", "month"})
+DEFAULT_READINESS_CLOSED = (
+    "🗳 Опрос «График {service_name} на {month}» завершён. Спасибо всем, "
+    "кто ответил! ❤️ График появится после утверждения."
+)
 DEFAULT_READINESS_REMINDER = (
     "🗳 {service_name} · график на {month}\n"
     "Ты ещё не отметил(а), когда можешь служить. Опрос в чате служения "
@@ -251,6 +256,7 @@ class ServiceRegistry:
                     enabled_at TEXT,
                     intro_template TEXT,
                     reminder_template TEXT,
+                    closed_template TEXT,
                     updated_at TEXT NOT NULL
                 );
 
@@ -720,6 +726,7 @@ class ServiceRegistry:
                 ("readiness_settings", "enabled_at", "TEXT"),
                 ("readiness_settings", "intro_template", "TEXT"),
                 ("readiness_settings", "reminder_template", "TEXT"),
+                ("readiness_settings", "closed_template", "TEXT"),
                 ("readiness_runs", "poll_stopped", "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "result_sent", "INTEGER NOT NULL DEFAULT 0"),
             ):
@@ -3466,8 +3473,14 @@ class ServiceRegistry:
         telegram_id: int,
         username: str = "",
         tasks=(),
+        *,
+        from_readiness: bool = False,
     ) -> None:
         """Привязывает Telegram к человеку служения во всех его задачах.
+
+        from_readiness — «➕ В состав» из опроса готовности: доступно и
+        админу служения; имя, уже занятое другим Telegram ID, не
+        перезаписывается.
 
         Задачи — из «Списков», из прежних привязок этого имени и tasks
         (например, задачи из графика). Человек не из состава добавляется.
@@ -3481,13 +3494,23 @@ class ServiceRegistry:
             raise ValueError("Имя участника обязательно.")
         username = username.strip().lstrip("@")
         with self._connection() as connection:
-            self._require_super_admin(connection, actor_id)
+            if from_readiness:
+                self._require_service_editor(connection, actor_id, service_id)
+            else:
+                self._require_super_admin(connection, actor_id)
             self._require_service(connection, service_id)
             member = connection.execute(
-                "SELECT tasks_json FROM service_members "
+                "SELECT tasks_json, telegram_id FROM service_members "
                 "WHERE service_id = ? AND name = ?",
                 (service_id, name),
             ).fetchone()
+            if from_readiness and member is not None and member[
+                "telegram_id"
+            ] not in (None, telegram_id):
+                raise ValueError(
+                    f"«{name}» в составе уже привязан к другому Telegram — "
+                    "добавьте через «👥 Ответственные»."
+                )
             now = _utc_now()
             if member is None:
                 connection.execute(
@@ -4530,14 +4553,15 @@ class ServiceRegistry:
         "remind_days": 1,
         "intro_template": None,
         "reminder_template": None,
+        "closed_template": None,
     }
 
     def get_readiness_settings(self, service_id: str) -> dict:
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT enabled, start_time, duration_days, deadline_time, "
-                "remind_days, enabled_at, intro_template, reminder_template "
-                "FROM readiness_settings WHERE service_id = ?",
+                "remind_days, enabled_at, intro_template, reminder_template, "
+                "closed_template FROM readiness_settings WHERE service_id = ?",
                 (service_id,),
             ).fetchone()
         if row is None:
@@ -4572,6 +4596,7 @@ class ServiceRegistry:
             ("intro_template", READINESS_INTRO_FIELDS, "Текст опроса"),
             ("reminder_template", READINESS_REMINDER_FIELDS,
              "Текст напоминания"),
+            ("closed_template", READINESS_CLOSED_FIELDS, "Текст завершения"),
         ):
             value = new[key]
             if value is None:
@@ -4592,8 +4617,9 @@ class ServiceRegistry:
             connection.execute(
                 "INSERT INTO readiness_settings (service_id, enabled, "
                 "start_time, duration_days, deadline_time, remind_days, "
-                "enabled_at, intro_template, reminder_template, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "enabled_at, intro_template, reminder_template, "
+                "closed_template, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id) DO UPDATE SET "
                 "enabled = excluded.enabled, start_time = excluded.start_time, "
                 "duration_days = excluded.duration_days, "
@@ -4602,12 +4628,14 @@ class ServiceRegistry:
                 "enabled_at = excluded.enabled_at, "
                 "intro_template = excluded.intro_template, "
                 "reminder_template = excluded.reminder_template, "
+                "closed_template = excluded.closed_template, "
                 "updated_at = excluded.updated_at",
                 (
                     service_id, int(new["enabled"]), new["start_time"],
                     new["duration_days"], new["deadline_time"],
                     new["remind_days"], new["enabled_at"],
-                    new["intro_template"], new["reminder_template"], now,
+                    new["intro_template"], new["reminder_template"],
+                    new["closed_template"], now,
                 ),
             )
             self._audit(
@@ -4743,7 +4771,7 @@ class ServiceRegistry:
         with self._connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM readiness_runs WHERE status = 'open' "
-                "ORDER BY deadline, id"
+                "AND month NOT LIKE '%#%' ORDER BY deadline, id"
             ).fetchall()
         return [self._readiness_run(row) for row in rows]
 
@@ -4800,6 +4828,15 @@ class ServiceRegistry:
                 "DELETE FROM readiness_runs WHERE id = ?", (run_id,)
             )
 
+    def list_parked_readiness_runs(self) -> list[dict]:
+        """Опросы, отложенные перезапуском (месяц «YYYY-MM#id»): бот
+        прервался между отправкой нового опроса и удалением старого."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM readiness_runs WHERE month LIKE '%#%' ORDER BY id"
+            ).fetchall()
+        return [self._readiness_run(row) for row in rows]
+
     def move_readiness_run(self, run_id: int, month: str) -> None:
         """Переносит опрос под другой ключ месяца: при перезапуске старый
         откладывается, пока не отправлен новый (при сбое — возвращается)."""
@@ -4836,6 +4873,7 @@ class ServiceRegistry:
         with self._connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM readiness_runs WHERE status = 'closed' "
+                "AND month NOT LIKE '%#%' "
                 "AND (poll_stopped = 0 OR result_sent = 0) ORDER BY id"
             ).fetchall()
         return [self._readiness_run(row) for row in rows]

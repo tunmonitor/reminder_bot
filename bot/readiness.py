@@ -18,12 +18,17 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyParameters,
+)
 
 from .group_send import send_to_service_group
 from .month_summary import month_end, month_key, month_title, next_month
 from .schedule_planner import Plan, PlanInput, build_plan
 from .service_registry import (  # noqa: F401 — шаблоны для экранов
+    DEFAULT_READINESS_CLOSED,
     DEFAULT_READINESS_INTRO,
     DEFAULT_READINESS_REMINDER,
 )
@@ -176,7 +181,7 @@ def outside_name(answer: dict) -> str:
 
 
 def progress_text(service_label: str, run: dict, summary: Summary, tz) -> str:
-    year, month = map(int, run["month"].split("-"))
+    year, month = month_of(run)
     status = {
         "open": f"до {local_text(run['deadline'], tz)}",
         "closed": "завершён",
@@ -254,6 +259,15 @@ def intro_text(service: dict, people: list[dict], year: int, month: int,
         month=month_title(year, month),
         deadline=local_text(deadline, tz),
         people=", ".join(mentions),
+    )
+
+
+def closed_text(service: dict, run: dict, template: str | None = None) -> str:
+    year, month = month_of(run)
+    return render_template(
+        template or DEFAULT_READINESS_CLOSED,
+        service_name=service["name"],
+        month=month_title(year, month),
     )
 
 
@@ -409,9 +423,12 @@ async def send_reminders(
                 telegram_id, text, parse_mode=None, reply_markup=markup,
             )
             sent += 1
-        except (TelegramForbiddenError, TelegramBadRequest):
-            # Не писал боту или заблокировал — повтор не поможет.
-            logger.info("Напоминание об опросе не доставлено %s", telegram_id)
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            # Не писал боту, заблокировал или Telegram отклонил запрос —
+            # повтор каждую минуту не поможет.
+            logger.info(
+                "Напоминание об опросе не доставлено %s: %s", telegram_id, exc
+            )
         except Exception:  # noqa: BLE001
             # Временный сбой — следующая проверка повторит.
             logger.warning(
@@ -438,7 +455,8 @@ def reminder_due(run: dict, settings: dict, now: datetime) -> bool:
 
 
 def month_of(run: dict) -> tuple[int, int]:
-    year, month = map(int, run["month"].split("-"))
+    # «YYYY-MM#id» — опрос, отложенный перезапуском.
+    year, month = map(int, run["month"].split("#")[0].split("-"))
     return year, month
 
 
@@ -466,9 +484,21 @@ def admin_keyboard(service_id: str, *rows) -> InlineKeyboardMarkup:
     ])
 
 
+_UNREACHABLE = ("chat not found", "user is deactivated", "bot was blocked")
+
+
+def unreachable(exc: Exception) -> bool:
+    """Получателю не доставить в принципе: повтор не поможет."""
+    return isinstance(exc, TelegramForbiddenError) or (
+        isinstance(exc, TelegramBadRequest)
+        and any(mark in str(exc).lower() for mark in _UNREACHABLE)
+    )
+
+
 async def notify_admins(
     bot, registry, service_id: str, admin_id: int, text: str,
     logger: logging.Logger, text_limit: int, reply_markup=None,
+    *, delivery_key: str | None = None, month: str | None = None,
 ) -> bool:
     """True — повторять не нужно: каждому админу уведомление доставлено или
     не может быть доставлено в принципе (не писал боту, заблокировал).
@@ -477,23 +507,31 @@ async def notify_admins(
 
     done = True
     for recipient in report_recipients(registry, service_id, admin_id):
+        # С delivery_key доставка отмечается на получателя: повтор идёт
+        # только тем, у кого был временный сбой, без дублей остальным.
+        kind = f"{delivery_key}:{recipient}" if delivery_key else None
+        if kind and registry.has_readiness_notice(service_id, month, kind):
+            continue
         try:
             await send_telegram_screen(
                 bot.send_message, recipient, text, limit=text_limit,
                 reply_markup=reply_markup,
             )
-        except (TelegramForbiddenError, TelegramBadRequest) as exc:
-            # Повтор не поможет — без трассировки и без повторов.
+        except Exception as exc:  # noqa: BLE001
+            if not unreachable(exc):
+                done = False
+                logger.warning(
+                    "Уведомление об опросе готовности не отправлено %s",
+                    recipient, exc_info=True,
+                )
+                continue
+            # Не писал боту или заблокировал — без трассировки и повторов.
             logger.info(
                 "Уведомление об опросе готовности не доставлено %s: %s",
                 recipient, exc,
             )
-        except Exception:  # noqa: BLE001
-            done = False
-            logger.info(
-                "Уведомление об опросе готовности не отправлено %s", recipient,
-                exc_info=True,
-            )
+        if kind:
+            registry.claim_readiness_notice(service_id, month, kind)
     return done
 
 
@@ -511,6 +549,30 @@ async def close_run(
     return True
 
 
+async def announce_closed(
+    bot, registry, run: dict, service: dict, logger: logging.Logger
+) -> None:
+    """Сообщение в чат служения, что опрос завершён (ответом на опрос)."""
+    if not run.get("chat_id") or not run.get("message_id"):
+        return
+    try:
+        await send_to_service_group(
+            bot.send_message, run["chat_id"],
+            closed_text(
+                service, run,
+                registry.get_readiness_settings(service["id"]).get(
+                    "closed_template"
+                ),
+            ),
+            service, registry=registry, logger=logger, parse_mode=None,
+            reply_parameters=ReplyParameters(
+                message_id=run["message_id"], allow_sending_without_reply=True,
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        logger.info("Сообщение о завершении опроса не отправлено", exc_info=True)
+
+
 async def finish_run(
     bot, registry, run: dict, service: dict, tz, admin_id: int,
     logger: logging.Logger, text_limit: int,
@@ -519,6 +581,7 @@ async def finish_run(
     удалось, повторяет следующая проверка (без повтора удавшегося)."""
     if not run["poll_stopped"] and await stop_run_poll(bot, run, logger):
         registry.mark_readiness_run(run["id"], poll_stopped=True)
+        await announce_closed(bot, registry, run, service, logger)
     if run["result_sent"]:
         return
     try:
@@ -534,6 +597,7 @@ async def finish_run(
         bot, registry, service["id"], admin_id,
         "🗳 Опрос завершён\n\n" + text, logger, text_limit,
         reply_markup=admin_keyboard(service["id"]),
+        delivery_key=f"result-{run['id']}", month=run["month"],
     ):
         registry.mark_readiness_run(run["id"], result_sent=True)
 
@@ -663,12 +727,32 @@ async def _tick_run(
             await send_reminders(bot, registry, current, service, tz, logger)
 
 
+def settle_parked_run(registry, parked: dict, logger: logging.Logger) -> None:
+    """Перезапуск прервался: новый опрос есть — старый удаляется, нет —
+    старый возвращается закрытым (опрос в чате уже остановлен)."""
+    key = parked["month"].split("#")[0]
+    if registry.get_readiness_run(parked["service_id"], key) is not None:
+        registry.delete_readiness_run(parked["id"])
+        logger.info("Удалён опрос %s, отложенный перезапуском", parked["id"])
+        return
+    registry.move_readiness_run(parked["id"], key)
+    registry.close_readiness_run(parked["id"])
+    registry.mark_readiness_run(parked["id"], poll_stopped=True)
+    logger.info("Возвращён опрос %s после прерванного перезапуска", parked["id"])
+
+
 async def run_readiness_tick(
     bot, registry, now: datetime, tz, admin_id: int,
     logger: logging.Logger, text_limit: int,
 ) -> None:
     """Раз в минуту: превью накануне, автозапуск, напоминание, срок.
     Сбой одного служения не мешает остальным."""
+    for parked in registry.list_parked_readiness_runs():
+        try:
+            async with service_lock(parked["service_id"]):
+                settle_parked_run(registry, parked, logger)
+        except Exception:  # noqa: BLE001
+            logger.exception("Сбой разбора отложенного опроса %s", parked["id"])
     for service in registry.list_services():
         try:
             await _tick_service(

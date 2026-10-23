@@ -14,7 +14,11 @@ from typing import Any
 
 from aiogram import F, Dispatcher, Router
 from aiogram.enums import ChatType
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramForbiddenError,
+)
 from aiogram.dispatcher.event.bases import UNHANDLED
 from aiogram.filters import Command
 from aiogram.types import (
@@ -277,6 +281,7 @@ REPORT_FIELDS = ("service_name", "sunday_date", "task_assignments",
                  "delivery_status", "confirmation_status")
 READINESS_INTRO_HELP = ("service_name", "month", "deadline", "people")
 READINESS_REMINDER_HELP = ("service_name", "month", "deadline")
+READINESS_CLOSED_HELP = ("service_name", "month")
 
 
 def template_fields_help(fields) -> str:
@@ -429,7 +434,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     chat_id=chat_id, message_id=message_id
                 )
             except TelegramAPIError as exc:
-                if "not found" in str(exc).lower():
+                text = str(exc).lower()
+                if isinstance(exc, (TelegramBadRequest, TelegramForbiddenError)):
+                    # Уже удалено, старше 48 часов или бот заблокирован —
+                    # повтор не поможет.
+                    debug.debug(
+                        "Сообщение навигации %s не удалить: %s", message_id, text
+                    )
                     continue
                 debug.debug(
                     "Не удалось удалить сообщение навигации %s", message_id
@@ -451,7 +462,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             if message_id != keep and isinstance(message_id, int)
         ]
         failed = await delete_quietly(chat_id, stale)
-        remaining = [*failed, *([keep] if isinstance(keep, int) else [])]
+        # Не больше 10 неудалённых: список не растёт бесконечно.
+        remaining = [
+            *failed[-10:], *([keep] if isinstance(keep, int) else []),
+        ]
         if state:
             state["helpers"] = remaining
         if remaining != known:
@@ -495,6 +509,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         её заново над новым экраном, старую удалить."""
         state = nav_state.setdefault(actor_id, {"shown": False, "helpers": []})
         if state["shown"] and not force:
+            helpers = state.get("helpers", [])
+            if len(helpers) > 1:
+                # Прежнюю подсказку не удалось удалить — ещё попытка.
+                await drop_old_hints(target.chat.id, actor_id, keep=helpers[-1])
             return
         try:
             hint = await target.answer(
@@ -596,7 +614,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "🔧", "🧹", "🔄", "⬅️", "➡️", "🏠", "✖️", "➕",
                         "➖", "🗑", "✏️", "1️⃣", "2️⃣", "3️⃣", "4️⃣",
                         "📤", "🔁", "🗓", "🧵", "🚫", "📆", "♾", "▶️", "⏸",
-                        "🗳", "⏹", "⏭", "↩️", "🏁", "💬",
+                        "🗳", "⏹", "⏭", "↩️", "🏁", "💬", "⬜", "☑️",
                     )
                 ):
                     button.text = f"📋 {label}"
@@ -3171,7 +3189,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             lines.append(f"Опрос на {title}: ✅ завершён.")
             rows.append([
                 readiness_button("📊 Итог опроса", "progress", service_id, month_arg),
-                readiness_button("🔄 Перезапустить", "restart", service_id,
+                readiness_button("▶️ Запустить заново", "restart", service_id,
                                  month_arg),
             ])
         rows.append([
@@ -3189,6 +3207,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         rows.append([
             readiness_button("📝 Текст опроса", "tpl", service_id, "intro"),
             readiness_button("💬 Текст напоминания", "tpl", service_id, "rem"),
+        ])
+        rows.append([
+            readiness_button("✅ Текст завершения", "tpl", service_id, "done"),
         ])
         rows.append([InlineKeyboardButton(
             text="⬅️ К карточке служения",
@@ -3215,6 +3236,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "Личное сообщение тем, кто не ответил, за «Напоминание» дней "
             "до срока.", READINESS_REMINDER_HELP,
         ),
+        "done": (
+            "closed_template", "✅ Текст завершения",
+            "Сообщение в чате служения (ответом на опрос), когда опрос "
+            "завершён.", READINESS_CLOSED_HELP,
+        ),
     }
 
     async def show_readiness_text(
@@ -3228,10 +3254,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         field, title, about, _ = READINESS_TEXTS[kind]
         template = registry.get_readiness_settings(service_id)[field]
-        default = (
-            readiness.DEFAULT_READINESS_INTRO if kind == "intro"
-            else readiness.DEFAULT_READINESS_REMINDER
-        )
+        default = {
+            "intro": readiness.DEFAULT_READINESS_INTRO,
+            "rem": readiness.DEFAULT_READINESS_REMINDER,
+            "done": readiness.DEFAULT_READINESS_CLOSED,
+        }[kind]
         lines = [
             f"{title} · {service_label(service)}",
             "",
@@ -3288,6 +3315,75 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             parse_mode=None,
         )
 
+    async def show_readiness_progress(
+        message: Message, service: dict, run: dict, notice: str | None = None,
+    ) -> None:
+        """Ход опроса / итог; у ответивших вне состава — «➕ В состав»."""
+        summary = await asyncio.to_thread(
+            readiness.summarize, service_registry(), run
+        )
+        text = readiness.progress_text(
+            service_label(service), run, summary, context.timezone
+        )
+        if notice:
+            text = f"{notice}\n\n{text}"
+        year, month = readiness.month_of(run)
+        rows = [
+            [readiness_button(
+                f"➕ {readiness.outside_name(answer)} в состав"[:60],
+                "addm", service["id"], str(answer["telegram_id"]),
+            )]
+            for answer in summary.outside[:20]
+        ]
+        rows.append([readiness_button("⬅️ К опросу", "open", service["id"])])
+        await _send_dialog(
+            message, text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keep_rows=True,
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
+            _dialog_text_limit=TELEGRAM_TEXT_LIMIT,
+            parse_mode=None,
+        )
+
+    async def show_readiness_member(
+        message: Message, actor_id: int, service_id: str,
+        notice: str | None = None,
+    ) -> None:
+        """«➕ В состав»: выбор задач ответившего вне состава."""
+        pending = pending_inputs.get(actor_id) or {}
+        tasks = pending.get("tasks", [])
+        selected = pending.get("selected", [])
+        lines = [
+            f"➕ {pending.get('name')} · в состав",
+            "",
+            "Отметил(а): " + (
+                ", ".join(
+                    date.fromisoformat(day).strftime("%d.%m")
+                    for day in pending.get("dates", [])
+                ) or "не сможет в этом месяце"
+            ),
+            "Выберите задачи — по ним бот будет ставить человека в график.",
+        ]
+        if notice:
+            lines = [notice, ""] + lines
+        buttons = [
+            readiness_button(
+                f"{'☑️' if task in selected else '⬜'} {task}"[:60],
+                "addmt", service_id, str(index),
+            )
+            for index, task in enumerate(tasks)
+        ]
+        rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+        rows.append([readiness_button("✅ Сохранить", "addms", service_id)])
+        rows.append([readiness_button("⬅️ К опросу", "open", service_id)])
+        await _send_dialog(
+            message, "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keep_rows=True,
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
+            parse_mode=None,
+        )
+
     async def show_readiness_choice(
         message: Message, service_id: str, title: str,
         options: list[tuple[str, str]], action: str, current: str,
@@ -3339,8 +3435,21 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             year, month = readiness.target_month(now.date())
             key = f"{year:04d}-{month:02d}"
             settings = registry.get_readiness_settings(service_id)
-            await clean_and_clear_pending_actor(actor_id)
-            await clean_previous_menu(callback.message, debug)
+            member_pending = pending_inputs.get(actor_id)
+            if action in {"addmt", "addms"} and not (
+                member_pending
+                and member_pending.get("operation") == "readiness_member"
+                and member_pending.get("service_id") == service_id
+            ):
+                await answer_quietly(callback, "⚠️ Этот экран уже устарел.")
+                return
+            if action in {"addmt", "addms"}:
+                # Выбор задач идёт в одной сессии — pending не сбрасывается.
+                await clean_previous_menu(callback.message, debug)
+                pending_inputs[actor_id].pop("menu_message_id", None)
+            else:
+                await clean_and_clear_pending_actor(actor_id)
+                await clean_previous_menu(callback.message, debug)
             notice = None
             if action in {
                 "start", "skip", "unskip", "progress", "extend", "finish",
@@ -3382,14 +3491,25 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await show_readiness(callback.message, service_id, notice)
                 return
             elif action == "restart":
-                await _send_dialog(
-                    callback.message,
+                run = registry.get_readiness_run(service_id, key)
+                running = run is not None and run["status"] == "open"
+                question = (
                     f"🔄 Перезапустить опрос на {month_title(year, month)}?\n\n"
                     "Опрос в чате будет остановлен, все ответы удалены, и "
-                    "в чат уйдёт новый опрос. Отвечать придётся заново.",
+                    "в чат уйдёт новый опрос."
+                    if running else
+                    f"▶️ Запустить опрос на {month_title(year, month)} "
+                    "заново?\n\nОтветы завершённого опроса будут удалены, "
+                    "в чат уйдёт новый опрос."
+                )
+                await _send_dialog(
+                    callback.message,
+                    question + " Отвечать придётся заново.",
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                         [readiness_button(
-                            "✅ Да, перезапустить", "restartok", service_id, arg,
+                            "✅ Да, перезапустить" if running
+                            else "✅ Да, запустить заново",
+                            "restartok", service_id, arg,
                         )],
                         [readiness_button("⬅️ К опросу", "open", service_id)],
                     ]),
@@ -3404,18 +3524,23 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     run = registry.get_readiness_run(service_id, key)
                     if run is not None and run["status"] == "skipped":
                         notice = "⚠️ Месяц пропущен — сначала «↩️ Не пропускать»"
-                    elif run is not None and run["status"] == "open" and not (
+                    elif run is not None and not run["poll_stopped"] and not (
                         await readiness.stop_run_poll(context.bot, run, debug)
                     ):
-                        # Иначе в чате остались бы два открытых опроса.
+                        # Опрос в чате не подтверждён остановленным — иначе
+                        # в чате остались бы два открытых опроса.
                         notice = (
                             "⚠️ Не удалось остановить опрос в чате — "
                             "перезапуск отменён, попробуйте позже"
                         )
                     else:
                         if run is not None:
+                            registry.mark_readiness_run(
+                                run["id"], poll_stopped=True
+                            )
                             # Старый опрос откладывается: при сбое отправки
-                            # нового он вернётся вместе с ответами.
+                            # нового он вернётся вместе с ответами; если бот
+                            # прервётся — его разберёт ежеминутная проверка.
                             registry.move_readiness_run(
                                 run["id"], f"{key}#{run['id']}"
                             )
@@ -3425,19 +3550,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                                 readiness.manual_deadline(now, settings), tz,
                                 debug, TELEGRAM_TEXT_LIMIT,
                             )
-                            notice = "✅ Новый опрос отправлен в чат служения"
-                            if run is not None:
-                                registry.delete_readiness_run(run["id"])
                         except Exception as exc:  # noqa: BLE001
                             if run is not None:
-                                # Опрос в чате уже остановлен — вернуть его
-                                # закрытым, без повторного итога админам.
+                                # Опрос в чате остановлен — вернуть закрытым;
+                                # итог шлётся, только если ещё не был.
                                 registry.move_readiness_run(run["id"], key)
                                 registry.close_readiness_run(run["id"])
-                                registry.mark_readiness_run(
-                                    run["id"], poll_stopped=True,
-                                    result_sent=True,
-                                )
+                                if run["status"] == "open":
+                                    registry.mark_readiness_run(
+                                        run["id"], result_sent=True
+                                    )
                             if isinstance(exc, ValueError):
                                 notice = f"⚠️ {exc}"
                             else:
@@ -3448,6 +3570,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                                     "❌ Новый опрос отправить не удалось — "
                                     "прежние ответы сохранены"
                                 )
+                        else:
+                            notice = "✅ Новый опрос отправлен в чат служения"
+                            if run is not None:
+                                try:
+                                    registry.delete_readiness_run(run["id"])
+                                except sqlite3.Error:
+                                    # Разберёт ежеминутная проверка.
+                                    debug.exception(
+                                        "Не удалось удалить прежний опрос %s",
+                                        run["id"],
+                                    )
                 await show_readiness(callback.message, service_id, notice)
                 return
             elif action == "skip":
@@ -3519,19 +3652,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     return
                 else:
                     await _answer_callback(callback, "⏳ Считаю…")
-                    summary = await asyncio.to_thread(
-                        readiness.summarize, registry, run
-                    )
-                    await _send_dialog(
-                        callback.message,
-                        readiness.progress_text(
-                            service_label(service), run, summary, tz
-                        ),
-                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                            readiness_button("⬅️ К опросу", "open", service_id)
-                        ]]),
-                        _dialog_text_limit=TELEGRAM_TEXT_LIMIT,
-                        parse_mode=None,
+                    await show_readiness_progress(
+                        callback.message, service, run
                     )
                     return
             elif action == "dur" and arg is None:
@@ -3580,6 +3702,106 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await show_readiness_text(callback.message, service_id, arg)
                 await _answer_callback(callback)
                 return
+            elif action == "addm" and arg and arg.isdigit():
+                run = registry.get_readiness_run(service_id, key)
+                answer = next(
+                    (
+                        item for item in (
+                            registry.list_readiness_answers(run["id"])
+                            if run is not None else []
+                        )
+                        if item["telegram_id"] == int(arg)
+                    ),
+                    None,
+                )
+                # Человек уже в составе (без задач) — привязать задачи к нему,
+                # а не заводить второго по имени из Telegram.
+                known = next(
+                    (
+                        person for person in registry.readiness_people(service_id)
+                        if answer is not None
+                        and person["telegram_id"] == answer["telegram_id"]
+                    ),
+                    None,
+                )
+                name = (
+                    known["name"] if known is not None
+                    else (answer or {}).get("full_name", "").strip()
+                    or (
+                        f"@{answer['username']}"
+                        if answer and answer["username"] else ""
+                    )
+                )
+                if answer is None:
+                    notice = "⚠️ Ответ не найден — откройте ход опроса заново"
+                elif not name:
+                    notice = (
+                        "⚠️ У человека нет имени в Telegram — добавьте его "
+                        "через «👥 Ответственные»"
+                    )
+                else:
+                    pending_inputs[actor_id] = {
+                        "operation": "readiness_member",
+                        "service_id": service_id,
+                        "telegram_id": answer["telegram_id"],
+                        "username": answer["username"],
+                        "name": name,
+                        "dates": answer["dates"],
+                        # Список задач экрана: отметка — по индексу в нём.
+                        "tasks": [
+                            task["name"]
+                            for task in registry.list_service_tasks(service_id)
+                            if task["enabled"]
+                        ],
+                        "selected": [],
+                        "step": "readiness_member",
+                    }
+                    await show_readiness_member(
+                        callback.message, actor_id, service_id
+                    )
+                    await _answer_callback(callback)
+                    return
+            elif action == "addmt" and arg and arg.isdigit():
+                tasks = pending_inputs[actor_id]["tasks"]
+                selected = pending_inputs[actor_id]["selected"]
+                if int(arg) < len(tasks):
+                    task = tasks[int(arg)]
+                    if task in selected:
+                        selected.remove(task)
+                    else:
+                        selected.append(task)
+                await show_readiness_member(callback.message, actor_id, service_id)
+                await _answer_callback(callback)
+                return
+            elif action == "addms":
+                member = pending_inputs[actor_id]
+                if not member["selected"]:
+                    await show_readiness_member(
+                        callback.message, actor_id, service_id,
+                        "⚠️ Выберите хотя бы одну задачу",
+                    )
+                    await _answer_callback(callback)
+                    return
+                pending_inputs.pop(actor_id, None)
+                try:
+                    registry.bind_service_member(
+                        actor_id, service_id, member["name"],
+                        member["telegram_id"], member["username"],
+                        tasks=member["selected"], from_readiness=True,
+                    )
+                    notice = (
+                        f"✅ {member['name']} в составе: "
+                        + ", ".join(member["selected"])
+                    )
+                except ValueError as exc:
+                    notice = _status_text(str(exc), "⚠️")
+                run = registry.get_readiness_run(service_id, key)
+                if run is not None and run["status"] != "skipped":
+                    await show_readiness_progress(
+                        callback.message, service, run, notice
+                    )
+                    await _answer_callback(callback)
+                    return
             elif action == "tplprev" and arg in READINESS_TEXTS:
                 # Как сообщение будет выглядеть: месяц и срок опроса этого
                 # месяца (идущего или по расписанию), упоминания состава.
@@ -3595,13 +3817,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         year, month, deadline, tz, settings["intro_template"],
                     )
                     where = "в чате служения перед опросом"
-                else:
+                elif arg == "rem":
                     body = readiness.reminder_text(
                         service,
                         {"month": key, "deadline": deadline.isoformat()},
                         tz, settings["reminder_template"],
                     )
                     where = "лично тем, кто не ответил"
+                else:
+                    body = readiness.closed_text(
+                        service, {"month": key}, settings["closed_template"],
+                    )
+                    where = "в чате служения, когда опрос завершён"
                 await _send_dialog(
                     callback.message,
                     f"👁 Предпросмотр · {where}\n\n"

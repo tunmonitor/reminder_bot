@@ -214,6 +214,14 @@ class ReadinessFlowTest(unittest.TestCase):
 
         tick(datetime(2026, 10, 22, 20, 0, tzinfo=TZ))
         bot.stop_poll.assert_awaited_once_with(-1005555, 12)
+        announced = [
+            call for call in bot.send_message.await_args_list
+            if call.args[0] == -1005555
+        ]
+        self.assertIn("завершён. Спасибо всем", announced[-1].args[1])
+        self.assertEqual(
+            announced[-1].kwargs["reply_parameters"].message_id, 12
+        )
         result = bot.send_message.await_args.args
         self.assertEqual(result[0], 1001)
         self.assertIn("Опрос завершён", result[1])
@@ -362,6 +370,57 @@ class ReadinessFlowTest(unittest.TestCase):
         ))
         self.assertEqual(self.registry.list_unfinished_readiness_runs(), [])
 
+    def test_result_retried_only_for_failed_admin(self):
+        self.registry.add_service_admin(1001, "sound", 2002)
+        self.registry.add_service_admin(1001, "sound", 2003)
+        bot = fake_bot()
+        run = self.launch(bot)
+        bot.send_message.reset_mock()
+
+        def send(chat_id, *args, **kwargs):
+            if chat_id == 2003 and send.fail:
+                raise RuntimeError("network")
+            return SimpleNamespace(message_id=1)
+
+        send.fail = True
+        bot.send_message.side_effect = send
+        asyncio.run(readiness.close_run(
+            bot, self.registry, run, self.service(), TZ, 1001, LOG, 4096,
+        ))
+        self.assertEqual(len(self.registry.list_unfinished_readiness_runs()), 1)
+        send.fail = False
+        bot.send_message.reset_mock()
+        self.tick(bot, datetime.now(TZ))
+        # Повтор — только тому, кому не дошло.
+        self.assertEqual(
+            [call.args[0] for call in bot.send_message.await_args_list], [2003]
+        )
+        self.assertEqual(self.registry.list_unfinished_readiness_runs(), [])
+
+    def test_other_bad_request_is_retried(self):
+        from aiogram.exceptions import TelegramBadRequest
+
+        self.assertTrue(readiness.unreachable(TelegramBadRequest(
+            method=SimpleNamespace(), message="Bad Request: chat not found"
+        )))
+        self.assertFalse(readiness.unreachable(TelegramBadRequest(
+            method=SimpleNamespace(), message="Bad Request: can't parse entities"
+        )))
+
+    def test_parked_run_is_settled(self):
+        run = self.launch(fake_bot())
+        self.registry.move_readiness_run(run["id"], f"2026-11#{run['id']}")
+        self.assertEqual(self.registry.list_open_readiness_runs(), [])
+        self.tick(fake_bot(), datetime(2026, 10, 20, 9, 0, tzinfo=TZ))
+        restored = self.registry.get_readiness_run("sound", "2026-11")
+        self.assertEqual(restored["id"], run["id"])
+        self.assertEqual(restored["status"], "closed")
+        # Новый опрос уже есть — отложенный удаляется.
+        self.registry.move_readiness_run(run["id"], f"2026-11#{run['id']}")
+        self.registry.create_readiness_run("sound", "2026-11", status="skipped")
+        self.tick(fake_bot(), datetime(2026, 10, 20, 9, 1, tzinfo=TZ))
+        self.assertIsNone(self.registry.get_readiness_run_by_id(run["id"]))
+
     def test_same_names_stay_distinct(self):
         self.registry.set_responsible_contact(
             1001, "sound", "сборка", "Глеб", 503
@@ -402,6 +461,20 @@ class ReadinessFlowTest(unittest.TestCase):
             ),
             "Напоминаю: ноябрь 2026, до 22.10 20:00",
         )
+        self.registry.set_readiness_settings(
+            1001, "sound", closed_template="Всё, {month} — спасибо!"
+        )
+        self.assertEqual(
+            readiness.closed_text(
+                self.service(), run,
+                self.registry.get_readiness_settings("sound")["closed_template"],
+            ),
+            "Всё, ноябрь 2026 — спасибо!",
+        )
+        with self.assertRaises(ValueError):
+            self.registry.set_readiness_settings(
+                1001, "sound", closed_template="{deadline}"
+            )
         # Без опрашиваемых строка «👥» не остаётся пустой.
         self.assertEqual(
             readiness.render_template("А\n👥 {people}", people=""), "А"
