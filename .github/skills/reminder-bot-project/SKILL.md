@@ -421,10 +421,13 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   `show_start`. Back buttons are recognised by `_BACK_PREFIXES` («⬅️ К »,
   «↩️ К », «⬅️ Назад», «⬅️ Отмена»); paging («⬅️ Стр. N», `ui_page:`,
   `task_page:`, «⬅️ Назад» on `contact_nav:`,
-  «⬅️ Предыдущее», dates) are not. The middleware also clears `back` on
-  any `SendMessage` to the chat outside `_send_dialog`, and `/start`
-  removes the keyboard for users unknown after a restart. New screens must
-  keep a «⬅️ К …» back button for this to work.
+  «⬅️ Предыдущее», dates) are not. `back` changes only in `_send_dialog`
+  (a background reminder must not break «Отмена»); it is restored if the
+  replay raises before a new screen. Show/hide run under a per-actor
+  `nav_locks` lock; a failed `ReplyKeyboardRemove` keeps `shown=True` so the
+  next root screen retries. `/start` seeds unknown users as shown and calls
+  `hide_nav_keyboard` itself (its menu may have no inline buttons). New
+  screens must keep a «⬅️ К …» back button for this to work.
 
 ### SQLite, backups, and restore
 

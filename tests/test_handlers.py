@@ -955,6 +955,63 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_nav_keyboard_middleware_installed_on_real_bot_session(self):
+        from aiogram import Bot
+
+        bot = Bot("123456:TEST-TOKEN")
+        self.addCleanup(lambda: asyncio.run(bot.session.close()))
+        context = SimpleNamespace(**{**vars(self.context), "bot": bot})
+        register(SimpleNamespace(include_router=MagicMock()), context)
+        self.assertEqual(
+            [item.__name__ for item in bot.session.middleware],
+            ["track_reply_keyboards"],
+        )
+
+    def test_nav_keyboard_removal_is_retried_and_start_without_menu_hides(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 12345)
+            await self.admin_router.message.handlers[6].callback(
+                self.message(12345, "/service_notify")
+            )
+            callback = SimpleNamespace(
+                data="service:service_notify:sound",
+                from_user=SimpleNamespace(id=12345),
+                message=self.message(12345, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_selected")(callback)
+            default = next(
+                button.callback_data
+                for row in callback.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith("group_reminder:default:")
+            )
+            callback.data = default
+            await self.callback_handler("on_group_reminder_action")(callback)
+            self.assertEqual(
+                callback.message.answer.await_args_list[-2].args[0], NAV_HINT
+            )
+
+            send = self.context.bot.send_message
+            send.side_effect = TelegramAPIError(MagicMock(), "flood")
+            start = self.admin_router.message.handlers[8].callback
+            await start(self.message(12345, "/start"))
+            failed = send.await_count
+            self.assertGreaterEqual(failed, 1)
+            # Клавиатура осталась у клиента — следующий /start убирает снова.
+            send.side_effect = None
+            await start(self.message(12345, "/start"))
+            self.assertEqual(send.await_count, failed + 1)
+            self.assertIsInstance(
+                send.await_args.kwargs["reply_markup"], ReplyKeyboardRemove
+            )
+            await start(self.message(12345, "/start"))
+            self.assertEqual(send.await_count, failed + 1)
+
+        asyncio.run(run())
+
     def test_template_screens_offer_preview_and_field_help(self):
         async def run():
             self.registry.add_service_admin(67890, "sound", 12345)
@@ -5723,7 +5780,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 message=self.message(67890, ""),
                 answer=AsyncMock(),
             )
+            opened.message.delete = AsyncMock()
             await self.callback_handler("on_service_tasks")(opened)
+            # Карточка служения не остаётся под экраном задач.
+            opened.message.delete.assert_awaited_once()
             screen = opened.message.answer.await_args.args[0]
             self.assertIn("ЗВУК · задачи", screen)
             self.assertIn("🔴 🎶 спевка · выключена", screen)

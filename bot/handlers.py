@@ -17,7 +17,6 @@ from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramAPIError
 from aiogram.dispatcher.event.bases import UNHANDLED
 from aiogram.filters import Command
-from aiogram.methods import SendMessage
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -350,16 +349,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     # Клавиатура навигации: shown, helpers (подсказки), back и screen
     # (кнопка «⬅️ …» и ID последнего экрана).
     nav_state: dict[int, dict[str, Any]] = {}
+    nav_locks: dict[int, asyncio.Lock] = {}
 
     async def track_reply_keyboards(make_request, bot, method):
         chat_id = replaces_nav_keyboard(method)
         if chat_id in nav_state:
             # Другая нижняя клавиатура заменила или убрала навигацию.
             nav_state[chat_id]["shown"] = False
-        if isinstance(method, SendMessage) and method.chat_id in nav_state:
-            # Сообщение не из _send_dialog: прежняя «⬅️ …» уже не текущая;
-            # _send_dialog запишет свою кнопку после отправки экрана.
-            nav_state[method.chat_id]["back"] = None
         return await make_request(bot, method)
 
     session_middleware = getattr(
@@ -382,6 +378,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
 
     async def show_nav_keyboard(target: Message, actor_id: int) -> None:
+        async with nav_locks.setdefault(actor_id, asyncio.Lock()):
+            await _show_nav_keyboard(target, actor_id)
+
+    async def hide_nav_keyboard(chat_id: int, actor_id: int) -> None:
+        # Показ и скрытие одного пользователя — по очереди, иначе ответы
+        # Telegram могут прийти в обратном порядке и разойтись с nav_state.
+        async with nav_locks.setdefault(actor_id, asyncio.Lock()):
+            await _hide_nav_keyboard(chat_id, actor_id)
+
+    async def _show_nav_keyboard(target: Message, actor_id: int) -> None:
         state = nav_state.setdefault(actor_id, {"shown": False, "helpers": []})
         if state["shown"]:
             return
@@ -398,21 +404,23 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         state["helpers"] = [hint.message_id]
         await delete_quietly(target.chat.id, stale)
 
-    async def hide_nav_keyboard(chat_id: int, actor_id: int) -> None:
+    async def _hide_nav_keyboard(chat_id: int, actor_id: int) -> None:
         state = nav_state.get(actor_id)
         if state is None or not state["shown"]:
             return
-        helpers = state["helpers"]
-        state["shown"] = False
-        state["helpers"] = []
         try:
             removed = await context.bot.send_message(
                 chat_id, NAV_REMOVED_TEXT, reply_markup=ReplyKeyboardRemove()
             )
         except TelegramAPIError:
+            # Клавиатура осталась у клиента: следующий корневой экран
+            # попробует убрать её снова.
             debug.warning("Не удалось убрать клавиатуру навигации %s", actor_id)
-            state["helpers"] = helpers
+            state["shown"] = True
             return
+        state["shown"] = False
+        helpers = state["helpers"]
+        state["helpers"] = []
         await delete_quietly(chat_id, [*helpers, removed.message_id])
     pending_personal_actions: dict[
         str, tuple[int, str, str, str, dict[str, Any]]
@@ -2866,6 +2874,24 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await _answer_callback(callback, "❌ Недостаточно прав.")
                 return
             if action == "open" and len(parts) == 3:
+                # Карточка служения не хранится в pending — убрать её здесь,
+                # иначе под экраном задач остаётся старая карточка.
+                await clean_previous_menu(callback.message, debug)
+                card = last_service_cards.get((actor_id, service_id))
+                message_id = getattr(callback.message, "message_id", None)
+                if card is not None and message_id in card[1]:
+                    # Длинная карточка — несколько сообщений.
+                    last_service_cards.pop((actor_id, service_id), None)
+                    for card_message_id in card[1]:
+                        if card_message_id != message_id:
+                            await clean_previous_menu_by_id(
+                                context.bot, card[0], card_message_id, debug
+                            )
+                previous = pending_inputs.get(actor_id)
+                if previous is not None and previous.get(
+                    "menu_message_id"
+                ) == getattr(callback.message, "message_id", None):
+                    previous.pop("menu_message_id", None)
                 await show_service_tasks(callback.message, actor_id, service_id)
                 await _answer_callback(callback)
                 return
@@ -5142,6 +5168,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             reply_markup=start_menu_keyboard(operations),
             _dialog_keyboard_limit=max(6, len(operations)),
         )
+        # Меню без кнопок (_send_dialog скрывает навигацию только у экранов
+        # с кнопками) — убрать её отдельно.
+        await hide_nav_keyboard(message.chat.id, actor_id)
         await refresh_user_commands(actor_id)
 
     @admin_router.callback_query(F.data.startswith("menu:"))
@@ -8288,12 +8317,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             data=back,
         )
         state["back"] = None
-        for target_router in (admin_router, router):
-            result = await target_router.propagate_event(
-                "callback_query", callback
-            )
-            if result is not UNHANDLED:
-                break
+        try:
+            for target_router in (admin_router, router):
+                result = await target_router.propagate_event(
+                    "callback_query", callback
+                )
+                if result is not UNHANDLED:
+                    break
+        except Exception:
+            if not screen.sent and state.get("back") is None:
+                # Экран не сменился — «Отмена» можно повторить.
+                state["back"] = back
+            raise
         if not screen.sent:
             # Кнопка устарела и нового экрана нет — не оставлять пустоту.
             await clean_previous_menu_by_id(
