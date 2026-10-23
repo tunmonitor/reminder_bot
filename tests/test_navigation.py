@@ -53,6 +53,18 @@ class NavigationTest(unittest.TestCase):
         self.assertEqual(
             back_callback(markup(("⬅️ Назад", "pact:d"))), "pact:d"
         )
+        # «✖️ Закрыть настройку» — выход, если «⬅️ …» нет.
+        self.assertEqual(
+            back_callback(markup(
+                ("✅ Завершить и сохранить", "s"), ("✖️ Закрыть настройку", "x"),
+            )),
+            "x",
+        )
+        self.assertEqual(
+            back_callback(markup(("✖️ Отмена", "x"), ("⬅️ К списку", "b"))), "b"
+        )
+        # «✖️ Закрыть» корня «Моих уведомлений» — корневой экран.
+        self.assertIsNone(back_callback(markup(("✖️ Закрыть", "pmn:finish"))))
 
     def test_screen_message_counts_screens_but_not_warnings(self):
         source = SimpleNamespace(

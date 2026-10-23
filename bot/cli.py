@@ -9,6 +9,7 @@ from dataclasses import dataclass
 class CliArgs:
     shm_dir: str
     log_dir: str
+    trace: bool = False
 
 
 def parse_args(argv=None) -> CliArgs:
@@ -26,5 +27,10 @@ def parse_args(argv=None) -> CliArgs:
         required=True,
         help="Директория логов (reminder_bot_interaction.log, reminder_bot_debug.log).",
     )
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="Отслеживание навигации (уровень TRACE в debug.log).",
+    )
     ns = parser.parse_args(argv)
-    return CliArgs(shm_dir=ns.shm_dir, log_dir=ns.log_dir)
+    return CliArgs(shm_dir=ns.shm_dir, log_dir=ns.log_dir, trace=ns.trace)

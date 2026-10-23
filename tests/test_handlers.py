@@ -917,8 +917,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 if data.startswith("group_reminder:default:")
             )
             screen = await press(default)
-            # Экран второго уровня: сначала подсказка с нижней клавиатурой.
-            hint = screen.await_args_list[0]
+            # Корень настройки («✖️ Закрыть настройку») — уже второй
+            # уровень: сначала подсказка с нижней клавиатурой.
+            hint = root.await_args_list[0]
             self.assertEqual(hint.args[0], NAV_HINT)
             self.assertEqual(
                 [b.text for b in hint.kwargs["reply_markup"].keyboard[0]],
@@ -952,6 +953,27 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIsInstance(
                 removal.kwargs["reply_markup"], ReplyKeyboardRemove
             )
+
+        asyncio.run(run())
+
+    def test_stored_nav_hint_is_deleted_after_restart(self):
+        async def run():
+            # Подсказка осталась от прошлого запуска бота.
+            self.registry.set_nav_hints(12345, [777, 778])
+            def delete(chat_id, message_id):
+                if message_id == 778:
+                    raise TelegramAPIError(MagicMock(), "flood")
+
+            self.context.bot.delete_message.side_effect = delete
+            start = self.admin_router.message.handlers[8].callback
+            await start(self.message(12345, "/start"))
+            deleted = [
+                call.kwargs["message_id"]
+                for call in self.context.bot.delete_message.await_args_list
+            ]
+            self.assertIn(777, deleted)
+            # Неудавшееся удаление остаётся в базе для следующей попытки.
+            self.assertEqual(self.registry.get_nav_hints(12345), [778])
 
         asyncio.run(run())
 
@@ -990,8 +1012,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             callback.data = default
             await self.callback_handler("on_group_reminder_action")(callback)
-            self.assertEqual(
-                callback.message.answer.await_args_list[-2].args[0], NAV_HINT
+            self.assertIn(
+                NAV_HINT,
+                [call.args[0] for call in callback.message.answer.await_args_list],
             )
 
             send = self.context.bot.send_message
@@ -1225,15 +1248,16 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 len(result_markup.inline_keyboard),
                 2,
             )
-            # Второе 502 — подсказка навигации (тот же мок ответа): итоговый
-            # экран без «⬅️ …» убирает нижнюю клавиатуру вместе с ней.
+            # Последнее 501 — подсказка навигации (тот же мок ответа, что у
+            # корня настройки): итоговый экран без «⬅️ …» убирает нижнюю
+            # клавиатуру вместе с ней.
             self.assertEqual(
                 [
                     call.kwargs["message_id"]
                     for call in self.context.bot.delete_message.await_args_list
                     if isinstance(call.kwargs["message_id"], int)
                 ],
-                [501, 502, 502, 503, 502, 503],
+                [501, 502, 502, 503, 503, 501],
             )
 
         asyncio.run(run())
@@ -1997,6 +2021,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             handler_name = "on_notification_edit_back"
         elif button.callback_data.startswith("svc_tasks:"):
             handler_name = "on_service_tasks"
+        elif button.callback_data.startswith("rdy:"):
+            handler_name = "on_readiness"
         else:
             handler_name = "on_group_reminder_action"
         await self.callback_handler(handler_name)(callback)
@@ -5838,24 +5864,24 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             saved = await self._click(
                 choice.message,
-                lambda button: button.text == "👥 2",
+                lambda button: button.text == "👥 3–4",
                 actor_id=67890,
             )
             self.assertIn(
-                "✅ «звук»: нужно людей — 2",
+                "✅ «звук»: нужно людей — 3–4",
                 saved.message.answer.await_args.args[0],
             )
             task = next(
                 item for item in self.registry.list_service_tasks("sound")
                 if item["name"] == "звук"
             )
-            self.assertEqual(task["people_needed"], 2)
+            self.assertEqual((task["people_needed"], task["people_max"]), (3, 4))
             back = await self._click(
                 saved.message,
                 lambda button: button.text == "⬅️ К задачам",
                 actor_id=67890,
             )
-            self.assertIn("👥 2", back.message.answer.await_args.args[0])
+            self.assertIn("👥 3–4", back.message.answer.await_args.args[0])
 
         asyncio.run(run())
 
@@ -5939,14 +5965,113 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIn(
                 "Экран устарел", stale.message.answer.await_args.args[0]
             )
+            text_screen = await press("rdy:tpl:sound:intro")
+            self.assertIn(
+                "Используется встроенный текст",
+                text_screen.message.answer.await_args.args[0],
+            )
+            preview = await press("rdy:tplprev:sound:intro")
+            self.assertIn(
+                "Спасибо за твое служение",
+                preview.message.answer.await_args.args[0],
+            )
+            prompt = await press("rdy:tpledit:sound:intro")
+            self.assertIn(
+                "• {people} — ", prompt.message.answer.await_args.args[0]
+            )
+            text_handler = next(
+                item.callback for item in self.admin_router.message.handlers
+                if item.callback.__name__ == "on_service_parameter"
+            )
+            bad = self.message(67890, "Привет {name}")
+            await text_handler(bad)
+            self.assertIn("не поддерживается", bad.answer.await_args.args[0])
+            good = self.message(67890, "Опрос {service_name} на {month}")
+            await text_handler(good)
+            self.assertIn("✅ Текст сохранён", good.answer.await_args.args[0])
+            self.assertEqual(
+                self.registry.get_readiness_settings("sound")["intro_template"],
+                "Опрос {service_name} на {month}",
+            )
+            await press("rdy:tplreset:sound:intro")
+            self.assertIsNone(
+                self.registry.get_readiness_settings("sound")["intro_template"]
+            )
             progress = await press(f"rdy:progress:sound:{month_arg}")
             self.assertIn(
                 "Ход опроса", progress.message.answer.await_args.args[0]
             )
+            # Ответивший вне состава — «➕ В состав» с выбором задач.
+            add_button = next(
+                button.callback_data
+                for row in progress.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.text.startswith("➕")
+            )
+            self.assertEqual(add_button, "rdy:addm:sound:12345")
+            # Уже в составе без задач — задачи привязываются к нему, а не
+            # ко второму участнику с именем из Telegram.
+            self.registry.bind_service_member(
+                67890, "sound", "Алексей из Списков", 12345
+            )
+            member_screen = await press(add_button)
+            token = next(
+                button.callback_data.split(":")[-1]
+                for row in member_screen.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith("rdy:addms:")
+            )
+            stale = await press("rdy:addms:sound:old")
+            self.assertIn("устарел", stale.answer.await_args.args[0])
+            empty = await press(f"rdy:addms:sound:{token}")
+            self.assertIn("хотя бы одну задачу",
+                          empty.message.answer.await_args.args[0])
+            await press(f"rdy:addmt:sound:{token}.0")
+            saved = await press(f"rdy:addms:sound:{token}")
+            self.assertIn("Алексей из Списков в составе",
+                          saved.message.answer.await_args.args[0])
+            self.assertEqual(
+                [
+                    member["name"]
+                    for member in self.registry.list_service_members("sound")
+                    if member["telegram_id"] == 12345
+                ],
+                ["Алексей из Списков"],
+            )
+            self.assertIn(12345, {
+                person["telegram_id"]
+                for person in self.registry.readiness_people("sound")
+                if person["tasks"]
+            })
             finished = await press(f"rdy:finish:sound:{month_arg}")
             self.assertIn("Опрос завершён",
                           finished.message.answer.await_args.args[0])
             self.context.bot.stop_poll.assert_awaited_once()
+            confirm = await press(f"rdy:restart:sound:{month_arg}")
+            self.assertIn("будут удалены",
+                          confirm.message.answer.await_args.args[0])
+            # Сбой отправки нового опроса — прежние ответы на месте.
+            self.context.bot.send_poll.side_effect = RuntimeError("network")
+            failed = await press(f"rdy:restartok:sound:{month_arg}")
+            self.assertIn("прежние ответы сохранены",
+                          failed.message.answer.await_args.args[0])
+            kept = self.registry.get_readiness_run("sound", f"{year:04d}-{month:02d}")
+            self.assertEqual(kept["poll_id"], "ready-poll")
+            self.assertEqual(len(self.registry.list_readiness_answers(kept["id"])), 1)
+            self.context.bot.send_poll.side_effect = None
+            self.context.bot.send_poll.return_value = SimpleNamespace(
+                message_id=13, poll=SimpleNamespace(id="ready-poll-2"),
+            )
+            restarted = await press(f"rdy:restartok:sound:{month_arg}")
+            self.assertIn("Новый опрос отправлен",
+                          restarted.message.answer.await_args.args[0])
+            run = self.registry.list_open_readiness_runs()[0]
+            self.assertEqual(run["poll_id"], "ready-poll-2")
+            self.assertEqual(self.registry.list_readiness_answers(run["id"]), [])
 
         self.context.bot.stop_poll = AsyncMock()
         asyncio.run(run())

@@ -99,7 +99,16 @@ class ServiceRegistryTest(unittest.TestCase):
     def test_people_needed_validated_and_migrated(self):
         self.registry.add_service_admin(1001, "sound", 2002)
         with self.assertRaises(PermissionError):
-            self.registry.set_service_task_people_needed(2002, "sound", "звук", 2)
+            self.registry.set_service_task_people_needed(3003, "sound", "звук", 2)
+        # Админ служения может; диапазон «3–4».
+        self.registry.set_service_task_people_needed(2002, "sound", "звук", 3, 4)
+        task = next(
+            item for item in self.registry.list_service_tasks("sound")
+            if item["name"] == "звук"
+        )
+        self.assertEqual((task["people_needed"], task["people_max"]), (3, 4))
+        with self.assertRaises(ValueError):
+            self.registry.set_service_task_people_needed(1001, "sound", "звук", 3, 2)
         for bad in (0, 6, True, "2"):
             with self.assertRaises(ValueError):
                 self.registry.set_service_task_people_needed(

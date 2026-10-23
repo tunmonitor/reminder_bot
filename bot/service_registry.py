@@ -61,6 +61,28 @@ DEFAULT_ADMIN_REPORT_TEMPLATE = (
     "📨 Личные уведомления:\n{delivery_status}\n\n"
     "✅ Подтверждения:\n{confirmation_status}"
 )
+# Опрос готовности (этап 5): вступление к опросу в чате служения и личное
+# напоминание не ответившим; NULL в настройках — встроенный текст.
+READINESS_INTRO_FIELDS = frozenset({"service_name", "month", "deadline", "people"})
+READINESS_REMINDER_FIELDS = frozenset({"service_name", "month", "deadline"})
+DEFAULT_READINESS_INTRO = (
+    "🗳 График {service_name} на {month}\n"
+    "Отметь воскресенья, когда можешь служить. Ответ можно менять "
+    "до {deadline}.\n"
+    "Постараемся составить график, удобный для всех. Спасибо за твое "
+    "служение в церкви! ❤️\n"
+    "👥 {people}"
+)
+READINESS_CLOSED_FIELDS = frozenset({"service_name", "month"})
+DEFAULT_READINESS_CLOSED = (
+    "🗳 Опрос «График {service_name} на {month}» завершён. Спасибо всем, "
+    "кто ответил! ❤️ График появится вскоре."
+)
+DEFAULT_READINESS_REMINDER = (
+    "🗳 {service_name} · график на {month}\n"
+    "Ты ещё не отметил(а), когда можешь служить. Опрос в чате служения "
+    "открыт до {deadline}."
+)
 # Шаблон по умолчанию для напоминания одной задачи (этап 3.1).
 DEFAULT_TASK_TEMPLATE = (
     "Напоминание о служении «{service_name}» в воскресенье {sunday_date}.\n"
@@ -232,7 +254,17 @@ class ServiceRegistry:
                     remind_days INTEGER NOT NULL DEFAULT 1
                         CHECK (remind_days BETWEEN 0 AND 5),
                     enabled_at TEXT,
+                    intro_template TEXT,
+                    reminder_template TEXT,
+                    closed_template TEXT,
                     updated_at TEXT NOT NULL
+                );
+
+                -- Подсказка нижней клавиатуры навигации: ID сообщений
+                -- переживают перезапуск бота, старая подсказка удаляется.
+                CREATE TABLE IF NOT EXISTS nav_hints (
+                    telegram_id INTEGER PRIMARY KEY,
+                    message_ids_json TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS readiness_runs (
@@ -252,6 +284,7 @@ class ServiceRegistry:
                     closed_at TEXT,
                     poll_stopped INTEGER NOT NULL DEFAULT 0,
                     result_sent INTEGER NOT NULL DEFAULT 0,
+                    closed_announced INTEGER NOT NULL DEFAULT 0,
                     UNIQUE (service_id, month)
                 );
 
@@ -373,6 +406,7 @@ class ServiceRegistry:
                         CHECK (source IN ('catalog', 'admin')),
                     people_needed INTEGER NOT NULL DEFAULT 1
                         CHECK (people_needed BETWEEN 1 AND 5),
+                    people_max INTEGER,
                     PRIMARY KEY (service_id, name)
                 );
 
@@ -691,9 +725,15 @@ class ServiceRegistry:
             # Опрос готовности (этап 5): колонки, добавленные после
             # первого развёртывания.
             for table, column, ddl in (
+                ("service_tasks", "people_max", "INTEGER"),
                 ("readiness_settings", "enabled_at", "TEXT"),
+                ("readiness_settings", "intro_template", "TEXT"),
+                ("readiness_settings", "reminder_template", "TEXT"),
+                ("readiness_settings", "closed_template", "TEXT"),
                 ("readiness_runs", "poll_stopped", "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "result_sent", "INTEGER NOT NULL DEFAULT 0"),
+                ("readiness_runs", "closed_announced",
+                 "INTEGER NOT NULL DEFAULT 0"),
             ):
                 columns = {
                     row["name"]
@@ -1350,8 +1390,8 @@ class ServiceRegistry:
         with self._connection() as connection:
             rows = connection.execute(
                 "SELECT name, position, enabled, aliases_json, source, "
-                "people_needed FROM service_tasks WHERE service_id = ? "
-                "ORDER BY position, name",
+                "people_needed, people_max FROM service_tasks "
+                "WHERE service_id = ? ORDER BY position, name",
                 (service_id,),
             ).fetchall()
         return [
@@ -1362,6 +1402,11 @@ class ServiceRegistry:
                 "aliases": json.loads(row["aliases_json"]),
                 "source": row["source"],
                 "people_needed": row["people_needed"],
+                # NULL — ровно people_needed.
+                "people_max": max(
+                    row["people_max"] or row["people_needed"],
+                    row["people_needed"],
+                ),
             }
             for row in rows
         ]
@@ -1425,23 +1470,28 @@ class ServiceRegistry:
             )
 
     def set_service_task_people_needed(
-        self, actor_id: int, service_id: str, task: str, count: int
+        self, actor_id: int, service_id: str, task: str, count: int,
+        maximum: int | None = None,
     ) -> None:
-        """«👥 Нужно людей» в задаче для распределения графика (этап 5.4)."""
+        """«👥 Нужно людей» в задаче для распределения графика (этап 5.4):
+        минимум и, если больше, максимум на одно воскресенье. Доступно
+        суперадмину и админу служения."""
         _validate_positive_id(actor_id, "actor_id")
-        if (
-            not isinstance(count, int)
-            or isinstance(count, bool)
-            or not 1 <= count <= 5
-        ):
-            raise ValueError("Нужно людей: от 1 до 5.")
+        maximum = count if maximum is None else maximum
+        for value in (count, maximum):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError("Нужно людей: число.")
+        if not 1 <= count <= 5 or not count <= maximum <= 6:
+            raise ValueError("Нужно людей: от 1 до 5, максимум — до 6.")
+        stored_max = maximum if maximum > count else None
         with self._connection() as connection:
-            self._require_super_admin(connection, actor_id)
+            self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
             cursor = connection.execute(
-                "UPDATE service_tasks SET people_needed = ? "
-                "WHERE service_id = ? AND name = ? AND people_needed != ?",
-                (count, service_id, task, count),
+                "UPDATE service_tasks SET people_needed = ?, people_max = ? "
+                "WHERE service_id = ? AND name = ? "
+                "AND (people_needed != ? OR people_max IS NOT ?)",
+                (count, stored_max, service_id, task, count, stored_max),
             )
             if cursor.rowcount == 0:
                 exists = connection.execute(
@@ -1454,7 +1504,7 @@ class ServiceRegistry:
                 return
             self._audit(
                 connection, actor_id, "service_task_updated", service_id,
-                {"task": task, "people_needed": count},
+                {"task": task, "people_needed": count, "people_max": maximum},
             )
 
     def add_service_task(
@@ -3438,8 +3488,14 @@ class ServiceRegistry:
         telegram_id: int,
         username: str = "",
         tasks=(),
+        *,
+        from_readiness: bool = False,
     ) -> None:
         """Привязывает Telegram к человеку служения во всех его задачах.
+
+        from_readiness — «➕ В состав» из опроса готовности: доступно и
+        админу служения; имя, уже занятое другим Telegram ID, не
+        перезаписывается.
 
         Задачи — из «Списков», из прежних привязок этого имени и tasks
         (например, задачи из графика). Человек не из состава добавляется.
@@ -3453,13 +3509,32 @@ class ServiceRegistry:
             raise ValueError("Имя участника обязательно.")
         username = username.strip().lstrip("@")
         with self._connection() as connection:
-            self._require_super_admin(connection, actor_id)
+            if from_readiness:
+                self._require_service_editor(connection, actor_id, service_id)
+            else:
+                self._require_super_admin(connection, actor_id)
             self._require_service(connection, service_id)
             member = connection.execute(
-                "SELECT tasks_json FROM service_members "
+                "SELECT tasks_json, telegram_id FROM service_members "
                 "WHERE service_id = ? AND name = ?",
                 (service_id, name),
             ).fetchone()
+            # Имя уже у другого Telegram — в составе или в привязках
+            # «👥 Ответственные»: чужие привязки не перезаписываются.
+            if from_readiness and (
+                (member is not None and member["telegram_id"] not in (
+                    None, telegram_id,
+                ))
+                or connection.execute(
+                    "SELECT 1 FROM responsible_contacts WHERE service_id = ? "
+                    "AND name = ? AND telegram_id != ?",
+                    (service_id, name, telegram_id),
+                ).fetchone() is not None
+            ):
+                raise ValueError(
+                    f"«{name}» в составе уже привязан к другому Telegram — "
+                    "добавьте через «👥 Ответственные»."
+                )
             now = _utc_now()
             if member is None:
                 connection.execute(
@@ -4500,14 +4575,17 @@ class ServiceRegistry:
         "duration_days": 3,
         "deadline_time": "20:00",
         "remind_days": 1,
+        "intro_template": None,
+        "reminder_template": None,
+        "closed_template": None,
     }
 
     def get_readiness_settings(self, service_id: str) -> dict:
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT enabled, start_time, duration_days, deadline_time, "
-                "remind_days, enabled_at FROM readiness_settings "
-                "WHERE service_id = ?",
+                "remind_days, enabled_at, intro_template, reminder_template, "
+                "closed_template FROM readiness_settings WHERE service_id = ?",
                 (service_id,),
             ).fetchone()
         if row is None:
@@ -4538,6 +4616,20 @@ class ServiceRegistry:
                 raise ValueError(f"Значение должно быть от {low} до {high}.")
         if new["remind_days"] >= new["duration_days"]:
             new["remind_days"] = new["duration_days"] - 1
+        for key, fields, label in (
+            ("intro_template", READINESS_INTRO_FIELDS, "Текст опроса"),
+            ("reminder_template", READINESS_REMINDER_FIELDS,
+             "Текст напоминания"),
+            ("closed_template", READINESS_CLOSED_FIELDS, "Текст завершения"),
+        ):
+            value = new[key]
+            if value is None:
+                continue
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{label} не может быть пустым.")
+            if len(value) > 1500:
+                raise ValueError(f"{label}: не больше 1500 символов.")
+            validate_notification_template(value, fields, label)
         with self._connection() as connection:
             self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
@@ -4549,18 +4641,25 @@ class ServiceRegistry:
             connection.execute(
                 "INSERT INTO readiness_settings (service_id, enabled, "
                 "start_time, duration_days, deadline_time, remind_days, "
-                "enabled_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "enabled_at, intro_template, reminder_template, "
+                "closed_template, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id) DO UPDATE SET "
                 "enabled = excluded.enabled, start_time = excluded.start_time, "
                 "duration_days = excluded.duration_days, "
                 "deadline_time = excluded.deadline_time, "
                 "remind_days = excluded.remind_days, "
                 "enabled_at = excluded.enabled_at, "
+                "intro_template = excluded.intro_template, "
+                "reminder_template = excluded.reminder_template, "
+                "closed_template = excluded.closed_template, "
                 "updated_at = excluded.updated_at",
                 (
                     service_id, int(new["enabled"]), new["start_time"],
                     new["duration_days"], new["deadline_time"],
-                    new["remind_days"], new["enabled_at"], now,
+                    new["remind_days"], new["enabled_at"],
+                    new["intro_template"], new["reminder_template"],
+                    new["closed_template"], now,
                 ),
             )
             self._audit(
@@ -4646,6 +4745,30 @@ class ServiceRegistry:
             result.append({**person, "key": key, "tasks": sorted(person["tasks"])})
         return result
 
+    def get_nav_hints(self, telegram_id: int) -> list[int]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT message_ids_json FROM nav_hints WHERE telegram_id = ?",
+                (telegram_id,),
+            ).fetchone()
+        return json.loads(row["message_ids_json"]) if row else []
+
+    def set_nav_hints(self, telegram_id: int, message_ids: list[int]) -> None:
+        # Служебное состояние интерфейса — не повод для резервной копии.
+        with self._connection(notify=False) as connection:
+            if message_ids:
+                connection.execute(
+                    "INSERT INTO nav_hints (telegram_id, message_ids_json) "
+                    "VALUES (?, ?) ON CONFLICT(telegram_id) DO UPDATE SET "
+                    "message_ids_json = excluded.message_ids_json",
+                    (telegram_id, json.dumps(list(message_ids))),
+                )
+            else:
+                connection.execute(
+                    "DELETE FROM nav_hints WHERE telegram_id = ?",
+                    (telegram_id,),
+                )
+
     def get_readiness_run(self, service_id: str, month: str) -> dict | None:
         with self._connection() as connection:
             row = connection.execute(
@@ -4672,7 +4795,7 @@ class ServiceRegistry:
         with self._connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM readiness_runs WHERE status = 'open' "
-                "ORDER BY deadline, id"
+                "AND month NOT LIKE '%#%' ORDER BY deadline, id"
             ).fetchall()
         return [self._readiness_run(row) for row in rows]
 
@@ -4718,10 +4841,51 @@ class ServiceRegistry:
         return self.get_readiness_run_by_id(run_id)
 
     def delete_readiness_run(self, run_id: int) -> None:
-        """Отмена пропуска месяца или неудачного запуска (ответов нет)."""
+        """Отмена пропуска месяца или перезапуск: опрос удаляется вместе
+        с ответами и отметками напоминаний."""
         with self._connection() as connection:
+            for table in ("readiness_answers", "readiness_reminders"):
+                connection.execute(
+                    f"DELETE FROM {table} WHERE run_id = ?", (run_id,)
+                )
             connection.execute(
                 "DELETE FROM readiness_runs WHERE id = ?", (run_id,)
+            )
+
+    def list_parked_readiness_runs(self) -> list[dict]:
+        """Опросы, отложенные перезапуском (месяц «YYYY-MM#id»): бот
+        прервался между отправкой нового опроса и удалением старого."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM readiness_runs WHERE month LIKE '%#%' ORDER BY id"
+            ).fetchall()
+        return [self._readiness_run(row) for row in rows]
+
+    def attach_readiness_poll(
+        self,
+        run_id: int,
+        *,
+        poll_id: str,
+        chat_id: int,
+        message_id: int,
+        intro_message_id: int | None,
+    ) -> dict:
+        """Опрос в чате отправлен — привязать его к записи месяца."""
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE readiness_runs SET poll_id = ?, chat_id = ?, "
+                "message_id = ?, intro_message_id = ? WHERE id = ?",
+                (poll_id, chat_id, message_id, intro_message_id, run_id),
+            )
+        return self.get_readiness_run_by_id(run_id)
+
+    def move_readiness_run(self, run_id: int, month: str) -> None:
+        """Переносит опрос под другой ключ месяца: при перезапуске старый
+        откладывается, пока не отправлен новый (при сбое — возвращается)."""
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE readiness_runs SET month = ? WHERE id = ?",
+                (month, run_id),
             )
 
     def close_readiness_run(self, run_id: int) -> bool:
@@ -4735,9 +4899,10 @@ class ServiceRegistry:
         return cursor.rowcount > 0
 
     def mark_readiness_run(self, run_id: int, **flags: bool) -> None:
-        """poll_stopped / result_sent — шаги закрытия, которые удались."""
+        """poll_stopped / result_sent / closed_announced — шаги закрытия,
+        которые удались."""
         for name in flags:
-            if name not in {"poll_stopped", "result_sent"}:
+            if name not in {"poll_stopped", "result_sent", "closed_announced"}:
                 raise ValueError(f"Неизвестный шаг: {name}")
         with self._connection(notify=False) as connection:
             for name, value in flags.items():
@@ -4751,7 +4916,8 @@ class ServiceRegistry:
         with self._connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM readiness_runs WHERE status = 'closed' "
-                "AND (poll_stopped = 0 OR result_sent = 0) ORDER BY id"
+                "AND month NOT LIKE '%#%' AND (poll_stopped = 0 "
+                "OR result_sent = 0 OR closed_announced = 0) ORDER BY id"
             ).fetchall()
         return [self._readiness_run(row) for row in rows]
 

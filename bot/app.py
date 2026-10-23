@@ -1746,7 +1746,11 @@ async def _run_locked(args: CliArgs) -> None:
         directory_fd = open_private_directory(directory, create=True)
         os.close(directory_fd)
 
-    interaction_logger, debug_logger = setup_loggers(log_dir)
+    interaction_logger, debug_logger = setup_loggers(
+        log_dir, trace=getattr(args, "trace", False)
+    )
+    if getattr(args, "trace", False):
+        debug_logger.info("Отслеживание навигации (TRACE) включено")
     credentials = load_credentials()
     templates = load_templates()
     tz = get_tz(credentials.timezone)

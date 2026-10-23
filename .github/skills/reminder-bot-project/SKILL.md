@@ -338,9 +338,73 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   `readiness_reminders` after delivery (Forbidden/BadRequest count as done).
   `readiness_people` keys people by Telegram ID (`key` is unique even for
   equal names; planner uses `key`).
-- `service_tasks.people_needed` (1–5, default 1, migrated with ALTER) is set
-  by the super admin in «📋 Задачи служения» → «👥 Нужно людей»
-  (`svc_tasks:people|ppick|pset`), `set_service_task_people_needed`.
+- Readiness texts: `intro_template` / `reminder_template` in
+  `readiness_settings` (NULL = `DEFAULT_READINESS_INTRO` /
+  `DEFAULT_READINESS_REMINDER`, fields `READINESS_INTRO_FIELDS` /
+  `READINESS_REMINDER_FIELDS`), rendered by `readiness.render_template`
+  (drops an empty «👥» line). UI `rdy:tpl|tpledit|tplreset:<service>:intro|rem`;
+  text input is pending operation `readiness_text` in `on_service_parameter`.
+- Navigation trace: level `TRACE` (5) in `bot/logger.py`, enabled by
+  `--trace` / `manage.sh trace on` (flag `.runtime/trace_enabled`).
+  `admin_router` outer middlewares `trace_callback` / `trace_message` and
+  `_send_dialog` / `on_nav_button` log with `debug.log(TRACE, ...)` — never
+  free text of user messages (commands — only the command word). Trace
+  middlewares sit on the dispatcher observers (all routers), falling back to
+  `admin_router` when the dispatcher is a test stub. `back_callback` falls
+  back to the last «✖️ Закрыть настройку» / «✖️ Отмена» (`_CLOSE_TEXTS`)
+  when a screen has no «⬅️ …»; the root «✖️ Закрыть» of /my_notifications is
+  not a back button. Nav hint ids are persisted in `nav_hints`;
+  `drop_old_hints` removes an id only after the message is deleted (or is
+  already gone), also on root screens when the keyboard was already
+  replaced. A user message marks `hint_stale`; the next screen with a back
+  button re-sends the hint above itself (`show_nav_keyboard(force=True)`).
+- Readiness restart: `rdy:restart` (confirmation) → `rdy:restartok` under
+  `service_lock`: stop the open poll (abort if that fails), park the old run
+  under month `KEY#id` (`move_readiness_run`), `launch_run` with
+  `manual_deadline`; on success `delete_readiness_run` (answers and reminder
+  marks too, outside the rollback `try`); on failure move it back as closed.
+  The old poll is stopped whenever `poll_stopped` is false (abort if that
+  fails). Parked runs (`month` with `#`) are excluded from open/unfinished
+  lists and settled each tick by `settle_parked_run` (new run exists →
+  delete, else restore closed).
+- Telegram delivery: `readiness.unreachable` (Forbidden, or BadRequest with
+  «chat not found» / «user is deactivated» / «bot was blocked») = final, no
+  retry; other errors retry. The result notice is marked per recipient
+  (`readiness_notices` kind `result-<run>:<admin>`), so retries go only to
+  admins who did not get it. Nav hint deletes: any BadRequest/Forbidden is
+  final; at most 10 failed ids are kept.
+- When the poll is stopped, `announce_closed` replies to the poll in the
+  service chat once. «➕ В состав»: `rdy:addm:<service>:<telegram_id>` →
+  pending `readiness_member` (selected tasks, not cleared by `addmt`/`addms`)
+  → `bind_service_member(..., from_readiness=True)` (service editor allowed;
+  refuses a name bound to another Telegram id) → progress re-shown. The name
+  is the roster name when `readiness_people` already has that Telegram id,
+  else the Telegram name; the task list is frozen in pending (`tasks`).
+- Third readiness text: `closed_template` (`DEFAULT_READINESS_CLOSED`,
+  fields `READINESS_CLOSED_FIELDS`), kind `done` in `READINESS_TEXTS`,
+  rendered by `readiness.closed_text` in `announce_closed`.
+- Reminder sends treat any Forbidden/BadRequest as final (marked reminded). Preview:
+  `rdy:tplprev:<service>:intro|rem`. `launch_run` records all intro chunk
+  ids and deletes them all if the poll fails.
+- `service_tasks.people_needed` (minimum 1–5, default 1) and `people_max`
+  (NULL = minimum, up to 6) — «👥 Нужно людей», set by service admins too
+  (`set_service_task_people_needed(actor, service, task, low, high)`) from
+  «🗳 Опрос готовности» or «📋 Задачи служения» (`rdy:people|ppick|pset`).
+- Planner: `PlanInput.extra` (optional seats above the minimum) and
+  `reluctant` (non-respondents: free on all dates, `RELUCTANT_WEIGHT` per
+  service). Per date two passes: required seats for everyone, then optional
+  seats for remaining respondents only; improvement never puts a reluctant
+  person beyond `needed`. `summarize` adds non-respondents (incl. no
+  Telegram) as reluctant; `progress_text` lists respondents with dates and
+  the plan per Sunday and task («*» = non-respondent).
+- Launch reserves the run row before sending (`attach_readiness_poll`
+  after), deletes it on failure. Closing notice is tracked by
+  `closed_announced` and retried; the admin result is fitted into one
+  message (`fit_one_screen`). `settle_parked_run` re-reads under the lock,
+  restores over a skipped marker, keeps the result decision; skip is
+  refused while a run is parked. «➕ В состав» buttons carry a pending
+  token; `bind_service_member(from_readiness=True)` refuses names bound to
+  another Telegram in `service_members` or `responsible_contacts`.
 
 ### Rich text, mentions, and message length
 
