@@ -311,6 +311,33 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   applied. Keep it deterministic (sorted iteration). A dense month (5 dates
   × 30 seats, 30 people) takes ~0.1 s on the Pi; still call it via
   `asyncio.to_thread` from handlers/jobs.
+- `bot/readiness.py` (step 2): one Telegram poll per service and month
+  (Sundays of the next month + `CANT_OPTION`, multiple answers). Tables
+  `readiness_settings` (enabled off by default, start/deadline time,
+  duration 1–6, remind 0–5 < duration), `readiness_runs` (UNIQUE service +
+  month; open/closed/skipped; poll/chat/message ids; UTC deadline),
+  `readiness_answers` (dates JSON; [] = «Не смогу»; retract deletes),
+  `readiness_notices` (one-off preview/reminder/launch_failed claims).
+  `run_readiness_tick` (job `readiness`, every minute): preview a day before
+  `launch_date` (last Sunday − 6 days), auto-launch, personal reminder,
+  close at deadline (stop_poll + admins get `progress_text`). Launch/close
+  per service run under `service_lock`. People = `readiness_people`
+  (members ∪ responsible_contacts, enabled tasks only). Poll answers are
+  routed in `on_replacement_poll_answer`: a readiness poll_id goes to
+  `record_readiness_answer` via `answer_dates`. UI: card → «🗳 Опрос
+  готовности» (`rdy:<action>:<service>[:arg]`, service admins), stateless
+  callbacks checked by `is_service_admin`. Lifecycle callbacks (start, skip,
+  unskip, progress, extend, finish) carry the month `YYYYMM` and are
+  rejected as stale after the month changes; skip/unskip/extend run under
+  `service_lock`; extend refuses an expired deadline.
+- Reliability: auto-launch claims `launch` once (no per-minute retries);
+  "missed" alert only if `enabled_at` ≤ scheduled start and no `launch`
+  claim, checked for the current and target months. Closing sets
+  `poll_stopped` / `result_sent` after success; `list_unfinished_readiness_runs`
+  retries them each tick for up to a day. Reminders are marked per person in
+  `readiness_reminders` after delivery (Forbidden/BadRequest count as done).
+  `readiness_people` keys people by Telegram ID (`key` is unique even for
+  equal names; planner uses `key`).
 - `service_tasks.people_needed` (1–5, default 1, migrated with ALTER) is set
   by the super admin in «📋 Задачи служения» → «👥 Нужно людей»
   (`svc_tasks:people|ppick|pset`), `set_service_task_people_needed`.
