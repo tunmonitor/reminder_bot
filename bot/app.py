@@ -71,10 +71,12 @@ if __package__:
     )
     from .ui import send_telegram_screen, visible_units
     from .secure_fs import open_private_directory
+    from .month_summary import send_due_month_summaries
     from .scheduler import (
         add_service_reminder_jobs,
         build_scheduler,
-        next_reminder_occurrence,
+        in_reminder_period,
+        reminder_occurrence,
         next_sunday_date,
         refresh_user_reminder_jobs as refresh_user_reminder_schedule_jobs,
         scheduled_reminder_date,
@@ -131,10 +133,12 @@ else:  # pragma: no cover - поддержка запуска файла нап�
     )
     from bot.ui import send_telegram_screen, visible_units
     from bot.secure_fs import open_private_directory
+    from bot.month_summary import send_due_month_summaries
     from bot.scheduler import (
         add_service_reminder_jobs,
         build_scheduler,
-        next_reminder_occurrence,
+        in_reminder_period,
+        reminder_occurrence,
         next_sunday_date,
         refresh_user_reminder_jobs as refresh_user_reminder_schedule_jobs,
         scheduled_reminder_date,
@@ -670,13 +674,15 @@ async def _load_upcoming_service_events(
     weeks: int = 6,
     services=None,
     until: date | None = None,
+    since: date | None = None,
 ) -> list:
-    """Read schedule events from today through the given number of weeks
-    (or through until, if it is later)."""
+    """Read schedule events from today (or since, if it is earlier) through
+    the given number of weeks (or through until, if it is later)."""
     today = datetime.now(tz).date()
+    first_day = min(since or today, today)
     last_day = max(today + timedelta(days=weeks * 7), until or today)
     months = []
-    month = today.replace(day=1)
+    month = first_day.replace(day=1)
     while month <= last_day:
         months.append(month)
         month = (month + timedelta(days=32)).replace(day=1)
@@ -722,7 +728,7 @@ async def _load_upcoming_service_events(
                 event
                 for service_events in events_by_service.values()
                 for event in service_events
-                if today <= event.event_date <= last_day
+                if first_day <= event.event_date <= last_day
             )
         return sorted(events, key=lambda event: (event.event_date, event.service_id))
     finally:
@@ -785,11 +791,10 @@ async def get_group_reminder_preview(
     if service is None:
         raise ValueError("Служение для напоминания не найдено.")
 
-    event_date, send_date = next_reminder_occurrence(
-        datetime.now(tz),
-        reminder["reminder_days"],
-        reminder["reminder_time"],
-    )
+    occurrence = reminder_occurrence(datetime.now(tz), reminder)
+    if occurrence is None:
+        raise ValueError("Период напоминания завершён.")
+    event_date, send_date = occurrence
     date_text = event_date.strftime("%d.%m.%Y")
     result = {
         "date": date_text,
@@ -945,6 +950,12 @@ async def _process_service_reminder(
     event_date = (run_date or datetime.now(tz).date()) + timedelta(
         days=reminder["reminder_days"]
     )
+    if not in_reminder_period(event_date, reminder):
+        interaction_logger.info(
+            "Уведомление %s служения %s пропущено: %s вне периода",
+            reminder_id, service_id, event_date,
+        )
+        return
     schedule_issues: list[str] = []
     raw_assignments: dict = {}
     try:
@@ -1781,24 +1792,31 @@ async def _run_locked(args: CliArgs) -> None:
         context.load_service_task_assignments = load_service_task_assignments
 
         upcoming_cache: dict[str, Any] = {
-            "loaded_at": None, "events": [], "until": None,
+            "loaded_at": None, "events": [], "until": None, "since": None,
         }
         upcoming_lock = asyncio.Lock()
 
         async def load_upcoming_service_events(
-            force: bool = False, until: date | None = None
+            force: bool = False, until: date | None = None,
+            since: date | None = None,
         ) -> list:
             # Один общий скачанный график на несколько минут для всех
             # пользователей: повторные нажатия не обращаются к Яндекс.Диску.
             # force — «🔄 Сверить график»: скачать заново. В кэше — график до
             # конца следующего месяца (для «🔁 Замена»); по умолчанию
-            # возвращаются ближайшие 6 недель, until — до этой даты.
+            # возвращаются ближайшие 6 недель, until — до этой даты, since —
+            # с этой даты (по умолчанию с сегодня; кэш — с начала месяца).
             today = datetime.now(tz).date()
             limit = until or today + timedelta(days=UPCOMING_WEEKS_DEFAULT * 7)
+            start = min(since or today, today)
+            month_start = today.replace(day=1)
 
             def window(events: list) -> list:
                 return _apply_event_replacements(
-                    [event for event in events if event.event_date <= limit],
+                    [
+                        event for event in events
+                        if start <= event.event_date <= limit
+                    ],
                     service_registry,
                 )
 
@@ -1812,6 +1830,8 @@ async def _run_locked(args: CliArgs) -> None:
                     # После смены месяца кэш может не покрывать окно.
                     and upcoming_cache["until"] is not None
                     and upcoming_cache["until"] >= limit
+                    and upcoming_cache.get("since") is not None
+                    and upcoming_cache["since"] <= start
                 ):
                     # Замены — из базы при каждом чтении: кэш хранит график.
                     return window(upcoming_cache["events"])
@@ -1828,10 +1848,12 @@ async def _run_locked(args: CliArgs) -> None:
                         if service_registry is not None else None
                     ),
                     until=max(end_of_next_month, limit),
+                    since=min(month_start, start),
                 )
                 upcoming_cache.update(
                     loaded_at=time.monotonic(), events=events,
                     until=max(end_of_next_month, limit),
+                    since=min(month_start, start),
                 )
                 return window(events)
 
@@ -1959,6 +1981,15 @@ async def _run_locked(args: CliArgs) -> None:
             async def refresh_service_reminders() -> None:
                 if service_registry is None or scheduler is None:
                     return
+                # Напоминания с завершённым периодом выключаются (этап 4.2).
+                expired = service_registry.disable_expired_group_reminders(
+                    datetime.now(tz).date()
+                )
+                if expired:
+                    interaction_logger.info(
+                        "Период напоминаний завершён, выключены: %s",
+                        ", ".join(map(str, expired)),
+                    )
                 await add_service_reminder_jobs(
                     scheduler,
                     service_registry.list_services(),
@@ -2132,6 +2163,90 @@ async def _run_locked(args: CliArgs) -> None:
             )
         if service_registry is not None:
             await refresh_service_reminders()
+            # Ночью выключаются напоминания с завершённым периодом (этап 4.2).
+            scheduler.add_job(
+                refresh_service_reminders,
+                "cron",
+                hour=0,
+                minute=5,
+                id="reminder-period-expiry",
+                replace_existing=True,
+                misfire_grace_time=None,
+                coalesce=True,
+            )
+
+            month_summary_pause: dict[str, datetime] = {}
+            # Пока сводка ждёт публикации графика, график перечитывается
+            # не чаще раза в 30 минут; проверка сроков — каждую минуту.
+            waiting_events: dict[str, Any] = {}
+
+            async def month_summary_events(
+                *, fresh: bool = False, **kwargs
+            ) -> list:
+                now = datetime.now(tz)
+                # fresh — крайний срок сводки: скачать график заново, но не
+                # чаще раза в 10 минут (если отправка срывается и повторяется).
+                forced_at = waiting_events.get("forced_at")
+                fresh = fresh and (
+                    forced_at is None or now - forced_at >= timedelta(minutes=10)
+                )
+                if (
+                    not fresh
+                    and waiting_events.get("kwargs") == kwargs
+                    and now - waiting_events["at"] < timedelta(minutes=30)
+                ):
+                    return waiting_events["events"]
+                events = await context.load_upcoming_service_events(
+                    force=fresh, **kwargs
+                )
+                if fresh:
+                    waiting_events["forced_at"] = now
+                waiting_events.update(kwargs=kwargs, at=now, events=events)
+                return events
+
+            async def month_summary_tick() -> None:
+                """Сводка на месяц (этап 4.1): раз в минуту — кому пора.
+
+                После сбоя загрузки графика — пауза 10 минут."""
+                now = datetime.now(tz)
+                resume_at = month_summary_pause.get("until")
+                if resume_at is not None and now < resume_at:
+                    return
+                month_summary_pause.clear()
+                try:
+                    run = await send_due_month_summaries(
+                        bot, service_registry, month_summary_events, now,
+                        debug_logger,
+                    )
+                except Exception as exc:
+                    waiting_events.clear()
+                    month_summary_pause["until"] = now + timedelta(minutes=10)
+                    debug_logger.warning(
+                        "Сводка на месяц отложена на 10 минут: %s: %s",
+                        type(exc).__name__, exc,
+                    )
+                    return
+                if not run.waiting:
+                    # Никто не ждёт — следующий раз график читается свежим.
+                    forced_at = waiting_events.get("forced_at")
+                    waiting_events.clear()
+                    if forced_at is not None:
+                        waiting_events["forced_at"] = forced_at
+                if run.sent:
+                    interaction_logger.info(
+                        "Сводок на месяц отправлено: %s", run.sent
+                    )
+
+            scheduler.add_job(
+                month_summary_tick,
+                "cron",
+                minute="*",
+                id="month-summary",
+                replace_existing=True,
+                misfire_grace_time=None,
+                coalesce=True,
+                max_instances=1,
+            )
             await refresh_user_reminder_jobs()
             # Открытые опросы замены переживают перезапуск бота.
             _reschedule_open_polls(

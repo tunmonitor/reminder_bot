@@ -1382,7 +1382,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 answer=AsyncMock(),
             )
             with patch(
-                "bot.handlers.next_reminder_occurrence",
+                "bot.handlers.reminder_occurrence",
                 return_value=(date(2026, 10, 25), date(2026, 10, 24)),
             ):
                 await self.callback_handler("on_group_reminder_action")(
@@ -2273,6 +2273,50 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIsNone(self.registry.get_group_reminder(other_id))
             self.assertIn(
                 "Первый текст", merged.message.answer.await_args.args[0]
+            )
+
+        asyncio.run(run())
+
+    def test_slot_with_other_period_is_not_merged(self):
+        async def run():
+            self._preview_with_data()
+            existing_id = self.registry.list_group_reminders("sound")[0]["id"]
+            self.registry.set_group_reminder_period(
+                67890, existing_id, date(2099, 1, 4), None,
+                today=date(2026, 10, 20),
+            )
+            other_id = self.registry.add_group_reminder(
+                67890, "sound", 2, "18:00", "Второй текст"
+            )
+            menu = await self._open_sound_reminders()
+            card = await self._click(
+                menu.message,
+                lambda button: button.callback_data.startswith(
+                    f"group_reminder:open:sound:{other_id}:"
+                ),
+            )
+            await self._click(
+                card.message, lambda button: button.text == "📅 Срок"
+            )
+            offer = await self._type("1")
+            self.assertIn(
+                "разными периодами не объединяются",
+                offer.answer.await_args.args[0],
+            )
+            labels = [
+                button.text
+                for row in offer.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+            ]
+            self.assertFalse(any("Объединить" in label for label in labels))
+            self.assertEqual(
+                self.registry.get_group_reminder(other_id)["reminder_days"], 2
+            )
+            await self._click(offer, lambda button: button.text == "➕ Отдельно")
+            self.assertEqual(
+                self.registry.get_group_reminder(other_id)["reminder_days"], 1
             )
 
         asyncio.run(run())
@@ -4688,7 +4732,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
             self.assertEqual(
                 self.callback_data_list(message),
-                ["menu:my_schedule", "menu:my_notifications"],
+                ["menu:my_schedule", "menu:my_month", "menu:my_notifications"],
             )
             text = message.answer.await_args.args[0]
             self.assertIn("Личные напоминания выключены: ЗВУК", text)
@@ -5421,7 +5465,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertNotIn("Пульт", text)
             self.assertEqual(
                 self.callback_data_list(message),
-                ["menu:my_notifications", "menu:start"],
+                ["menu:my_month", "menu:my_notifications", "menu:start"],
             )
 
         asyncio.run(run())
