@@ -80,20 +80,16 @@ async def last_served(
     py, pm = previous_month(year, month)
     previous = registry.get_schedule_plan(service_id, month_key(py, pm))
     if previous is not None and previous["approved"] is not None:
-        # Фактический день служения: разовый на дату, иначе свой день
-        # человека, иначе воскресенье графика.
-        by_key = {person["key"]: person for person in people}
-        approved_days = previous.get("approved_days") or {}
+        # Фактический день служения — как был при публикации (разовый или
+        # свой день), иначе воскресенье графика.
+        served = previous.get("served_offsets") or {}
         result = {}
         for person, days in served_dates(previous["approved"]).items():
-            actual = []
-            for day in days:
-                offset = approved_days.get(day, {}).get(person)
-                if offset is None:
-                    offset = (by_key.get(person) or {}).get("day_offset") or 0
-                actual.append(date.fromisoformat(day) + timedelta(days=offset))
-            # Сдвиг последнего воскресенья не уводит дату в новый месяц.
-            result[person] = min(max(actual), month_end(py, pm)).isoformat()
+            result[person] = max(
+                date.fromisoformat(day)
+                + timedelta(days=served.get(day, {}).get(person) or 0)
+                for day in days
+            ).isoformat()
         return result, None
     if events_loader is None:
         return {}, "прошлый месяц не учтён — график не загружен"
@@ -290,6 +286,20 @@ def day_offset(plan: dict | None, person: dict | None, day: str) -> int | None:
     if override is not None:
         return override
     return (person or {}).get("day_offset")
+
+
+def served_offsets(plan: dict, people: list[dict]) -> dict:
+    """Фактический сдвиг дня служения каждого поставленного (разовый или
+    свой день) — снимок при публикации."""
+    by_key = {person["key"]: person for person in people}
+    result: dict = {}
+    for day, tasks in plan["slots"].items():
+        for keys in tasks.values():
+            for key in keys:
+                offset = day_offset(plan, by_key.get(key), day)
+                if offset:
+                    result.setdefault(day, {})[key] = offset
+    return result
 
 
 def person_day(person: dict | None, day: str, plan: dict | None = None) -> str:
@@ -710,6 +720,7 @@ async def publish(
                 actor_id, service["id"], plan["month"], plan["slots"],
                 chat_id=chat_id, message_id=sent[0] if sent else None,
                 updated_at=plan["updated_at"], days=plan.get("days", {}),
+                served_offsets=served_offsets(plan, people),
             )
         except Exception as exc:  # noqa: BLE001
             if attempt:

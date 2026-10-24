@@ -329,6 +329,10 @@ class ServiceRegistry:
                     -- approved_days_json — как опубликовано.
                     days_json TEXT NOT NULL DEFAULT '{}',
                     approved_days_json TEXT,
+                    -- Фактический день служения каждого в опубликованном
+                    -- графике (дата → ключ → сдвиг): для интервалов следующего
+                    -- месяца, даже если свой день потом изменят.
+                    served_offsets_json TEXT,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (service_id, month)
                 );
@@ -789,6 +793,7 @@ class ServiceRegistry:
                 ("schedule_plans", "republish", "INTEGER NOT NULL DEFAULT 0"),
                 ("schedule_plans", "days_json", "TEXT NOT NULL DEFAULT '{}'"),
                 ("schedule_plans", "approved_days_json", "TEXT"),
+                ("schedule_plans", "served_offsets_json", "TEXT"),
                 ("service_members", "tasks_manual",
                  "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "poll_stopped", "INTEGER NOT NULL DEFAULT 0"),
@@ -5314,6 +5319,8 @@ class ServiceRegistry:
         approved = plan.pop("approved_json")
         plan["approved"] = json.loads(approved) if approved else None
         plan["days"] = json.loads(plan.pop("days_json") or "{}")
+        served = plan.pop("served_offsets_json", None)
+        plan["served_offsets"] = json.loads(served) if served else {}
         approved_days = plan.pop("approved_days_json")
         plan["approved_days"] = (
             json.loads(approved_days) if approved_days else {}
@@ -5512,6 +5519,7 @@ class ServiceRegistry:
         message_id: int | None,
         updated_at: str | None = None,
         days: dict | None = None,
+        served_offsets: dict | None = None,
     ) -> dict:
         """«✅ Утвердить»: опубликованная копия = slots. updated_at —
         версия опубликованного графика: если дни служения сменились, пока
@@ -5522,7 +5530,7 @@ class ServiceRegistry:
             cursor = connection.execute(
                 "UPDATE schedule_plans SET approved_json = ?, approved_by = ?, "
                 "approved_at = ?, chat_id = ?, message_id = ?, "
-                "approved_days_json = ?, "
+                "approved_days_json = ?, served_offsets_json = ?, "
                 "republish = CASE WHEN ? IS NULL OR updated_at = ? THEN 0 "
                 "ELSE republish END "
                 "WHERE service_id = ? AND month = ?",
@@ -5530,6 +5538,7 @@ class ServiceRegistry:
                     json.dumps(slots, ensure_ascii=False), actor_id,
                     _utc_now(), chat_id, message_id,
                     json.dumps(days or {}, ensure_ascii=False),
+                    json.dumps(served_offsets or {}, ensure_ascii=False),
                     updated_at, updated_at, service_id, month,
                 ),
             )

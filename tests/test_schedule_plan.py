@@ -125,7 +125,10 @@ class SchedulePlanTest(unittest.TestCase):
         self.registry.approve_schedule_plan(
             1001, "sound", "2026-10", plan["slots"], chat_id=None,
             message_id=None, days=plan["days"],
+            served_offsets=schedule_plan.served_offsets(plan, self.people()),
         )
+        # Личный день меняют потом — прошлое служение остаётся в пятницу.
+        self.registry.set_service_member_day(1001, "sound", "Борис", -5)
         served, _ = asyncio.run(schedule_plan.last_served(
             self.registry, "sound", 2026, 11, self.people(), loader, LOG,
         ))
