@@ -3432,7 +3432,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_service_sync_requires_super_admin_before_showing_services(self):
+    def test_service_sync_requires_service_admin_before_showing_services(self):
         async def run():
             command = self.message(12345, "/service_sync")
             handler = next(
@@ -3444,7 +3444,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             await handler(command)
 
             self.assertIn(
-                "только супер-администратору",
+                "нет прав администратора",
                 command.answer.await_args.args[0].lower(),
             )
             self.assertIsNone(
@@ -4966,9 +4966,12 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
             text = message.answer.await_args.args[0]
             self.assertIn("администратор служений: ЗВУК", text)
+            # Всё по служению, кроме назначения админов.
             self.assertEqual(
                 self.callback_data_list(message),
-                ["menu:service_settings", "menu:service_notify"],
+                ["menu:service_settings", "menu:service_notify",
+                 "menu:service_contact", "menu:service_sync",
+                 "menu:service_chat"],
             )
 
         asyncio.run(run())
@@ -5058,7 +5061,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 for item in self.context.bot.set_my_commands.await_args.args[0]
             ]
             self.assertIn("service_notify", commands)
-            self.assertNotIn("service_contact", commands)
+            self.assertIn("service_contact", commands)
+            self.assertNotIn("service_admin_add", commands)
             self.assertEqual(
                 self.context.bot.set_my_commands.await_args.kwargs[
                     "scope"
@@ -5965,6 +5969,13 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIn(
                 "Экран устарел", stale.message.answer.await_args.args[0]
             )
+            texts = await press("rdy:texts:sound")
+            self.assertIn("📝 Тексты опроса", texts.message.answer.await_args.args[0])
+            self.assertIn("❓ Вопрос опроса", texts.message.answer.await_args.args[0])
+            question = await press("rdy:tplprev:sound:q")
+            self.assertIn(
+                "Когда можешь служить в", question.message.answer.await_args.args[0]
+            )
             text_screen = await press("rdy:tpl:sound:intro")
             self.assertIn(
                 "Используется встроенный текст",
@@ -6505,7 +6516,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run_test())
 
-    def test_service_admin_cannot_open_service_tasks(self):
+    def test_service_admin_opens_own_service_tasks_only(self):
         async def run():
             self.registry.add_service_admin(67890, "sound", 24680)
             callback = SimpleNamespace(
@@ -6515,9 +6526,18 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 answer=AsyncMock(),
             )
             await self.callback_handler("on_service_tasks")(callback)
-
-            self.assertIn("Недостаточно прав", callback.answer.await_args.args[0])
-            callback.message.answer.assert_not_awaited()
+            self.assertIn(
+                "задачи", callback.message.answer.await_args.args[0]
+            )
+            other = SimpleNamespace(
+                data="svc_tasks:open:kitchen",
+                from_user=SimpleNamespace(id=24680),
+                message=self.message(24680, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_tasks")(other)
+            self.assertIn("Недостаточно прав", other.answer.await_args.args[0])
+            other.message.answer.assert_not_awaited()
 
         asyncio.run(run())
 
@@ -6532,14 +6552,88 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             await self.callback_handler("on_service_selected")(callback)
 
+            # Всё по служению, кроме назначения и снятия админов.
             self.assertEqual(
                 self.callback_data_list(callback.message),
-                ["service:edit_notify:sound", "service:service_replace:sound",
-                 "rdy:open:sound", "service:back_to_services:list"],
+                ["service:edit_notify:sound", "service:service_contact:sound",
+                 "service:service_replace:sound", "service:service_sync:sound",
+                 "service:service_chat:sound", "rdy:open:sound",
+                 "svc_tasks:open:sound", "service:back_to_services:list"],
             )
             self.assertIn(
                 "👤 Администраторы · 1",
                 callback.message.answer.await_args.args[0],
+            )
+
+        asyncio.run(run())
+
+    def test_service_admin_manages_own_service_but_not_admins(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 24680)
+
+            async def press(data):
+                callback = SimpleNamespace(
+                    data=data,
+                    from_user=SimpleNamespace(id=24680),
+                    message=self.message(24680, ""),
+                    answer=AsyncMock(),
+                )
+                await self.callback_handler("on_service_selected")(callback)
+                return callback
+
+            chat = await press("service:service_chat:sound")
+            self.assertIn(
+                "выберите действие", chat.message.answer.await_args.args[0]
+            )
+            contact = await press("service:service_contact:sound")
+            self.assertTrue(contact.message.answer.await_args_list)
+            self.assertNotIn(
+                "Недостаточно", str(contact.message.answer.await_args_list)
+            )
+            admins = await press("service:service_admin_add:sound")
+            self.assertIn(
+                "только супер-администратор",
+                admins.message.answer.await_args.args[0],
+            )
+
+        asyncio.run(run())
+
+    def test_manual_chat_id_requires_membership_for_service_admin(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 24680)
+            self.context.bot.get_chat = AsyncMock(
+                return_value=SimpleNamespace(type="channel")
+            )
+            self.context.bot.get_chat_member = AsyncMock(
+                return_value=SimpleNamespace(status="member")
+            )
+            self.context.bot.get_chat.side_effect = asyncio.TimeoutError()
+            slow = self.message(24680, "/service_chat sound -100555 on")
+            await self.message_handler("on_service_chat")(slow)
+            self.assertIn("Не удалось проверить", slow.answer.await_args.args[0])
+            self.context.bot.get_chat.side_effect = None
+            channel = self.message(24680, "/service_chat sound -100555 on")
+            await self.message_handler("on_service_chat")(channel)
+            self.assertIn("не группа", channel.answer.await_args.args[0])
+            self.context.bot.get_chat.return_value = SimpleNamespace(
+                type="supergroup"
+            )
+            self.context.bot.get_chat_member.return_value = SimpleNamespace(
+                status="left"
+            )
+            command = self.message(24680, "/service_chat sound -100555 on")
+            await self.message_handler("on_service_chat")(command)
+            self.assertIn("не состоите", command.answer.await_args.args[0])
+            self.assertNotEqual(
+                self.registry.get_service("sound")["group_chat_id"], -100555
+            )
+            self.context.bot.get_chat_member.return_value = SimpleNamespace(
+                status="member"
+            )
+            command = self.message(24680, "/service_chat sound -100555 on")
+            await self.message_handler("on_service_chat")(command)
+            self.assertEqual(
+                self.registry.get_service("sound")["group_chat_id"], -100555
             )
 
         asyncio.run(run())

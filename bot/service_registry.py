@@ -74,6 +74,9 @@ DEFAULT_READINESS_INTRO = (
     "👥 {people}"
 )
 READINESS_CLOSED_FIELDS = frozenset({"service_name", "month"})
+# Вопрос Telegram-опроса над вариантами (до 300 символов).
+READINESS_QUESTION_FIELDS = frozenset({"service_name", "month", "month_in"})
+DEFAULT_READINESS_QUESTION = "Когда можешь служить в {month_in}?"
 DEFAULT_READINESS_CLOSED = (
     "🗳 Опрос «График {service_name} на {month}» завершён. Спасибо всем, "
     "кто ответил! ❤️ График появится вскоре."
@@ -264,6 +267,7 @@ class ServiceRegistry:
                     reminder_template TEXT,
                     closed_template TEXT,
                     chat_reminder_template TEXT,
+                    question_template TEXT,
                     -- «Нужно людей» служения без задач (оно — одна задача).
                     people_needed INTEGER NOT NULL DEFAULT 1,
                     people_max INTEGER,
@@ -784,6 +788,7 @@ class ServiceRegistry:
                 ("readiness_settings", "reminder_template", "TEXT"),
                 ("readiness_settings", "closed_template", "TEXT"),
                 ("readiness_settings", "chat_reminder_template", "TEXT"),
+                ("readiness_settings", "question_template", "TEXT"),
                 ("readiness_settings", "people_needed",
                  "INTEGER NOT NULL DEFAULT 1"),
                 ("readiness_settings", "people_max", "INTEGER"),
@@ -1544,7 +1549,7 @@ class ServiceRegistry:
         if not isinstance(enabled, bool):
             raise ValueError("enabled должен быть логическим значением")
         with self._connection() as connection:
-            self._require_super_admin(connection, actor_id)
+            self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
             cursor = connection.execute(
                 "UPDATE service_tasks SET enabled = ? "
@@ -1605,7 +1610,7 @@ class ServiceRegistry:
         if not name or len(name) > 60 or "\x00" in name:
             raise ValueError("Название задачи: от 1 до 60 символов.")
         with self._connection() as connection:
-            self._require_super_admin(connection, actor_id)
+            self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
             existing = connection.execute(
                 "SELECT name, aliases_json, position FROM service_tasks "
@@ -1727,8 +1732,36 @@ class ServiceRegistry:
         if group_chat_id == 0:
             raise ValueError("ID группового чата не может быть равен нулю")
         with self._connection() as connection:
-            self._require_super_admin(connection, actor_id)
+            self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
+            is_super_admin = connection.execute(
+                "SELECT 1 FROM super_admins WHERE telegram_id = ?",
+                (actor_id,),
+            ).fetchone() is not None
+            if not is_super_admin:
+                # Админ служения — только группа и не чужая: иначе он слал
+                # бы напоминания в чат другого служения или личный чат.
+                if group_chat_id > 0:
+                    raise ValueError(
+                        "Укажите групповой чат (ID группы отрицательный)."
+                    )
+                current = connection.execute(
+                    "SELECT group_chat_id FROM services WHERE id = ?",
+                    (service_id,),
+                ).fetchone()
+                own_chat = current is not None and (
+                    current["group_chat_id"] == group_chat_id
+                )
+                if not own_chat and connection.execute(
+                    "SELECT 1 FROM services WHERE group_chat_id = ? "
+                    "AND id != ?",
+                    (group_chat_id, service_id),
+                ).fetchone() is not None:
+                    raise PermissionError(
+                        "Этот чат уже привязан к другому служению — "
+                        "общий чат для нескольких служений настраивает "
+                        "супер-администратор."
+                    )
             # Новый чат — тема прежнего чата к нему не относится.
             connection.execute(
                 "UPDATE services SET group_thread_id = CASE "
@@ -1793,7 +1826,7 @@ class ServiceRegistry:
         if not isinstance(enabled, bool):
             raise ValueError("enabled должен быть логическим значением")
         with self._connection() as connection:
-            self._require_super_admin(connection, actor_id)
+            self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
             connection.execute(
                 "UPDATE services SET enabled = ? WHERE id = ?",
@@ -3396,7 +3429,7 @@ class ServiceRegistry:
         if not task or not name:
             raise ValueError("Название задачи и имя ответственного обязательны")
         with self._connection() as connection:
-            self._require_super_admin(connection, actor_id)
+            self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
             other_tasks = [
                 row["task"]
@@ -3600,8 +3633,8 @@ class ServiceRegistry:
     ) -> None:
         """Привязывает Telegram к человеку служения во всех его задачах.
 
-        from_readiness — «➕ В состав» из опроса готовности: доступно и
-        админу служения; имя, уже занятое другим Telegram ID, не
+        from_readiness — «➕ В состав» из опроса готовности и «➕ Другой
+        человек из Telegram»: имя, уже занятое другим Telegram ID, не
         перезаписывается.
 
         Задачи — из «Списков», из прежних привязок этого имени и tasks
@@ -3616,10 +3649,9 @@ class ServiceRegistry:
             raise ValueError("Имя участника обязательно.")
         username = username.strip().lstrip("@")
         with self._connection() as connection:
-            if from_readiness:
-                self._require_service_editor(connection, actor_id, service_id)
-            else:
-                self._require_super_admin(connection, actor_id)
+            # Админ служения — как и супер-администратор (кроме назначения
+            # админов, всё по своему служению).
+            self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
             member = connection.execute(
                 "SELECT tasks_json, telegram_id, tasks_manual "
@@ -4849,7 +4881,7 @@ class ServiceRegistry:
     ) -> list[dict]:
         _validate_positive_id(actor_id, "actor_id")
         with self._connection() as connection:
-            self._require_super_admin(connection, actor_id)
+            self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
             rows = connection.execute(
                 "SELECT task, name, telegram_id, username "
@@ -4904,6 +4936,7 @@ class ServiceRegistry:
         "reminder_template": None,
         "closed_template": None,
         "chat_reminder_template": None,
+        "question_template": None,
         "people_needed": 1,
         "people_max": None,
         "day_from": 0,
@@ -4915,8 +4948,8 @@ class ServiceRegistry:
             row = connection.execute(
                 "SELECT enabled, start_time, duration_days, deadline_time, "
                 "remind_days, enabled_at, intro_template, reminder_template, "
-                "closed_template, chat_reminder_template, people_needed, "
-                "people_max, day_from, day_to "
+                "closed_template, chat_reminder_template, question_template, "
+                "people_needed, people_max, day_from, day_to "
                 "FROM readiness_settings WHERE service_id = ?",
                 (service_id,),
             ).fetchone()
@@ -4974,14 +5007,17 @@ class ServiceRegistry:
             ("closed_template", READINESS_CLOSED_FIELDS, "Текст завершения"),
             ("chat_reminder_template", READINESS_REMINDER_FIELDS,
              "Напоминание в чат"),
+            ("question_template", READINESS_QUESTION_FIELDS,
+             "Вопрос опроса"),
         ):
             value = new[key]
             if value is None:
                 continue
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{label} не может быть пустым.")
-            if len(value) > 1500:
-                raise ValueError(f"{label}: не больше 1500 символов.")
+            limit = 300 if key == "question_template" else 1500
+            if len(value) > limit:
+                raise ValueError(f"{label}: не больше {limit} символов.")
             validate_notification_template(value, fields, label)
         with self._connection() as connection:
             self._require_service_editor(connection, actor_id, service_id)
@@ -4995,9 +5031,9 @@ class ServiceRegistry:
                 "INSERT INTO readiness_settings (service_id, enabled, "
                 "start_time, duration_days, deadline_time, remind_days, "
                 "enabled_at, intro_template, reminder_template, "
-                "closed_template, chat_reminder_template, people_needed, "
-                "people_max, day_from, day_to, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "closed_template, chat_reminder_template, question_template, "
+                "people_needed, people_max, day_from, day_to, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id) DO UPDATE SET "
                 "enabled = excluded.enabled, start_time = excluded.start_time, "
                 "duration_days = excluded.duration_days, "
@@ -5008,6 +5044,7 @@ class ServiceRegistry:
                 "reminder_template = excluded.reminder_template, "
                 "closed_template = excluded.closed_template, "
                 "chat_reminder_template = excluded.chat_reminder_template, "
+                "question_template = excluded.question_template, "
                 "people_needed = excluded.people_needed, "
                 "people_max = excluded.people_max, "
                 "day_from = excluded.day_from, day_to = excluded.day_to, "
@@ -5018,6 +5055,7 @@ class ServiceRegistry:
                     new["remind_days"], new["enabled_at"],
                     new["intro_template"], new["reminder_template"],
                     new["closed_template"], new["chat_reminder_template"],
+                    new["question_template"],
                     new["people_needed"], new["people_max"],
                     new["day_from"], new["day_to"], now,
                 ),
@@ -5125,12 +5163,16 @@ class ServiceRegistry:
             key = person["name"]
             if names.count(key) > 1:
                 key = f"{key} · {person['telegram_id'] or 'без Telegram'}"
+            active = person.pop("active", True)
             if implicit:
-                tasks = {implicit} if person.get("active", True) else set()
+                tasks = {implicit} if active else set()
             else:
                 tasks = person["tasks"]
-            person.pop("active", None)
-            result.append({**person, "key": key, "tasks": sorted(tasks)})
+            # in_roster — в «Списках» или добавлен в боте (выбывший — нет).
+            result.append({
+                **person, "key": key, "tasks": sorted(tasks),
+                "in_roster": active,
+            })
         return result
 
     def get_nav_hints(self, telegram_id: int) -> list[int]:

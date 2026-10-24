@@ -546,6 +546,7 @@ async def _load_service_task_assignments(
     issues: list[str] | None = None,
     registry: ServiceRegistry | None = None,
     raw_out: dict | None = None,
+    own_roster_only: bool = False,
 ) -> dict[str, dict[str, object]] | tuple[dict[str, dict[str, object]], bool]:
     """Назначения служения из графика; issues пополняется предупреждениями.
 
@@ -613,7 +614,7 @@ async def _load_service_task_assignments(
             # Привязки и состав — по графику, без замен.
             _sync_rosters_and_contacts(
                 registry, xlsx_path, service_id, result, services,
-                debug_logger, issues,
+                debug_logger, issues, own_roster_only,
             )
             if only_date is not None:
                 # Замена на одну дату (этап 3.3) главнее графика. Без
@@ -643,13 +644,21 @@ def _sync_rosters_and_contacts(
     services,
     debug_logger,
     issues: list[str] | None,
+    own_roster_only: bool = False,
 ) -> None:
-    """Сбой «Списков» не мешает напоминаниям: он только записывается в лог."""
+    """Сбой «Списков» не мешает напоминаниям: он только записывается в лог.
+    own_roster_only — сверка из бота (её запускает админ служения):
+    обновляется состав только этого служения."""
     roster_issues: list[str] = []
     try:
         rosters = parse_service_rosters(
             xlsx_path, debug_logger, services, roster_issues
         )
+        if own_roster_only:
+            rosters = (
+                {service_id: rosters[service_id]}
+                if service_id in rosters else {}
+            )
         registry.sync_service_rosters(rosters)
     except Exception:
         debug_logger.exception("Не удалось обновить состав служений из «Списков»")
@@ -1830,6 +1839,9 @@ async def _run_locked(args: CliArgs) -> None:
                     if service_registry is not None else None
                 ),
                 registry=service_registry,
+                # Сверка из бота — только состав этого служения; плановые
+                # загрузки графика обновляют состав всех служений.
+                own_roster_only=True,
             )
 
         async def prepare_service_test_previews(
