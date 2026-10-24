@@ -37,13 +37,13 @@ from .schedule_planner import Plan, PlanInput, build_plan
 from .service_registry import (  # noqa: F401 — шаблоны для экранов
     DEFAULT_READINESS_CHAT_REMINDER,
     DEFAULT_READINESS_CLOSED,
+    DEFAULT_READINESS_QUESTION,
     DEFAULT_READINESS_INTRO,
     DEFAULT_READINESS_REMINDER,
 )
 from .ui import send_telegram_screen, user_link
 
 CANT_OPTION = "❌ Не смогу в этом месяце"
-POLL_QUESTION = "Когда можешь служить в {month}?"
 MONTHS_IN = (
     "январе", "феврале", "марте", "апреле", "мае", "июне",
     "июле", "августе", "сентябре", "октябре", "ноябре", "декабре",
@@ -365,6 +365,41 @@ def render_template(template: str, **values: str) -> str:
     ).strip()
 
 
+WEEKDAYS_PLURAL = (
+    "по понедельникам", "по вторникам", "по средам", "по четвергам",
+    "по пятницам", "по субботам", "по воскресеньям",
+)
+
+
+def option_label(day: str, window: tuple[int, int] = (0, 0)) -> str:
+    """Вариант опроса: дата воскресенья или окно дней служения
+    («сб 31.10–пн 02.11»)."""
+    sunday = date.fromisoformat(day)
+    start, end = window
+    if (start, end) == (0, 0):
+        return sunday.strftime("%d.%m")
+    weekdays = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
+
+    def short(moment: date) -> str:
+        return f"{weekdays[moment.weekday()]} {moment:%d.%m}"
+
+    return (
+        f"{short(sunday + timedelta(days=start))}–"
+        f"{short(sunday + timedelta(days=end))}"
+    )
+
+
+def own_days_note(people: list[dict]) -> str:
+    """Сноска к опросу: у кого свой день служения."""
+    own = [
+        f"{person['name']} — "
+        + WEEKDAYS_PLURAL[(6 + person["day_offset"]) % 7]
+        for person in people
+        if person["tasks"] and person.get("day_offset") is not None
+    ]
+    return ("📅 Свой день: " + "; ".join(own)) if own else ""
+
+
 def intro_text(service: dict, people: list[dict], year: int, month: int,
                deadline: datetime, tz, template: str | None = None) -> str:
     mentions = [
@@ -372,13 +407,28 @@ def intro_text(service: dict, people: list[dict], year: int, month: int,
         if person["telegram_id"] else person["name"]
         for person in people if person["tasks"]
     ]
-    return render_template(
+    text = render_template(
         template or DEFAULT_READINESS_INTRO,
         service_name=service["name"],
         month=month_title(year, month),
         deadline=local_text(deadline, tz),
         people=", ".join(mentions),
     )
+    # У кого свой день — сноской после текста (шаблон не нужно менять).
+    note = own_days_note(people)
+    return f"{text}\n\n{note}" if note else text
+
+
+def question_text(service: dict, year: int, month: int,
+                  template: str | None = None) -> str:
+    """Вопрос Telegram-опроса над вариантами (не длиннее 300 символов —
+    предел Telegram)."""
+    return render_template(
+        template or DEFAULT_READINESS_QUESTION,
+        service_name=service["name"],
+        month=month_title(year, month),
+        month_in=MONTHS_IN[month - 1],
+    )[:300]
 
 
 def closed_text(service: dict, run: dict, template: str | None = None) -> str:
@@ -428,6 +478,8 @@ async def launch_run(
     dates = [day.isoformat() for day in month_sundays(year, month)]
     people = registry.readiness_people(service["id"])
     settings = registry.get_readiness_settings(service["id"])
+    # Варианты опроса — по окну дней служения («сб 31.10–пн 02.11»).
+    window = (settings["day_from"], settings["day_to"])
     # Запись — до отправки: месяц занят (перезапуск, прерванный между
     # отправкой и записью, не вернёт старый опрос поверх нового).
     run = registry.create_readiness_run(
@@ -465,10 +517,12 @@ async def launch_run(
         sending_poll = True
         poll_message = await send_to_service_group(
             bot.send_poll, chat_id,
-            POLL_QUESTION.format(month=MONTHS_IN[month - 1]),
+            question_text(
+                service, year, month, settings.get("question_template")
+            ),
             service, registry=registry, logger=logger,
             options=[
-                *(date.fromisoformat(day).strftime("%d.%m") for day in dates),
+                *(option_label(day, window) for day in dates),
                 CANT_OPTION,
             ],
             is_anonymous=False,
@@ -964,14 +1018,20 @@ async def finish_run(
 
 
 def preview_text(service: dict, people: list[dict], year: int, month: int,
-                 start: datetime, tz) -> str:
+                 start: datetime, tz,
+                 window: tuple[int, int] = (0, 0)) -> str:
     polled = [person for person in people if person["tasks"]]
     without = [person["name"] for person in polled if not person["telegram_id"]]
-    dates = ", ".join(day.strftime("%d") for day in month_sundays(year, month))
+    sundays = month_sundays(year, month)
+    dates = (
+        ", ".join(day.strftime("%d") for day in sundays) + f".{month:02d}"
+        if window == (0, 0)
+        else "; ".join(option_label(day.isoformat(), window) for day in sundays)
+    )
     lines = [
         f"🗳 {local_text(start, tz)} — опрос готовности {service['name']} "
         f"на {month_title(year, month)}",
-        f"Даты: {dates}.{month:02d}",
+        f"Даты: {dates}",
         f"Опрашиваются {len(polled)} чел."
         + (f", без Telegram: {', '.join(without)} — соберите сами"
            if without else ""),
@@ -1051,7 +1111,10 @@ async def _tick_service(
             if registry.claim_readiness_notice(service["id"], key, "preview"):
                 people = registry.readiness_people(service["id"])
                 if not await tell(
-                    preview_text(service, people, year, month, start, tz),
+                    preview_text(
+                        service, people, year, month, start, tz,
+                        (settings["day_from"], settings["day_to"]),
+                    ),
                     "preview", key,
                 ):
                     registry.release_readiness_notice(

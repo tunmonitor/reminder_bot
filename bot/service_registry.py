@@ -74,6 +74,9 @@ DEFAULT_READINESS_INTRO = (
     "👥 {people}"
 )
 READINESS_CLOSED_FIELDS = frozenset({"service_name", "month"})
+# Вопрос Telegram-опроса над вариантами (до 300 символов).
+READINESS_QUESTION_FIELDS = frozenset({"service_name", "month", "month_in"})
+DEFAULT_READINESS_QUESTION = "Когда можешь служить в {month_in}?"
 DEFAULT_READINESS_CLOSED = (
     "🗳 Опрос «График {service_name} на {month}» завершён. Спасибо всем, "
     "кто ответил! ❤️ График появится вскоре."
@@ -264,6 +267,7 @@ class ServiceRegistry:
                     reminder_template TEXT,
                     closed_template TEXT,
                     chat_reminder_template TEXT,
+                    question_template TEXT,
                     -- «Нужно людей» служения без задач (оно — одна задача).
                     people_needed INTEGER NOT NULL DEFAULT 1,
                     people_max INTEGER,
@@ -784,6 +788,7 @@ class ServiceRegistry:
                 ("readiness_settings", "reminder_template", "TEXT"),
                 ("readiness_settings", "closed_template", "TEXT"),
                 ("readiness_settings", "chat_reminder_template", "TEXT"),
+                ("readiness_settings", "question_template", "TEXT"),
                 ("readiness_settings", "people_needed",
                  "INTEGER NOT NULL DEFAULT 1"),
                 ("readiness_settings", "people_max", "INTEGER"),
@@ -4904,6 +4909,7 @@ class ServiceRegistry:
         "reminder_template": None,
         "closed_template": None,
         "chat_reminder_template": None,
+        "question_template": None,
         "people_needed": 1,
         "people_max": None,
         "day_from": 0,
@@ -4915,8 +4921,8 @@ class ServiceRegistry:
             row = connection.execute(
                 "SELECT enabled, start_time, duration_days, deadline_time, "
                 "remind_days, enabled_at, intro_template, reminder_template, "
-                "closed_template, chat_reminder_template, people_needed, "
-                "people_max, day_from, day_to "
+                "closed_template, chat_reminder_template, question_template, "
+                "people_needed, people_max, day_from, day_to "
                 "FROM readiness_settings WHERE service_id = ?",
                 (service_id,),
             ).fetchone()
@@ -4974,14 +4980,17 @@ class ServiceRegistry:
             ("closed_template", READINESS_CLOSED_FIELDS, "Текст завершения"),
             ("chat_reminder_template", READINESS_REMINDER_FIELDS,
              "Напоминание в чат"),
+            ("question_template", READINESS_QUESTION_FIELDS,
+             "Вопрос опроса"),
         ):
             value = new[key]
             if value is None:
                 continue
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{label} не может быть пустым.")
-            if len(value) > 1500:
-                raise ValueError(f"{label}: не больше 1500 символов.")
+            limit = 300 if key == "question_template" else 1500
+            if len(value) > limit:
+                raise ValueError(f"{label}: не больше {limit} символов.")
             validate_notification_template(value, fields, label)
         with self._connection() as connection:
             self._require_service_editor(connection, actor_id, service_id)
@@ -4995,9 +5004,9 @@ class ServiceRegistry:
                 "INSERT INTO readiness_settings (service_id, enabled, "
                 "start_time, duration_days, deadline_time, remind_days, "
                 "enabled_at, intro_template, reminder_template, "
-                "closed_template, chat_reminder_template, people_needed, "
-                "people_max, day_from, day_to, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "closed_template, chat_reminder_template, question_template, "
+                "people_needed, people_max, day_from, day_to, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id) DO UPDATE SET "
                 "enabled = excluded.enabled, start_time = excluded.start_time, "
                 "duration_days = excluded.duration_days, "
@@ -5008,6 +5017,7 @@ class ServiceRegistry:
                 "reminder_template = excluded.reminder_template, "
                 "closed_template = excluded.closed_template, "
                 "chat_reminder_template = excluded.chat_reminder_template, "
+                "question_template = excluded.question_template, "
                 "people_needed = excluded.people_needed, "
                 "people_max = excluded.people_max, "
                 "day_from = excluded.day_from, day_to = excluded.day_to, "
@@ -5018,6 +5028,7 @@ class ServiceRegistry:
                     new["remind_days"], new["enabled_at"],
                     new["intro_template"], new["reminder_template"],
                     new["closed_template"], new["chat_reminder_template"],
+                    new["question_template"],
                     new["people_needed"], new["people_max"],
                     new["day_from"], new["day_to"], now,
                 ),

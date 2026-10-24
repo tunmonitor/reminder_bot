@@ -273,6 +273,7 @@ TEMPLATE_FIELD_HELP = {
     "delivery_status": "кому включены личные уведомления",
     "confirmation_status": "ответы «Принял» / «Не смогу»",
     "month": "месяц опроса (ноябрь 2026)",
+    "month_in": "месяц опроса после «в» (ноябре)",
     "deadline": "срок ответа (дд.мм чч:мм)",
     "people": "упоминания опрашиваемых",
 }
@@ -283,6 +284,7 @@ REPORT_FIELDS = ("service_name", "sunday_date", "task_assignments",
 READINESS_INTRO_HELP = ("service_name", "month", "deadline", "people")
 READINESS_REMINDER_HELP = ("service_name", "month", "deadline")
 READINESS_CLOSED_HELP = ("service_name", "month")
+READINESS_QUESTION_HELP = ("service_name", "month", "month_in")
 
 
 def template_fields_help(fields) -> str:
@@ -3721,14 +3723,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             readiness_button("📆 Дни служения", "days", service_id),
             readiness_button("📅 Свой день", "own", service_id),
         ])
-        rows.append([
-            readiness_button("📝 Текст опроса", "tpl", service_id, "intro"),
-            readiness_button("💬 Текст напоминания", "tpl", service_id, "rem"),
-        ])
-        rows.append([
-            readiness_button("📣 Напоминание в чат", "tpl", service_id, "chat"),
-            readiness_button("✅ Текст завершения", "tpl", service_id, "done"),
-        ])
+        rows.append([readiness_button("📝 Тексты", "texts", service_id)])
         current_key = f"{now.year:04d}-{now.month:02d}"
         current_plan = registry.get_schedule_plan(service_id, current_key)
         if current_plan is not None:
@@ -3764,6 +3759,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "Личное сообщение тем, кто не ответил, за «Напоминание» дней "
             "до срока.", READINESS_REMINDER_HELP,
         ),
+        "q": (
+            "question_template", "❓ Вопрос опроса",
+            "Вопрос над вариантами опроса в чате служения (до 300 "
+            "символов).", READINESS_QUESTION_HELP,
+        ),
         "chat": (
             "chat_reminder_template", "📣 Напоминание в чат",
             "Общее сообщение в чате служения (ответом на опрос) в день "
@@ -3776,6 +3776,29 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "завершён.", READINESS_CLOSED_HELP,
         ),
     }
+
+    async def show_readiness_texts(
+        message: Message, service_id: str,
+    ) -> None:
+        """«📝 Тексты» раздела «📅 График»: все шаблоны опроса."""
+        registry = service_registry()
+        settings = registry.get_readiness_settings(service_id)
+        rows = []
+        lines = ["📝 Тексты опроса", "", "✏️ — свой текст, ⚪ — встроенный."]
+        for kind in ("intro", "q", "rem", "chat", "done"):
+            field, title, about, _ = READINESS_TEXTS[kind]
+            mark = "✏️" if settings[field] else "⚪"
+            lines.append(f"{mark} {title} — {about}")
+            rows.append([readiness_button(title, "tpl", service_id, kind)])
+        rows.append([readiness_button("⬅️ К разделу «График»", "open", service_id)])
+        await _send_dialog(
+            message, "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keep_rows=True,
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
+            _dialog_text_limit=TELEGRAM_TEXT_LIMIT,
+            parse_mode=None,
+        )
 
     async def show_readiness_text(
         message: Message, service_id: str, kind: str,
@@ -3792,6 +3815,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "intro": readiness.DEFAULT_READINESS_INTRO,
             "rem": readiness.DEFAULT_READINESS_REMINDER,
             "chat": readiness.DEFAULT_READINESS_CHAT_REMINDER,
+            "q": readiness.DEFAULT_READINESS_QUESTION,
             "done": readiness.DEFAULT_READINESS_CLOSED,
         }[kind]
         lines = [
@@ -3813,7 +3837,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 readiness_button("🔄 Вернуть встроенный", "tplreset",
                                  service_id, kind)
             )
-        rows.append([readiness_button("⬅️ К разделу «График»", "open", service_id)])
+        rows.append([readiness_button("⬅️ К текстам", "texts", service_id)])
         await _send_dialog(
             message, "\n".join(lines),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -5206,6 +5230,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
                 await _answer_callback(callback)
                 return
+            elif action == "texts":
+                await show_readiness_texts(callback.message, service_id)
+                await _answer_callback(callback)
+                return
             elif action == "own":
                 await show_own_days(callback.message, actor_id, service_id)
                 await _answer_callback(callback)
@@ -5500,6 +5528,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         year, month, deadline, tz, settings["intro_template"],
                     )
                     where = "в чате служения перед опросом"
+                elif arg == "q":
+                    body = readiness.question_text(
+                        service, year, month, settings["question_template"]
+                    )
+                    where = "вопрос над вариантами опроса"
                 elif arg in {"rem", "chat"}:
                     body = readiness.reminder_text(
                         service,
