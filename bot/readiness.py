@@ -106,9 +106,13 @@ def manual_deadline(now: datetime, settings: dict) -> datetime:
     return deadline
 
 
-def live_run(run: dict | None) -> bool:
-    """Опрос идёт (у завершённого срок уже в прошлом)."""
-    return bool(run and run.get("status") == "open" and run.get("deadline"))
+def live_run(run: dict | None, now: datetime) -> bool:
+    """Опрос идёт: открыт и срок ещё впереди (просроченный закроет
+    ближайшая проверка)."""
+    return bool(
+        run and run.get("status") == "open" and run.get("deadline")
+        and deadline_of(run) > now
+    )
 
 
 def preview_note(run: dict | None, settings: dict, year: int, month: int,
@@ -116,7 +120,7 @@ def preview_note(run: dict | None, settings: dict, year: int, month: int,
     """Подсказка над предпросмотром: откуда месяц и срок."""
     title = month_title(year, month)
     tz = now.tzinfo
-    if live_run(run):
+    if live_run(run, now):
         return f"Опрос на {title} идёт — срок как в нём."
     start, _ = schedule(settings, year, month, tz)
     if now < start:
@@ -135,7 +139,7 @@ def preview_deadline(run: dict | None, settings: dict, year: int, month: int,
     """Срок для предпросмотра текстов: идущего опроса; иначе — по
     расписанию, если автозапуск ещё впереди; иначе — как при запуске
     вручную сейчас (прошедший срок в предпросмотре не показывается)."""
-    if live_run(run):
+    if live_run(run, now):
         return deadline_of(run)
     start, deadline = schedule(settings, year, month, now.tzinfo)
     if now < start:
@@ -143,7 +147,9 @@ def preview_deadline(run: dict | None, settings: dict, year: int, month: int,
     try:
         return manual_deadline(now, settings)
     except ValueError:
-        return deadline
+        # Последний час месяца: запуск уже невозможен — для предпросмотра
+        # срок через час, не в прошлом.
+        return now + timedelta(hours=1)
 
 
 def local_text(moment: datetime | str, tz) -> str:

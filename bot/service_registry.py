@@ -3787,19 +3787,22 @@ class ServiceRegistry:
         with self._connection() as connection:
             self._require_service_editor(connection, actor_id, service_id)
             row = connection.execute(
-                "SELECT day_offset FROM service_members "
+                "SELECT telegram_id FROM service_members "
                 "WHERE service_id = ? AND name = ?",
                 (service_id, name),
             ).fetchone()
             if row is None:
                 raise ValueError(f"«{name}» нет в составе.")
-            if row["day_offset"] == offset:
-                return
-            connection.execute(
+            # Человек — Telegram ID: личный день во всех его строках.
+            cursor = connection.execute(
                 "UPDATE service_members SET day_offset = ?, updated_at = ? "
-                "WHERE service_id = ? AND name = ?",
-                (offset, _utc_now(), service_id, name),
+                "WHERE service_id = ? AND (name = ? OR (telegram_id IS NOT NULL "
+                "AND telegram_id = ?)) AND day_offset IS NOT ?",
+                (offset, _utc_now(), service_id, name, row["telegram_id"],
+                 offset),
             )
+            if cursor.rowcount == 0:
+                return
             self._mark_days_changed(connection, service_id)
             self._audit(
                 connection, actor_id, "service_member_day", service_id,

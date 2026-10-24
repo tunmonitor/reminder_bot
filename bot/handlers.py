@@ -1924,6 +1924,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         token = secrets.token_urlsafe(6)
         pending["member_card"] = {"token": token, "name": name, "tasks": tasks}
         telegram_id = (person or member or {}).get("telegram_id")
+        # Действующий личный день (у человека может быть несколько строк).
+        day_offset = (person or member or {}).get("day_offset")
         username = (person or member or {}).get("username")
         if member is None:
             origin = "⚠️ нет в «Списках» (есть в графике или привязках)"
@@ -1944,9 +1946,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "Задачи: " + (", ".join(tasks) or "⚠️ нет — в график не попадает")
             + (" (заданы в боте)" if member and member["tasks_manual"] else ""),
             "📅 День служения: " + (
-                member_day_label(member["day_offset"])
-                if member and member["day_offset"] is not None
-                else "как у всех"
+                member_day_label(day_offset)
+                if day_offset is not None else "как у всех"
             ),
         ]
         scheduled = next(

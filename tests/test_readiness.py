@@ -124,6 +124,16 @@ class ReadinessDatesTest(unittest.TestCase):
         self.assertNotIn(
             "идёт", readiness.preview_note(closed, settings, 2026, 11, late)
         )
+        # Открыт, но срок уже прошёл (проверка ещё не закрыла).
+        overdue = {**closed, "status": "open"}
+        self.assertNotIn(
+            "идёт", readiness.preview_note(overdue, settings, 2026, 11, late)
+        )
+        last_hour = datetime(2026, 10, 31, 23, 30, tzinfo=TZ)
+        self.assertEqual(
+            readiness.preview_deadline(None, settings, 2026, 11, last_hour),
+            last_hour + timedelta(hours=1),
+        )
 
     def test_answer_dates(self):
         dates = ["2026-11-01", "2026-11-08"]
