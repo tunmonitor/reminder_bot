@@ -59,6 +59,82 @@ class ReadinessDatesTest(unittest.TestCase):
                 datetime(2026, 10, 31, 23, 30, tzinfo=TZ), settings
             )
 
+    def test_reminder_line(self):
+        run = {
+            "deadline": datetime(2026, 10, 22, 20, 0, tzinfo=TZ).isoformat(),
+            "created_at": datetime(2026, 10, 19, 10, 0, tzinfo=TZ).isoformat(),
+        }
+        settings = {"remind_days": 1}
+        before = datetime(2026, 10, 20, 12, 0, tzinfo=TZ)
+        self.assertEqual(
+            readiness.reminder_line(run, settings, before, TZ),
+            "🔔 Напоминание: 21.10 20:00 — лично не ответившим и общее в "
+            "чат служения",
+        )
+        after = datetime(2026, 10, 21, 21, 0, tzinfo=TZ)
+        self.assertIn("отправлено 21.10 20:00",
+                      readiness.reminder_line(run, settings, after, TZ))
+        self.assertIn("выключено", readiness.reminder_line(
+            run, {"remind_days": 0}, before, TZ
+        ))
+        self.assertIn("не отправлено", readiness.reminder_line(
+            run, settings, after, TZ, sent=False
+        ))
+        late = {**run, "created_at": after.isoformat()}
+        self.assertIn("не будет", readiness.reminder_line(
+            late, settings, after, TZ
+        ))
+
+    def test_preview_deadline_is_not_in_the_past(self):
+        settings = ServiceRegistry.READINESS_DEFAULTS
+        before = datetime(2026, 10, 18, 12, 0, tzinfo=TZ)
+        self.assertEqual(
+            readiness.preview_deadline(None, settings, 2026, 11, before),
+            datetime(2026, 10, 22, 20, 0, tzinfo=TZ),
+        )
+        # Автозапуск уже прошёл — срок как при запуске сейчас.
+        late = datetime(2026, 10, 24, 15, 28, tzinfo=TZ)
+        self.assertEqual(
+            readiness.preview_deadline(None, settings, 2026, 11, late),
+            datetime(2026, 10, 27, 20, 0, tzinfo=TZ),
+        )
+        self.assertIn(
+            "автозапуска (19.10 10:00) прошло",
+            readiness.preview_note(None, settings, 2026, 11, late),
+        )
+        self.assertIn(
+            "как при автозапуске 19.10 10:00",
+            readiness.preview_note(None, settings, 2026, 11, before),
+        )
+        run = {
+            "status": "open",
+            "deadline": datetime(2026, 10, 30, 20, 0, tzinfo=TZ).isoformat(),
+        }
+        self.assertEqual(
+            readiness.preview_deadline(run, settings, 2026, 11, late),
+            datetime(2026, 10, 30, 20, 0, tzinfo=TZ),
+        )
+        # Завершённый опрос — его прошедший срок не показывается.
+        closed = {**run, "status": "closed",
+                  "deadline": datetime(2026, 10, 22, 20, 0, tzinfo=TZ).isoformat()}
+        self.assertEqual(
+            readiness.preview_deadline(closed, settings, 2026, 11, late),
+            datetime(2026, 10, 27, 20, 0, tzinfo=TZ),
+        )
+        self.assertNotIn(
+            "идёт", readiness.preview_note(closed, settings, 2026, 11, late)
+        )
+        # Открыт, но срок уже прошёл (проверка ещё не закрыла).
+        overdue = {**closed, "status": "open"}
+        self.assertNotIn(
+            "идёт", readiness.preview_note(overdue, settings, 2026, 11, late)
+        )
+        last_hour = datetime(2026, 10, 31, 23, 30, tzinfo=TZ)
+        self.assertEqual(
+            readiness.preview_deadline(None, settings, 2026, 11, last_hour),
+            last_hour + timedelta(hours=1),
+        )
+
     def test_answer_dates(self):
         dates = ["2026-11-01", "2026-11-08"]
         self.assertIsNone(readiness.answer_dates([], dates))
@@ -207,7 +283,15 @@ class ReadinessFlowTest(unittest.TestCase):
         bot.send_message.reset_mock()
         tick(datetime(2026, 10, 21, 20, 0, tzinfo=TZ))
         reminded = {call.args[0] for call in bot.send_message.await_args_list}
-        self.assertEqual(reminded, {502, 503})
+        # Лично не ответившим и общее — в чат служения, ответом на опрос.
+        self.assertEqual(reminded, {502, 503, -1005555})
+        chat = next(
+            call for call in bot.send_message.await_args_list
+            if call.args[0] == -1005555
+        )
+        self.assertIn("Кто ещё не отметил воскресенья", chat.args[1])
+        self.assertNotIn("Борис", chat.args[1])
+        self.assertEqual(chat.kwargs["reply_parameters"].message_id, 12)
         bot.send_message.reset_mock()
         tick(datetime(2026, 10, 21, 20, 1, tzinfo=TZ))
         bot.send_message.assert_not_awaited()
@@ -329,15 +413,75 @@ class ReadinessFlowTest(unittest.TestCase):
         bot.send_message.reset_mock()
         bot.send_message.side_effect = [
             RuntimeError("network"), SimpleNamespace(message_id=1),
-            SimpleNamespace(message_id=2),
+            SimpleNamespace(message_id=2), RuntimeError("network"),
         ]
         self.tick(bot, datetime(2026, 10, 21, 20, 0, tzinfo=TZ))
         bot.send_message.side_effect = None
         self.tick(bot, datetime(2026, 10, 21, 20, 1, tzinfo=TZ))
         self.tick(bot, datetime(2026, 10, 21, 20, 2, tzinfo=TZ))
         recipients = [call.args[0] for call in bot.send_message.await_args_list]
-        # 501 — сбой и повтор; доставленным второй раз не пишем.
-        self.assertEqual(sorted(recipients), [501, 501, 502, 503])
+        # 501 и чат — сбой и повтор; доставленным второй раз не пишем.
+        self.assertEqual(
+            sorted(recipients), [-1005555, -1005555, 501, 501, 502, 503]
+        )
+
+    def test_no_autostart_when_planned_without_poll(self):
+        self.registry.save_schedule_draft(
+            "sound", "2026-11", run_id=None, dates=["2026-11-01"], tasks=[],
+            slots={}, last_served={},
+        )
+        bot = fake_bot()
+        self.tick(bot, datetime(2026, 10, 18, 10, 30, tzinfo=TZ))
+        self.tick(bot, datetime(2026, 10, 19, 10, 0, tzinfo=TZ))
+        bot.send_poll.assert_not_awaited()
+        bot.send_message.assert_not_awaited()
+        # И в ноябре — без «опрос не был запущен вовремя».
+        self.tick(bot, datetime(2026, 11, 2, 10, 0, tzinfo=TZ))
+        bot.send_message.assert_not_awaited()
+
+    def test_no_chat_reminder_when_everyone_answered(self):
+        bot = fake_bot()
+        run = self.launch(bot)
+        for telegram_id in (501, 502, 503):
+            self.registry.record_readiness_answer(
+                "poll-1", telegram_id, "", "", ["2026-11-01"]
+            )
+        bot.send_message.reset_mock()
+        asyncio.run(readiness.send_chat_reminder(
+            bot, self.registry, run, self.service(), TZ, LOG,
+        ))
+        bot.send_message.assert_not_awaited()
+
+    def test_sent_chat_reminder_skips_summary(self):
+        bot = fake_bot()
+        run = self.launch(bot)
+        asyncio.run(readiness.send_chat_reminder(
+            bot, self.registry, run, self.service(), TZ, LOG,
+        ))
+        with patch.object(readiness, "summarize") as summarize:
+            asyncio.run(readiness.send_chat_reminder(
+                bot, self.registry, run, self.service(), TZ, LOG,
+            ))
+        summarize.assert_not_called()
+
+    def test_unreachable_chat_reminder_is_not_reported_sent(self):
+        from aiogram.exceptions import TelegramForbiddenError
+
+        bot = fake_bot()
+        run = self.launch(bot)
+        bot.send_message.side_effect = TelegramForbiddenError(
+            method=SimpleNamespace(), message="bot was kicked"
+        )
+        asyncio.run(readiness.send_chat_reminder(
+            bot, self.registry, run, self.service(), TZ, LOG,
+        ))
+        self.assertFalse(readiness.reminder_sent(self.registry, run))
+        bot.send_message.side_effect = None
+        bot.send_message.reset_mock()
+        asyncio.run(readiness.send_chat_reminder(
+            bot, self.registry, run, self.service(), TZ, LOG,
+        ))
+        bot.send_message.assert_not_awaited()
 
     def test_close_retries_stop_and_result(self):
         bot = fake_bot()

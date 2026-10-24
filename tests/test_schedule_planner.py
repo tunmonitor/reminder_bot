@@ -228,5 +228,39 @@ class SchedulePlannerTest(unittest.TestCase):
         self.assertEqual(plan.covered(), 150)
 
 
+    def test_rotation_when_more_people_than_seats(self):
+        # 4 воскресенья, нужен один: кто служил в прошлом месяце позже,
+        # тот в этом остаётся без служения.
+        dates = SUNDAYS[:4]
+        last = {
+            "Анна": date(2026, 10, 25), "Вера": date(2026, 10, 18),
+            "Галя": date(2026, 10, 11), "Даша": date(2026, 10, 4),
+        }
+        for people, out in (
+            (["Анна", "Вера", "Галя", "Даша", "Ева"], {"Анна"}),
+            (["Анна", "Вера", "Галя", "Даша", "Ева", "Женя"], {"Анна", "Вера"}),
+        ):
+            plan = build_plan(plan_input(
+                {person: set(dates) for person in people},
+                {person: {"уборка"} for person in people},
+                needed={"уборка": 1}, last_served=last, dates=dates,
+            ))
+            served = set(plan.load())
+            self.assertEqual(set(people) - served, out)
+            self.assertEqual(max(plan.load().values()), 1)
+
+
+    def test_service_early_in_month_counts_as_one_week_gap(self):
+        # Служил в пн 02.11 (с прошлого месяца) — 08.11 через 6 дней.
+        dates = SUNDAYS[1:3]
+        plan = build_plan(plan_input(
+            {"Анна": set(dates), "Вера": set(dates)},
+            {"Анна": {"звук"}, "Вера": {"звук"}},
+            needed={"звук": 1}, dates=dates,
+            last_served={"Анна": date(2026, 11, 2)},
+        ))
+        self.assertEqual(plan.slots[(dates[0], "звук")], ["Вера"])
+
+
 if __name__ == "__main__":
     unittest.main()

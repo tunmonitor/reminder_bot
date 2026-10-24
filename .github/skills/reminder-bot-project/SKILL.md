@@ -415,6 +415,72 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   failed. A failed restart restores the old run without suppressing its
   result. `_send_dialog` keeps the stored back route for messages without
   inline buttons. «➕ В состав» buttons carry `YYYYMM.<telegram_id>`.
+- Step 3 (`bot/schedule_plan.py`): `schedule_plans` (PK service + month;
+  `slots` working copy date → task → person keys, `approved` published copy,
+  `dirty` = they differ; `run_id`, `tasks` with needed/max, `last_served`,
+  `note`, `edited`, `source` poll|excel for step 4). `finish_run` calls
+  `ensure_plan` (rebuilds when `run_id` differs, e.g. after a restart) and
+  sends `plan_text` with `rdy:plan`. `last_served` = previous month's approved
+  plan, else Excel via `events_loader` (= `context.load_upcoming_service_events`,
+  threaded through `run_readiness_tick` → `close_run` → `finish_run`); unique
+  normalized names only. UI actions `PLAN_ACTIONS` in `on_plan_action`:
+  `plan`, `precalc[ok]`, `pedit` → `pdate` (`YYYYMM.d`) → `ptask`
+  (`YYYYMM.d.t`) → pending `readiness_plan` with token + `keys`, `padd` /
+  `prem` / `pclear` (`token.i`); `pok` → `pokok` → `publish` (chat, then
+  `approve_schedule_plan`) and `send_excel_block` (text + `excel_file`
+  .xlsx). Plan months allowed: target month or current month
+  (`plan_month`). Edits run under `service_lock` on a fresh read; one task
+  per day enforced (`busy_on`); `max == 1` replaces.
+- Feedback 24.10: plan/progress list one person per line (`readiness.task_lines`),
+  load per line `N — name` sorted desc (admins only). Reminder day also posts a
+  general chat reminder (`send_chat_reminder`, reply to poll, notice kind
+  `chat-reminder-<run>`, template `chat_reminder_template` / «📣 Напоминание в
+  чат»); «📊 Ход опроса» shows `reminder_line`. Roster («👥 Состав»): person →
+  member card (`show_member_card`, callbacks `mbr:<action>:<service>:<token>[.i]`,
+  state `pending["member_card"]` in the `service_contact` session) with
+  «🔗 Telegram» (→ `offer_contact_user_selection`), «📝 Задачи»
+  (`set_service_member_tasks`: `service_members.tasks_manual = 1`, roster sync
+  keeps those tasks and skips their auto-contacts; contacts limited to chosen
+  tasks) and «🗑 Удалить» (`remove_service_member`; a «Списки» person returns on
+  the next sync — warned). Bot-added members (source manual, not in list) are
+  marked 🆕.
+- Section renamed «📅 График» (still `rdy:` callbacks). No-poll plan: `pfree`
+  → `schedule_plan.build_draft(free_run(...))` with `summarize(assume_free=True)`
+  (everyone with tasks free on all Sundays, not reluctant); stored with
+  `run_id = NULL`; `plan_current` treats it as current while the month has no
+  run or a skipped one; `plan_run`/`plan_summary` give screens the right
+  summary. Slot editor `pnew` → reply keyboard `request_users`
+  (`pending_shares` kind `plan_user`) → `on_plan_user_shared`: existing person
+  by Telegram id, else `bind_service_member(from_readiness=True, tasks=[task])`,
+  then `change_slot(..., "padd", key)`; `⬅️ Назад` text returns via
+  `reshow_plan_slot`. `_send_dialog`: a screen sent in reply to a `/command`
+  deletes the previous menu screen (`nav_state[actor]["menu"]`), recording the
+  new screen before awaiting the delete.
+- Task-less services (catalog `tasks: []`): `ServiceRegistry.plan_tasks` returns
+  one implicit task named after the service (position "s", people_needed /
+  people_max in readiness_settings); `readiness_people` gives everyone that task;
+  `summarize` / `schedule_plan.plan_tasks` / «👥 Нужно людей» use `plan_tasks`.
+- Planner rotation: `_rotation_penalty` = max(0, ROTATION_WEEKS − weeks from
+  last_served to the month's first date), added once per person (first
+  service of the month) in `assign` cost and `_person_cost`; smaller than a
+  load step so load balance wins. Day window `readiness_settings.day_from/day_to`
+  («📆 Дни служения», `DAY_WINDOWS`), personal day `service_members.day_offset`
+  («📅 Свой день», `set_service_member_day`, `mbr:day|dset`); shown via
+  `schedule_plan.day_label` / `person_day` in `plan_text` and
+  `publication_text` (`window_of`). Reminders by window/personal day — step 4.
+- Task-less plans (`schedule_plan.implicit_plan`, tasks carry `implicit`): text,
+  publication and Excel text show people directly under the date
+  (`task_lines(bare=True)`, `Summary.implicit`); `pdate` jumps to the slot.
+  Per-date day: `schedule_plans.days_json` / `approved_days_json`,
+  `set_schedule_day`, UI `pday`/`pdset` (token.i[.offset|n|back]);
+  `schedule_plan.day_offset` = per-date > personal; `set_schedule_slots` drops
+  overrides of people no longer on that date; revision includes days.
+- «📅 Свой день» also from the «📅 График» section: `show_own_days`
+  (pending `readiness_own` with token + member names; `rdy:own` → `ownp`
+  token.i → `owns` token.i.offset|n). `schedule_plan.date_window` drops the
+  window from a date header when everyone on that date has their own day.
+- Customer decision 5 (24.10): Excel may stop being filled — step 4 adds a
+  per-service source switch and «📥 Загрузить график из Excel».
 
 ### Rich text, mentions, and message length
 

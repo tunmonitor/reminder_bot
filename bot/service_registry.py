@@ -83,6 +83,12 @@ DEFAULT_READINESS_REMINDER = (
     "Ты ещё не отметил(а), когда можешь служить. Опрос в чате служения "
     "открыт до {deadline}."
 )
+# Общее напоминание в чат служения (ответом на опрос), без имён.
+DEFAULT_READINESS_CHAT_REMINDER = (
+    "🔔 {service_name}: опрос о графике на {month} открыт до {deadline}.\n"
+    "Кто ещё не отметил воскресенья — проголосуй, пожалуйста, в опросе "
+    "выше 🙏"
+)
 # Шаблон по умолчанию для напоминания одной задачи (этап 3.1).
 DEFAULT_TASK_TEMPLATE = (
     "Напоминание о служении «{service_name}» в воскресенье {sunday_date}.\n"
@@ -257,6 +263,13 @@ class ServiceRegistry:
                     intro_template TEXT,
                     reminder_template TEXT,
                     closed_template TEXT,
+                    chat_reminder_template TEXT,
+                    -- «Нужно людей» служения без задач (оно — одна задача).
+                    people_needed INTEGER NOT NULL DEFAULT 1,
+                    people_max INTEGER,
+                    -- Окно дней служения от воскресенья (Уборка: −1…+1).
+                    day_from INTEGER NOT NULL DEFAULT 0,
+                    day_to INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
                 );
 
@@ -286,6 +299,42 @@ class ServiceRegistry:
                     result_sent INTEGER NOT NULL DEFAULT 0,
                     closed_announced INTEGER NOT NULL DEFAULT 0,
                     UNIQUE (service_id, month)
+                );
+
+                -- График месяца по итогам опроса (этап 5.4–5.5): рабочая
+                -- копия (slots) и утверждённая (approved — опубликована
+                -- в чате). Отличаются — правки ещё не опубликованы.
+                CREATE TABLE IF NOT EXISTS schedule_plans (
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    month TEXT NOT NULL,
+                    run_id INTEGER,
+                    -- poll — по итогам опроса, excel — загружен из файла.
+                    source TEXT NOT NULL DEFAULT 'poll'
+                        CHECK (source IN ('poll', 'excel')),
+                    dates_json TEXT NOT NULL,
+                    tasks_json TEXT NOT NULL,
+                    slots_json TEXT NOT NULL,
+                    last_served_json TEXT NOT NULL DEFAULT '{}',
+                    note TEXT,
+                    edited INTEGER NOT NULL DEFAULT 0,
+                    approved_json TEXT,
+                    approved_by INTEGER,
+                    approved_at TEXT,
+                    chat_id INTEGER,
+                    message_id INTEGER,
+                    -- После утверждения сменились дни служения.
+                    republish INTEGER NOT NULL DEFAULT 0,
+                    -- День на дату для человека: дата → ключ → сдвиг от вс;
+                    -- approved_days_json — как опубликовано.
+                    days_json TEXT NOT NULL DEFAULT '{}',
+                    approved_days_json TEXT,
+                    -- Фактический день служения каждого в опубликованном
+                    -- графике (дата → ключ → сдвиг): для интервалов следующего
+                    -- месяца, даже если свой день потом изменят.
+                    served_offsets_json TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (service_id, month)
                 );
 
                 -- Личные напоминания об опросе — отметка на человека после
@@ -426,6 +475,10 @@ class ServiceRegistry:
                         CHECK (in_list IN (0, 1)),
                     source TEXT NOT NULL
                         CHECK (source IN ('excel', 'manual', 'legacy')),
+                    -- Задачи заданы в боте: «Списки» их не перезаписывают.
+                    tasks_manual INTEGER NOT NULL DEFAULT 0,
+                    -- Личный день служения: сдвиг от воскресенья (чт = −3).
+                    day_offset INTEGER,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (service_id, name)
                 );
@@ -730,6 +783,19 @@ class ServiceRegistry:
                 ("readiness_settings", "intro_template", "TEXT"),
                 ("readiness_settings", "reminder_template", "TEXT"),
                 ("readiness_settings", "closed_template", "TEXT"),
+                ("readiness_settings", "chat_reminder_template", "TEXT"),
+                ("readiness_settings", "people_needed",
+                 "INTEGER NOT NULL DEFAULT 1"),
+                ("readiness_settings", "people_max", "INTEGER"),
+                ("readiness_settings", "day_from", "INTEGER NOT NULL DEFAULT 0"),
+                ("readiness_settings", "day_to", "INTEGER NOT NULL DEFAULT 0"),
+                ("service_members", "day_offset", "INTEGER"),
+                ("schedule_plans", "republish", "INTEGER NOT NULL DEFAULT 0"),
+                ("schedule_plans", "days_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("schedule_plans", "approved_days_json", "TEXT"),
+                ("schedule_plans", "served_offsets_json", "TEXT"),
+                ("service_members", "tasks_manual",
+                 "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "poll_stopped", "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "result_sent", "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "closed_announced",
@@ -1410,6 +1476,30 @@ class ServiceRegistry:
             }
             for row in rows
         ]
+
+    def plan_tasks(self, service_id: str) -> list[dict]:
+        """Задачи графика: включённые задачи служения; у служения без задач
+        (Уборка, Книги) — одна задача с названием служения и «Нужно людей»
+        из настроек раздела «📅 График»."""
+        tasks = self.list_service_tasks(service_id)
+        if tasks:
+            return [
+                {
+                    "name": task["name"], "needed": task["people_needed"],
+                    "max": task["people_max"], "position": str(task["position"]),
+                    "implicit": False,
+                }
+                for task in tasks if task["enabled"]
+            ]
+        service = self.get_service(service_id)
+        if service is None:
+            return []
+        settings = self.get_readiness_settings(service_id)
+        return [{
+            "name": service["name"], "needed": settings["people_needed"],
+            "max": settings["people_max"] or settings["people_needed"],
+            "position": "s", "implicit": True,
+        }]
 
     def service_catalog(self) -> tuple[ServiceDefinition, ...]:
         """Каталог из файла с задачами в состоянии из БД (для парсера)."""
@@ -3410,8 +3500,8 @@ class ServiceRegistry:
             self._require_service(connection, service_id)
             rows = connection.execute(
                 "SELECT name, telegram_id, username, tasks_json, in_list, "
-                "source FROM service_members WHERE service_id = ? "
-                "ORDER BY in_list DESC, rowid",
+                "source, tasks_manual, day_offset FROM service_members "
+                "WHERE service_id = ? ORDER BY in_list DESC, rowid",
                 (service_id,),
             ).fetchall()
         return [
@@ -3422,6 +3512,8 @@ class ServiceRegistry:
                 "tasks": json.loads(row["tasks_json"]),
                 "in_list": bool(row["in_list"]),
                 "source": row["source"],
+                "tasks_manual": bool(row["tasks_manual"]),
+                "day_offset": row["day_offset"],
             }
             for row in rows
         ]
@@ -3453,12 +3545,17 @@ class ServiceRegistry:
                             updated_at
                         ) VALUES (?, ?, ?, 1, 'excel', ?)
                         ON CONFLICT(service_id, name) DO UPDATE SET
-                            tasks_json = excluded.tasks_json,
+                            tasks_json = CASE
+                                WHEN service_members.tasks_manual = 1
+                                THEN service_members.tasks_json
+                                ELSE excluded.tasks_json END,
                             in_list = 1
                         -- Без изменений строка не пишется: запись считается
                         -- изменением данных (бэкап, обновление задач).
-                        WHERE service_members.tasks_json
-                                  IS NOT excluded.tasks_json
+                        -- Задачи, заданные в боте, файл не меняет.
+                        WHERE (service_members.tasks_manual = 0
+                               AND service_members.tasks_json
+                                   IS NOT excluded.tasks_json)
                            OR service_members.in_list = 0
                         """,
                         (
@@ -3475,7 +3572,17 @@ class ServiceRegistry:
                     f"AND name NOT IN ({placeholders})",
                     (service_id, *names),
                 )
+                manual = {
+                    row["name"]
+                    for row in connection.execute(
+                        "SELECT name FROM service_members WHERE service_id = ? "
+                        "AND tasks_manual = 1",
+                        (service_id,),
+                    )
+                }
                 for member in members:
+                    if member.name in manual:
+                        continue
                     self._ensure_member_task_contacts(
                         connection, service_id, member.name, member.tasks
                     )
@@ -3515,8 +3622,8 @@ class ServiceRegistry:
                 self._require_super_admin(connection, actor_id)
             self._require_service(connection, service_id)
             member = connection.execute(
-                "SELECT tasks_json, telegram_id FROM service_members "
-                "WHERE service_id = ? AND name = ?",
+                "SELECT tasks_json, telegram_id, tasks_manual "
+                "FROM service_members WHERE service_id = ? AND name = ?",
                 (service_id, name),
             ).fetchone()
             # Имя уже у другого Telegram — в составе или в привязках
@@ -3545,11 +3652,17 @@ class ServiceRegistry:
                 )
                 roster_tasks = []
             else:
+                # «➕ В состав» возвращает выпавшего из «Списков»: он снова
+                # в составе — как добавленный в боте.
                 connection.execute(
                     "UPDATE service_members SET telegram_id = ?, "
-                    "username = ?, updated_at = ? "
+                    "username = ?, updated_at = ?, source = CASE "
+                    "WHEN ? AND in_list = 0 THEN 'manual' ELSE source END "
                     "WHERE service_id = ? AND name = ?",
-                    (telegram_id, username, now, service_id, name),
+                    (
+                        telegram_id, username, now, int(from_readiness),
+                        service_id, name,
+                    ),
                 )
                 roster_tasks = json.loads(member["tasks_json"])
             bound_tasks = [
@@ -3561,6 +3674,17 @@ class ServiceRegistry:
                 )
             ]
             all_tasks = list(dict.fromkeys([*roster_tasks, *bound_tasks, *tasks]))
+            if member is not None and member["tasks_manual"]:
+                # Задачи заданы в боте — привязка только к ним (снятые
+                # вручную не возвращаются из графика).
+                all_tasks = roster_tasks
+                placeholders = ", ".join("?" for _ in all_tasks) or "''"
+                connection.execute(
+                    "DELETE FROM responsible_contacts WHERE service_id = ? "
+                    "AND name = ? AND telegram_id = ? "
+                    f"AND task NOT IN ({placeholders})",
+                    (service_id, name, telegram_id, *all_tasks),
+                )
             for task in all_tasks:
                 self._write_contact(
                     connection, actor_id, service_id, task, name,
@@ -3571,6 +3695,205 @@ class ServiceRegistry:
                 connection, actor_id, "service_member_bound", service_id,
                 {"name": name, "telegram_id": telegram_id, "tasks": all_tasks},
             )
+
+    def set_service_member_tasks(
+        self, actor_id: int, service_id: str, name: str, tasks,
+    ) -> list[str]:
+        """Задачи человека в составе задаёт админ служения: дальше «Списки»
+        их не меняют. Привязки Telegram — только к выбранным задачам."""
+        _validate_positive_id(actor_id, "actor_id")
+        name = name.strip() if isinstance(name, str) else ""
+        if not name or "\x00" in name:
+            raise ValueError("Имя участника обязательно.")
+        tasks = list(dict.fromkeys(tasks))
+        if not tasks:
+            raise ValueError("Выберите хотя бы одну задачу.")
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            known = {
+                row["name"]
+                for row in connection.execute(
+                    "SELECT name FROM service_tasks WHERE service_id = ?",
+                    (service_id,),
+                )
+            }
+            unknown = [task for task in tasks if task not in known]
+            if unknown:
+                raise ValueError(f"Задача «{unknown[0]}» не найдена.")
+            member = connection.execute(
+                "SELECT telegram_id, username FROM service_members "
+                "WHERE service_id = ? AND name = ?",
+                (service_id, name),
+            ).fetchone()
+            contact = connection.execute(
+                "SELECT telegram_id, username FROM responsible_contacts "
+                "WHERE service_id = ? AND name = ? LIMIT 1",
+                (service_id, name),
+            ).fetchone()
+            now = _utc_now()
+            # Telegram — из состава, иначе из привязок.
+            bound = member if member and member["telegram_id"] else contact
+            telegram_id = bound["telegram_id"] if bound else None
+            username = (bound["username"] if bound else "") or ""
+            if member is None:
+                # Был только в привязках «👥 Ответственные» или в графике —
+                # в состав.
+                connection.execute(
+                    "INSERT INTO service_members (service_id, name, "
+                    "telegram_id, username, tasks_json, source, tasks_manual, "
+                    "updated_at) VALUES (?, ?, ?, ?, ?, 'manual', 1, ?)",
+                    (
+                        service_id, name, telegram_id, username,
+                        json.dumps(tasks, ensure_ascii=False), now,
+                    ),
+                )
+            else:
+                connection.execute(
+                    "UPDATE service_members SET tasks_json = ?, "
+                    "tasks_manual = 1, updated_at = ? "
+                    "WHERE service_id = ? AND name = ?",
+                    (json.dumps(tasks, ensure_ascii=False), now, service_id, name),
+                )
+            placeholders = ", ".join("?" for _ in tasks)
+            connection.execute(
+                "DELETE FROM responsible_contacts WHERE service_id = ? "
+                f"AND name = ? AND task NOT IN ({placeholders})",
+                (service_id, name, *tasks),
+            )
+            if telegram_id:
+                for task in tasks:
+                    self._write_contact(
+                        connection, actor_id, service_id, task, name,
+                        telegram_id, username,
+                    )
+            self._cleanup_unbound_user_data(connection, service_id)
+            self._audit(
+                connection, actor_id, "service_member_tasks", service_id,
+                {"name": name, "tasks": tasks},
+            )
+        return tasks
+
+    @staticmethod
+    def _mark_days_changed(connection: sqlite3.Connection, service_id: str) -> None:
+        """Дни служения изменились — утверждённые графики текущего и
+        будущих месяцев надо опубликовать заново."""
+        connection.execute(
+            "UPDATE schedule_plans SET republish = 1, updated_at = ? "
+            "WHERE service_id = ? AND approved_json IS NOT NULL "
+            "AND month >= ?",
+            (_utc_now(), service_id, _current_month()),
+        )
+
+    def set_service_member_day(
+        self, actor_id: int, service_id: str, name: str, offset: int | None,
+    ) -> None:
+        """Личный день служения человека: сдвиг от воскресенья (−6…+6,
+        None — как у всех)."""
+        _validate_positive_id(actor_id, "actor_id")
+        if offset is not None and (
+            isinstance(offset, bool) or not isinstance(offset, int)
+            or not -6 <= offset <= 6
+        ):
+            raise ValueError("Личный день: от вс −6 до вс +6.")
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            row = connection.execute(
+                "SELECT telegram_id FROM service_members "
+                "WHERE service_id = ? AND name = ?",
+                (service_id, name),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"«{name}» нет в составе.")
+            # Человек — Telegram ID: личный день во всех его строках.
+            cursor = connection.execute(
+                "UPDATE service_members SET day_offset = ?, updated_at = ? "
+                "WHERE service_id = ? AND (name = ? OR (telegram_id IS NOT NULL "
+                "AND telegram_id = ?)) AND day_offset IS NOT ?",
+                (offset, _utc_now(), service_id, name, row["telegram_id"],
+                 offset),
+            )
+            if cursor.rowcount == 0:
+                return
+            self._mark_days_changed(connection, service_id)
+            self._audit(
+                connection, actor_id, "service_member_day", service_id,
+                {"name": name, "day_offset": offset},
+            )
+
+    def remove_service_member(
+        self, actor_id: int, service_id: str, name: str,
+    ) -> bool:
+        """Убирает человека из состава служения вместе с привязками к
+        задачам. True — он есть в «Списках» (файл вернёт его при чтении)."""
+        _validate_positive_id(actor_id, "actor_id")
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            member = connection.execute(
+                "SELECT in_list FROM service_members "
+                "WHERE service_id = ? AND name = ?",
+                (service_id, name),
+            ).fetchone()
+            removed = connection.execute(
+                "DELETE FROM service_members WHERE service_id = ? AND name = ?",
+                (service_id, name),
+            ).rowcount + connection.execute(
+                "DELETE FROM responsible_contacts "
+                "WHERE service_id = ? AND name = ?",
+                (service_id, name),
+            ).rowcount
+            if not removed:
+                raise ValueError(f"«{name}» нет в составе.")
+            # Из рабочих копий графиков (опубликованная остаётся — правка
+            # станет видна как неопубликованная).
+            def is_removed(key: str) -> bool:
+                # Ключ — имя, при совпадении имён «имя · ID» (как в
+                # readiness_people); все с этим именем удалены выше.
+                return key == name or bool(re.fullmatch(
+                    re.escape(name) + r" · (?:\d+|без Telegram)", key,
+                ))
+
+            for row in connection.execute(
+                "SELECT month, slots_json, days_json FROM schedule_plans "
+                "WHERE service_id = ?",
+                (service_id,),
+            ).fetchall():
+                slots = json.loads(row["slots_json"])
+                changed = False
+                for tasks in slots.values():
+                    for task, people in tasks.items():
+                        kept = [key for key in people if not is_removed(key)]
+                        if kept != people:
+                            tasks[task] = kept
+                            changed = True
+                # И разовые дни — иначе вернувшийся получил бы старый день.
+                days = {}
+                for day, people_days in json.loads(
+                    row["days_json"] or "{}"
+                ).items():
+                    kept_days = {
+                        key: offset for key, offset in people_days.items()
+                        if not is_removed(key)
+                    }
+                    changed |= kept_days != people_days
+                    if kept_days:
+                        days[day] = kept_days
+                if changed:
+                    connection.execute(
+                        "UPDATE schedule_plans SET slots_json = ?, "
+                        "days_json = ?, edited = 1, updated_at = ? "
+                        "WHERE service_id = ? AND month = ?",
+                        (
+                            json.dumps(slots, ensure_ascii=False),
+                            json.dumps(days, ensure_ascii=False), _utc_now(),
+                            service_id, row["month"],
+                        ),
+                    )
+            self._cleanup_unbound_user_data(connection, service_id)
+            self._audit(
+                connection, actor_id, "service_member_removed", service_id,
+                {"name": name},
+            )
+        return bool(member and member["in_list"])
 
     def ensure_member_contacts(self, service_id: str, assignments) -> None:
         """Создаёт привязки «задача + имя» для привязанных людей служения.
@@ -3605,9 +3928,11 @@ class ServiceRegistry:
         под другим именем, которого в графике задачи уже нет (человека
         переименовали), переходит на имя из графика.
         """
+        # Задачи, заданные в боте, график и «Списки» не расширяют.
         member = connection.execute(
             "SELECT telegram_id, username FROM service_members "
-            "WHERE service_id = ? AND name = ? AND telegram_id IS NOT NULL",
+            "WHERE service_id = ? AND name = ? AND telegram_id IS NOT NULL "
+            "AND tasks_manual = 0",
             (service_id, name),
         ).fetchone()
         if member is None:
@@ -4578,6 +4903,11 @@ class ServiceRegistry:
         "intro_template": None,
         "reminder_template": None,
         "closed_template": None,
+        "chat_reminder_template": None,
+        "people_needed": 1,
+        "people_max": None,
+        "day_from": 0,
+        "day_to": 0,
     }
 
     def get_readiness_settings(self, service_id: str) -> dict:
@@ -4585,7 +4915,9 @@ class ServiceRegistry:
             row = connection.execute(
                 "SELECT enabled, start_time, duration_days, deadline_time, "
                 "remind_days, enabled_at, intro_template, reminder_template, "
-                "closed_template FROM readiness_settings WHERE service_id = ?",
+                "closed_template, chat_reminder_template, people_needed, "
+                "people_max, day_from, day_to "
+                "FROM readiness_settings WHERE service_id = ?",
                 (service_id,),
             ).fetchone()
         if row is None:
@@ -4616,11 +4948,32 @@ class ServiceRegistry:
                 raise ValueError(f"Значение должно быть от {low} до {high}.")
         if new["remind_days"] >= new["duration_days"]:
             new["remind_days"] = new["duration_days"] - 1
+        low, high = new["people_needed"], new["people_max"]
+        if (
+            isinstance(low, bool) or not isinstance(low, int)
+            or not 1 <= low <= 5
+            or high is not None and (
+                isinstance(high, bool) or not isinstance(high, int)
+                or not low <= high <= 6
+            )
+        ):
+            raise ValueError("Нужно людей: от 1 до 5, максимум — до 6.")
+        if high == low:
+            new["people_max"] = None
+        day_from, day_to = new["day_from"], new["day_to"]
+        if (
+            any(isinstance(value, bool) or not isinstance(value, int)
+                for value in (day_from, day_to))
+            or not -6 <= day_from <= 0 <= day_to <= 6
+        ):
+            raise ValueError("Дни служения: от вс −6 до вс +6, включая вс.")
         for key, fields, label in (
             ("intro_template", READINESS_INTRO_FIELDS, "Текст опроса"),
             ("reminder_template", READINESS_REMINDER_FIELDS,
              "Текст напоминания"),
             ("closed_template", READINESS_CLOSED_FIELDS, "Текст завершения"),
+            ("chat_reminder_template", READINESS_REMINDER_FIELDS,
+             "Напоминание в чат"),
         ):
             value = new[key]
             if value is None:
@@ -4642,8 +4995,9 @@ class ServiceRegistry:
                 "INSERT INTO readiness_settings (service_id, enabled, "
                 "start_time, duration_days, deadline_time, remind_days, "
                 "enabled_at, intro_template, reminder_template, "
-                "closed_template, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "closed_template, chat_reminder_template, people_needed, "
+                "people_max, day_from, day_to, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id) DO UPDATE SET "
                 "enabled = excluded.enabled, start_time = excluded.start_time, "
                 "duration_days = excluded.duration_days, "
@@ -4653,15 +5007,25 @@ class ServiceRegistry:
                 "intro_template = excluded.intro_template, "
                 "reminder_template = excluded.reminder_template, "
                 "closed_template = excluded.closed_template, "
+                "chat_reminder_template = excluded.chat_reminder_template, "
+                "people_needed = excluded.people_needed, "
+                "people_max = excluded.people_max, "
+                "day_from = excluded.day_from, day_to = excluded.day_to, "
                 "updated_at = excluded.updated_at",
                 (
                     service_id, int(new["enabled"]), new["start_time"],
                     new["duration_days"], new["deadline_time"],
                     new["remind_days"], new["enabled_at"],
                     new["intro_template"], new["reminder_template"],
-                    new["closed_template"], now,
+                    new["closed_template"], new["chat_reminder_template"],
+                    new["people_needed"], new["people_max"],
+                    new["day_from"], new["day_to"], now,
                 ),
             )
+            if (new["day_from"], new["day_to"]) != (
+                current["day_from"], current["day_to"]
+            ):
+                self._mark_days_changed(connection, service_id)
             self._audit(
                 connection, actor_id, "readiness_settings_updated", service_id,
                 changes,
@@ -4681,9 +5045,19 @@ class ServiceRegistry:
                     (service_id,),
                 )
             }
+            # Служение без задач — одна задача с его названием: в ней все.
+            implicit = None
+            if connection.execute(
+                "SELECT 1 FROM service_tasks WHERE service_id = ? LIMIT 1",
+                (service_id,),
+            ).fetchone() is None:
+                row = connection.execute(
+                    "SELECT name FROM services WHERE id = ?", (service_id,)
+                ).fetchone()
+                implicit = row["name"] if row else None
             members = connection.execute(
-                "SELECT name, telegram_id, username, tasks_json "
-                "FROM service_members WHERE service_id = ? "
+                "SELECT name, telegram_id, username, tasks_json, in_list, "
+                "source, day_offset FROM service_members WHERE service_id = ? "
                 "ORDER BY in_list DESC, rowid",
                 (service_id,),
             ).fetchall()
@@ -4707,9 +5081,17 @@ class ServiceRegistry:
                     task for task in json.loads(row["tasks_json"])
                     if task in enabled
                 },
+                # В составе: в «Списках» или добавлен в боте (пропавший из
+                # «Списков» — нет).
+                "active": bool(row["in_list"]) or row["source"] != "excel",
+                "day_offset": row["day_offset"],
             }
             if row["telegram_id"] in by_id:
                 by_id[row["telegram_id"]]["tasks"] |= person["tasks"]
+                by_id[row["telegram_id"]]["active"] |= person["active"]
+                if by_id[row["telegram_id"]]["day_offset"] is None:
+                    # Личный день — с любой строки этого человека.
+                    by_id[row["telegram_id"]]["day_offset"] = person["day_offset"]
                 continue
             people.append(person)
             if row["telegram_id"]:
@@ -4728,6 +5110,7 @@ class ServiceRegistry:
                         "telegram_id": row["telegram_id"],
                         "username": "",
                         "tasks": set(),
+                        "day_offset": None,
                     }
                     people.append(person)
                 by_id[row["telegram_id"]] = person
@@ -4742,7 +5125,12 @@ class ServiceRegistry:
             key = person["name"]
             if names.count(key) > 1:
                 key = f"{key} · {person['telegram_id'] or 'без Telegram'}"
-            result.append({**person, "key": key, "tasks": sorted(person["tasks"])})
+            if implicit:
+                tasks = {implicit} if person.get("active", True) else set()
+            else:
+                tasks = person["tasks"]
+            person.pop("active", None)
+            result.append({**person, "key": key, "tasks": sorted(tasks)})
         return result
 
     def get_nav_hints(self, telegram_id: int) -> list[int]:
@@ -4920,6 +5308,250 @@ class ServiceRegistry:
                 "OR result_sent = 0 OR closed_announced = 0) ORDER BY id"
             ).fetchall()
         return [self._readiness_run(row) for row in rows]
+
+    @staticmethod
+    def _schedule_plan(row) -> dict | None:
+        if row is None:
+            return None
+        plan = dict(row)
+        for name in ("dates", "tasks", "slots", "last_served"):
+            plan[name] = json.loads(plan.pop(f"{name}_json"))
+        approved = plan.pop("approved_json")
+        plan["approved"] = json.loads(approved) if approved else None
+        plan["days"] = json.loads(plan.pop("days_json") or "{}")
+        served = plan.pop("served_offsets_json", None)
+        plan["served_offsets"] = json.loads(served) if served else {}
+        # Снимок есть (пусть и пустой — все по воскресеньям) или график
+        # утверждён до появления снимка.
+        plan["served_snapshot"] = served is not None
+        approved_days = plan.pop("approved_days_json")
+        plan["approved_days"] = (
+            json.loads(approved_days) if approved_days else {}
+        )
+        # Правки после утверждения ещё не опубликованы (порядок людей в
+        # задаче не важен).
+        def normal(slots):
+            return None if slots is None else {
+                day: {task: sorted(people) for task, people in tasks.items()}
+                for day, tasks in slots.items()
+            }
+
+        # republish — после утверждения сменились дни служения (окно или
+        # личный день): опубликованные даты устарели.
+        plan["dirty"] = bool(plan.get("republish")) or (
+            normal(plan["approved"]) != normal(plan["slots"])
+        ) or (
+            plan["approved"] is not None
+            and plan["approved_days"] != plan["days"]
+        )
+        return plan
+
+    def get_schedule_plan(self, service_id: str, month: str) -> dict | None:
+        """График месяца: slots — дата → задача → ключи людей
+        (`readiness_people`), approved — опубликованная копия."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM schedule_plans WHERE service_id = ? AND month = ?",
+                (service_id, month),
+            ).fetchone()
+        return self._schedule_plan(row)
+
+    def save_schedule_draft(
+        self,
+        service_id: str,
+        month: str,
+        *,
+        run_id: int | None,
+        dates: list[str],
+        tasks: list[dict],
+        slots: dict,
+        last_served: dict,
+        note: str | None = None,
+    ) -> dict:
+        """Предложенный (пересчитанный) график: рабочая копия заменяется,
+        ручные правки сбрасываются; утверждённая копия остаётся."""
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            connection.execute(
+                "INSERT INTO schedule_plans (service_id, month, run_id, "
+                "dates_json, tasks_json, slots_json, last_served_json, note, "
+                "edited, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?) "
+                "ON CONFLICT(service_id, month) DO UPDATE SET "
+                "run_id = excluded.run_id, source = 'poll', "
+                "dates_json = excluded.dates_json, "
+                "tasks_json = excluded.tasks_json, "
+                "slots_json = excluded.slots_json, "
+                "last_served_json = excluded.last_served_json, "
+                "note = excluded.note, edited = 0, days_json = '{}', "
+                "updated_at = excluded.updated_at",
+                (
+                    service_id, month, run_id, json.dumps(dates),
+                    json.dumps(tasks, ensure_ascii=False),
+                    json.dumps(slots, ensure_ascii=False),
+                    json.dumps(last_served, ensure_ascii=False),
+                    note, _utc_now(),
+                ),
+            )
+        return self.get_schedule_plan(service_id, month)
+
+    def rename_plan_task(
+        self, service_id: str, month: str, old: str, new: str,
+    ) -> dict:
+        """Переименовать задачу в рабочей копии графика (служение без задач
+        переименовано в каталоге). Утверждённая копия — как опубликовано:
+        график становится «с правками», и «✅ Утвердить изменения»
+        опубликует новое название (одной строкой в списке изменений)."""
+        def renamed(slots: dict) -> str:
+            return json.dumps({
+                day: {(new if task == old else task): people
+                      for task, people in day_tasks.items()}
+                for day, day_tasks in slots.items()
+            }, ensure_ascii=False)
+
+        # Чтение и запись — в одной транзакции: параллельная правка графика
+        # не затрётся старой копией.
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT tasks_json, slots_json FROM schedule_plans "
+                "WHERE service_id = ? AND month = ?",
+                (service_id, month),
+            ).fetchone()
+            if row is None:
+                raise ValueError("График не найден.")
+            tasks = [
+                {**task, "name": new, "implicit": True}
+                if task["name"] == old else task
+                for task in json.loads(row["tasks_json"])
+            ]
+            connection.execute(
+                "UPDATE schedule_plans SET tasks_json = ?, slots_json = ?, "
+                "updated_at = ? WHERE service_id = ? AND month = ?",
+                (
+                    json.dumps(tasks, ensure_ascii=False),
+                    renamed(json.loads(row["slots_json"])), _utc_now(),
+                    service_id, month,
+                ),
+            )
+        return self.get_schedule_plan(service_id, month)
+
+    def set_schedule_day(
+        self, actor_id: int, service_id: str, month: str, day: str, key: str,
+        offset: int | None,
+    ) -> dict:
+        """День служения человека только на эту дату графика (сдвиг от
+        воскресенья; None — как обычно)."""
+        _validate_positive_id(actor_id, "actor_id")
+        if offset is not None and (
+            isinstance(offset, bool) or not isinstance(offset, int)
+            or not -6 <= offset <= 6
+        ):
+            raise ValueError("День: от вс −6 до вс +6.")
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            row = connection.execute(
+                "SELECT days_json FROM schedule_plans "
+                "WHERE service_id = ? AND month = ?",
+                (service_id, month),
+            ).fetchone()
+            if row is None:
+                raise ValueError("График не найден — откройте его заново.")
+            days = json.loads(row["days_json"] or "{}")
+            if offset is None:
+                days.get(day, {}).pop(key, None)
+                if not days.get(day):
+                    days.pop(day, None)
+            else:
+                days.setdefault(day, {})[key] = offset
+            connection.execute(
+                "UPDATE schedule_plans SET days_json = ?, edited = 1, "
+                "updated_at = ? WHERE service_id = ? AND month = ?",
+                (
+                    json.dumps(days, ensure_ascii=False), _utc_now(),
+                    service_id, month,
+                ),
+            )
+        return self.get_schedule_plan(service_id, month)
+
+    def set_schedule_slots(
+        self, actor_id: int, service_id: str, month: str, slots: dict,
+    ) -> dict:
+        """Ручная правка графика админом служения («✏️ Изменить»). Разовые
+        дни убранных из даты людей отбрасываются."""
+        _validate_positive_id(actor_id, "actor_id")
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            row = connection.execute(
+                "SELECT days_json FROM schedule_plans "
+                "WHERE service_id = ? AND month = ?",
+                (service_id, month),
+            ).fetchone()
+            if row is None:
+                raise ValueError("График не найден — откройте его заново.")
+            days = {}
+            for day, people_days in json.loads(row["days_json"] or "{}").items():
+                serving = {
+                    key for people in slots.get(day, {}).values()
+                    for key in people
+                }
+                kept = {
+                    key: offset for key, offset in people_days.items()
+                    if key in serving
+                }
+                if kept:
+                    days[day] = kept
+            connection.execute(
+                "UPDATE schedule_plans SET slots_json = ?, days_json = ?, "
+                "edited = 1, updated_at = ? WHERE service_id = ? AND month = ?",
+                (
+                    json.dumps(slots, ensure_ascii=False),
+                    json.dumps(days, ensure_ascii=False), _utc_now(),
+                    service_id, month,
+                ),
+            )
+        return self.get_schedule_plan(service_id, month)
+
+    def approve_schedule_plan(
+        self,
+        actor_id: int,
+        service_id: str,
+        month: str,
+        slots: dict,
+        *,
+        chat_id: int | None,
+        message_id: int | None,
+        updated_at: str | None = None,
+        days: dict | None = None,
+        served_offsets: dict | None = None,
+    ) -> dict:
+        """«✅ Утвердить»: опубликованная копия = slots. updated_at —
+        версия опубликованного графика: если дни служения сменились, пока
+        шла публикация, отметка «опубликовать заново» остаётся."""
+        _validate_positive_id(actor_id, "actor_id")
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            cursor = connection.execute(
+                "UPDATE schedule_plans SET approved_json = ?, approved_by = ?, "
+                "approved_at = ?, chat_id = ?, message_id = ?, "
+                "approved_days_json = ?, served_offsets_json = ?, "
+                "republish = CASE WHEN ? IS NULL OR updated_at = ? THEN 0 "
+                "ELSE republish END "
+                "WHERE service_id = ? AND month = ?",
+                (
+                    json.dumps(slots, ensure_ascii=False), actor_id,
+                    _utc_now(), chat_id, message_id,
+                    json.dumps(days or {}, ensure_ascii=False),
+                    json.dumps(served_offsets or {}, ensure_ascii=False),
+                    updated_at, updated_at, service_id, month,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("График не найден — откройте его заново.")
+            self._audit(
+                connection, actor_id, "schedule_plan_approved", service_id,
+                {"month": month},
+            )
+        return self.get_schedule_plan(service_id, month)
 
     def reminded_readiness_ids(self, run_id: int) -> set[int]:
         with self._connection() as connection:
@@ -5190,6 +5822,11 @@ def normalize_member_name(name) -> str:
     if not name or len(name) > 60 or "\x00" in name:
         raise ValueError("Имя участника: от 1 до 60 символов.")
     return name
+
+
+def _current_month() -> str:
+    today = datetime.now(timezone.utc).date()
+    return f"{today.year:04d}-{today.month:02d}"
 
 
 def _utc_now() -> str:

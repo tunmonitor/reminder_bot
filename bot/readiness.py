@@ -35,6 +35,7 @@ from .month_summary import month_end, month_key, month_title, next_month
 from .presentation import task_emoji
 from .schedule_planner import Plan, PlanInput, build_plan
 from .service_registry import (  # noqa: F401 — шаблоны для экранов
+    DEFAULT_READINESS_CHAT_REMINDER,
     DEFAULT_READINESS_CLOSED,
     DEFAULT_READINESS_INTRO,
     DEFAULT_READINESS_REMINDER,
@@ -105,6 +106,52 @@ def manual_deadline(now: datetime, settings: dict) -> datetime:
     return deadline
 
 
+def live_run(run: dict | None, now: datetime) -> bool:
+    """Опрос идёт: открыт и срок ещё впереди (просроченный закроет
+    ближайшая проверка)."""
+    return bool(
+        run and run.get("status") == "open" and run.get("deadline")
+        and deadline_of(run) > now
+    )
+
+
+def preview_note(run: dict | None, settings: dict, year: int, month: int,
+                 now: datetime) -> str:
+    """Подсказка над предпросмотром: откуда месяц и срок."""
+    title = month_title(year, month)
+    tz = now.tzinfo
+    if live_run(run, now):
+        return f"Опрос на {title} идёт — срок как в нём."
+    start, _ = schedule(settings, year, month, tz)
+    if now < start:
+        return (
+            f"Опрос на {title} — срок как при автозапуске "
+            f"{local_text(start, tz)}."
+        )
+    return (
+        f"Опрос на {title}: время автозапуска ({local_text(start, tz)}) "
+        "прошло — срок как при запуске вручную сейчас."
+    )
+
+
+def preview_deadline(run: dict | None, settings: dict, year: int, month: int,
+                     now: datetime) -> datetime:
+    """Срок для предпросмотра текстов: идущего опроса; иначе — по
+    расписанию, если автозапуск ещё впереди; иначе — как при запуске
+    вручную сейчас (прошедший срок в предпросмотре не показывается)."""
+    if live_run(run, now):
+        return deadline_of(run)
+    start, deadline = schedule(settings, year, month, now.tzinfo)
+    if now < start:
+        return deadline
+    try:
+        return manual_deadline(now, settings)
+    except ValueError:
+        # Последний час месяца: запуск уже невозможен — для предпросмотра
+        # срок через час, не в прошлом.
+        return now + timedelta(hours=1)
+
+
 def local_text(moment: datetime | str, tz) -> str:
     if isinstance(moment, str):
         moment = datetime.fromisoformat(moment)
@@ -131,16 +178,30 @@ class Summary:
     not_answered: list[dict] = field(default_factory=list)
     plan: Plan | None = None
     free_count: dict[str, int] = field(default_factory=dict)
+    # Служение без задач: в тексте люди сразу под датой.
+    implicit: bool = False
 
 
-def summarize(registry, run: dict, *, with_plan: bool = True) -> Summary:
+def summarize(registry, run: dict, *, with_plan: bool = True,
+              last_served: dict[str, date] | None = None,
+              assume_free: bool = False) -> Summary:
+    """last_served — последнее служение человека (ключ) в прошлом
+    месяце: для интервала между служениями. assume_free — график без
+    опроса: все из состава с задачами свободны во все даты."""
     people = registry.readiness_people(run["service_id"])
     by_id = {
         person["telegram_id"]: person
         for person in people if person["telegram_id"]
     }
     summary = Summary(people=people)
-    for answer in registry.list_readiness_answers(run["id"]):
+    if assume_free:
+        summary.answered = {
+            person["key"]: list(run["dates"])
+            for person in people if person["tasks"]
+        }
+    for answer in (
+        [] if assume_free else registry.list_readiness_answers(run["id"])
+    ):
         person = by_id.get(answer["telegram_id"])
         if person is None or not person["tasks"]:
             # Без задач человека некуда поставить — админ распределяет
@@ -160,10 +221,9 @@ def summarize(registry, run: dict, *, with_plan: bool = True) -> Summary:
     }
     if with_plan:
         tasks = {person["key"]: person["tasks"] for person in people}
-        catalog = [
-            task for task in registry.list_service_tasks(run["service_id"])
-            if task["enabled"]
-        ]
+        # У служения без задач — одна задача с его названием.
+        catalog = registry.plan_tasks(run["service_id"])
+        summary.implicit = any(task["implicit"] for task in catalog)
         all_dates = frozenset(date.fromisoformat(day) for day in run["dates"])
         free = {
             name: frozenset(date.fromisoformat(day) for day in dates)
@@ -175,14 +235,14 @@ def summarize(registry, run: dict, *, with_plan: bool = True) -> Summary:
         free.update({name: all_dates for name in silent})
         summary.plan = build_plan(PlanInput(
             dates=tuple(sorted(all_dates)),
-            needed={task["name"]: task["people_needed"] for task in catalog},
+            needed={task["name"]: task["needed"] for task in catalog},
             extra={
-                task["name"]: task["people_max"] - task["people_needed"]
-                for task in catalog
+                task["name"]: task["max"] - task["needed"] for task in catalog
             },
             free=free,
             tasks={name: frozenset(tasks[name]) for name in free},
             reluctant=frozenset(silent),
+            last_served=dict(last_served or {}),
         ))
     return summary
 
@@ -197,7 +257,9 @@ def outside_name(answer: dict) -> str:
     )
 
 
-def progress_text(service_label: str, run: dict, summary: Summary, tz) -> str:
+def progress_text(service_label: str, run: dict, summary: Summary, tz,
+                  reminder: str | None = None) -> str:
+    """reminder — строка «когда напоминание» (идущий опрос)."""
     year, month = month_of(run)
     status = {
         "open": f"до {local_text(run['deadline'], tz)}",
@@ -207,6 +269,10 @@ def progress_text(service_label: str, run: dict, summary: Summary, tz) -> str:
     lines = [
         f"📊 Ход опроса · {service_label} · {month_title(year, month)}",
         f"⏳ {status}",
+    ]
+    if reminder:
+        lines.append(reminder)
+    lines += [
         "",
         f"Ответили {len(summary.answered)} из {len(polled)}"
         + (f" · вне состава: {len(summary.outside)}" if summary.outside else ""),
@@ -230,19 +296,19 @@ def progress_text(service_label: str, run: dict, summary: Summary, tz) -> str:
         used_silent = False
         for day in run["dates"]:
             event_date = date.fromisoformat(day)
-            lines.append(f"🗓 {event_date:%d.%m}")
+            lines += ["", f"🗓 {event_date:%d.%m}"]
             for task, needed in summary.plan.needed.items():
                 people = summary.plan.slots.get((event_date, task), [])
                 used_silent |= any(person in silent for person in people)
-                shown = ", ".join(
-                    names.get(person, person) + ("*" if person in silent else "")
-                    for person in people
+                lines += task_lines(
+                    task, needed,
+                    [
+                        names.get(person, person)
+                        + ("*" if person in silent else "")
+                        for person in people
+                    ],
+                    empty="⚠️ некого поставить", bare=summary.implicit,
                 )
-                if not people:
-                    shown = "⚠️ некого поставить"
-                elif len(people) < needed:
-                    shown += f" · ⚠️ {len(people)} из {needed}"
-                lines.append(f"   {task_emoji(task)} {task} — {shown}")
         if used_silent:
             lines.append(
                 "* не ответил(а) — поставлен(а) по общей логике, после "
@@ -267,6 +333,23 @@ def progress_text(service_label: str, run: dict, summary: Summary, tz) -> str:
             waiting + [f"{name} (без Telegram)" for name in without_telegram]
         )]
     return "\n".join(lines)
+
+
+def task_lines(task: str, needed: int, names: list[str],
+               empty: str = "⚠️ никого", *, bare: bool = False) -> list[str]:
+    """Задача даты: заголовок и каждый человек на своей строке. bare —
+    служение без задач: люди сразу под датой, без названия задачи."""
+    if bare:
+        lines = [f"   • {name}" for name in names] or [f"   {empty}"]
+        if names and len(names) < needed:
+            lines.append(f"   ⚠️ {len(names)} из {needed}")
+        return lines
+    head = f"   {task_emoji(task)} {task}"
+    if not names:
+        return [f"{head} — {empty}"]
+    if len(names) < needed:
+        head += f" · ⚠️ {len(names)} из {needed}"
+    return [head] + [f"      • {name}" for name in names]
 
 
 class _Values(dict):
@@ -308,10 +391,14 @@ def closed_text(service: dict, run: dict, template: str | None = None) -> str:
 
 
 def reminder_text(service: dict, run: dict, tz,
-                  template: str | None = None) -> str:
+                  template: str | None = None, *, chat: bool = False) -> str:
+    """Личное напоминание или (chat) общее — в чат служения, без имён."""
     year, month = month_of(run)
     return render_template(
-        template or DEFAULT_READINESS_REMINDER,
+        template or (
+            DEFAULT_READINESS_CHAT_REMINDER if chat
+            else DEFAULT_READINESS_REMINDER
+        ),
         service_name=service["name"],
         month=month_title(year, month),
         deadline=local_text(run["deadline"], tz),
@@ -601,6 +688,85 @@ async def send_reminders(
     return sent
 
 
+async def send_chat_reminder(
+    bot, registry, run: dict, service: dict, tz, logger: logging.Logger
+) -> None:
+    """Общее напоминание в чат служения ответом на опрос — один раз;
+    временный сбой — повтор следующей проверкой."""
+    kind = f"chat-reminder-{run['id']}"
+    if not run.get("chat_id") or registry.has_readiness_notice(
+        service["id"], run["month"], kind
+    ):
+        # Уже отправлено (или некуда) — без подсчёта ответов каждую минуту.
+        return
+    if not any(
+        person["telegram_id"]
+        for person in summarize(registry, run, with_plan=False).not_answered
+    ):
+        # Ответили все, кто может голосовать, — напоминать некому.
+        return
+    if not run.get("chat_id") or not registry.claim_readiness_notice(
+        service["id"], run["month"], kind
+    ):
+        return
+    text = reminder_text(
+        service, run, tz,
+        registry.get_readiness_settings(service["id"]).get(
+            "chat_reminder_template"
+        ),
+        chat=True,
+    )
+    try:
+        await send_to_service_group(
+            bot.send_message, run["chat_id"], text, service,
+            registry=registry, logger=logger, parse_mode=None,
+            reply_parameters=ReplyParameters(
+                message_id=run["message_id"], allow_sending_without_reply=True,
+            ) if run.get("message_id") else None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if unreachable(exc):
+            # Отметка остаётся (без повторов), но доставленным не считается.
+            logger.info("Напоминание в чат служения не доставлено: %s", exc)
+            return
+        logger.warning("Напоминание в чат служения не отправлено", exc_info=True)
+        registry.release_readiness_notice(service["id"], run["month"], kind)
+        return
+    registry.claim_readiness_notice(service["id"], run["month"], f"{kind}-sent")
+
+
+def reminder_line(run: dict, settings: dict, now: datetime, tz,
+                  sent: bool = True) -> str:
+    """Когда напоминание (для «📊 Ход опроса»); sent — хоть одно
+    напоминание (личное или в чат) доставлено."""
+    days = settings["remind_days"]
+    if days <= 0:
+        return "🔔 Напоминание: выключено"
+    remind_at = deadline_of(run) - timedelta(days=days)
+    when = local_text(remind_at, tz)
+    if datetime.fromisoformat(run["created_at"]) >= remind_at:
+        return f"🔔 Напоминания не будет: опрос запущен позже {when}"
+    if remind_at <= now:
+        if not sent:
+            return (
+                f"🔔 Напоминание {when}: не отправлено — ответили все с "
+                "Telegram или сбой доставки (бот повторит)"
+            )
+        return f"🔔 Напоминание отправлено {when}"
+    return (
+        f"🔔 Напоминание: {when} — лично не ответившим и общее в чат служения"
+    )
+
+
+def reminder_sent(registry, run: dict) -> bool:
+    """Доставлено ли хоть одно напоминание опроса."""
+    return bool(registry.reminded_readiness_ids(run["id"])) or (
+        registry.has_readiness_notice(
+            run["service_id"], run["month"], f"chat-reminder-{run['id']}-sent"
+        )
+    )
+
+
 def deadline_of(run: dict) -> datetime:
     return datetime.fromisoformat(run["deadline"])
 
@@ -640,7 +806,7 @@ def admin_keyboard(service_id: str, *rows) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         *rows,
         [InlineKeyboardButton(
-            text="🗳 Опрос готовности", callback_data=f"rdy:open:{service_id}"
+            text="📅 График", callback_data=f"rdy:open:{service_id}"
         )],
     ])
 
@@ -698,14 +864,14 @@ async def notify_admins(
 
 async def close_run(
     bot, registry, run: dict, service: dict, tz, admin_id: int,
-    logger: logging.Logger, text_limit: int,
+    logger: logging.Logger, text_limit: int, events_loader=None,
 ) -> bool:
     """Закрывает опрос и присылает админам итог. False — уже закрыт."""
     if not registry.close_readiness_run(run["id"]):
         return False
     await finish_run(
         bot, registry, registry.get_readiness_run_by_id(run["id"]), service,
-        tz, admin_id, logger, text_limit,
+        tz, admin_id, logger, text_limit, events_loader,
     )
     return True
 
@@ -744,7 +910,7 @@ async def announce_closed(
 
 async def finish_run(
     bot, registry, run: dict, service: dict, tz, admin_id: int,
-    logger: logging.Logger, text_limit: int,
+    logger: logging.Logger, text_limit: int, events_loader=None,
 ) -> None:
     """Шаги закрытия — остановка опроса в чате и итог админам; что не
     удалось, повторяет следующая проверка (без повтора удавшегося)."""
@@ -758,21 +924,40 @@ async def finish_run(
         registry.mark_readiness_run(run["id"], closed_announced=True)
     if run["result_sent"]:
         return
+    from .schedule_plan import ensure_plan, plan_text, window_of
+
     try:
-        summary = await asyncio.to_thread(summarize, registry, run)
-        text = progress_text(service["name"], run, summary, tz)
+        # Итог — предложенный график (сохраняется в базе для правки).
+        plan = await ensure_plan(registry, run, events_loader, logger)
+        summary = await asyncio.to_thread(
+            summarize, registry, run, with_plan=False
+        )
+        text = plan_text(
+            service["name"], plan, summary, tz,
+            window_of(registry, service["id"]),
+        )
     except Exception:  # noqa: BLE001
         logger.exception("Не удалось подвести итог опроса готовности")
-        text = (
-            f"⚠️ {service['name']}: итог посчитать не удалось — откройте "
-            "«📊 Итог опроса»."
+        # Админам — один раз; итог не отмечается, следующая проверка
+        # попробует составить график снова.
+        await notify_admins(
+            bot, registry, service["id"], admin_id,
+            f"⚠️ {service['name']}: опрос завершён, но график составить пока "
+            "не удалось — бот попробует снова, или откройте «📋 График».",
+            logger, text_limit, reply_markup=admin_keyboard(service["id"]),
+            delivery_key=f"resultfail-{run['id']}", month=run["month"],
         )
+        return
     # Одно сообщение: доставка отмечается на получателя целиком (длинный
-    # итог сокращается, полностью — «📊 Итог опроса»).
+    # итог сокращается, полностью — «📋 График»).
     text = fit_one_screen("🗳 Опрос завершён\n\n" + text, text_limit)
+    year, month = month_of(run)
     if await notify_admins(
         bot, registry, service["id"], admin_id, text, logger, text_limit,
-        reply_markup=admin_keyboard(service["id"]),
+        reply_markup=admin_keyboard(service["id"], [InlineKeyboardButton(
+            text="📋 График: правка и утверждение",
+            callback_data=f"rdy:plan:{service['id']}:{year:04d}{month:02d}",
+        )]),
         delivery_key=f"result-{run['id']}", month=run["month"],
     ):
         registry.mark_readiness_run(run["id"], result_sent=True)
@@ -802,11 +987,15 @@ def _missed(registry, service_id: str, key: str, settings: dict,
     бот не работал всё окно. Включённый после времени запуска автозапуск
     — не пропуск."""
     enabled_at = settings.get("enabled_at")
-    return (
-        enabled_at is not None
-        and datetime.fromisoformat(enabled_at) <= start
-        and not registry.has_readiness_notice(service_id, key, "launch")
-    )
+    if (
+        enabled_at is None
+        or datetime.fromisoformat(enabled_at) > start
+        or registry.has_readiness_notice(service_id, key, "launch")
+    ):
+        return False
+    # График составлен без опроса — опрос и не должен был идти.
+    plan = registry.get_schedule_plan(service_id, key)
+    return not (plan is not None and plan["run_id"] is None)
 
 
 async def _tick_service(
@@ -853,6 +1042,11 @@ async def _tick_service(
         start, deadline = schedule(settings, year, month, tz)
         if registry.get_readiness_run(service["id"], key) is not None:
             return
+        free_plan = registry.get_schedule_plan(service["id"], key)
+        if free_plan is not None and free_plan["run_id"] is None:
+            # График месяца уже составлен без опроса — автоопрос (и его
+            # превью) заменил бы его по ответам.
+            return
         if start - timedelta(days=1) <= now < start:
             if registry.claim_readiness_notice(service["id"], key, "preview"):
                 people = registry.readiness_people(service["id"])
@@ -896,7 +1090,7 @@ async def _tick_service(
 
 async def _tick_run(
     bot, registry, run: dict, now: datetime, tz, admin_id: int,
-    logger: logging.Logger, text_limit: int,
+    logger: logging.Logger, text_limit: int, events_loader=None,
 ) -> None:
     service = registry.get_service(run["service_id"])
     if service is None:
@@ -919,11 +1113,14 @@ async def _tick_run(
         if now >= deadline_of(current):
             await close_run(
                 bot, registry, current, service, tz, admin_id, logger,
-                text_limit,
+                text_limit, events_loader,
             )
         elif reminder_due(current, settings, now):
             # Отметка — на человека после доставки: идемпотентно.
             await send_reminders(bot, registry, current, service, tz, logger)
+            await send_chat_reminder(
+                bot, registry, current, service, tz, logger
+            )
 
 
 def settle_parked_run(registry, parked: dict, logger: logging.Logger) -> None:
@@ -961,7 +1158,7 @@ def settle_parked_run(registry, parked: dict, logger: logging.Logger) -> None:
 
 async def run_readiness_tick(
     bot, registry, now: datetime, tz, admin_id: int,
-    logger: logging.Logger, text_limit: int,
+    logger: logging.Logger, text_limit: int, events_loader=None,
 ) -> None:
     """Раз в минуту: превью накануне, автозапуск, напоминание, срок.
     Сбой одного служения не мешает остальным."""
@@ -983,7 +1180,8 @@ async def run_readiness_tick(
     for run in registry.list_open_readiness_runs():
         try:
             await _tick_run(
-                bot, registry, run, now, tz, admin_id, logger, text_limit
+                bot, registry, run, now, tz, admin_id, logger, text_limit,
+                events_loader,
             )
         except Exception:  # noqa: BLE001
             logger.exception("Сбой опроса готовности %s", run["id"])
@@ -1010,7 +1208,7 @@ async def run_readiness_tick(
                     continue
                 await finish_run(
                     bot, registry, current, service, tz, admin_id, logger,
-                    text_limit,
+                    text_limit, events_loader,
                 )
         except Exception:  # noqa: BLE001
             logger.exception("Сбой закрытия опроса готовности %s", run["id"])

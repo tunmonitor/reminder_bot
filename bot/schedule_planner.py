@@ -41,6 +41,12 @@ LOAD_WEIGHT = 3
 RELUCTANT_WEIGHT = 1_000_000
 # Штраф за интервал между служениями человека, в неделях.
 GAP_PENALTY = {1: 6, 2: 2}
+# Чередование, когда людей больше, чем мест: кто служил в прошлом месяце
+# позже, тот в этом ставится позже — штраф за первое служение месяца
+# ROTATION_WEEKS − (недель от прошлого служения до начала месяца), не
+# меньше 0. Меньше шага нагрузки (2 × LOAD_WEIGHT): ровнее нагрузка
+# главнее чередования.
+ROTATION_WEEKS = 5
 # Предел проходов улучшения: план маленький, улучшения быстро кончаются.
 MAX_IMPROVE_ROUNDS = 50
 
@@ -104,7 +110,17 @@ def _weeks(earlier: date, later: date) -> int:
 def _gap_penalty(earlier: date | None, later: date) -> int:
     if earlier is None:
         return 0
-    return GAP_PENALTY.get(_weeks(earlier, later), 0)
+    # Меньше недели (служение в начале месяца с прошлого) — как неделя.
+    return GAP_PENALTY.get(max(1, _weeks(earlier, later)), 0)
+
+
+def _rotation_penalty(data: PlanInput, person: str) -> int:
+    """Штраф первого служения месяца: кто дольше не служил, тот первый."""
+    previous = data.last_served.get(person)
+    if previous is None or not data.dates:
+        return 0
+    weeks = max(0, _weeks(previous, min(data.dates)))
+    return max(0, ROTATION_WEEKS - weeks)
 
 
 def plan_cost(plan: Plan, data: PlanInput) -> int:
@@ -226,6 +242,7 @@ def build_plan(data: PlanInput) -> Plan:
         cost = {
             person: LOAD_WEIGHT * (2 * load.get(person, 0) + 1)
             + _gap_penalty(last.get(person), event_date)
+            + (0 if load.get(person) else _rotation_penalty(data, person))
             + (RELUCTANT_WEIGHT if person in data.reluctant else 0)
             for person in people
         }
@@ -261,6 +278,8 @@ def _person_cost(data: PlanInput, person: str, dates: Iterable[date]) -> int:
     """Вклад человека в стоимость плана: нагрузка² и штрафы интервала."""
     ordered = sorted(dates)
     total = LOAD_WEIGHT * len(ordered) ** 2
+    if ordered:
+        total += _rotation_penalty(data, person)
     if person in data.reluctant:
         total += RELUCTANT_WEIGHT * len(ordered)
     previous = data.last_served.get(person)

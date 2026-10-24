@@ -2358,6 +2358,8 @@ async def _run_locked(args: CliArgs) -> None:
                         bot, service_registry, datetime.now(tz), tz,
                         credentials.admin_tg_id, debug_logger,
                         TELEGRAM_TEXT_LIMIT,
+                        # Прошлый месяц для интервалов предложенного графика.
+                        events_loader=context.load_upcoming_service_events,
                     )
                 except Exception:
                     debug_logger.exception("Сбой проверки опроса готовности")
