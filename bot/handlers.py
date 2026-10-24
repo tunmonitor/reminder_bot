@@ -7678,7 +7678,19 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         service_id, raw_chat_id, raw_enabled = parts[1:]
         try:
-            await require_chat_member(message.from_user.id, int(raw_chat_id))
+            # Сначала права и формат — запрос в Telegram только админу
+            # служения.
+            if not is_service_admin(message.from_user.id, service_id):
+                raise PermissionError(
+                    "Настройки доступны только администратору этого служения."
+                )
+            if raw_enabled not in {"on", "off"}:
+                raise ValueError("Последний параметр должен быть on или off.")
+            try:
+                chat_id = int(raw_chat_id)
+            except ValueError as exc:
+                raise ValueError("ID чата должен быть числом.") from exc
+            await require_chat_member(message.from_user.id, chat_id)
         except (PermissionError, ValueError) as exc:
             await _send_dialog(
                 message, _status_text(str(exc), "❌"), parse_mode=None

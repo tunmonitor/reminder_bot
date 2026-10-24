@@ -2208,3 +2208,30 @@ class PersonalOriginMigrationTest(unittest.TestCase):
                     ("сборка", "user", 0, "Мой текст"),
                 ],
             )
+
+
+class InteractiveRosterSyncTest(unittest.TestCase):
+    def test_own_roster_only_updates_just_that_service(self):
+        from unittest.mock import MagicMock, patch
+
+        from bot import app
+        from bot.excel_parser import RosterMember
+
+        registry = MagicMock()
+        rosters = {
+            "sound": [RosterMember("Алексей", ("звук",))],
+            "kitchen": [RosterMember("Вера", ("в смене",))],
+        }
+        with patch.object(app, "parse_service_rosters", return_value=rosters):
+            app._sync_rosters_and_contacts(
+                registry, Path("x.xlsx"), "sound", {}, None, MagicMock(),
+                None, own_roster_only=True,
+            )
+            registry.sync_service_rosters.assert_called_once_with(
+                {"sound": rosters["sound"]}
+            )
+            registry.reset_mock()
+            app._sync_rosters_and_contacts(
+                registry, Path("x.xlsx"), "sound", {}, None, MagicMock(), None,
+            )
+            registry.sync_service_rosters.assert_called_once_with(rosters)
