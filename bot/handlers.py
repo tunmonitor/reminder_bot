@@ -4061,10 +4061,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     async def change_slot(
         actor_id: int, service_id: str, key: str, pending: dict, action: str,
-        person: str | None,
+        person: str | None, new_member=None,
     ) -> tuple:
         """Правка задачи даты (padd / prem / pclear) на свежем графике под
-        блокировкой; → (опрос, график, № даты, № задачи, пояснение)."""
+        блокировкой; → (опрос, график, № даты, № задачи, пояснение).
+        new_member — добавить человека в состав (→ его ключ) под той же
+        блокировкой, только если место в задаче есть."""
         registry = service_registry()
         day_index, task_index = pending["day_index"], pending["task_index"]
         notice = None
@@ -4090,6 +4092,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             slots = plan["slots"]
             people = slots.setdefault(day, {}).setdefault(task["name"], [])
             changed = False
+            if new_member is not None:
+                limit = task["max"] or task["needed"]
+                if limit > 1 and len(people) >= limit:
+                    raise ValueError(
+                        f"Мест нет ({limit}) — сначала уберите кого-нибудь."
+                    )
+                person = new_member()
             if action == "pclear":
                 changed = bool(people)
                 people.clear()
@@ -4167,31 +4176,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             notice,
         )
 
-    async def check_slot_free(service_id: str, pending: dict) -> None:
-        """ValueError, если в задачу даты сейчас нельзя поставить нового
-        человека (график изменился или мест нет)."""
-        registry = service_registry()
-        async with readiness.service_lock(service_id):
-            run = registry.get_readiness_run(service_id, pending["month"])
-            plan = registry.get_schedule_plan(service_id, pending["month"])
-            if not plan_current(run, plan) or (
-                schedule_plan.revision(plan) != pending.get("revision")
-            ):
-                raise ValueError("График изменился — откройте его заново.")
-            task = next(
-                (item for item in plan["tasks"]
-                 if item["name"] == pending["task"]),
-                None,
-            )
-            if task is None or pending["day"] not in plan["dates"]:
-                raise ValueError("График пересчитан — откройте его заново.")
-            limit = task["max"] or task["needed"]
-            people = schedule_plan.slot_people(plan, pending["day"], task["name"])
-            if limit > 1 and len(people) >= limit:
-                raise ValueError(
-                    f"Мест нет ({limit}) — сначала уберите кого-нибудь."
-                )
-
     async def on_plan_user_shared(message: Message, share: tuple) -> None:
         """«➕ Другой человек из Telegram»: в состав на задачу и в дату."""
         actor_id = message.from_user.id
@@ -4237,9 +4221,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "У пользователя нет имени в Telegram — добавьте его "
                         "через «👥 Ответственные»."
                     )
-                # Новый человек: сначала проверить, что место есть, —
-                # иначе он остался бы в составе без места в графике.
-                await check_slot_free(service_id, pending)
                 # Имя из Telegram может совпасть с чужим в составе —
                 # привязка ушла бы к однофамильцу.
                 taken = {
@@ -4261,18 +4242,24 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             "«👥 Ответственные»."
                         )
                     name = unique
+
+            def add_member() -> str:
+                # В состав — под блокировкой графика, когда место проверено.
                 registry.bind_service_member(
                     actor_id, service_id, name, user.user_id, username,
                     tasks=[pending["task"]], from_readiness=True,
                 )
-                key = person_key()
-                if key is None:
+                added = person_key()
+                if added is None:
                     raise ValueError(
                         "Не удалось добавить пользователя в состав — "
                         "попробуйте через «👥 Ответственные»."
                     )
+                return added
+
             run, plan, _, _, notice = await change_slot(
                 actor_id, service_id, pending["month"], pending, "padd", key,
+                new_member=add_member if key is None else None,
             )
         except (PermissionError, ValueError) as exc:
             await reshow_plan_slot(
