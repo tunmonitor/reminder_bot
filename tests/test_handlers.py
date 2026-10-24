@@ -3,7 +3,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -6245,6 +6245,80 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertEqual(katya["day_offset"], -3)
             stale = await press(find(person, "📅 пт (вс -2)"))
             self.assertIn("устарел", stale.answer.await_args.args[0])
+
+        asyncio.run(run())
+
+    def test_section_shows_missed_autostart(self):
+        handler = self.callback_handler("on_readiness")
+        today = datetime.now(ZoneInfo("UTC")).date()
+        year, month = (
+            (today.year + 1, 1) if today.month == 12
+            else (today.year, today.month + 1)
+        )
+        from bot import readiness as readiness_module
+
+        start, deadline = readiness_module.schedule(
+            self.registry.get_readiness_settings("sound"), year, month,
+            ZoneInfo("UTC"),
+        )
+
+        async def open_at(moment):
+            callback = SimpleNamespace(
+                data="rdy:open:sound",
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            with patch("bot.handlers.datetime") as clock:
+                clock.now.return_value = moment
+                clock.combine = datetime.combine
+                clock.fromisoformat = datetime.fromisoformat
+                await handler(callback)
+            return "\n".join(
+                call.args[0]
+                for call in callback.message.answer.await_args_list
+            )
+
+        async def run():
+            unbound = await open_at(deadline + timedelta(hours=1))
+            self.assertIn("❗ Служение выключено", unbound)
+            self.registry.set_group_chat(67890, "sound", -1005555, enabled=True)
+            before = await open_at(start - timedelta(days=2))
+            self.assertIn("▶️ Запуск:", before)
+            self.assertNotIn("сроки прошли", before)
+            after = await open_at(deadline + timedelta(hours=1))
+            self.assertIn("Автозапуск выключен", after)
+            self.assertIn("❗ Сейчас нужно запустить опрос вручную", after)
+            self.registry.set_readiness_settings(67890, "sound", enabled=True)
+            # Включён только что (после окна) — не «ожидался».
+            late = await open_at(deadline + timedelta(hours=1))
+            self.assertIn("Автозапуск включён после времени запуска", late)
+            with closing(sqlite3.connect(self.registry.path)) as connection:
+                connection.execute(
+                    "UPDATE readiness_settings SET enabled_at = ?",
+                    ((start - timedelta(days=5)).isoformat(),),
+                )
+                connection.commit()
+            expected = await open_at(deadline + timedelta(hours=1))
+            self.assertIn("сроки прошли, опрос не запускался", expected)
+            self.registry.set_group_chat(67890, "sound", -1005555, enabled=False)
+            disabled = await open_at(deadline + timedelta(hours=1))
+            self.assertIn("❗ Служение выключено", disabled)
+            self.registry.set_group_chat(67890, "sound", -1005555, enabled=True)
+            # Попытка автозапуска была и не удалась.
+            self.registry.claim_readiness_notice(
+                "sound", f"{year:04d}-{month:02d}", "launch"
+            )
+            failed = await open_at(start + timedelta(hours=1))
+            self.assertIn("не удался", failed)
+            # График составлен без опроса — подсказки «запустить» нет.
+            self.registry.save_schedule_draft(
+                "sound", f"{year:04d}-{month:02d}", run_id=None, dates=[],
+                tasks=[], slots={}, last_served={},
+            )
+            planned = await open_at(deadline + timedelta(hours=1))
+            self.assertNotIn("❗", planned)
+            self.assertNotIn("сроки прошли", planned)
 
         asyncio.run(run())
 
