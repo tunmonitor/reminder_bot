@@ -479,6 +479,11 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   (pending `readiness_own` with token + member names; `rdy:own` → `ownp`
   token.i → `owns` token.i.offset|n). `schedule_plan.date_window` drops the
   window from a date header when everyone on that date has their own day.
+- Permissions (24.10): a service admin may do everything for own services
+  (chat, contacts/bindings, members, tasks, sync, notify, replace, «📅 График»);
+  only `ADMIN_OPERATIONS` (service_admin_add/remove) stay super-admin-only;
+  registry uses `_require_service_editor` everywhere else; `/test_notify` —
+  main admin only.
 - User guides: `docs/ADMIN_GUIDE.md` and `docs/VOLUNTEER_GUIDE.md` (Russian,
   schematic screens). Update them together with UI changes.
 - Customer decision 5 (24.10): Excel may stop being filled — step 4 adds a

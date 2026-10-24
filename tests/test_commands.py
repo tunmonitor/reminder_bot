@@ -43,7 +43,11 @@ class CommandsForRoleTest(unittest.TestCase):
         names = command_names(commands_for_role(ROLE_SERVICE_ADMIN))
         self.assertEqual(
             names,
-            ["start", "services", "service_notify", "change", "my_schedule", "my_notifications", "cancel"],
+            [
+                "start", "services", "service_notify", "change",
+                "service_contact", "service_sync", "service_chat",
+                "my_schedule", "my_notifications", "cancel",
+            ],
         )
 
     def test_main_super_admin_gets_full_menu_with_delivery_check(self):
@@ -86,7 +90,9 @@ class SyncCommandsTest(unittest.TestCase):
         menus = {call.kwargs["scope"].chat_id: command_names(call.args[0]) for call in calls[1:]}
         self.assertEqual(set(menus), {24680, 67890})
         self.assertIn("test_notify", menus[67890])
-        self.assertNotIn("service_contact", menus[24680])
+        # Админ служения: всё по служению, кроме назначения админов.
+        self.assertIn("service_contact", menus[24680])
+        self.assertNotIn("service_admin_add", menus[24680])
 
     def test_main_admin_missing_from_registry_gets_delivery_check(self):
         bot = MagicMock(set_my_commands=AsyncMock(), delete_my_commands=AsyncMock())
