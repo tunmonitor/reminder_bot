@@ -737,6 +737,22 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             state = nav_state.setdefault(
                 nav_actor, {"shown": False, "helpers": []}
             )
+            previous_menu = state.get("screen") if state.get("menu") else None
+            state["menu"] = isinstance(markup, InlineKeyboardMarkup)
+            # Сразу, до await: параллельный обработчик увидит этот экран.
+            state["screen"] = sent_message.message_id
+            if (
+                clean_previous
+                and previous_menu is not None
+                and previous_menu != sent_message.message_id
+                and isinstance(markup, InlineKeyboardMarkup)
+                and (getattr(target, "text", None) or "").startswith("/")
+            ):
+                # Экран команды заменяет прежнее меню. Удаление — после
+                # отправки: два быстрых /services не оставят оба экрана.
+                await clean_previous_menu_by_id(
+                    context.bot, target.chat.id, previous_menu, debug
+                )
             if markup is not None or not text.startswith("⏳"):
                 state["back"] = nav_back
             # «⏳ Загружаю…» шаг назад не меняет: «Отмена» вернёт с прежнего
@@ -1295,7 +1311,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="🗳 Опрос готовности",
+                    text="📅 График",
                     callback_data=f"rdy:open:{service_id}",
                 )
             ]
@@ -3358,7 +3374,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         ]
         rows = layout_buttons(buttons) if buttons else []
         rows.append([
-            readiness_button("⬅️ К опросу", "open", service_id)
+            readiness_button("⬅️ К разделу «График»", "open", service_id)
             if back == "o" else InlineKeyboardButton(
                 text="⬅️ К задачам",
                 callback_data=f"svc_tasks:open:{service_id}",
@@ -3411,7 +3427,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def show_readiness(
         message: Message, service_id: str, notice: str | None = None
     ) -> None:
-        """Карточка служения → «🗳 Опрос готовности» (этап 5.3)."""
+        """Карточка служения → «📅 График»: опрос готовности и график месяца
+        (этап 5)."""
         registry = service_registry()
         service = registry.get_service(service_id) if registry else None
         if service is None:
@@ -3429,9 +3446,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         month_arg = f"{year:04d}{month:02d}"
         weekdays = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
         lines = [
-            f"🗳 Опрос готовности · {service_label(service)}",
+            f"📅 График · {service_label(service)}",
             "",
-            "Статус: " + (
+            "🗳 Опрос готовности — автозапуск: " + (
                 "🟢 включён" if settings["enabled"]
                 else "🔴 выключен (запуск только вручную)"
             ),
@@ -3451,22 +3468,55 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "",
         ]
         rows: list[list[InlineKeyboardButton]] = []
+        plan = registry.get_schedule_plan(service_id, f"{year:04d}-{month:02d}")
+
+        def plan_status(plan: dict) -> str:
+            return "📋 График: " + (
+                "черновик, не утверждён" if plan["approved"] is None
+                else "есть неопубликованные правки" if plan["dirty"]
+                else "✅ утверждён"
+            ) + (" (без опроса)" if plan["run_id"] is None else "")
+
+        # График без опроса — пока опроса месяца нет или он пропущен.
+        free_plan = plan if plan is not None and plan["run_id"] is None and (
+            run is None or run["status"] == "skipped"
+        ) else None
+        free_row = [
+            readiness_button("📋 График", "plan", service_id, month_arg)
+            if free_plan is not None else
+            readiness_button(
+                "🧮 Составить без опроса", "pfree", service_id, month_arg
+            )
+        ]
         if run is None:
-            lines.append(f"Опрос на {title}: ещё не запускался.")
+            lines.append(
+                f"Опрос на {title}: ещё не запускался"
+                + (
+                    " — график составлен без опроса, автоматически опрос "
+                    "не запустится (запуск вручную составит график по "
+                    "ответам заново)."
+                    if free_plan is not None else "."
+                )
+            )
             rows.append([
                 readiness_button(
-                    "▶️ Запустить сейчас", "start", service_id, month_arg
+                    "🗳 Запустить опрос", "start", service_id, month_arg
                 ),
                 readiness_button(f"⏭ Пропустить {title.split()[0]}",
                                  "skip", service_id, month_arg),
             ])
+            rows.append(free_row)
         elif run["status"] == "skipped":
-            lines.append(f"Опрос на {title}: ⏭ пропущен.")
+            lines.append(
+                f"Опрос на {title}: ⏭ пропущен — автоматически не "
+                "запустится. График можно составить без опроса."
+            )
             rows.append([
                 readiness_button(
                     "↩️ Не пропускать", "unskip", service_id, month_arg
                 ),
             ])
+            rows.append(free_row)
         elif run["status"] == "open":
             lines.append(
                 f"Опрос на {title}: 🟢 идёт до "
@@ -3482,16 +3532,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                                  month_arg),
             ])
         else:
-            plan = registry.get_schedule_plan(service_id, run["month"])
             lines.append(f"Опрос на {title}: ✅ завершён.")
-            if plan is not None:
-                lines.append(
-                    "📋 График: " + (
-                        "черновик, не утверждён" if plan["approved"] is None
-                        else "есть неопубликованные правки" if plan["dirty"]
-                        else "✅ утверждён"
-                    )
-                )
+            if plan is not None and plan["run_id"] == run["id"]:
+                lines.append(plan_status(plan))
             rows.append([
                 readiness_button("📋 График", "plan", service_id, month_arg),
                 readiness_button("📊 Итог опроса", "progress", service_id, month_arg),
@@ -3500,6 +3543,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 readiness_button("▶️ Запустить заново", "restart", service_id,
                                  month_arg),
             ])
+        if free_plan is not None:
+            lines.append(plan_status(free_plan))
         rows.append([
             readiness_button("⏳ Срок", "dur", service_id),
             readiness_button("🕒 Начало", "time", service_id),
@@ -3521,10 +3566,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             readiness_button("📣 Напоминание в чат", "tpl", service_id, "chat"),
             readiness_button("✅ Текст завершения", "tpl", service_id, "done"),
         ])
-        rows.append([InlineKeyboardButton(
-            text="⬅️ К карточке служения",
-            callback_data=f"service:service_settings:{service_id}",
-        )])
         current_key = f"{now.year:04d}-{now.month:02d}"
         current_plan = registry.get_schedule_plan(service_id, current_key)
         if current_plan is not None:
@@ -3533,6 +3574,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 f"📋 График на {month_title(now.year, now.month)}", "plan",
                 service_id, current_key.replace("-", ""),
             )])
+        rows.append([InlineKeyboardButton(
+            text="⬅️ К карточке служения",
+            callback_data=f"service:service_settings:{service_id}",
+        )])
         if notice:
             lines = [notice, ""] + lines
         await _send_dialog(
@@ -3603,7 +3648,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 readiness_button("🔄 Вернуть встроенный", "tplreset",
                                  service_id, kind)
             )
-        rows.append([readiness_button("⬅️ К опросу", "open", service_id)])
+        rows.append([readiness_button("⬅️ К разделу «График»", "open", service_id)])
         await _send_dialog(
             message, "\n".join(lines),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -3674,7 +3719,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             rows.append([readiness_button(
                 "📋 График", "plan", service["id"], f"{year:04d}{month:02d}"
             )])
-        rows.append([readiness_button("⬅️ К опросу", "open", service["id"])])
+        rows.append([readiness_button("⬅️ К разделу «График»", "open", service["id"])])
         await _send_dialog(
             message, text,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -3715,7 +3760,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         ]
         rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
         rows.append([readiness_button("✅ Сохранить", "addms", service_id, token)])
-        rows.append([readiness_button("⬅️ К опросу", "open", service_id)])
+        rows.append([readiness_button("⬅️ К разделу «График»", "open", service_id)])
         await _send_dialog(
             message, "\n".join(lines),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -3726,7 +3771,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     PLAN_ACTIONS = {
         "plan", "precalc", "precalcok", "pedit", "pdate", "ptask", "padd",
-        "prem", "pclear", "pok", "pokok",
+        "prem", "pclear", "pok", "pokok", "pfree", "pnew",
     }
 
     def plan_month(arg: str | None, now: datetime) -> str | None:
@@ -3753,9 +3798,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         )
 
     def plan_current(run: dict | None, plan: dict | None) -> bool:
-        """График относится к закрытому опросу, который сейчас у месяца."""
+        """График действующий: по закрытому опросу, который сейчас у
+        месяца, или без опроса — если опроса месяца нет (или он пропущен)."""
+        if plan is None:
+            return False
+        if plan["run_id"] is None:
+            return run is None or run["status"] == "skipped"
         return (
-            run is not None and plan is not None and run["status"] == "closed"
+            run is not None and run["status"] == "closed"
             and plan["run_id"] == run["id"]
         )
 
@@ -3768,7 +3818,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             run = registry.get_readiness_run(service_id, key)
             plan = registry.get_schedule_plan(service_id, key)
             if run is None or run["status"] != "closed":
-                return run, plan
+                # График без опроса — пока опрос месяца не идёт.
+                return run, plan if plan_current(run, plan) else None
             plan = await schedule_plan.ensure_plan(
                 registry, run,
                 getattr(context, "load_upcoming_service_events", None), debug,
@@ -3781,7 +3832,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     ) -> None:
         """«📋 График»: предложенный (или утверждённый) график месяца."""
         summary = await asyncio.to_thread(
-            readiness.summarize, service_registry(), run, with_plan=False
+            schedule_plan.plan_summary, service_registry(), plan, run
         )
         text = schedule_plan.plan_text(
             service_label(service), plan, summary, context.timezone
@@ -3816,7 +3867,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )]
                 for answer in summary.outside[:20]
             ]
-        rows.append([readiness_button("⬅️ К опросу", "open", service_id)])
+        rows.append([readiness_button("⬅️ К разделу «График»", "open", service_id)])
         await _send_dialog(
             message, text,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -3881,7 +3932,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         """Кто стоит на задаче в дату: ❌ — убрать, имя — поставить."""
         registry = service_registry()
         summary = await asyncio.to_thread(
-            readiness.summarize, registry, run, with_plan=False
+            schedule_plan.plan_summary, registry, plan, run
         )
         names = {person["key"]: person["name"] for person in summary.people}
         day = plan["dates"][day_index]
@@ -3942,6 +3993,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     f"{token}.{keys.index(key)}",
                 ))
         rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+        rows.append([readiness_button(
+            "➕ Другой человек из Telegram", "pnew", service["id"], token
+        )])
         if current:
             rows.append([readiness_button(
                 "🚫 Оставить пустым", "pclear", service["id"], token
@@ -3978,6 +4032,185 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             BufferedInputFile(data, filename=f"{service['id']}-{plan['month']}.xlsx"),
         )
 
+    async def change_slot(
+        actor_id: int, service_id: str, key: str, pending: dict, action: str,
+        person: str | None,
+    ) -> tuple:
+        """Правка задачи даты (padd / prem / pclear) на свежем графике под
+        блокировкой; → (опрос, график, № даты, № задачи, пояснение)."""
+        registry = service_registry()
+        day_index, task_index = pending["day_index"], pending["task_index"]
+        notice = None
+        async with readiness.service_lock(service_id):
+            # Свежий график: другой админ мог поправить его только что,
+            # а опрос — быть перезапущен.
+            run = registry.get_readiness_run(service_id, key)
+            plan = registry.get_schedule_plan(service_id, key)
+            if not plan_current(run, plan) or (
+                schedule_plan.revision(plan) != pending.get("revision")
+            ):
+                raise ValueError("График изменился — откройте его заново.")
+            day = pending["day"]
+            task = next(
+                (item for item in plan["tasks"]
+                 if item["name"] == pending["task"]),
+                None,
+            )
+            if day not in plan["dates"] or task is None:
+                raise ValueError("График пересчитан — откройте его заново.")
+            day_index = plan["dates"].index(day)
+            task_index = plan["tasks"].index(task)
+            slots = plan["slots"]
+            people = slots.setdefault(day, {}).setdefault(task["name"], [])
+            changed = False
+            if action == "pclear":
+                changed = bool(people)
+                people.clear()
+                notice = "🚫 Задача оставлена пустой"
+            elif person is None:
+                notice = "⚠️ Экран устарел"
+            elif action == "prem":
+                if person in people:
+                    people.remove(person)
+                    changed = True
+                notice = "✅ Убран(а) из задачи"
+            elif person in people:
+                notice = "ℹ️ Уже стоит на этой задаче"
+            elif person in schedule_plan.busy_on(plan, day, task["name"]):
+                notice = "⚠️ В этот день уже на другой задаче — одна задача в день"
+            else:
+                limit = task["max"] or task["needed"]
+                replaced = None
+                if len(people) >= limit and limit == 1:
+                    replaced = people.pop()
+                if len(people) >= limit:
+                    notice = (
+                        f"⚠️ Мест нет ({limit}) — сначала уберите кого-нибудь"
+                    )
+                else:
+                    people.append(person)
+                    changed = True
+                    summary = await asyncio.to_thread(
+                        schedule_plan.plan_summary, registry, plan, run
+                    )
+                    names = {
+                        item["key"]: item["name"] for item in summary.people
+                    }
+                    plan_view = {**plan, "slots": slots}
+                    notes = schedule_plan.choice_notes(
+                        plan_view, summary, person, day, task["name"]
+                    )
+                    notice = "\n".join(
+                        [f"✅ Поставлен(а): {names.get(person, person)}"
+                         + (f" вместо {names.get(replaced, replaced)}"
+                            if replaced else "")]
+                        + notes
+                    )
+            if changed:
+                plan = registry.set_schedule_slots(
+                    actor_id, service_id, key, slots
+                )
+        return run, plan, day_index, task_index, notice
+
+    async def reshow_plan_slot(
+        message: Message, actor_id: int, notice: str | None = None,
+    ) -> None:
+        """Вернуться к экрану задачи даты после выбора в Telegram."""
+        pending = pending_inputs.get(actor_id) or {}
+        registry = service_registry()
+        service = registry.get_service(pending.get("service_id", ""))
+        run, plan = await load_plan(pending["service_id"], pending["month"])
+        task = next(
+            (item for item in (plan or {}).get("tasks", [])
+             if item["name"] == pending.get("task")),
+            None,
+        )
+        if service is None or not plan_current(run, plan) or task is None or (
+            pending.get("day") not in plan["dates"]
+        ):
+            pending_inputs.pop(actor_id, None)
+            await _send_dialog(
+                message, "⚠️ График изменился — откройте его заново.",
+                reply_markup=ReplyKeyboardRemove(), parse_mode=None,
+            )
+            return
+        await show_plan_slot(
+            message, actor_id, service, run, plan,
+            plan["dates"].index(pending["day"]), plan["tasks"].index(task),
+            notice,
+        )
+
+    async def on_plan_user_shared(message: Message, share: tuple) -> None:
+        """«➕ Другой человек из Telegram»: в состав на задачу и в дату."""
+        actor_id = message.from_user.id
+        pending = pending_inputs.get(actor_id)
+        if (
+            pending is None
+            or pending.get("operation") != "readiness_plan"
+            or pending.get("step") != "plan_user"
+            or pending.get("service_id") != share[2]
+            or pending.get("share_request") != message.users_shared.request_id
+        ):
+            await _send_dialog(
+                message, "Выбор пользователя устарел. Откройте график заново.",
+                reply_markup=ReplyKeyboardRemove(), parse_mode=None,
+            )
+            return
+        pending["step"] = "readiness_plan"
+        user = message.users_shared.users[0]
+        username = (getattr(user, "username", None) or "").strip()
+        name = " ".join(
+            part for part in (
+                getattr(user, "first_name", None), getattr(user, "last_name", None)
+            ) if part
+        ).strip() or (f"@{username}" if username else "")
+        registry = service_registry()
+        service_id = pending["service_id"]
+
+        def person_key() -> str | None:
+            return next(
+                (
+                    person["key"]
+                    for person in registry.readiness_people(service_id)
+                    if person["telegram_id"] == user.user_id
+                ),
+                None,
+            )
+
+        try:
+            key = person_key()
+            if key is None:
+                if not name:
+                    raise ValueError(
+                        "У пользователя нет имени в Telegram — добавьте его "
+                        "через «👥 Ответственные»."
+                    )
+                registry.bind_service_member(
+                    actor_id, service_id, name, user.user_id, username,
+                    tasks=[pending["task"]], from_readiness=True,
+                )
+                key = person_key()
+                if key is None:
+                    raise ValueError(
+                        "Не удалось добавить пользователя в состав — "
+                        "попробуйте через «👥 Ответственные»."
+                    )
+            run, plan, _, _, notice = await change_slot(
+                actor_id, service_id, pending["month"], pending, "padd", key,
+            )
+        except (PermissionError, ValueError) as exc:
+            await reshow_plan_slot(
+                message, actor_id, _status_text(str(exc), "⚠️")
+            )
+            return
+        except sqlite3.Error:
+            debug.exception("Не удалось добавить пользователя в график")
+            await reshow_plan_slot(
+                message, actor_id, "❌ Не удалось сохранить — попробуйте позже"
+            )
+            return
+        await reshow_plan_slot(message, actor_id, notice)
+
     async def on_plan_action(
         callback: CallbackQuery, action: str, service: dict, arg: str | None,
         actor_id: int, now: datetime,
@@ -3985,7 +4218,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         """Действия «📋 График» (этап 5.4–5.5)."""
         registry = service_registry()
         service_id = service["id"]
-        if action in {"padd", "prem", "pclear"}:
+        if action in {"padd", "prem", "pclear", "pnew"}:
             pending = pending_inputs.get(actor_id) or {}
             key = plan_month((pending.get("month") or "").replace("-", ""), now)
         else:
@@ -3996,11 +4229,38 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             await _answer_callback(callback)
             return
+        loader = getattr(context, "load_upcoming_service_events", None)
+        if action == "pfree":
+            await _answer_callback(callback, "⏳ Составляю…")
+            year, month = map(int, key.split("-"))
+            notice = "🧮 График составлен без опроса — проверьте и утвердите"
+            async with readiness.service_lock(service_id):
+                run = registry.get_readiness_run(service_id, key)
+                plan = registry.get_schedule_plan(service_id, key)
+                if run is not None and run["status"] != "skipped":
+                    notice = (
+                        "⚠️ Опрос этого месяца уже есть — график составляется "
+                        "по его ответам"
+                    )
+                    plan = None
+                elif plan_current(run, plan):
+                    notice = "ℹ️ График уже составлен"
+                else:
+                    plan = await schedule_plan.build_draft(
+                        registry, schedule_plan.free_run(service_id, year, month),
+                        loader, debug,
+                    )
+            if plan is None:
+                await show_readiness(callback.message, service_id, notice)
+            else:
+                await show_plan(callback.message, service, run, plan, notice)
+            return
         run, plan = await load_plan(service_id, key)
-        if plan is None or run is None or run["status"] != "closed":
+        if not plan_current(run, plan):
             await show_readiness(
                 callback.message, service_id,
-                "⚠️ График появится, когда опрос будет завершён",
+                "⚠️ Графика пока нет: он появится, когда опрос будет "
+                "завершён, или «🧮 Составить без опроса»",
             )
             await _answer_callback(callback)
             return
@@ -4022,7 +4282,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             month_arg = key.replace("-", "")
             await _send_dialog(
                 callback.message,
-                "🔄 Пересчитать график по ответам опроса?\n\nРучные правки "
+                "🔄 Пересчитать график заново?\n\nРучные правки "
                 "сбросятся (утверждённый график в чате не изменится, пока "
                 "вы его снова не утвердите).",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -4038,7 +4298,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         elif action in {"precalc", "precalcok"}:
             await _answer_callback(callback, "⏳ Считаю…")
             rev = schedule_plan.revision(plan)
-            notice = "🔄 График пересчитан по ответам и текущим задачам"
+            notice = "🔄 График пересчитан по текущему составу и задачам"
             async with readiness.service_lock(service_id):
                 # Под блокировкой: опрос мог быть перезапущен, а график —
                 # поправлен другим админом после подтверждения.
@@ -4055,11 +4315,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         )
                 else:
                     plan = await schedule_plan.build_draft(
-                        registry, run,
-                        getattr(context, "load_upcoming_service_events", None),
+                        registry, schedule_plan.plan_run(plan, run), loader,
                         debug,
                     )
-            if run is None or plan is None or run["status"] != "closed":
+            if not plan_current(run, plan):
                 await show_readiness(callback.message, service_id, notice)
             else:
                 await show_plan(callback.message, service, run, plan, notice)
@@ -4085,84 +4344,53 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 callback.message, actor_id, service, run, plan,
                 int(parts[1]), int(parts[2]),
             )
+        elif action == "pnew":
+            pending = pending_inputs[actor_id]
+            pending["step"] = "plan_user"
+            for request_id, share in list(pending_shares.items()):
+                if share[0] == actor_id:
+                    pending_shares.pop(request_id, None)
+            request_id = new_share_request_id()
+            pending_shares[request_id] = (
+                actor_id, "plan_user", service_id, None, None
+            )
+            pending["share_request"] = request_id
+            day = date.fromisoformat(pending["day"])
+            await _send_dialog(
+                callback.message,
+                f"➕ {day:%d.%m} · «{pending['task']}»: нажмите кнопку и "
+                "выберите пользователя Telegram. Он добавится в состав "
+                "служения на эту задачу и встанет в эту дату. "
+                f"«{CONTACT_BACK_TEXT}» — вернуться к выбору.",
+                reply_markup=ReplyKeyboardMarkup(
+                    keyboard=[
+                        [KeyboardButton(
+                            text="Выбрать пользователя",
+                            request_users=KeyboardButtonRequestUsers(
+                                request_id=request_id,
+                                user_is_bot=False,
+                                max_quantity=1,
+                                request_name=True,
+                                request_username=True,
+                            ),
+                        )],
+                        [KeyboardButton(text=CONTACT_BACK_TEXT)],
+                    ],
+                    resize_keyboard=True,
+                    one_time_keyboard=True,
+                ),
+                parse_mode=None,
+            )
         elif action in {"padd", "prem", "pclear"}:
             pending = pending_inputs[actor_id]
-            day_index, task_index = pending["day_index"], pending["task_index"]
-            notice = None
-            async with readiness.service_lock(service_id):
-                # Свежий график: другой админ мог поправить его только что,
-                # а опрос — быть перезапущен.
-                run = registry.get_readiness_run(service_id, key)
-                plan = registry.get_schedule_plan(service_id, key)
-                if not plan_current(run, plan) or (
-                    schedule_plan.revision(plan) != pending.get("revision")
-                ):
-                    raise ValueError("График изменился — откройте его заново.")
-                day = pending["day"]
-                task = next(
-                    (item for item in plan["tasks"]
-                     if item["name"] == pending["task"]),
-                    None,
-                )
-                if day not in plan["dates"] or task is None:
-                    raise ValueError("График пересчитан — откройте его заново.")
-                day_index = plan["dates"].index(day)
-                task_index = plan["tasks"].index(task)
-                slots = plan["slots"]
-                people = slots.setdefault(day, {}).setdefault(task["name"], [])
-                index = int(parts[-1]) if parts[-1].isdigit() else -1
-                person = (
-                    pending["keys"][index]
-                    if 0 <= index < len(pending["keys"]) else None
-                )
-                changed = False
-                if action == "pclear":
-                    changed = bool(people)
-                    people.clear()
-                    notice = "🚫 Задача оставлена пустой"
-                elif person is None:
-                    notice = "⚠️ Экран устарел"
-                elif action == "prem":
-                    if person in people:
-                        people.remove(person)
-                        changed = True
-                    notice = "✅ Убран(а) из задачи"
-                elif person in people:
-                    notice = "ℹ️ Уже стоит на этой задаче"
-                elif person in schedule_plan.busy_on(plan, day, task["name"]):
-                    notice = "⚠️ В этот день уже на другой задаче — одна задача в день"
-                else:
-                    limit = task["max"] or task["needed"]
-                    replaced = None
-                    if len(people) >= limit and limit == 1:
-                        replaced = people.pop()
-                    if len(people) >= limit:
-                        notice = (
-                            f"⚠️ Мест нет ({limit}) — сначала уберите кого-нибудь"
-                        )
-                    else:
-                        people.append(person)
-                        changed = True
-                        summary = await asyncio.to_thread(
-                            readiness.summarize, registry, run, with_plan=False
-                        )
-                        names = {
-                            item["key"]: item["name"] for item in summary.people
-                        }
-                        plan_view = {**plan, "slots": slots}
-                        notes = schedule_plan.choice_notes(
-                            plan_view, summary, person, day, task["name"]
-                        )
-                        notice = "\n".join(
-                            [f"✅ Поставлен(а): {names.get(person, person)}"
-                             + (f" вместо {names.get(replaced, replaced)}"
-                                if replaced else "")]
-                            + notes
-                        )
-                if changed:
-                    plan = registry.set_schedule_slots(
-                        actor_id, service_id, key, slots
-                    )
+            index = int(parts[-1]) if parts[-1].isdigit() else -1
+            person = (
+                pending["keys"][index]
+                if 0 <= index < len(pending["keys"]) else None
+            )
+            run, plan, day_index, task_index, notice = await change_slot(
+                actor_id, service_id, key, pending, action, person
+            )
             await show_plan_slot(
                 callback.message, actor_id, service, run, plan,
                 day_index, task_index, notice,
@@ -4253,7 +4481,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         except Exception:  # noqa: BLE001
                             debug.exception("Не удалось отправить блок для Excel")
                             notice += "\n⚠️ Блок для Excel отправить не удалось"
-            if run is None or plan is None or run["status"] != "closed":
+            if not plan_current(run, plan):
                 await show_readiness(callback.message, service_id, notice)
             else:
                 await show_plan(callback.message, service, run, plan, notice)
@@ -4274,7 +4502,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             for label, value in options
         ]
         rows = [buttons[index:index + 3] for index in range(0, len(buttons), 3)]
-        rows.append([readiness_button("⬅️ К опросу", "open", service_id)])
+        rows.append([readiness_button("⬅️ К разделу «График»", "open", service_id)])
         await _send_dialog(
             message, title,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -4323,7 +4551,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await answer_quietly(callback, "⚠️ Этот экран уже устарел.")
                 return
             plan_pending = member_pending
-            if action in {"padd", "prem", "pclear"} and not (
+            if action in {"padd", "prem", "pclear", "pnew"} and not (
                 plan_pending
                 and plan_pending.get("operation") == "readiness_plan"
                 and plan_pending.get("service_id") == service_id
@@ -4331,7 +4559,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ):
                 await answer_quietly(callback, "⚠️ Этот экран уже устарел.")
                 return
-            if action in {"addmt", "addms", "padd", "prem", "pclear"}:
+            if action in {"addmt", "addms", "padd", "prem", "pclear", "pnew"}:
                 # Выбор задач идёт в одной сессии — pending не сбрасывается.
                 await clean_previous_menu(callback.message, debug)
                 pending_inputs[actor_id].pop("menu_message_id", None)
@@ -4404,7 +4632,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             else "✅ Да, запустить заново",
                             "restartok", service_id, arg,
                         )],
-                        [readiness_button("⬅️ К опросу", "open", service_id)],
+                        [readiness_button("⬅️ К разделу «График»", "open", service_id)],
                     ]),
                     _dialog_keep_rows=True,
                     parse_mode=None,
@@ -4502,7 +4730,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             )
                             notice = (
                                 f"⏭ {month_title(year, month)}: опрос не "
-                                "запустится"
+                                "запустится автоматически. График можно "
+                                "составить без опроса — «🧮 Составить без "
+                                "опроса»"
                             )
                         except ValueError as exc:
                             notice = f"⚠️ {exc}"
@@ -8349,6 +8579,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await on_replace_user_shared(message, pending)
             return
         if (
+            pending is not None
+            and pending[0] == message.from_user.id
+            and pending[1] == "plan_user"
+            and len(message.users_shared.users) == 1
+        ):
+            await on_plan_user_shared(message, pending)
+            return
+        if (
             pending is None
             or pending[0] != message.from_user.id
             or pending[1] not in {"service_admin_add", "service_contact"}
@@ -10442,6 +10680,21 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
                 await show_replace_candidates(
                     message, message.from_user.id, pending
+                )
+            return
+        if pending.get("operation") == "readiness_plan":
+            if pending.get("step") == "plan_user":
+                if message.text == CONTACT_BACK_TEXT:
+                    pending["step"] = "readiness_plan"
+                    await reshow_plan_slot(message, message.from_user.id)
+                else:
+                    await message.answer(
+                        "Выберите пользователя кнопкой внизу или нажмите "
+                        f"«{CONTACT_BACK_TEXT}».", parse_mode=None,
+                    )
+            else:
+                await message.answer(
+                    "Выберите действие кнопками меню.", parse_mode=None
                 )
             return
         if pending.get("operation") == "my_notifications_input":

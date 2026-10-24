@@ -375,6 +375,17 @@ class ReadinessFlowTest(unittest.TestCase):
             sorted(recipients), [-1005555, -1005555, 501, 501, 502, 503]
         )
 
+    def test_no_autostart_when_planned_without_poll(self):
+        self.registry.save_schedule_draft(
+            "sound", "2026-11", run_id=None, dates=["2026-11-01"], tasks=[],
+            slots={}, last_served={},
+        )
+        bot = fake_bot()
+        self.tick(bot, datetime(2026, 10, 18, 10, 30, tzinfo=TZ))
+        self.tick(bot, datetime(2026, 10, 19, 10, 0, tzinfo=TZ))
+        bot.send_poll.assert_not_awaited()
+        bot.send_message.assert_not_awaited()
+
     def test_no_chat_reminder_when_everyone_answered(self):
         bot = fake_bot()
         run = self.launch(bot)

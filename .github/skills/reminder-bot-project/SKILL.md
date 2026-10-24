@@ -444,6 +444,18 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   tasks) and «🗑 Удалить» (`remove_service_member`; a «Списки» person returns on
   the next sync — warned). Bot-added members (source manual, not in list) are
   marked 🆕.
+- Section renamed «📅 График» (still `rdy:` callbacks). No-poll plan: `pfree`
+  → `schedule_plan.build_draft(free_run(...))` with `summarize(assume_free=True)`
+  (everyone with tasks free on all Sundays, not reluctant); stored with
+  `run_id = NULL`; `plan_current` treats it as current while the month has no
+  run or a skipped one; `plan_run`/`plan_summary` give screens the right
+  summary. Slot editor `pnew` → reply keyboard `request_users`
+  (`pending_shares` kind `plan_user`) → `on_plan_user_shared`: existing person
+  by Telegram id, else `bind_service_member(from_readiness=True, tasks=[task])`,
+  then `change_slot(..., "padd", key)`; `⬅️ Назад` text returns via
+  `reshow_plan_slot`. `_send_dialog`: a screen sent in reply to a `/command`
+  deletes the previous menu screen (`nav_state[actor]["menu"]`), recording the
+  new screen before awaiting the delete.
 - Customer decision 5 (24.10): Excel may stop being filled — step 4 adds a
   per-service source switch and «📥 Загрузить график из Excel».
 
