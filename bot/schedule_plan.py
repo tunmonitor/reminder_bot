@@ -374,8 +374,22 @@ def choice_notes(plan: dict, summary: Summary, key: str, day: str,
 
 
 def plan_changes(old: dict, new: dict, names: dict[str, str]) -> list[str]:
-    """Отличия нового графика от опубликованного — для «обновлён»."""
+    """Отличия нового графика от опубликованного — для «обновлён».
+    Единственная задача сменила название (служение без задач переименовано
+    в каталоге) — одной строкой, люди сравниваются под новым названием.
+    При нескольких задачах смена набора — это выключение и включение, не
+    переименование."""
     lines = []
+    old_tasks = {task for tasks in old.values() for task in tasks}
+    new_tasks = {task for tasks in new.values() for task in tasks}
+    if len(old_tasks) == len(new_tasks) == 1 and old_tasks != new_tasks:
+        (was,), (now,) = old_tasks, new_tasks
+        lines.append(f"• Задача «{was}» теперь называется «{now}»")
+        old = {
+            day: {(now if task == was else task): people
+                  for task, people in tasks.items()}
+            for day, tasks in old.items()
+        }
     for day in sorted(set(old) | set(new)):
         tasks = list(dict.fromkeys([*new.get(day, {}), *old.get(day, {})]))
         for task in tasks:

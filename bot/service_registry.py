@@ -5276,9 +5276,10 @@ class ServiceRegistry:
     def rename_plan_task(
         self, service_id: str, month: str, old: str, new: str,
     ) -> dict:
-        """Переименовать задачу графика (служение без задач переименовано
-        в каталоге) — и в рабочей, и в утверждённой копии: смена названия
-        не считается правкой графика."""
+        """Переименовать задачу в рабочей копии графика (служение без задач
+        переименовано в каталоге). Утверждённая копия — как опубликовано:
+        график становится «с правками», и «✅ Утвердить изменения»
+        опубликует новое название (одной строкой в списке изменений)."""
         plan = self.get_schedule_plan(service_id, month)
         if plan is None:
             raise ValueError("График не найден.")
@@ -5287,9 +5288,7 @@ class ServiceRegistry:
             for task in plan["tasks"]
         ]
 
-        def renamed(slots: dict | None) -> str | None:
-            if slots is None:
-                return None
+        def renamed(slots: dict) -> str:
             return json.dumps({
                 day: {(new if task == old else task): people
                       for task, people in day_tasks.items()}
@@ -5299,12 +5298,10 @@ class ServiceRegistry:
         with self._connection() as connection:
             connection.execute(
                 "UPDATE schedule_plans SET tasks_json = ?, slots_json = ?, "
-                "approved_json = ?, updated_at = ? "
-                "WHERE service_id = ? AND month = ?",
+                "updated_at = ? WHERE service_id = ? AND month = ?",
                 (
                     json.dumps(tasks, ensure_ascii=False),
-                    renamed(plan["slots"]), renamed(plan["approved"]),
-                    _utc_now(), service_id, month,
+                    renamed(plan["slots"]), _utc_now(), service_id, month,
                 ),
             )
         return self.get_schedule_plan(service_id, month)

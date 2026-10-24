@@ -271,8 +271,27 @@ class SchedulePlanTest(unittest.TestCase):
                 "UPDATE services SET name = 'Уборка' WHERE id = 'office_cleaning'"
             )
             connection.commit()
+        self.registry.approve_schedule_plan(
+            1001, "office_cleaning", plan["month"], plan["slots"],
+            chat_id=None, message_id=None,
+        )
         renamed = schedule_plan.sync_implicit_task(self.registry, plan)
         self.assertEqual(renamed["tasks"][0]["name"], "Уборка")
+        # Опубликован со старым названием — смена названия публикуется
+        # одной строкой.
+        self.assertTrue(renamed["dirty"])
+        self.assertEqual(
+            schedule_plan.plan_changes(renamed["approved"], renamed["slots"], {}),
+            [f"• Задача «{name}» теперь называется «Уборка»"],
+        )
+        # Несколько задач: выключили одну, включили другую — не
+        # переименование.
+        swap = schedule_plan.plan_changes(
+            {"2026-11-01": {"звук": ["А"], "сборка": ["Б"]}},
+            {"2026-11-01": {"звук": ["А"], "спевка": ["Б"]}},
+            {},
+        )
+        self.assertNotIn("теперь называется", " ".join(swap))
         self.assertEqual(
             renamed["slots"][plan["dates"][0]]["Уборка"],
             plan["slots"][plan["dates"][0]][name],
