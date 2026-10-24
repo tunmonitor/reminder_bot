@@ -83,6 +83,12 @@ DEFAULT_READINESS_REMINDER = (
     "Ты ещё не отметил(а), когда можешь служить. Опрос в чате служения "
     "открыт до {deadline}."
 )
+# Общее напоминание в чат служения (ответом на опрос), без имён.
+DEFAULT_READINESS_CHAT_REMINDER = (
+    "🔔 {service_name}: опрос о графике на {month} открыт до {deadline}.\n"
+    "Кто ещё не отметил воскресенья — проголосуй, пожалуйста, в опросе "
+    "выше 🙏"
+)
 # Шаблон по умолчанию для напоминания одной задачи (этап 3.1).
 DEFAULT_TASK_TEMPLATE = (
     "Напоминание о служении «{service_name}» в воскресенье {sunday_date}.\n"
@@ -257,6 +263,7 @@ class ServiceRegistry:
                     intro_template TEXT,
                     reminder_template TEXT,
                     closed_template TEXT,
+                    chat_reminder_template TEXT,
                     updated_at TEXT NOT NULL
                 );
 
@@ -452,6 +459,8 @@ class ServiceRegistry:
                         CHECK (in_list IN (0, 1)),
                     source TEXT NOT NULL
                         CHECK (source IN ('excel', 'manual', 'legacy')),
+                    -- Задачи заданы в боте: «Списки» их не перезаписывают.
+                    tasks_manual INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (service_id, name)
                 );
@@ -756,6 +765,9 @@ class ServiceRegistry:
                 ("readiness_settings", "intro_template", "TEXT"),
                 ("readiness_settings", "reminder_template", "TEXT"),
                 ("readiness_settings", "closed_template", "TEXT"),
+                ("readiness_settings", "chat_reminder_template", "TEXT"),
+                ("service_members", "tasks_manual",
+                 "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "poll_stopped", "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "result_sent", "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "closed_announced",
@@ -3436,8 +3448,8 @@ class ServiceRegistry:
             self._require_service(connection, service_id)
             rows = connection.execute(
                 "SELECT name, telegram_id, username, tasks_json, in_list, "
-                "source FROM service_members WHERE service_id = ? "
-                "ORDER BY in_list DESC, rowid",
+                "source, tasks_manual FROM service_members "
+                "WHERE service_id = ? ORDER BY in_list DESC, rowid",
                 (service_id,),
             ).fetchall()
         return [
@@ -3448,6 +3460,7 @@ class ServiceRegistry:
                 "tasks": json.loads(row["tasks_json"]),
                 "in_list": bool(row["in_list"]),
                 "source": row["source"],
+                "tasks_manual": bool(row["tasks_manual"]),
             }
             for row in rows
         ]
@@ -3479,12 +3492,17 @@ class ServiceRegistry:
                             updated_at
                         ) VALUES (?, ?, ?, 1, 'excel', ?)
                         ON CONFLICT(service_id, name) DO UPDATE SET
-                            tasks_json = excluded.tasks_json,
+                            tasks_json = CASE
+                                WHEN service_members.tasks_manual = 1
+                                THEN service_members.tasks_json
+                                ELSE excluded.tasks_json END,
                             in_list = 1
                         -- Без изменений строка не пишется: запись считается
                         -- изменением данных (бэкап, обновление задач).
-                        WHERE service_members.tasks_json
-                                  IS NOT excluded.tasks_json
+                        -- Задачи, заданные в боте, файл не меняет.
+                        WHERE (service_members.tasks_manual = 0
+                               AND service_members.tasks_json
+                                   IS NOT excluded.tasks_json)
                            OR service_members.in_list = 0
                         """,
                         (
@@ -3501,7 +3519,17 @@ class ServiceRegistry:
                     f"AND name NOT IN ({placeholders})",
                     (service_id, *names),
                 )
+                manual = {
+                    row["name"]
+                    for row in connection.execute(
+                        "SELECT name FROM service_members WHERE service_id = ? "
+                        "AND tasks_manual = 1",
+                        (service_id,),
+                    )
+                }
                 for member in members:
+                    if member.name in manual:
+                        continue
                     self._ensure_member_task_contacts(
                         connection, service_id, member.name, member.tasks
                     )
@@ -3541,8 +3569,8 @@ class ServiceRegistry:
                 self._require_super_admin(connection, actor_id)
             self._require_service(connection, service_id)
             member = connection.execute(
-                "SELECT tasks_json, telegram_id FROM service_members "
-                "WHERE service_id = ? AND name = ?",
+                "SELECT tasks_json, telegram_id, tasks_manual "
+                "FROM service_members WHERE service_id = ? AND name = ?",
                 (service_id, name),
             ).fetchone()
             # Имя уже у другого Telegram — в составе или в привязках
@@ -3587,6 +3615,10 @@ class ServiceRegistry:
                 )
             ]
             all_tasks = list(dict.fromkeys([*roster_tasks, *bound_tasks, *tasks]))
+            if member is not None and member["tasks_manual"]:
+                # Задачи заданы в боте — привязка только к ним (снятые
+                # вручную не возвращаются из графика).
+                all_tasks = roster_tasks
             for task in all_tasks:
                 self._write_contact(
                     connection, actor_id, service_id, task, name,
@@ -3597,6 +3629,111 @@ class ServiceRegistry:
                 connection, actor_id, "service_member_bound", service_id,
                 {"name": name, "telegram_id": telegram_id, "tasks": all_tasks},
             )
+
+    def set_service_member_tasks(
+        self, actor_id: int, service_id: str, name: str, tasks,
+    ) -> list[str]:
+        """Задачи человека в составе задаёт админ служения: дальше «Списки»
+        их не меняют. Привязки Telegram — только к выбранным задачам."""
+        _validate_positive_id(actor_id, "actor_id")
+        tasks = list(dict.fromkeys(tasks))
+        if not tasks:
+            raise ValueError("Выберите хотя бы одну задачу.")
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            known = {
+                row["name"]
+                for row in connection.execute(
+                    "SELECT name FROM service_tasks WHERE service_id = ?",
+                    (service_id,),
+                )
+            }
+            unknown = [task for task in tasks if task not in known]
+            if unknown:
+                raise ValueError(f"Задача «{unknown[0]}» не найдена.")
+            member = connection.execute(
+                "SELECT telegram_id, username FROM service_members "
+                "WHERE service_id = ? AND name = ?",
+                (service_id, name),
+            ).fetchone()
+            contact = connection.execute(
+                "SELECT telegram_id, username FROM responsible_contacts "
+                "WHERE service_id = ? AND name = ? LIMIT 1",
+                (service_id, name),
+            ).fetchone()
+            if member is None and contact is None:
+                raise ValueError(f"«{name}» нет в составе.")
+            now = _utc_now()
+            # Telegram — из состава, иначе из привязок.
+            bound = member if member and member["telegram_id"] else contact
+            telegram_id = bound["telegram_id"] if bound else None
+            username = (bound["username"] if bound else "") or ""
+            if member is None:
+                # Был только в привязках «👥 Ответственные» — в состав.
+                connection.execute(
+                    "INSERT INTO service_members (service_id, name, "
+                    "telegram_id, username, tasks_json, source, tasks_manual, "
+                    "updated_at) VALUES (?, ?, ?, ?, ?, 'manual', 1, ?)",
+                    (
+                        service_id, name, telegram_id, username,
+                        json.dumps(tasks, ensure_ascii=False), now,
+                    ),
+                )
+            else:
+                connection.execute(
+                    "UPDATE service_members SET tasks_json = ?, "
+                    "tasks_manual = 1, updated_at = ? "
+                    "WHERE service_id = ? AND name = ?",
+                    (json.dumps(tasks, ensure_ascii=False), now, service_id, name),
+                )
+            placeholders = ", ".join("?" for _ in tasks)
+            connection.execute(
+                "DELETE FROM responsible_contacts WHERE service_id = ? "
+                f"AND name = ? AND task NOT IN ({placeholders})",
+                (service_id, name, *tasks),
+            )
+            if telegram_id:
+                for task in tasks:
+                    self._write_contact(
+                        connection, actor_id, service_id, task, name,
+                        telegram_id, username,
+                    )
+            self._cleanup_unbound_user_data(connection, service_id)
+            self._audit(
+                connection, actor_id, "service_member_tasks", service_id,
+                {"name": name, "tasks": tasks},
+            )
+        return tasks
+
+    def remove_service_member(
+        self, actor_id: int, service_id: str, name: str,
+    ) -> bool:
+        """Убирает человека из состава служения вместе с привязками к
+        задачам. True — он есть в «Списках» (файл вернёт его при чтении)."""
+        _validate_positive_id(actor_id, "actor_id")
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            member = connection.execute(
+                "SELECT in_list FROM service_members "
+                "WHERE service_id = ? AND name = ?",
+                (service_id, name),
+            ).fetchone()
+            removed = connection.execute(
+                "DELETE FROM service_members WHERE service_id = ? AND name = ?",
+                (service_id, name),
+            ).rowcount + connection.execute(
+                "DELETE FROM responsible_contacts "
+                "WHERE service_id = ? AND name = ?",
+                (service_id, name),
+            ).rowcount
+            if not removed:
+                raise ValueError(f"«{name}» нет в составе.")
+            self._cleanup_unbound_user_data(connection, service_id)
+            self._audit(
+                connection, actor_id, "service_member_removed", service_id,
+                {"name": name},
+            )
+        return bool(member and member["in_list"])
 
     def ensure_member_contacts(self, service_id: str, assignments) -> None:
         """Создаёт привязки «задача + имя» для привязанных людей служения.
@@ -4604,6 +4741,7 @@ class ServiceRegistry:
         "intro_template": None,
         "reminder_template": None,
         "closed_template": None,
+        "chat_reminder_template": None,
     }
 
     def get_readiness_settings(self, service_id: str) -> dict:
@@ -4611,7 +4749,8 @@ class ServiceRegistry:
             row = connection.execute(
                 "SELECT enabled, start_time, duration_days, deadline_time, "
                 "remind_days, enabled_at, intro_template, reminder_template, "
-                "closed_template FROM readiness_settings WHERE service_id = ?",
+                "closed_template, chat_reminder_template "
+                "FROM readiness_settings WHERE service_id = ?",
                 (service_id,),
             ).fetchone()
         if row is None:
@@ -4647,6 +4786,8 @@ class ServiceRegistry:
             ("reminder_template", READINESS_REMINDER_FIELDS,
              "Текст напоминания"),
             ("closed_template", READINESS_CLOSED_FIELDS, "Текст завершения"),
+            ("chat_reminder_template", READINESS_REMINDER_FIELDS,
+             "Напоминание в чат"),
         ):
             value = new[key]
             if value is None:
@@ -4668,8 +4809,8 @@ class ServiceRegistry:
                 "INSERT INTO readiness_settings (service_id, enabled, "
                 "start_time, duration_days, deadline_time, remind_days, "
                 "enabled_at, intro_template, reminder_template, "
-                "closed_template, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "closed_template, chat_reminder_template, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id) DO UPDATE SET "
                 "enabled = excluded.enabled, start_time = excluded.start_time, "
                 "duration_days = excluded.duration_days, "
@@ -4679,13 +4820,15 @@ class ServiceRegistry:
                 "intro_template = excluded.intro_template, "
                 "reminder_template = excluded.reminder_template, "
                 "closed_template = excluded.closed_template, "
+                "chat_reminder_template = excluded.chat_reminder_template, "
                 "updated_at = excluded.updated_at",
                 (
                     service_id, int(new["enabled"]), new["start_time"],
                     new["duration_days"], new["deadline_time"],
                     new["remind_days"], new["enabled_at"],
                     new["intro_template"], new["reminder_template"],
-                    new["closed_template"], now,
+                    new["closed_template"], new["chat_reminder_template"],
+                    now,
                 ),
             )
             self._audit(

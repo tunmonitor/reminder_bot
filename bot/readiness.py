@@ -35,6 +35,7 @@ from .month_summary import month_end, month_key, month_title, next_month
 from .presentation import task_emoji
 from .schedule_planner import Plan, PlanInput, build_plan
 from .service_registry import (  # noqa: F401 — шаблоны для экранов
+    DEFAULT_READINESS_CHAT_REMINDER,
     DEFAULT_READINESS_CLOSED,
     DEFAULT_READINESS_INTRO,
     DEFAULT_READINESS_REMINDER,
@@ -201,7 +202,9 @@ def outside_name(answer: dict) -> str:
     )
 
 
-def progress_text(service_label: str, run: dict, summary: Summary, tz) -> str:
+def progress_text(service_label: str, run: dict, summary: Summary, tz,
+                  reminder: str | None = None) -> str:
+    """reminder — строка «когда напоминание» (идущий опрос)."""
     year, month = month_of(run)
     status = {
         "open": f"до {local_text(run['deadline'], tz)}",
@@ -211,6 +214,10 @@ def progress_text(service_label: str, run: dict, summary: Summary, tz) -> str:
     lines = [
         f"📊 Ход опроса · {service_label} · {month_title(year, month)}",
         f"⏳ {status}",
+    ]
+    if reminder:
+        lines.append(reminder)
+    lines += [
         "",
         f"Ответили {len(summary.answered)} из {len(polled)}"
         + (f" · вне состава: {len(summary.outside)}" if summary.outside else ""),
@@ -234,19 +241,19 @@ def progress_text(service_label: str, run: dict, summary: Summary, tz) -> str:
         used_silent = False
         for day in run["dates"]:
             event_date = date.fromisoformat(day)
-            lines.append(f"🗓 {event_date:%d.%m}")
+            lines += ["", f"🗓 {event_date:%d.%m}"]
             for task, needed in summary.plan.needed.items():
                 people = summary.plan.slots.get((event_date, task), [])
                 used_silent |= any(person in silent for person in people)
-                shown = ", ".join(
-                    names.get(person, person) + ("*" if person in silent else "")
-                    for person in people
+                lines += task_lines(
+                    task, needed,
+                    [
+                        names.get(person, person)
+                        + ("*" if person in silent else "")
+                        for person in people
+                    ],
+                    empty="⚠️ некого поставить",
                 )
-                if not people:
-                    shown = "⚠️ некого поставить"
-                elif len(people) < needed:
-                    shown += f" · ⚠️ {len(people)} из {needed}"
-                lines.append(f"   {task_emoji(task)} {task} — {shown}")
         if used_silent:
             lines.append(
                 "* не ответил(а) — поставлен(а) по общей логике, после "
@@ -271,6 +278,17 @@ def progress_text(service_label: str, run: dict, summary: Summary, tz) -> str:
             waiting + [f"{name} (без Telegram)" for name in without_telegram]
         )]
     return "\n".join(lines)
+
+
+def task_lines(task: str, needed: int, names: list[str],
+               empty: str = "⚠️ никого") -> list[str]:
+    """Задача даты: заголовок и каждый человек на своей строке."""
+    head = f"   {task_emoji(task)} {task}"
+    if not names:
+        return [f"{head} — {empty}"]
+    if len(names) < needed:
+        head += f" · ⚠️ {len(names)} из {needed}"
+    return [head] + [f"      • {name}" for name in names]
 
 
 class _Values(dict):
@@ -312,10 +330,14 @@ def closed_text(service: dict, run: dict, template: str | None = None) -> str:
 
 
 def reminder_text(service: dict, run: dict, tz,
-                  template: str | None = None) -> str:
+                  template: str | None = None, *, chat: bool = False) -> str:
+    """Личное напоминание или (chat) общее — в чат служения, без имён."""
     year, month = month_of(run)
     return render_template(
-        template or DEFAULT_READINESS_REMINDER,
+        template or (
+            DEFAULT_READINESS_CHAT_REMINDER if chat
+            else DEFAULT_READINESS_REMINDER
+        ),
         service_name=service["name"],
         month=month_title(year, month),
         deadline=local_text(run["deadline"], tz),
@@ -603,6 +625,61 @@ async def send_reminders(
             continue
         registry.mark_readiness_reminded(run["id"], telegram_id)
     return sent
+
+
+async def send_chat_reminder(
+    bot, registry, run: dict, service: dict, tz, logger: logging.Logger
+) -> None:
+    """Общее напоминание в чат служения ответом на опрос — один раз;
+    временный сбой — повтор следующей проверкой."""
+    kind = f"chat-reminder-{run['id']}"
+    if not any(
+        person["telegram_id"]
+        for person in summarize(registry, run, with_plan=False).not_answered
+    ):
+        # Ответили все, кто может голосовать, — напоминать некому.
+        return
+    if not run.get("chat_id") or not registry.claim_readiness_notice(
+        service["id"], run["month"], kind
+    ):
+        return
+    text = reminder_text(
+        service, run, tz,
+        registry.get_readiness_settings(service["id"]).get(
+            "chat_reminder_template"
+        ),
+        chat=True,
+    )
+    try:
+        await send_to_service_group(
+            bot.send_message, run["chat_id"], text, service,
+            registry=registry, logger=logger, parse_mode=None,
+            reply_parameters=ReplyParameters(
+                message_id=run["message_id"], allow_sending_without_reply=True,
+            ) if run.get("message_id") else None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if unreachable(exc):
+            logger.info("Напоминание в чат служения не доставлено: %s", exc)
+            return
+        logger.warning("Напоминание в чат служения не отправлено", exc_info=True)
+        registry.release_readiness_notice(service["id"], run["month"], kind)
+
+
+def reminder_line(run: dict, settings: dict, now: datetime, tz) -> str:
+    """Когда напоминание (для «📊 Ход опроса»)."""
+    days = settings["remind_days"]
+    if days <= 0:
+        return "🔔 Напоминание: выключено"
+    remind_at = deadline_of(run) - timedelta(days=days)
+    when = local_text(remind_at, tz)
+    if datetime.fromisoformat(run["created_at"]) >= remind_at:
+        return f"🔔 Напоминания не будет: опрос запущен позже {when}"
+    if remind_at <= now:
+        return f"🔔 Напоминание отправлено {when}"
+    return (
+        f"🔔 Напоминание: {when} — лично не ответившим и общее в чат служения"
+    )
 
 
 def deadline_of(run: dict) -> datetime:
@@ -944,6 +1021,9 @@ async def _tick_run(
         elif reminder_due(current, settings, now):
             # Отметка — на человека после доставки: идемпотентно.
             await send_reminders(bot, registry, current, service, tz, logger)
+            await send_chat_reminder(
+                bot, registry, current, service, tz, logger
+            )
 
 
 def settle_parked_run(registry, parked: dict, logger: logging.Logger) -> None:

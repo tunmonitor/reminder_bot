@@ -225,7 +225,9 @@ class SchedulePlanTest(unittest.TestCase):
         self.assertIn("📝 Черновик", text)
         self.assertIn("Ответили 3 из 4", text)
         self.assertIn("🗓 01.11", text)
-        self.assertIn("👥 Нагрузка:", text)
+        self.assertIn("👥 Нагрузка (воскресений в месяце):", text)
+        self.assertIn("   3 — Дмитрий (без Telegram)", text)
+        self.assertIn("   🎚️ звук\n      • Борис", text)
         self.assertIn("Дмитрий", text)
 
         day = "2026-11-08"

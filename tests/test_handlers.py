@@ -6486,6 +6486,15 @@ class ServiceManagementHandlerTest(unittest.TestCase):
         message = await self.open_contact_overview()
         return await self.press_contact(message, "✏️ Изменить привязки")
 
+    async def open_person(self, source, label):
+        """Человек из «Состава» → карточка → «Привязать Telegram»."""
+        card = await self.press_inline(
+            source, label, "on_contact_person_choice"
+        )
+        return await self.press_inline(
+            card.message, "🔗 Привязать Telegram", "on_member_card"
+        )
+
     async def type_text(self, text):
         message = self.message(67890, text)
         await self.message_handler("on_service_parameter")(message)
@@ -6503,7 +6512,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 [
                     "✅ Алексей · @alex",
                     "⚪ Пётр · не привязан",
-                    "✅ Иван",
+                    "✅ 🆕 Иван",
                     "⚠️ Мария · нет в списке",
                     "➕ Добавить участника",
                     "⬅️ К обзору",
@@ -6515,9 +6524,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
     def test_member_binding_covers_all_schedule_tasks(self):
         async def run():
             members = await self.open_members()
-            person = await self.press_inline(
-                members.message, "⚠️ Мария · нет в списке",
-                "on_contact_person_choice",
+            person = await self.open_person(
+                members.message, "⚠️ Мария · нет в списке"
             )
             prompt = person.message.answer.await_args
             self.assertIn("все его задачи служения", prompt.args[0])
@@ -6555,10 +6563,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
     def test_member_user_step_back_and_cancel_return_to_people(self):
         async def run():
             members = await self.open_members()
-            await self.press_inline(
-                members.message, "⚪ Пётр · не привязан",
-                "on_contact_person_choice",
-            )
+            await self.open_person(members.message, "⚪ Пётр · не привязан")
             back = await self.type_text("⬅️ Назад")
             self.assertIn("👥 Состав", back.answer.await_args.args[0])
             self.assertEqual(
@@ -6568,9 +6573,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 "Алексей",
             )
 
-            await self.press_inline(
-                back, "⚪ Пётр · не привязан", "on_contact_person_choice"
-            )
+            await self.open_person(back, "⚪ Пётр · не привязан")
             cancel = self.message(67890, "/cancel")
             await self.message_handler("on_cancel_service_command")(cancel)
             calls = [call.args[0] for call in cancel.answer.await_args_list]
@@ -6579,6 +6582,66 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
             stale = await self.type_text("55555")
             self.assertNotIn("Подтвердить", str(stale.answer.await_args))
+
+        asyncio.run(run())
+
+    def test_member_card_edits_tasks_and_removes(self):
+        from bot.excel_parser import RosterMember
+
+        async def run():
+            members = await self.open_members()
+            card = await self.press_inline(
+                members.message, "⚪ Пётр · не привязан",
+                "on_contact_person_choice",
+            )
+            text = card.message.answer.await_args.args[0]
+            self.assertIn("👤 Пётр", text)
+            self.assertIn("Задачи: Пульт", text)
+            tasks = await self.press_inline(
+                card.message, "📝 Задачи", "on_member_card"
+            )
+            labels = self.inline_labels(tasks.message)
+            self.assertIn("⬜ звук", labels)
+            toggled = await self.press_inline(
+                tasks.message, "⬜ звук", "on_member_card"
+            )
+            saved = await self.press_inline(
+                toggled.message, "✅ Сохранить", "on_member_card"
+            )
+            self.assertIn(
+                "✅ Задачи сохранены: звук",
+                saved.message.answer.await_args.args[0],
+            )
+            # «Списки» больше не меняют задачи, заданные в боте.
+            self.registry.sync_service_rosters({"sound": [
+                RosterMember("Алексей", ("Микшер",)),
+                RosterMember("Пётр", ("Пульт",)),
+            ]})
+            peter = next(
+                item for item in self.registry.list_service_members("sound")
+                if item["name"] == "Пётр"
+            )
+            self.assertEqual(peter["tasks"], ["звук"])
+            self.assertTrue(peter["tasks_manual"])
+
+            ask = await self.press_inline(
+                saved.message, "🗑 Удалить из состава", "on_member_card"
+            )
+            self.assertIn("Убрать «Пётр»", ask.message.answer.await_args.args[0])
+            done = await self.press_inline(
+                ask.message, "✅ Да, убрать", "on_member_card"
+            )
+            text = done.message.answer.await_args.args[0]
+            self.assertIn("убран(а) из состава", text)
+            self.assertIn("есть в «Списках»", text)
+            self.assertNotIn(
+                "Пётр",
+                [item["name"] for item in self.registry.list_service_members("sound")],
+            )
+            stale = await self.press_inline(
+                ask.message, "✅ Да, убрать", "on_member_card"
+            )
+            self.assertIn("устарел", stale.answer.await_args.args[0])
 
         asyncio.run(run())
 

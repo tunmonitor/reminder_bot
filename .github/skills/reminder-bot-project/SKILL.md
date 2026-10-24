@@ -431,6 +431,19 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   .xlsx). Plan months allowed: target month or current month
   (`plan_month`). Edits run under `service_lock` on a fresh read; one task
   per day enforced (`busy_on`); `max == 1` replaces.
+- Feedback 24.10: plan/progress list one person per line (`readiness.task_lines`),
+  load per line `N — name` sorted desc (admins only). Reminder day also posts a
+  general chat reminder (`send_chat_reminder`, reply to poll, notice kind
+  `chat-reminder-<run>`, template `chat_reminder_template` / «📣 Напоминание в
+  чат»); «📊 Ход опроса» shows `reminder_line`. Roster («👥 Состав»): person →
+  member card (`show_member_card`, callbacks `mbr:<action>:<service>:<token>[.i]`,
+  state `pending["member_card"]` in the `service_contact` session) with
+  «🔗 Telegram» (→ `offer_contact_user_selection`), «📝 Задачи»
+  (`set_service_member_tasks`: `service_members.tasks_manual = 1`, roster sync
+  keeps those tasks and skips their auto-contacts; contacts limited to chosen
+  tasks) and «🗑 Удалить» (`remove_service_member`; a «Списки» person returns on
+  the next sync — warned). Bot-added members (source manual, not in list) are
+  marked 🆕.
 - Customer decision 5 (24.10): Excel may stop being filled — step 4 adds a
   per-service source switch and «📥 Загрузить график из Excel».
 

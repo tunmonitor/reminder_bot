@@ -1662,13 +1662,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "in_list": member["in_list"],
                 "telegram_id": member["telegram_id"],
                 "username": member["username"],
+                "source": member["source"],
             }
         for name in schedule_tasks:
             people.setdefault(
                 name,
                 {
                     "name": name, "in_list": False,
-                    "telegram_id": None, "username": "",
+                    "telegram_id": None, "username": "", "source": "",
                 },
             )
         for person in people.values():
@@ -1722,10 +1723,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 pending_contact_navigation.pop(token, None)
         rows = []
         for person in people[page * MEMBER_PAGE_SIZE:(page + 1) * MEMBER_PAGE_SIZE]:
+            added = person["source"] == "manual" and not person["in_list"]
             if person["telegram_id"]:
-                label = f"✅ {person['name']}" + (
+                label = f"✅ {'🆕 ' if added else ''}{person['name']}" + (
                     f" · @{person['username']}" if person["username"] else ""
                 )
+            elif added:
+                label = f"⚪ 🆕 {person['name']} · не привязан"
             elif has_roster and not person["in_list"]:
                 label = f"⚠️ {person['name']} · нет в списке"
             else:
@@ -1779,12 +1783,20 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             f"👥 Состав · {service_label(service)}",
             f"📊 Привязано {linked} из {len(people)}"
             + (f" · стр. {page + 1} из {page_count}" if page_count > 1 else ""),
-            "ℹ️ Выберите человека: Telegram привязывается сразу ко всем "
-            "его задачам служения.",
+            "ℹ️ Выберите человека: Telegram, задачи или удаление из "
+            "состава. Telegram привязывается сразу ко всем его задачам.",
         ]
         if not people:
             lines[1] = "⚪ В «Списках» и графике пока никого нет."
-        if has_roster and any(not person["in_list"] for person in people):
+        if any(
+            person["source"] == "manual" and not person["in_list"]
+            for person in people
+        ):
+            lines.append("🆕 — добавлен(а) в боте (например, из опроса), в конце списка.")
+        if has_roster and any(
+            not person["in_list"] and person["source"] != "manual"
+            for person in people
+        ):
             lines.append("⚠️ нет в списке — человек есть в графике, но не в «Списках».")
         text = "\n".join(lines)
         if notice:
@@ -1797,6 +1809,270 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             _dialog_keyboard_limit=MEMBER_PAGE_SIZE + 4,
             _dialog_keep_rows=True,
         )
+
+    def refresh_registered_contacts(actor_id: int, service_id: str) -> None:
+        """Привязки сессии «Состава» — заново из базы после правки."""
+        pending = pending_inputs.get(actor_id)
+        if pending is None:
+            return
+        try:
+            contacts = service_registry().list_responsible_contacts(
+                actor_id, service_id
+            )
+        except (PermissionError, ValueError, sqlite3.Error):
+            debug.exception("Не удалось обновить список привязок")
+            return
+        pending["registered_contacts"] = {}
+        for contact in contacts:
+            pending["registered_contacts"].setdefault(
+                contact["task"], []
+            ).append(contact)
+
+    def member_card_state(actor_id: int, service_id: str, token: str) -> dict | None:
+        """Карточка человека в «Составе» — только из своей сессии привязки."""
+        pending = pending_inputs.get(actor_id)
+        card = (pending or {}).get("member_card")
+        if (
+            pending is None
+            or pending.get("operation") != "service_contact"
+            or pending.get("service_id") != service_id
+            or card is None
+            or card.get("token") != token
+        ):
+            return None
+        return card
+
+    def member_button(text: str, action: str, service_id: str, token: str,
+                      arg: str | None = None) -> InlineKeyboardButton:
+        data = f"mbr:{action}:{service_id}:{token}" + (f".{arg}" if arg else "")
+        return InlineKeyboardButton(text=text, callback_data=data)
+
+    async def show_member_card(
+        message: Message, actor_id: int, service_id: str, name: str,
+        notice: str | None = None,
+    ) -> None:
+        """Человек в составе: Telegram, задачи, удаление."""
+        registry = service_registry()
+        pending = pending_inputs[actor_id]
+        service = service_by_id(registry, service_id)
+        member = next(
+            (item for item in registry.list_service_members(service_id)
+             if item["name"] == name),
+            None,
+        )
+        person = next(
+            (item for item in registry.readiness_people(service_id)
+             if item["name"] == name),
+            None,
+        )
+        # «Списки» (или заданные в боте) и привязки к задачам.
+        tasks = list(dict.fromkeys(
+            (member or {}).get("tasks", []) + (person or {}).get("tasks", [])
+        ))
+        token = secrets.token_urlsafe(6)
+        pending["member_card"] = {"token": token, "name": name, "tasks": tasks}
+        telegram_id = (person or member or {}).get("telegram_id")
+        username = (person or member or {}).get("username")
+        if member is None:
+            origin = "⚠️ нет в «Списках» (есть в графике или привязках)"
+        elif member["in_list"]:
+            origin = "«Списки» Excel"
+        elif member["source"] == "manual":
+            origin = "добавлен(а) в боте"
+        else:
+            origin = "⚠️ нет в «Списках»"
+        lines = [
+            f"👤 {name} · {service_label(service)}",
+            "",
+            "Telegram: " + (
+                (f"@{username}" if username else f"ID {telegram_id}")
+                if telegram_id else "⚪ не привязан"
+            ),
+            f"Источник: {origin}",
+            "Задачи: " + (", ".join(tasks) or "⚠️ нет — в график не попадает")
+            + (" (заданы в боте)" if member and member["tasks_manual"] else ""),
+        ]
+        scheduled = next(
+            (item["schedule_tasks"]
+             for item in contact_members(registry, pending, service_id)
+             if item["name"] == name),
+            [],
+        )
+        if scheduled:
+            lines.append("В графике по датам: " + ", ".join(scheduled))
+        if notice:
+            lines = [notice, ""] + lines
+        rows = [
+            [member_button(
+                "🔄 Изменить Telegram" if telegram_id else "🔗 Привязать Telegram",
+                "bind", service_id, token,
+            )],
+            [member_button("📝 Задачи", "tasks", service_id, token)],
+        ]
+        if member is not None or person is not None:
+            # Только в графике — удалять из состава нечего.
+            rows.append([
+                member_button("🗑 Удалить из состава", "del", service_id, token)
+            ])
+        rows.append([member_button("⬅️ К составу", "back", service_id, token)])
+        await _send_dialog(
+            message, "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keep_rows=True,
+            parse_mode=None,
+        )
+
+    async def show_member_tasks(
+        message: Message, actor_id: int, service_id: str,
+        notice: str | None = None,
+    ) -> None:
+        """Выбор задач человека (⬜/☑️)."""
+        card = pending_inputs[actor_id]["member_card"]
+        # Включённые задачи и выключенные, которые у человека уже есть
+        # (иначе сохранение молча сняло бы их).
+        options = card.setdefault("options", [
+            task["name"]
+            for task in service_registry().list_service_tasks(service_id)
+            if task["enabled"] or task["name"] in card["tasks"]
+        ])
+        selected = card.setdefault("selected", list(card["tasks"]))
+        token = card["token"]
+        buttons = [
+            member_button(
+                f"{'☑️' if task in selected else '⬜'} {task}"[:60],
+                "tt", service_id, token, str(index),
+            )
+            for index, task in enumerate(options)
+        ]
+        rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+        rows.append([member_button("✅ Сохранить", "ts", service_id, token)])
+        rows.append([member_button("⬅️ К человеку", "card", service_id, token)])
+        text = (
+            f"📝 Задачи · {card['name']}\n\nОтметьте задачи, на которые человек "
+            "ставится в график. Заданные здесь задачи «Списки» Excel больше "
+            "не меняют."
+        )
+        if notice:
+            text = f"{notice}\n\n{text}"
+        await _send_dialog(
+            message, text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keep_rows=True,
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
+            parse_mode=None,
+        )
+
+    @admin_router.callback_query(F.data.startswith("mbr:"))
+    async def on_member_card(callback: CallbackQuery) -> None:
+        if (
+            not callback.from_user
+            or not callback.message
+            or callback.message.chat.type != ChatType.PRIVATE
+        ):
+            await _answer_callback(callback)
+            return
+        parts = callback.data.split(":")
+        if len(parts) != 4:
+            await _answer_callback(callback, "⚠️ Меню устарело.")
+            return
+        _, action, service_id, rest = parts
+        token, _, arg = rest.partition(".")
+        actor_id = callback.from_user.id
+        card = member_card_state(actor_id, service_id, token)
+        if card is None:
+            await answer_quietly(callback, "⚠️ Этот экран уже устарел.")
+            return
+        registry = service_registry()
+        name = card["name"]
+        message = callback.message
+        try:
+            await clean_previous_menu(message, debug)
+            if action == "card":
+                await show_member_card(message, actor_id, service_id, name)
+            elif action == "back":
+                pending_inputs[actor_id].pop("member_card", None)
+                await send_member_choices(
+                    message, actor_id, service_id,
+                    pending_inputs[actor_id].get("member_page", 0),
+                )
+            elif action == "bind":
+                pending_inputs[actor_id].pop("member_card", None)
+                await offer_contact_user_selection(
+                    message, actor_id, service_id, None, name
+                )
+            elif action == "tasks":
+                card.pop("selected", None)
+                card.pop("options", None)
+                await show_member_tasks(message, actor_id, service_id)
+            elif action == "tt" and arg.isdigit() and "options" in card:
+                index = int(arg)
+                if index < len(card["options"]):
+                    task = card["options"][index]
+                    selected = card["selected"]
+                    if task in selected:
+                        selected.remove(task)
+                    else:
+                        selected.append(task)
+                await show_member_tasks(message, actor_id, service_id)
+            elif action == "ts" and "selected" in card:
+                try:
+                    tasks = registry.set_service_member_tasks(
+                        actor_id, service_id, name,
+                        [task for task in card["options"] if task in card["selected"]],
+                    )
+                except ValueError as exc:
+                    await show_member_tasks(
+                        message, actor_id, service_id,
+                        _status_text(str(exc), "⚠️"),
+                    )
+                else:
+                    refresh_registered_contacts(actor_id, service_id)
+                    await show_member_card(
+                        message, actor_id, service_id, name,
+                        "✅ Задачи сохранены: " + ", ".join(tasks),
+                    )
+            elif action == "del":
+                await _send_dialog(
+                    message,
+                    f"🗑 Убрать «{name}» из состава служения?\n\nПривязки к "
+                    "задачам удалятся, в распределение графика человек больше "
+                    "не попадёт.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [member_button("✅ Да, убрать", "delok", service_id, token)],
+                        [member_button("⬅️ К человеку", "card", service_id, token)],
+                    ]),
+                    _dialog_keep_rows=True,
+                    parse_mode=None,
+                )
+            elif action == "delok":
+                in_list = registry.remove_service_member(
+                    actor_id, service_id, name
+                )
+                refresh_registered_contacts(actor_id, service_id)
+                pending_inputs[actor_id].pop("member_card", None)
+                notice = f"🗑 «{name}» убран(а) из состава"
+                if in_list:
+                    notice += (
+                        "\n⚠️ Он(а) есть в «Списках» Excel — при следующем "
+                        "чтении файла вернётся; уберите и там."
+                    )
+                await send_member_choices(
+                    message, actor_id, service_id,
+                    pending_inputs[actor_id].get("member_page", 0), notice,
+                )
+            else:
+                await show_member_card(
+                    message, actor_id, service_id, name, "⚠️ Экран устарел"
+                )
+            await _answer_callback(callback)
+        except (PermissionError, ValueError) as exc:
+            await show_member_card(
+                message, actor_id, service_id, name, _status_text(str(exc), "⚠️")
+            )
+            await answer_quietly(callback, _status_text(str(exc), "⚠️"))
+        except Exception:  # noqa: BLE001
+            debug.exception("Ошибка карточки участника")
+            await answer_quietly(callback, "❌ Не удалось выполнить действие.")
 
     async def return_to_contact_choices(
         message: Message, actor_id: int, notice: str
@@ -3233,6 +3509,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             readiness_button("💬 Текст напоминания", "tpl", service_id, "rem"),
         ])
         rows.append([
+            readiness_button("📣 Напоминание в чат", "tpl", service_id, "chat"),
             readiness_button("✅ Текст завершения", "tpl", service_id, "done"),
         ])
         rows.append([InlineKeyboardButton(
@@ -3268,6 +3545,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "Личное сообщение тем, кто не ответил, за «Напоминание» дней "
             "до срока.", READINESS_REMINDER_HELP,
         ),
+        "chat": (
+            "chat_reminder_template", "📣 Напоминание в чат",
+            "Общее сообщение в чате служения (ответом на опрос) в день "
+            "напоминания — без имён, для всех, кто ещё не проголосовал.",
+            READINESS_REMINDER_HELP,
+        ),
         "done": (
             "closed_template", "✅ Текст завершения",
             "Сообщение в чате служения (ответом на опрос), когда опрос "
@@ -3289,6 +3572,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         default = {
             "intro": readiness.DEFAULT_READINESS_INTRO,
             "rem": readiness.DEFAULT_READINESS_REMINDER,
+            "chat": readiness.DEFAULT_READINESS_CHAT_REMINDER,
             "done": readiness.DEFAULT_READINESS_CLOSED,
         }[kind]
         lines = [
@@ -3356,8 +3640,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             # Закрытый опрос — распределение в «📋 График».
             with_plan=run["status"] == "open",
         )
+        reminder = None
+        if run["status"] == "open":
+            reminder = readiness.reminder_line(
+                run, service_registry().get_readiness_settings(service["id"]),
+                datetime.now(context.timezone), context.timezone,
+            )
         text = readiness.progress_text(
-            service_label(service), run, summary, context.timezone
+            service_label(service), run, summary, context.timezone, reminder,
         )
         if notice:
             text = f"{notice}\n\n{text}"
@@ -4507,13 +4797,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         year, month, deadline, tz, settings["intro_template"],
                     )
                     where = "в чате служения перед опросом"
-                elif arg == "rem":
+                elif arg in {"rem", "chat"}:
                     body = readiness.reminder_text(
                         service,
                         {"month": key, "deadline": deadline.isoformat()},
-                        tz, settings["reminder_template"],
+                        tz, settings[READINESS_TEXTS[arg][0]],
+                        chat=arg == "chat",
                     )
-                    where = "лично тем, кто не ответил"
+                    where = (
+                        "в чате служения, ответом на опрос" if arg == "chat"
+                        else "лично тем, кто не ответил"
+                    )
                 else:
                     body = readiness.closed_text(
                         service, {"month": key}, settings["closed_template"],
@@ -7905,13 +8199,20 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await _answer_callback(callback,"⚠️ Выбор устарел. Начните команду заново.")
             return
         try:
-            await offer_contact_user_selection(
-                callback.message,
-                callback.from_user.id,
-                selection[1],
-                selection[2],
-                selection[3],
-            )
+            if member_mode:
+                # Человек из «Состава» — карточка: Telegram, задачи, удаление.
+                await show_member_card(
+                    callback.message, callback.from_user.id, selection[1],
+                    selection[3],
+                )
+            else:
+                await offer_contact_user_selection(
+                    callback.message,
+                    callback.from_user.id,
+                    selection[1],
+                    selection[2],
+                    selection[3],
+                )
         except ValueError as exc:
             await _send_dialog(callback.message, _status_text(str(exc), "❌"), parse_mode=None
             )

@@ -20,7 +20,14 @@ from .excel_parser import _schedule_sheet_name
 from .group_send import send_to_service_group
 from .month_summary import month_end, month_key, month_title
 from .presentation import task_emoji
-from .readiness import Summary, local_text, month_of, outside_name, summarize
+from .readiness import (
+    Summary,
+    local_text,
+    month_of,
+    outside_name,
+    summarize,
+    task_lines,
+)
 from .services import ScheduleColumn, normalized_name
 from .ui import send_telegram_screen, user_link
 
@@ -220,19 +227,24 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz) -> str:
         for task in plan["tasks"]:
             people = plan["slots"].get(day, {}).get(task["name"], [])
             used_silent |= any(person in silent for person in people)
-            shown = ", ".join(
-                names.get(person, person) + ("*" if person in silent else "")
-                for person in people
-            ) or "⚠️ никого"
-            if people and len(people) < task["needed"]:
-                shown += f" · ⚠️ {len(people)} из {task['needed']}"
-            lines.append(f"   {task_emoji(task['name'])} {task['name']} — {shown}")
+            lines += task_lines(
+                task["name"], task["needed"],
+                [
+                    names.get(person, person) + ("*" if person in silent else "")
+                    for person in people
+                ],
+            )
+    # Нагрузка — только админам: сколько воскресений у каждого, по убыванию.
     load = served_dates(plan["slots"])
-    lines += ["", "👥 Нагрузка: " + " · ".join(
-        f"{person['name']} {len(load.get(person['key'], []))}"
+    ordered = sorted(
+        polled, key=lambda person: (-len(load.get(person["key"], [])),
+                                    person["name"]),
+    )
+    lines += ["", "👥 Нагрузка (воскресений в месяце):"] + [
+        f"   {len(load.get(person['key'], []))} — {person['name']}"
         + ("" if person["telegram_id"] else " (без Telegram)")
-        for person in polled
-    )]
+        for person in ordered
+    ]
     problems = gaps(plan)
     if problems:
         lines += [""] + problems
