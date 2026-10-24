@@ -3534,6 +3534,52 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         title = month_title(year, month)
         month_arg = f"{year:04d}{month:02d}"
         weekdays = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
+        key_month = f"{year:04d}-{month:02d}"
+        early_plan = registry.get_schedule_plan(service_id, key_month)
+        planned_free = early_plan is not None and early_plan["run_id"] is None
+        # Автозапуск месяца не состоялся: попытка не удалась, окно прошло
+        # или автозапуск выключен и время прошло, — а опроса и графика без
+        # опроса нет.
+        failed = run is None and registry.has_readiness_notice(
+            service_id, key_month, "launch"
+        )
+        missed = run is None and not planned_free and (
+            failed or now >= deadline
+            or (now >= start and not settings["enabled"])
+        )
+
+        def autostart_lines() -> list[str]:
+            when_start = (
+                f"{weekdays[start.weekday()]} {start:%d.%m} в "
+                f"{settings['start_time']}"
+            )
+            when_end = (
+                f"{weekdays[deadline.weekday()]} {deadline:%d.%m} в "
+                f"{settings['deadline_time']}"
+            )
+            if missed:
+                if failed:
+                    head = (
+                        f"▶️ Автозапуск {when_start} не удался — повторно "
+                        "бот не запускает."
+                    )
+                elif not settings["enabled"]:
+                    head = (
+                        f"▶️ Автозапуск выключен — опрос на {title} не "
+                        f"запускался (окно: {when_start} – {when_end})."
+                    )
+                else:
+                    head = (
+                        f"▶️ Опрос на {title} ожидался {when_start} – "
+                        f"{when_end} — сроки прошли, опрос не запускался."
+                    )
+                return [
+                    head, f"⏳ Срок опроса: {settings['duration_days']} дн.",
+                ]
+            return [
+                f"▶️ Запуск: {when_start} (последняя полная неделя)",
+                f"⏳ Срок: {settings['duration_days']} дн. → {when_end}",
+            ]
         lines = [
             f"📅 График · {service_label(service)}",
             "",
@@ -3541,11 +3587,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "🟢 включён" if settings["enabled"]
                 else "🔴 выключен (запуск только вручную)"
             ),
-            f"▶️ Запуск: {weekdays[start.weekday()]} {start:%d.%m} в "
-            f"{settings['start_time']} (последняя полная неделя)",
-            f"⏳ Срок: {settings['duration_days']} дн. → "
-            f"{weekdays[deadline.weekday()]} {deadline:%d.%m} в "
-            f"{settings['deadline_time']}",
+            *autostart_lines(),
             "🔔 Напомнить не ответившим: " + (
                 f"за {settings['remind_days']} дн. до срока"
                 if settings["remind_days"] else "выключено"
@@ -3587,6 +3629,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     if free_plan is not None else "."
                 )
             )
+            if missed:
+                lines.append(
+                    "❗ Сейчас нужно запустить опрос вручную («🗳 Запустить "
+                    "опрос») или составить график без опроса («🧮 Составить "
+                    "без опроса») и отправить его."
+                )
             rows.append([
                 readiness_button(
                     "🗳 Запустить опрос", "start", service_id, month_arg
@@ -3681,6 +3729,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             _dialog_keyboard_limit=sum(len(row) for row in rows),
             _dialog_keep_rows=True,
+            # Экран раздела — одним сообщением (кнопки под всем текстом).
+            _dialog_text_limit=TELEGRAM_TEXT_LIMIT,
             parse_mode=None,
         )
 
