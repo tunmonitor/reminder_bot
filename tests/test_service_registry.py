@@ -83,12 +83,15 @@ class ServiceRegistryTest(unittest.TestCase):
             [("звук",), ("спевка",)],
         )
 
-    def test_service_task_changes_require_super_admin_and_unique_names(self):
+    def test_service_task_changes_by_service_admin_and_unique_names(self):
         self.registry.add_service_admin(1001, "sound", 2002)
+        # Админ служения — своё служение, чужое — нет.
+        self.registry.set_service_task_enabled(2002, "sound", "звук", False)
+        self.registry.add_service_task(2002, "sound", "Новая")
         with self.assertRaises(PermissionError):
-            self.registry.set_service_task_enabled(2002, "sound", "звук", False)
+            self.registry.add_service_task(2002, "kitchen", "Новая")
         with self.assertRaises(PermissionError):
-            self.registry.add_service_task(2002, "sound", "Новая")
+            self.registry.add_service_admin(2002, "sound", 3003)
         with self.assertRaises(ValueError):
             self.registry.add_service_task(1001, "sound", "Сборка оборудования")
         with self.assertRaises(ValueError):
@@ -1948,8 +1951,21 @@ class ServiceRegistryTest(unittest.TestCase):
                 group_template="Слайды",
                 personal_templates={},
             )
+        # Чат своего служения — можно, чужого — нет.
+        self.registry.set_group_chat(3003, "sound", -10023, enabled=True)
         with self.assertRaises(PermissionError):
-            self.registry.set_group_chat(3003, "sound", -10023, enabled=True)
+            self.registry.set_group_chat(3003, "books", -10024, enabled=True)
+        # Чат другого служения или личный чат админ служения не привяжет;
+        # супер-администратор — может (общий чат для нескольких служений).
+        self.registry.set_group_chat(1001, "books", -10024, enabled=True)
+        with self.assertRaises(PermissionError):
+            self.registry.set_group_chat(3003, "sound", -10024, enabled=True)
+        with self.assertRaises(ValueError):
+            self.registry.set_group_chat(3003, "sound", 777, enabled=True)
+        self.registry.set_group_chat(1001, "sound", -10024, enabled=True)
+        # Свой общий чат админ служения может привязать заново.
+        self.registry.set_group_chat(3003, "sound", -10024, enabled=False)
+        self.registry.set_group_chat(3003, "sound", -10024, enabled=True)
 
     def test_invalid_ids_and_unknown_services_are_rejected(self):
         with self.assertRaises(ValueError):
@@ -2192,3 +2208,30 @@ class PersonalOriginMigrationTest(unittest.TestCase):
                     ("сборка", "user", 0, "Мой текст"),
                 ],
             )
+
+
+class InteractiveRosterSyncTest(unittest.TestCase):
+    def test_own_roster_only_updates_just_that_service(self):
+        from unittest.mock import MagicMock, patch
+
+        from bot import app
+        from bot.excel_parser import RosterMember
+
+        registry = MagicMock()
+        rosters = {
+            "sound": [RosterMember("Алексей", ("звук",))],
+            "kitchen": [RosterMember("Вера", ("в смене",))],
+        }
+        with patch.object(app, "parse_service_rosters", return_value=rosters):
+            app._sync_rosters_and_contacts(
+                registry, Path("x.xlsx"), "sound", {}, None, MagicMock(),
+                None, own_roster_only=True,
+            )
+            registry.sync_service_rosters.assert_called_once_with(
+                {"sound": rosters["sound"]}
+            )
+            registry.reset_mock()
+            app._sync_rosters_and_contacts(
+                registry, Path("x.xlsx"), "sound", {}, None, MagicMock(), None,
+            )
+            registry.sync_service_rosters.assert_called_once_with(rosters)

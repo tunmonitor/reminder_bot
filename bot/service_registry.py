@@ -1549,7 +1549,7 @@ class ServiceRegistry:
         if not isinstance(enabled, bool):
             raise ValueError("enabled должен быть логическим значением")
         with self._connection() as connection:
-            self._require_super_admin(connection, actor_id)
+            self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
             cursor = connection.execute(
                 "UPDATE service_tasks SET enabled = ? "
@@ -1610,7 +1610,7 @@ class ServiceRegistry:
         if not name or len(name) > 60 or "\x00" in name:
             raise ValueError("Название задачи: от 1 до 60 символов.")
         with self._connection() as connection:
-            self._require_super_admin(connection, actor_id)
+            self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
             existing = connection.execute(
                 "SELECT name, aliases_json, position FROM service_tasks "
@@ -1732,8 +1732,36 @@ class ServiceRegistry:
         if group_chat_id == 0:
             raise ValueError("ID группового чата не может быть равен нулю")
         with self._connection() as connection:
-            self._require_super_admin(connection, actor_id)
+            self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
+            is_super_admin = connection.execute(
+                "SELECT 1 FROM super_admins WHERE telegram_id = ?",
+                (actor_id,),
+            ).fetchone() is not None
+            if not is_super_admin:
+                # Админ служения — только группа и не чужая: иначе он слал
+                # бы напоминания в чат другого служения или личный чат.
+                if group_chat_id > 0:
+                    raise ValueError(
+                        "Укажите групповой чат (ID группы отрицательный)."
+                    )
+                current = connection.execute(
+                    "SELECT group_chat_id FROM services WHERE id = ?",
+                    (service_id,),
+                ).fetchone()
+                own_chat = current is not None and (
+                    current["group_chat_id"] == group_chat_id
+                )
+                if not own_chat and connection.execute(
+                    "SELECT 1 FROM services WHERE group_chat_id = ? "
+                    "AND id != ?",
+                    (group_chat_id, service_id),
+                ).fetchone() is not None:
+                    raise PermissionError(
+                        "Этот чат уже привязан к другому служению — "
+                        "общий чат для нескольких служений настраивает "
+                        "супер-администратор."
+                    )
             # Новый чат — тема прежнего чата к нему не относится.
             connection.execute(
                 "UPDATE services SET group_thread_id = CASE "
@@ -1798,7 +1826,7 @@ class ServiceRegistry:
         if not isinstance(enabled, bool):
             raise ValueError("enabled должен быть логическим значением")
         with self._connection() as connection:
-            self._require_super_admin(connection, actor_id)
+            self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
             connection.execute(
                 "UPDATE services SET enabled = ? WHERE id = ?",
@@ -3401,7 +3429,7 @@ class ServiceRegistry:
         if not task or not name:
             raise ValueError("Название задачи и имя ответственного обязательны")
         with self._connection() as connection:
-            self._require_super_admin(connection, actor_id)
+            self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
             other_tasks = [
                 row["task"]
@@ -3605,8 +3633,8 @@ class ServiceRegistry:
     ) -> None:
         """Привязывает Telegram к человеку служения во всех его задачах.
 
-        from_readiness — «➕ В состав» из опроса готовности: доступно и
-        админу служения; имя, уже занятое другим Telegram ID, не
+        from_readiness — «➕ В состав» из опроса готовности и «➕ Другой
+        человек из Telegram»: имя, уже занятое другим Telegram ID, не
         перезаписывается.
 
         Задачи — из «Списков», из прежних привязок этого имени и tasks
@@ -3621,10 +3649,9 @@ class ServiceRegistry:
             raise ValueError("Имя участника обязательно.")
         username = username.strip().lstrip("@")
         with self._connection() as connection:
-            if from_readiness:
-                self._require_service_editor(connection, actor_id, service_id)
-            else:
-                self._require_super_admin(connection, actor_id)
+            # Админ служения — как и супер-администратор (кроме назначения
+            # админов, всё по своему служению).
+            self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
             member = connection.execute(
                 "SELECT tasks_json, telegram_id, tasks_manual "
@@ -4854,7 +4881,7 @@ class ServiceRegistry:
     ) -> list[dict]:
         _validate_positive_id(actor_id, "actor_id")
         with self._connection() as connection:
-            self._require_super_admin(connection, actor_id)
+            self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
             rows = connection.execute(
                 "SELECT task, name, telegram_id, username "

@@ -182,6 +182,9 @@ PERSONAL_RULE_PRESETS = (
     (0, "08:00"),
 )
 UPCOMING_WEEKS = 6
+# Только супер-администратор: назначение и снятие админов. Остальное по
+# служению доступно и его администратору.
+ADMIN_OPERATIONS = frozenset({"service_admin_add", "service_admin_remove"})
 # С каких шагов сценария привязки доступна каждая кнопка навигации.
 CONTACT_NAVIGATION_STEPS = {
     "tasks": {"choose_contact_person"},
@@ -888,6 +891,29 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 or registry.is_service_admin(actor_id, service_id)
             )
         )
+    async def require_chat_member(actor_id: int, chat_id: int) -> None:
+        """Чат по ID вручную: админ служения должен сам состоять в группе
+        (выбор кнопкой Telegram это гарантирует). Супер-администратор — без
+        проверки."""
+        registry = service_registry()
+        if registry is None or registry.is_super_admin(actor_id):
+            return
+        try:
+            member = await context.bot.get_chat_member(chat_id, actor_id)
+        except TelegramAPIError as exc:
+            raise PermissionError(
+                "Не удалось проверить, что вы состоите в этом чате, — "
+                "выберите чат кнопкой."
+            ) from exc
+        status = getattr(member, "status", None)
+        if status not in {
+            "creator", "administrator", "member", "restricted",
+        } or (status == "restricted" and not getattr(member, "is_member", True)):
+            raise PermissionError(
+                "Вы не состоите в этом чате — привязать можно только свой "
+                "групповой чат."
+            )
+
     def is_user_linked(actor_id: int) -> bool:
         """Проверяет, привязан ли пользователь хотя бы к одной задаче."""
         registry = service_registry()
@@ -1086,14 +1112,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         keyboard_limit=keyboard_size(keyboard),
                     )
                     return
-                if operation == "service_notify":
-                    if not is_service_admin(actor_id, service_id):
+                if operation in ADMIN_OPERATIONS:
+                    if not registry.is_super_admin(actor_id):
                         raise PermissionError(
-                            "Настройки доступны только администратору этого служения."
+                            "Назначать и снимать администраторов может только "
+                            "супер-администратор."
                         )
-                elif not registry.is_super_admin(actor_id):
+                elif not is_service_admin(actor_id, service_id):
                     raise PermissionError(
-                        "Эта команда доступна только супер-администратору."
+                        "Настройки доступны только администратору этого служения."
                     )
                 if operation == "service_admin_add":
                     await offer_user_selection(
@@ -1111,7 +1138,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
             is_super_admin = registry.is_super_admin(actor_id)
             services = registry.list_services()
-            if operation in {"service_settings", "service_notify"}:
+            if operation in ADMIN_OPERATIONS:
+                if not is_super_admin:
+                    raise PermissionError(
+                        "Назначать и снимать администраторов может только "
+                        "супер-администратор."
+                    )
+            else:
+                # Остальное — админу своих служений.
                 services = [
                     item for item in services
                     if is_super_admin
@@ -1121,15 +1155,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     raise PermissionError(
                         "У вас нет прав администратора ни для одного служения."
                     )
-            elif operation in {"service_admin_add", "service_sync"}:
-                if not is_super_admin:
-                    raise PermissionError(
-                        "Эта команда доступна только супер-администратору."
-                    )
-            elif not is_super_admin:
-                raise PermissionError(
-                    "Эта команда доступна только супер-администратору."
-                )
         except (PermissionError, ValueError) as exc:
             await _send_dialog(message, _status_text(str(exc), "❌"), parse_mode=None)
             return
@@ -1312,20 +1337,20 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     ) -> InlineKeyboardMarkup:
         registry = service_registry()
         is_super_admin = bool(registry and registry.is_super_admin(actor_id))
-        items = [("⏰ Напоминания и шаблоны", "edit_notify")]
+        items = [
+            ("⏰ Напоминания и шаблоны", "edit_notify"),
+            ("👥 Ответственные", "service_contact"),
+            ("🔁 Замена", "service_replace"),
+            ("🔄 Сверить график", "service_sync"),
+            ("📡 Групповой чат", "service_chat"),
+        ]
         if is_super_admin:
             items.extend(
                 [
-                    ("👥 Ответственные", "service_contact"),
-                    ("🔁 Замена", "service_replace"),
-                    ("🔄 Сверить график", "service_sync"),
-                    ("📡 Групповой чат", "service_chat"),
                     ("👤 Назначить админа", "service_admin_add"),
                     ("➖ Снять админа", "service_admin_remove"),
                 ]
             )
-        else:
-            items.append(("🔁 Замена", "service_replace"))
         if actor_id == context.admin_id:
             items.append(("🧪 Проверка доставки", "test_notify"))
         rows = [
@@ -1345,15 +1370,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
             ]
         )
-        if is_super_admin:
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        text="📋 Задачи служения",
-                        callback_data=f"svc_tasks:open:{service_id}",
-                    )
-                ]
-            )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="📋 Задачи служения",
+                    callback_data=f"svc_tasks:open:{service_id}",
+                )
+            ]
+        )
         rows.append(
             [
                 InlineKeyboardButton(
@@ -5646,7 +5670,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         parts = callback.data.split(":")
         action, service_id = (parts[1], parts[2]) if len(parts) >= 3 else ("", "")
         try:
-            if registry is None or not registry.is_super_admin(actor_id):
+            if registry is None or not is_service_admin(actor_id, service_id):
                 await _answer_callback(callback, "❌ Недостаточно прав.")
                 return
             if action == "open" and len(parts) == 3:
@@ -7653,6 +7677,25 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             return
         service_id, raw_chat_id, raw_enabled = parts[1:]
+        try:
+            # Сначала права и формат — запрос в Telegram только админу
+            # служения.
+            if not is_service_admin(message.from_user.id, service_id):
+                raise PermissionError(
+                    "Настройки доступны только администратору этого служения."
+                )
+            if raw_enabled not in {"on", "off"}:
+                raise ValueError("Последний параметр должен быть on или off.")
+            try:
+                chat_id = int(raw_chat_id)
+            except ValueError as exc:
+                raise ValueError("ID чата должен быть числом.") from exc
+            await require_chat_member(message.from_user.id, chat_id)
+        except (PermissionError, ValueError) as exc:
+            await _send_dialog(
+                message, _status_text(str(exc), "❌"), parse_mode=None
+            )
+            return
 
         def update_chat(actor_id: int) -> str:
             if raw_enabled not in {"on", "off"}:
@@ -7807,17 +7850,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     ) -> list[str]:
         operations = []
         if role != ROLE_USER:
-            operations.extend(["service_settings", "service_notify"])
+            operations.extend([
+                "service_settings", "service_notify", "service_contact",
+                "service_sync", "service_chat",
+            ])
         if role == ROLE_SUPER_ADMIN:
-            operations.extend(
-                [
-                    "service_contact",
-                    "service_sync",
-                    "service_chat",
-                    "service_admin_add",
-                    "service_admin_remove",
-                ]
-            )
+            operations.extend(["service_admin_add", "service_admin_remove"])
         if actor_id == context.admin_id:
             operations.append("test_notify")
         if linked:
@@ -8096,18 +8134,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     service_label(service),
                 )
             elif operation == "service_chat":
-                if not registry.is_super_admin(callback.from_user.id):
+                if not is_service_admin(callback.from_user.id, service_id):
                     raise PermissionError(
-                        "Эта команда доступна только супер-администратору."
+                        "Настройки доступны только администратору этого служения."
                     )
                 await _send_dialog(callback.message, f"{service_label(service)}: выберите действие.",
                     reply_markup=service_chat_keyboard(service_id),
                     parse_mode=None,
                 )
             elif operation == "service_chat_set":
-                if not registry.is_super_admin(callback.from_user.id):
+                if not is_service_admin(callback.from_user.id, service_id):
                     raise PermissionError(
-                        "Эта команда доступна только супер-администратору."
+                        "Настройки доступны только администратору этого служения."
                     )
                 await ask_for_service_parameters(
                     callback.message,
@@ -8117,9 +8155,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     service_label(service),
                 )
             elif operation == "service_chat_disable":
-                if not registry.is_super_admin(callback.from_user.id):
+                if not is_service_admin(callback.from_user.id, service_id):
                     raise PermissionError(
-                        "Эта команда доступна только супер-администратору."
+                        "Настройки доступны только администратору этого служения."
                     )
                 registry.set_service_enabled(
                     callback.from_user.id, service_id, False
@@ -8159,9 +8197,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     parse_mode=None,
                 )
             elif operation == "service_sync":
-                if not registry.is_super_admin(callback.from_user.id):
+                if not is_service_admin(callback.from_user.id, service_id):
                     raise PermissionError(
-                        "Синхронизация графика доступна только супер-администратору."
+                        "Настройки доступны только администратору этого служения."
                     )
                 await ask_for_service_parameters(
                     callback.message,
@@ -8171,9 +8209,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     service_label(service),
                 )
             else:
-                if not registry.is_super_admin(callback.from_user.id):
+                if operation in ADMIN_OPERATIONS:
+                    if not registry.is_super_admin(callback.from_user.id):
+                        raise PermissionError(
+                            "Назначать и снимать администраторов может только "
+                            "супер-администратор."
+                        )
+                elif not is_service_admin(callback.from_user.id, service_id):
                     raise PermissionError(
-                        "Эта команда доступна только супер-администратору."
+                        "Настройки доступны только администратору этого служения."
                     )
                 if operation == "service_admin_add":
                     await offer_user_selection(
@@ -11402,6 +11446,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "-1001234567890 on."
                     )
                 chat_id = int(parts[0])
+                await require_chat_member(message.from_user.id, chat_id)
                 registry.set_group_chat(
                     message.from_user.id,
                     service_id,
