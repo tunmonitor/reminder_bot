@@ -4951,8 +4951,8 @@ class ServiceRegistry:
                 ).fetchone()
                 implicit = row["name"] if row else None
             members = connection.execute(
-                "SELECT name, telegram_id, username, tasks_json "
-                "FROM service_members WHERE service_id = ? "
+                "SELECT name, telegram_id, username, tasks_json, in_list, "
+                "source FROM service_members WHERE service_id = ? "
                 "ORDER BY in_list DESC, rowid",
                 (service_id,),
             ).fetchall()
@@ -4976,9 +4976,13 @@ class ServiceRegistry:
                     task for task in json.loads(row["tasks_json"])
                     if task in enabled
                 },
+                # В составе: в «Списках» или добавлен в боте (пропавший из
+                # «Списков» — нет).
+                "active": bool(row["in_list"]) or row["source"] != "excel",
             }
             if row["telegram_id"] in by_id:
                 by_id[row["telegram_id"]]["tasks"] |= person["tasks"]
+                by_id[row["telegram_id"]]["active"] |= person["active"]
                 continue
             people.append(person)
             if row["telegram_id"]:
@@ -5011,7 +5015,11 @@ class ServiceRegistry:
             key = person["name"]
             if names.count(key) > 1:
                 key = f"{key} · {person['telegram_id'] or 'без Telegram'}"
-            tasks = {implicit} if implicit else person["tasks"]
+            if implicit:
+                tasks = {implicit} if person.get("active", True) else set()
+            else:
+                tasks = person["tasks"]
+            person.pop("active", None)
             result.append({**person, "key": key, "tasks": sorted(tasks)})
         return result
 

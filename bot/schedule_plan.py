@@ -466,14 +466,26 @@ def excel_rows(registry, plan: dict, people: list[dict]) -> list[list]:
     return rows
 
 
+def has_sheet_columns(registry, service_id: str) -> bool:
+    """У служения есть колонки на листе графика (иначе .xlsx не нужен)."""
+    return any(
+        item.id == service_id and item.columns
+        for item in registry.service_catalog()
+    )
+
+
 def excel_text(registry, service: dict, plan: dict, people: list[dict]) -> str:
     year, month = map(int, plan["month"].split("-"))
     names = _names(people)
     lines = [
         f"📋 Для Excel · {service['name']} · лист "
         f"«{_schedule_sheet_name(date(year, month, 1))}»",
-        "Файл ниже — те же назначения по колонкам служения, как на "
-        "листе графика.",
+        (
+            "Файл ниже — те же назначения по колонкам служения, как на "
+            "листе графика."
+            if has_sheet_columns(registry, service["id"])
+            else "У служения нет колонки на листе графика — только текст."
+        ),
         "",
     ]
     for day in plan["dates"]:

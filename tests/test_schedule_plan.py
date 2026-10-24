@@ -216,6 +216,19 @@ class SchedulePlanTest(unittest.TestCase):
         name = self.registry.get_service("office_cleaning")["name"]
         people = self.registry.readiness_people("office_cleaning")
         self.assertEqual({tuple(item["tasks"]) for item in people}, {(name,)})
+        # Пропавший из «Списков» в служение без задач не попадает.
+        self.registry.sync_service_rosters({"office_cleaning": [
+            RosterMember("Анна", ()), RosterMember("Вера", ()),
+        ]})
+        gone = next(
+            item for item in self.registry.readiness_people("office_cleaning")
+            if item["name"] == "Галя"
+        )
+        self.assertEqual(gone["tasks"], [])
+        self.registry.sync_service_rosters({"office_cleaning": [
+            RosterMember("Анна", ()), RosterMember("Вера", ()),
+            RosterMember("Галя", ()),
+        ]})
         self.registry.set_readiness_settings(
             1001, "office_cleaning", people_needed=1, people_max=2
         )

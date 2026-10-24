@@ -4054,6 +4054,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             schedule_plan.excel_text(registry, service, plan, people),
             limit=TELEGRAM_TEXT_LIMIT,
         )
+        if not schedule_plan.has_sheet_columns(registry, service["id"]):
+            # У служения нет колонки на листе графика — файл не нужен.
+            return
         data = await asyncio.to_thread(
             schedule_plan.excel_file, registry, service, plan, people
         )
