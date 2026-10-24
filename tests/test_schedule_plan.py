@@ -297,7 +297,10 @@ class SchedulePlanTest(unittest.TestCase):
             plan["slots"][plan["dates"][0]][name],
         )
 
-    def test_day_window_and_personal_day_in_texts(self):
+    @unittest.mock.patch(
+        "bot.service_registry._current_month", return_value="2026-10"
+    )
+    def test_day_window_and_personal_day_in_texts(self, _month):
         self.assertEqual(
             schedule_plan.day_label("2026-11-01", (-1, 1)),
             "01.11 (сб 31.10 – пн 02.11)",
@@ -322,6 +325,27 @@ class SchedulePlanTest(unittest.TestCase):
         self.registry.set_service_member_day(1001, "sound", "Алексей", None)
         alex = next(p for p in self.people() if p["name"] == "Алексей")
         self.assertIsNone(alex["day_offset"])
+        # Утверждён, затем сменились дни — «с правками», в публикации строка.
+        plan = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", plan["slots"]
+        )
+        asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+        ))
+        self.assertFalse(self.registry.get_schedule_plan("sound", "2026-11")["dirty"])
+        self.registry.set_readiness_settings(1001, "sound", day_from=0, day_to=0)
+        changed = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertTrue(changed["dirty"])
+        self.assertIn(
+            "• Изменены дни служения",
+            schedule_plan.publication_text(self.service(), changed, self.people()),
+        )
+        asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), changed, 1001, LOG, 4096,
+        ))
+        self.assertFalse(self.registry.get_schedule_plan("sound", "2026-11")["dirty"])
+        self.registry.set_service_member_day(1001, "sound", "Борис", 0)
+        self.assertTrue(self.registry.get_schedule_plan("sound", "2026-11")["dirty"])
 
     def test_order_only_change_is_not_dirty(self):
         plan = self.draft()

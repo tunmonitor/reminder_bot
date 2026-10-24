@@ -1888,7 +1888,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return None
         return card
 
-    MEMBER_DAYS = (-6, -5, -4, -3, -2, -1, 1, 2)
+    MEMBER_DAYS = (-6, -5, -4, -3, -2, -1, 0, 1, 2)
 
     def member_day_label(offset: int) -> str:
         weekday = schedule_plan.WEEKDAYS[(6 + offset) % 7]
@@ -5193,10 +5193,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 # Как сообщение будет выглядеть: месяц и срок опроса этого
                 # месяца (идущего или по расписанию), упоминания состава.
                 run = registry.get_readiness_run(service_id, key)
-                deadline = (
-                    readiness.deadline_of(run)
-                    if run is not None and run.get("deadline")
-                    else readiness.schedule(settings, year, month, tz)[1]
+                deadline = readiness.preview_deadline(
+                    run, settings, year, month, now
                 )
                 if arg == "intro":
                     body = readiness.intro_text(
@@ -5222,8 +5220,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     where = "в чате служения, когда опрос завершён"
                 await _send_dialog(
                     callback.message,
-                    f"👁 Предпросмотр · {where}\n\n"
-                    "──────────────────\n\n" + body,
+                    f"👁 Предпросмотр · {where}\n"
+                    "ℹ️ " + readiness.preview_note(
+                        run, settings, year, month, now
+                    )
+                    + (
+                        " Упоминания — текущий состав."
+                        if arg == "intro" else ""
+                    )
+                    + "\n\n──────────────────\n\n" + body,
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                         readiness_button("⬅️ К тексту", "tpl", service_id, arg)
                     ]]),

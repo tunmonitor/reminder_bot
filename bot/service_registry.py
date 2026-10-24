@@ -323,6 +323,8 @@ class ServiceRegistry:
                     approved_at TEXT,
                     chat_id INTEGER,
                     message_id INTEGER,
+                    -- После утверждения сменились дни служения.
+                    republish INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (service_id, month)
                 );
@@ -780,6 +782,7 @@ class ServiceRegistry:
                 ("readiness_settings", "day_from", "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_settings", "day_to", "INTEGER NOT NULL DEFAULT 0"),
                 ("service_members", "day_offset", "INTEGER"),
+                ("schedule_plans", "republish", "INTEGER NOT NULL DEFAULT 0"),
                 ("service_members", "tasks_manual",
                  "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "poll_stopped", "INTEGER NOT NULL DEFAULT 0"),
@@ -3759,6 +3762,17 @@ class ServiceRegistry:
             )
         return tasks
 
+    @staticmethod
+    def _mark_days_changed(connection: sqlite3.Connection, service_id: str) -> None:
+        """Дни служения изменились — утверждённые графики текущего и
+        будущих месяцев надо опубликовать заново."""
+        connection.execute(
+            "UPDATE schedule_plans SET republish = 1, updated_at = ? "
+            "WHERE service_id = ? AND approved_json IS NOT NULL "
+            "AND month >= ?",
+            (_utc_now(), service_id, _current_month()),
+        )
+
     def set_service_member_day(
         self, actor_id: int, service_id: str, name: str, offset: int | None,
     ) -> None:
@@ -3772,13 +3786,21 @@ class ServiceRegistry:
             raise ValueError("Личный день: от вс −6 до вс +6.")
         with self._connection() as connection:
             self._require_service_editor(connection, actor_id, service_id)
-            cursor = connection.execute(
+            row = connection.execute(
+                "SELECT day_offset FROM service_members "
+                "WHERE service_id = ? AND name = ?",
+                (service_id, name),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"«{name}» нет в составе.")
+            if row["day_offset"] == offset:
+                return
+            connection.execute(
                 "UPDATE service_members SET day_offset = ?, updated_at = ? "
                 "WHERE service_id = ? AND name = ?",
                 (offset, _utc_now(), service_id, name),
             )
-            if cursor.rowcount == 0:
-                raise ValueError(f"«{name}» нет в составе.")
+            self._mark_days_changed(connection, service_id)
             self._audit(
                 connection, actor_id, "service_member_day", service_id,
                 {"name": name, "day_offset": offset},
@@ -4973,6 +4995,10 @@ class ServiceRegistry:
                     new["day_from"], new["day_to"], now,
                 ),
             )
+            if (new["day_from"], new["day_to"]) != (
+                current["day_from"], current["day_to"]
+            ):
+                self._mark_days_changed(connection, service_id)
             self._audit(
                 connection, actor_id, "readiness_settings_updated", service_id,
                 changes,
@@ -5036,6 +5062,9 @@ class ServiceRegistry:
             if row["telegram_id"] in by_id:
                 by_id[row["telegram_id"]]["tasks"] |= person["tasks"]
                 by_id[row["telegram_id"]]["active"] |= person["active"]
+                if by_id[row["telegram_id"]]["day_offset"] is None:
+                    # Личный день — с любой строки этого человека.
+                    by_id[row["telegram_id"]]["day_offset"] = person["day_offset"]
                 continue
             people.append(person)
             if row["telegram_id"]:
@@ -5270,7 +5299,11 @@ class ServiceRegistry:
                 for day, tasks in slots.items()
             }
 
-        plan["dirty"] = normal(plan["approved"]) != normal(plan["slots"])
+        # republish — после утверждения сменились дни служения (окно или
+        # личный день): опубликованные даты устарели.
+        plan["dirty"] = bool(plan.get("republish")) or (
+            normal(plan["approved"]) != normal(plan["slots"])
+        )
         return plan
 
     def get_schedule_plan(self, service_id: str, month: str) -> dict | None:
@@ -5382,18 +5415,24 @@ class ServiceRegistry:
         *,
         chat_id: int | None,
         message_id: int | None,
+        updated_at: str | None = None,
     ) -> dict:
-        """«✅ Утвердить»: опубликованная копия = slots."""
+        """«✅ Утвердить»: опубликованная копия = slots. updated_at —
+        версия опубликованного графика: если дни служения сменились, пока
+        шла публикация, отметка «опубликовать заново» остаётся."""
         _validate_positive_id(actor_id, "actor_id")
         with self._connection() as connection:
             self._require_service_editor(connection, actor_id, service_id)
             cursor = connection.execute(
                 "UPDATE schedule_plans SET approved_json = ?, approved_by = ?, "
-                "approved_at = ?, chat_id = ?, message_id = ? "
+                "approved_at = ?, chat_id = ?, message_id = ?, "
+                "republish = CASE WHEN ? IS NULL OR updated_at = ? THEN 0 "
+                "ELSE republish END "
                 "WHERE service_id = ? AND month = ?",
                 (
                     json.dumps(slots, ensure_ascii=False), actor_id,
-                    _utc_now(), chat_id, message_id, service_id, month,
+                    _utc_now(), chat_id, message_id, updated_at, updated_at,
+                    service_id, month,
                 ),
             )
             if cursor.rowcount == 0:
@@ -5673,6 +5712,11 @@ def normalize_member_name(name) -> str:
     if not name or len(name) > 60 or "\x00" in name:
         raise ValueError("Имя участника: от 1 до 60 символов.")
     return name
+
+
+def _current_month() -> str:
+    today = datetime.now(timezone.utc).date()
+    return f"{today.year:04d}-{today.month:02d}"
 
 
 def _utc_now() -> str:

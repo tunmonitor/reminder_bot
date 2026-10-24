@@ -85,6 +85,46 @@ class ReadinessDatesTest(unittest.TestCase):
             late, settings, after, TZ
         ))
 
+    def test_preview_deadline_is_not_in_the_past(self):
+        settings = ServiceRegistry.READINESS_DEFAULTS
+        before = datetime(2026, 10, 18, 12, 0, tzinfo=TZ)
+        self.assertEqual(
+            readiness.preview_deadline(None, settings, 2026, 11, before),
+            datetime(2026, 10, 22, 20, 0, tzinfo=TZ),
+        )
+        # Автозапуск уже прошёл — срок как при запуске сейчас.
+        late = datetime(2026, 10, 24, 15, 28, tzinfo=TZ)
+        self.assertEqual(
+            readiness.preview_deadline(None, settings, 2026, 11, late),
+            datetime(2026, 10, 27, 20, 0, tzinfo=TZ),
+        )
+        self.assertIn(
+            "автозапуска (19.10 10:00) прошло",
+            readiness.preview_note(None, settings, 2026, 11, late),
+        )
+        self.assertIn(
+            "как при автозапуске 19.10 10:00",
+            readiness.preview_note(None, settings, 2026, 11, before),
+        )
+        run = {
+            "status": "open",
+            "deadline": datetime(2026, 10, 30, 20, 0, tzinfo=TZ).isoformat(),
+        }
+        self.assertEqual(
+            readiness.preview_deadline(run, settings, 2026, 11, late),
+            datetime(2026, 10, 30, 20, 0, tzinfo=TZ),
+        )
+        # Завершённый опрос — его прошедший срок не показывается.
+        closed = {**run, "status": "closed",
+                  "deadline": datetime(2026, 10, 22, 20, 0, tzinfo=TZ).isoformat()}
+        self.assertEqual(
+            readiness.preview_deadline(closed, settings, 2026, 11, late),
+            datetime(2026, 10, 27, 20, 0, tzinfo=TZ),
+        )
+        self.assertNotIn(
+            "идёт", readiness.preview_note(closed, settings, 2026, 11, late)
+        )
+
     def test_answer_dates(self):
         dates = ["2026-11-01", "2026-11-08"]
         self.assertIsNone(readiness.answer_dates([], dates))

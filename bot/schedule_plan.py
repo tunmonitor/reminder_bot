@@ -474,6 +474,8 @@ def publication_text(service: dict, plan: dict, people: list[dict],
         lines.append(f"🗓 {day_label(day, window)} — " + " · ".join(parts))
     if update:
         changes = plan_changes(plan["approved"], plan["slots"], _names(people))
+        if plan.get("republish"):
+            changes.append("• Изменены дни служения")
         if changes:
             lines += ["", "Изменения:"] + changes
     return "\n".join(lines)
@@ -632,6 +634,7 @@ async def publish(
             return registry.approve_schedule_plan(
                 actor_id, service["id"], plan["month"], plan["slots"],
                 chat_id=chat_id, message_id=sent[0] if sent else None,
+                updated_at=plan["updated_at"],
             )
         except Exception as exc:  # noqa: BLE001
             if attempt:
