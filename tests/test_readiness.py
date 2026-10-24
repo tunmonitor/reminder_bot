@@ -385,6 +385,9 @@ class ReadinessFlowTest(unittest.TestCase):
         self.tick(bot, datetime(2026, 10, 19, 10, 0, tzinfo=TZ))
         bot.send_poll.assert_not_awaited()
         bot.send_message.assert_not_awaited()
+        # И в ноябре — без «опрос не был запущен вовремя».
+        self.tick(bot, datetime(2026, 11, 2, 10, 0, tzinfo=TZ))
+        bot.send_message.assert_not_awaited()
 
     def test_no_chat_reminder_when_everyone_answered(self):
         bot = fake_bot()

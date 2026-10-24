@@ -927,11 +927,15 @@ def _missed(registry, service_id: str, key: str, settings: dict,
     бот не работал всё окно. Включённый после времени запуска автозапуск
     — не пропуск."""
     enabled_at = settings.get("enabled_at")
-    return (
-        enabled_at is not None
-        and datetime.fromisoformat(enabled_at) <= start
-        and not registry.has_readiness_notice(service_id, key, "launch")
-    )
+    if (
+        enabled_at is None
+        or datetime.fromisoformat(enabled_at) > start
+        or registry.has_readiness_notice(service_id, key, "launch")
+    ):
+        return False
+    # График составлен без опроса — опрос и не должен был идти.
+    plan = registry.get_schedule_plan(service_id, key)
+    return not (plan is not None and plan["run_id"] is None)
 
 
 async def _tick_service(

@@ -6167,13 +6167,26 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     username="sergey_new",
                 )],
             )
+            # Однофамилец в составе без Telegram — новому имя с @username.
+            self.registry.sync_service_rosters({"sound": [
+                RosterMember("Алексей", ("звук",)),
+                RosterMember("Борис", ("звук",)),
+                RosterMember("Сергей Новый", ("сборка",)),
+            ]})
             await self.message_handler("on_users_shared")(shared)
             self.assertIn(
-                "Поставлен(а): Сергей Новый",
+                "Поставлен(а): Сергей Новый (@sergey_new)",
                 shared.answer.await_args_list[-1].args[0],
             )
             plan = self.registry.get_schedule_plan("sound", key)
-            self.assertEqual(plan["slots"][first_day]["звук"], ["Сергей Новый"])
+            self.assertEqual(
+                plan["slots"][first_day]["звук"], ["Сергей Новый (@sergey_new)"]
+            )
+            namesake = next(
+                item for item in self.registry.list_service_members("sound")
+                if item["name"] == "Сергей Новый"
+            )
+            self.assertIsNone(namesake["telegram_id"])
             sergey = next(
                 person for person in self.registry.readiness_people("sound")
                 if person["telegram_id"] == 777
@@ -6195,10 +6208,23 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             first.answer = AsyncMock(return_value=SimpleNamespace(message_id=677))
             second = self.message(67890, "/services")
             second.answer = AsyncMock(return_value=SimpleNamespace(message_id=678))
+            first.message_id, second.message_id = 10, 11
             await handler(first)
             await handler(second)
             self.context.bot.delete_message.assert_any_await(
                 chat_id=67890, message_id=677
+            )
+            # Запоздавшая более ранняя команда свой экран не показывает и
+            # экран новой не трогает.
+            late = self.message(67890, "/services")
+            late.message_id = 9
+            late.answer = AsyncMock(return_value=SimpleNamespace(message_id=679))
+            await handler(late)
+            late.answer.assert_not_awaited()
+            self.assertNotIn(
+                678,
+                [call.kwargs.get("message_id")
+                 for call in self.context.bot.delete_message.await_args_list],
             )
 
         asyncio.run(run())

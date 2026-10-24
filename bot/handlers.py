@@ -696,6 +696,27 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             if chat_type == ChatType.PRIVATE and actor_id is not None
             else None
         )
+        command = (
+            nav_actor is not None
+            and isinstance(markup, InlineKeyboardMarkup)
+            and (getattr(target, "text", None) or "").startswith("/")
+        )
+        command_id = getattr(target, "message_id", None) if command else None
+        if not isinstance(command_id, int):
+            command_id = None
+
+        def late_command() -> bool:
+            # Более поздняя команда уже показала свой экран.
+            return command_id is not None and command_id < nav_state.get(
+                nav_actor, {}
+            ).get("last_command", 0)
+
+        if late_command():
+            return None
+        if command_id is not None:
+            nav_state.setdefault(
+                nav_actor, {"shown": False, "helpers": []}
+            )["last_command"] = command_id
         nav_back = None
         nav_action = "без изменений"
         if nav_actor is not None and isinstance(markup, InlineKeyboardMarkup):
@@ -730,6 +751,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             if sent_ids is not None:
                 sent_ids.append(sent_message.message_id)
+        if sent_message is not None and late_command():
+            # Пока отправлялся этот экран, более поздняя команда показала
+            # свой — этот лишний.
+            await clean_previous_menu_by_id(
+                context.bot, target.chat.id, sent_message.message_id, debug
+            )
+            return None
         if sent_message is not None and pending is not None:
             pending["menu_message_id"] = sent_message.message_id
             pending["menu_chat_id"] = target.chat.id
@@ -743,10 +771,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             state["screen"] = sent_message.message_id
             if (
                 clean_previous
+                and command
                 and previous_menu is not None
                 and previous_menu != sent_message.message_id
-                and isinstance(markup, InlineKeyboardMarkup)
-                and (getattr(target, "text", None) or "").startswith("/")
             ):
                 # Экран команды заменяет прежнее меню. Удаление — после
                 # отправки: два быстрых /services не оставят оба экрана.
@@ -4140,6 +4167,31 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             notice,
         )
 
+    async def check_slot_free(service_id: str, pending: dict) -> None:
+        """ValueError, если в задачу даты сейчас нельзя поставить нового
+        человека (график изменился или мест нет)."""
+        registry = service_registry()
+        async with readiness.service_lock(service_id):
+            run = registry.get_readiness_run(service_id, pending["month"])
+            plan = registry.get_schedule_plan(service_id, pending["month"])
+            if not plan_current(run, plan) or (
+                schedule_plan.revision(plan) != pending.get("revision")
+            ):
+                raise ValueError("График изменился — откройте его заново.")
+            task = next(
+                (item for item in plan["tasks"]
+                 if item["name"] == pending["task"]),
+                None,
+            )
+            if task is None or pending["day"] not in plan["dates"]:
+                raise ValueError("График пересчитан — откройте его заново.")
+            limit = task["max"] or task["needed"]
+            people = schedule_plan.slot_people(plan, pending["day"], task["name"])
+            if limit > 1 and len(people) >= limit:
+                raise ValueError(
+                    f"Мест нет ({limit}) — сначала уберите кого-нибудь."
+                )
+
     async def on_plan_user_shared(message: Message, share: tuple) -> None:
         """«➕ Другой человек из Telegram»: в состав на задачу и в дату."""
         actor_id = message.from_user.id
@@ -4185,6 +4237,30 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "У пользователя нет имени в Telegram — добавьте его "
                         "через «👥 Ответственные»."
                     )
+                # Новый человек: сначала проверить, что место есть, —
+                # иначе он остался бы в составе без места в графике.
+                await check_slot_free(service_id, pending)
+                # Имя из Telegram может совпасть с чужим в составе —
+                # привязка ушла бы к однофамильцу.
+                taken = {
+                    person["name"]
+                    for person in registry.readiness_people(service_id)
+                } | {
+                    member["name"]
+                    for member in registry.list_service_members(service_id)
+                }
+                name = name[:60]
+                if name in taken:
+                    unique = (
+                        f"{name} (@{username})" if username
+                        else f"{name} ({user.user_id})"
+                    )
+                    if unique in taken:
+                        raise ValueError(
+                            f"«{name}» уже есть в составе — добавьте через "
+                            "«👥 Ответственные»."
+                        )
+                    name = unique
                 registry.bind_service_member(
                     actor_id, service_id, name, user.user_id, username,
                     tasks=[pending["task"]], from_readiness=True,
