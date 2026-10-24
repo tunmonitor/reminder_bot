@@ -6601,8 +6601,20 @@ class ServiceManagementHandlerTest(unittest.TestCase):
     def test_manual_chat_id_requires_membership_for_service_admin(self):
         async def run():
             self.registry.add_service_admin(67890, "sound", 24680)
+            self.context.bot.get_chat = AsyncMock(
+                return_value=SimpleNamespace(type="channel")
+            )
             self.context.bot.get_chat_member = AsyncMock(
-                return_value=SimpleNamespace(status="left")
+                return_value=SimpleNamespace(status="member")
+            )
+            channel = self.message(24680, "/service_chat sound -100555 on")
+            await self.message_handler("on_service_chat")(channel)
+            self.assertIn("не группа", channel.answer.await_args.args[0])
+            self.context.bot.get_chat.return_value = SimpleNamespace(
+                type="supergroup"
+            )
+            self.context.bot.get_chat_member.return_value = SimpleNamespace(
+                status="left"
             )
             command = self.message(24680, "/service_chat sound -100555 on")
             await self.message_handler("on_service_chat")(command)

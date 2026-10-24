@@ -249,6 +249,7 @@ class ReadinessFlowTest(unittest.TestCase):
         bot = fake_bot()
         self.launch(bot)
         self.assertEqual(bot.send_poll.await_args.args[1], "Звук: когда в ноябре?")
+        self.assertIsNone(bot.send_poll.await_args.kwargs["question_parse_mode"])
         with self.assertRaises(ValueError):
             self.registry.set_readiness_settings(
                 1001, "sound", question_template="x" * 301
