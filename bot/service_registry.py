@@ -329,6 +329,10 @@ class ServiceRegistry:
                     -- approved_days_json — как опубликовано.
                     days_json TEXT NOT NULL DEFAULT '{}',
                     approved_days_json TEXT,
+                    -- Фактический день служения каждого в опубликованном
+                    -- графике (дата → ключ → сдвиг): для интервалов следующего
+                    -- месяца, даже если свой день потом изменят.
+                    served_offsets_json TEXT,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (service_id, month)
                 );
@@ -789,6 +793,7 @@ class ServiceRegistry:
                 ("schedule_plans", "republish", "INTEGER NOT NULL DEFAULT 0"),
                 ("schedule_plans", "days_json", "TEXT NOT NULL DEFAULT '{}'"),
                 ("schedule_plans", "approved_days_json", "TEXT"),
+                ("schedule_plans", "served_offsets_json", "TEXT"),
                 ("service_members", "tasks_manual",
                  "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "poll_stopped", "INTEGER NOT NULL DEFAULT 0"),
@@ -5314,6 +5319,11 @@ class ServiceRegistry:
         approved = plan.pop("approved_json")
         plan["approved"] = json.loads(approved) if approved else None
         plan["days"] = json.loads(plan.pop("days_json") or "{}")
+        served = plan.pop("served_offsets_json", None)
+        plan["served_offsets"] = json.loads(served) if served else {}
+        # Снимок есть (пусть и пустой — все по воскресеньям) или график
+        # утверждён до появления снимка.
+        plan["served_snapshot"] = served is not None
         approved_days = plan.pop("approved_days_json")
         plan["approved_days"] = (
             json.loads(approved_days) if approved_days else {}
@@ -5391,15 +5401,6 @@ class ServiceRegistry:
         переименовано в каталоге). Утверждённая копия — как опубликовано:
         график становится «с правками», и «✅ Утвердить изменения»
         опубликует новое название (одной строкой в списке изменений)."""
-        plan = self.get_schedule_plan(service_id, month)
-        if plan is None:
-            raise ValueError("График не найден.")
-        tasks = [
-            {**task, "name": new, "implicit": True} if task["name"] == old
-            else task
-            for task in plan["tasks"]
-        ]
-
         def renamed(slots: dict) -> str:
             return json.dumps({
                 day: {(new if task == old else task): people
@@ -5407,13 +5408,29 @@ class ServiceRegistry:
                 for day, day_tasks in slots.items()
             }, ensure_ascii=False)
 
+        # Чтение и запись — в одной транзакции: параллельная правка графика
+        # не затрётся старой копией.
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT tasks_json, slots_json FROM schedule_plans "
+                "WHERE service_id = ? AND month = ?",
+                (service_id, month),
+            ).fetchone()
+            if row is None:
+                raise ValueError("График не найден.")
+            tasks = [
+                {**task, "name": new, "implicit": True}
+                if task["name"] == old else task
+                for task in json.loads(row["tasks_json"])
+            ]
             connection.execute(
                 "UPDATE schedule_plans SET tasks_json = ?, slots_json = ?, "
                 "updated_at = ? WHERE service_id = ? AND month = ?",
                 (
                     json.dumps(tasks, ensure_ascii=False),
-                    renamed(plan["slots"]), _utc_now(), service_id, month,
+                    renamed(json.loads(row["slots_json"])), _utc_now(),
+                    service_id, month,
                 ),
             )
         return self.get_schedule_plan(service_id, month)
@@ -5505,6 +5522,7 @@ class ServiceRegistry:
         message_id: int | None,
         updated_at: str | None = None,
         days: dict | None = None,
+        served_offsets: dict | None = None,
     ) -> dict:
         """«✅ Утвердить»: опубликованная копия = slots. updated_at —
         версия опубликованного графика: если дни служения сменились, пока
@@ -5515,7 +5533,7 @@ class ServiceRegistry:
             cursor = connection.execute(
                 "UPDATE schedule_plans SET approved_json = ?, approved_by = ?, "
                 "approved_at = ?, chat_id = ?, message_id = ?, "
-                "approved_days_json = ?, "
+                "approved_days_json = ?, served_offsets_json = ?, "
                 "republish = CASE WHEN ? IS NULL OR updated_at = ? THEN 0 "
                 "ELSE republish END "
                 "WHERE service_id = ? AND month = ?",
@@ -5523,6 +5541,7 @@ class ServiceRegistry:
                     json.dumps(slots, ensure_ascii=False), actor_id,
                     _utc_now(), chat_id, message_id,
                     json.dumps(days or {}, ensure_ascii=False),
+                    json.dumps(served_offsets or {}, ensure_ascii=False),
                     updated_at, updated_at, service_id, month,
                 ),
             )

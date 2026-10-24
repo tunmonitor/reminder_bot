@@ -250,5 +250,17 @@ class SchedulePlannerTest(unittest.TestCase):
             self.assertEqual(max(plan.load().values()), 1)
 
 
+    def test_service_early_in_month_counts_as_one_week_gap(self):
+        # Служил в пн 02.11 (с прошлого месяца) — 08.11 через 6 дней.
+        dates = SUNDAYS[1:3]
+        plan = build_plan(plan_input(
+            {"Анна": set(dates), "Вера": set(dates)},
+            {"Анна": {"звук"}, "Вера": {"звук"}},
+            needed={"звук": 1}, dates=dates,
+            last_served={"Анна": date(2026, 11, 2)},
+        ))
+        self.assertEqual(plan.slots[(dates[0], "звук")], ["Вера"])
+
+
 if __name__ == "__main__":
     unittest.main()

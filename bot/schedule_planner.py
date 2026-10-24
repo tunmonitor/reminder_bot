@@ -110,7 +110,8 @@ def _weeks(earlier: date, later: date) -> int:
 def _gap_penalty(earlier: date | None, later: date) -> int:
     if earlier is None:
         return 0
-    return GAP_PENALTY.get(_weeks(earlier, later), 0)
+    # Меньше недели (служение в начале месяца с прошлого) — как неделя.
+    return GAP_PENALTY.get(max(1, _weeks(earlier, later)), 0)
 
 
 def _rotation_penalty(data: PlanInput, person: str) -> int:
@@ -118,7 +119,8 @@ def _rotation_penalty(data: PlanInput, person: str) -> int:
     previous = data.last_served.get(person)
     if previous is None or not data.dates:
         return 0
-    return max(0, ROTATION_WEEKS - _weeks(previous, min(data.dates)))
+    weeks = max(0, _weeks(previous, min(data.dates)))
+    return max(0, ROTATION_WEEKS - weeks)
 
 
 def plan_cost(plan: Plan, data: PlanInput) -> int:
