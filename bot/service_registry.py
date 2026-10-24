@@ -5136,12 +5136,16 @@ class ServiceRegistry:
             key = person["name"]
             if names.count(key) > 1:
                 key = f"{key} · {person['telegram_id'] or 'без Telegram'}"
+            active = person.pop("active", True)
             if implicit:
-                tasks = {implicit} if person.get("active", True) else set()
+                tasks = {implicit} if active else set()
             else:
                 tasks = person["tasks"]
-            person.pop("active", None)
-            result.append({**person, "key": key, "tasks": sorted(tasks)})
+            # in_roster — в «Списках» или добавлен в боте (выбывший — нет).
+            result.append({
+                **person, "key": key, "tasks": sorted(tasks),
+                "in_roster": active,
+            })
         return result
 
     def get_nav_hints(self, telegram_id: int) -> list[int]:

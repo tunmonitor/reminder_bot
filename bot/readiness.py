@@ -391,11 +391,21 @@ def option_label(day: str, window: tuple[int, int] = (0, 0)) -> str:
 
 def own_days_note(people: list[dict]) -> str:
     """Сноска к опросу: у кого свой день служения."""
+    def label(person: dict) -> str:
+        # Однофамильцы различаются: @username, иначе ключ состава.
+        if person.get("key", person["name"]) == person["name"]:
+            return person["name"]
+        if person.get("username"):
+            return f"{person['name']} (@{person['username']})"
+        return person["key"]
+
+    # Выбывшие из состава в сноску не попадают.
     own = [
-        f"{person['name']} — "
+        f"{label(person)} — "
         + WEEKDAYS_PLURAL[(6 + person["day_offset"]) % 7]
         for person in people
         if person["tasks"] and person.get("day_offset") is not None
+        and person.get("in_roster", True)
     ]
     return ("📅 Свой день: " + "; ".join(own)) if own else ""
 
@@ -423,12 +433,16 @@ def question_text(service: dict, year: int, month: int,
                   template: str | None = None) -> str:
     """Вопрос Telegram-опроса над вариантами (не длиннее 300 символов —
     предел Telegram)."""
-    return render_template(
-        template or DEFAULT_READINESS_QUESTION,
+    values = dict(
         service_name=service["name"],
         month=month_title(year, month),
         month_in=MONTHS_IN[month - 1],
-    )[:300]
+    )
+    text = render_template(template or DEFAULT_READINESS_QUESTION, **values)
+    if not text.strip():
+        # Пустой вопрос Telegram не примет — опрос не запустился бы.
+        text = render_template(DEFAULT_READINESS_QUESTION, **values)
+    return text[:300]
 
 
 def closed_text(service: dict, run: dict, template: str | None = None) -> str:

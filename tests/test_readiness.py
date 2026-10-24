@@ -150,6 +150,22 @@ class ReadinessDatesTest(unittest.TestCase):
             "📅 Свой день: Катя Степанова — по четвергам",
         )
         self.assertEqual(readiness.own_days_note(people[1:]), "")
+        twins = [
+            {"name": "Аня", "key": "Аня · 1", "tasks": ["у"], "day_offset": -3,
+             "username": "anya1"},
+            {"name": "Аня", "key": "Аня · 2", "tasks": ["у"], "day_offset": -1},
+            {"name": "Вика", "key": "Вика", "tasks": ["у"], "day_offset": -2,
+             "in_roster": False},
+        ]
+        self.assertEqual(
+            readiness.own_days_note(twins),
+            "📅 Свой день: Аня (@anya1) — по четвергам; Аня · 2 — по субботам",
+        )
+        service = {"name": "Звук"}
+        self.assertEqual(
+            readiness.question_text(service, 2026, 11, "👥"),
+            "Когда можешь служить в ноябре?",
+        )
 
     def test_answer_dates(self):
         dates = ["2026-11-01", "2026-11-08"]
