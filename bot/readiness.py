@@ -541,6 +541,9 @@ async def launch_run(
             ],
             is_anonymous=False,
             allows_multiple_answers=True,
+            # Вопрос — обычный текст: «&» или «<» из шаблона не должны
+            # ломать отправку (у бота по умолчанию HTML).
+            question_parse_mode=None,
         )
         attached = registry.attach_readiness_poll(
             run["id"],

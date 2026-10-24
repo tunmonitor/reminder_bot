@@ -899,6 +899,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if registry is None or registry.is_super_admin(actor_id):
             return
         try:
+            chat = await context.bot.get_chat(chat_id)
+            if getattr(chat, "type", None) not in {"group", "supergroup"}:
+                raise PermissionError(
+                    "Это не группа — привязать можно только групповой чат."
+                )
             member = await context.bot.get_chat_member(chat_id, actor_id)
         except TelegramAPIError as exc:
             raise PermissionError(
