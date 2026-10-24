@@ -192,8 +192,24 @@ async def ensure_plan(
     — новый предложенный."""
     plan = registry.get_schedule_plan(run["service_id"], month_key(*month_of(run)))
     if plan is not None and plan["run_id"] == run["id"]:
-        return plan
+        return sync_implicit_task(registry, plan)
     return await build_draft(registry, run, events_loader, logger)
+
+
+def sync_implicit_task(registry, plan: dict) -> dict:
+    """Служение без задач переименовано в каталоге — задача графика
+    (его название) переименовывается вслед, правки сохраняются."""
+    current = registry.plan_tasks(plan["service_id"])
+    if (
+        len(current) == 1 and current[0]["implicit"]
+        and len(plan["tasks"]) == 1
+        and plan["tasks"][0]["name"] != current[0]["name"]
+    ):
+        return registry.rename_plan_task(
+            plan["service_id"], plan["month"], plan["tasks"][0]["name"],
+            current[0]["name"],
+        )
+    return plan
 
 
 def _names(people: list[dict]) -> dict[str, str]:

@@ -3849,7 +3849,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             plan = registry.get_schedule_plan(service_id, key)
             if run is None or run["status"] != "closed":
                 # График без опроса — пока опрос месяца не идёт.
-                return run, plan if plan_current(run, plan) else None
+                if not plan_current(run, plan):
+                    return run, None
+                return run, schedule_plan.sync_implicit_task(registry, plan)
             plan = await schedule_plan.ensure_plan(
                 registry, run,
                 getattr(context, "load_upcoming_service_events", None), debug,

@@ -3629,11 +3629,17 @@ class ServiceRegistry:
                 )
                 roster_tasks = []
             else:
+                # «➕ В состав» возвращает выпавшего из «Списков»: он снова
+                # в составе — как добавленный в боте.
                 connection.execute(
                     "UPDATE service_members SET telegram_id = ?, "
-                    "username = ?, updated_at = ? "
+                    "username = ?, updated_at = ?, source = CASE "
+                    "WHEN ? AND in_list = 0 THEN 'manual' ELSE source END "
                     "WHERE service_id = ? AND name = ?",
-                    (telegram_id, username, now, service_id, name),
+                    (
+                        telegram_id, username, now, int(from_readiness),
+                        service_id, name,
+                    ),
                 )
                 roster_tasks = json.loads(member["tasks_json"])
             bound_tasks = [
@@ -5263,6 +5269,42 @@ class ServiceRegistry:
                     json.dumps(slots, ensure_ascii=False),
                     json.dumps(last_served, ensure_ascii=False),
                     note, _utc_now(),
+                ),
+            )
+        return self.get_schedule_plan(service_id, month)
+
+    def rename_plan_task(
+        self, service_id: str, month: str, old: str, new: str,
+    ) -> dict:
+        """Переименовать задачу графика (служение без задач переименовано
+        в каталоге) — и в рабочей, и в утверждённой копии: смена названия
+        не считается правкой графика."""
+        plan = self.get_schedule_plan(service_id, month)
+        if plan is None:
+            raise ValueError("График не найден.")
+        tasks = [
+            {**task, "name": new} if task["name"] == old else task
+            for task in plan["tasks"]
+        ]
+
+        def renamed(slots: dict | None) -> str | None:
+            if slots is None:
+                return None
+            return json.dumps({
+                day: {(new if task == old else task): people
+                      for task, people in day_tasks.items()}
+                for day, day_tasks in slots.items()
+            }, ensure_ascii=False)
+
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE schedule_plans SET tasks_json = ?, slots_json = ?, "
+                "approved_json = ?, updated_at = ? "
+                "WHERE service_id = ? AND month = ?",
+                (
+                    json.dumps(tasks, ensure_ascii=False),
+                    renamed(plan["slots"]), renamed(plan["approved"]),
+                    _utc_now(), service_id, month,
                 ),
             )
         return self.get_schedule_plan(service_id, month)
