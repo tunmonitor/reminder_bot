@@ -3651,6 +3651,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         lines.append("📆 Дни служения: " + DAY_WINDOWS.get(window, "свои"))
         rows.append([
             readiness_button("📆 Дни служения", "days", service_id),
+            readiness_button("📅 Свой день", "own", service_id),
         ])
         rows.append([
             readiness_button("📝 Текст опроса", "tpl", service_id, "intro"),
@@ -4732,6 +4733,57 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await show_plan(callback.message, service, run, plan, "⚠️ Экран устарел")
         await _answer_callback(callback)
 
+    async def show_own_days(
+        message: Message, actor_id: int, service_id: str,
+        notice: str | None = None,
+    ) -> None:
+        """«📅 Свой день» из раздела «📅 График»: у кого служение в другой
+        день недели, чем у всех."""
+        registry = service_registry()
+        members = registry.list_service_members(service_id)
+        usual = DAY_WINDOWS.get(
+            schedule_plan.window_of(registry, service_id), "свои дни"
+        )
+        token = secrets.token_urlsafe(6)
+        pending_inputs[actor_id] = {
+            "operation": "readiness_own",
+            "service_id": service_id,
+            "names": [member["name"] for member in members],
+            "step": "readiness_own",
+            "token": token,
+        }
+        lines = [
+            "📅 Свой день",
+            "",
+            f"Дни служения для всех: {usual}. Выберите человека, который "
+            "служит в другой день недели (каждую неделю). Для одной недели — "
+            "в правке графика: «📅 Имя — день».",
+        ]
+        if not members:
+            lines.append("⚪ В составе пока никого нет.")
+        if notice:
+            lines = [notice, ""] + lines
+        rows = [
+            [readiness_button(
+                f"📅 {member['name']} — "
+                + (
+                    member_day_label(member["day_offset"])
+                    if member["day_offset"] is not None else usual
+                ),
+                "ownp", service_id, f"{token}.{index}",
+            )]
+            for index, member in enumerate(members)
+        ]
+        for row in rows:
+            row[0].text = row[0].text[:60]
+        rows.append([readiness_button("⬅️ К разделу «График»", "open", service_id)])
+        await _send_dialog(
+            message, "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keyboard_limit=8,
+            parse_mode=None,
+        )
+
     async def show_readiness_choice(
         message: Message, service_id: str, title: str,
         options: list[tuple[str, str]], action: str, current: str,
@@ -4792,6 +4844,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ):
                 await answer_quietly(callback, "⚠️ Этот экран уже устарел.")
                 return
+            if action in {"ownp", "owns"} and not (
+                member_pending
+                and member_pending.get("operation") == "readiness_own"
+                and member_pending.get("service_id") == service_id
+                and (arg or "").split(".")[0] == member_pending.get("token")
+            ):
+                await answer_quietly(callback, "⚠️ Этот экран уже устарел.")
+                return
             plan_pending = member_pending
             if action in {
                 "padd", "prem", "pclear", "pnew", "pday", "pdset",
@@ -4805,7 +4865,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 return
             if action in {
                 "addmt", "addms", "padd", "prem", "pclear", "pnew", "pday",
-                "pdset",
+                "pdset", "ownp", "owns",
             }:
                 # Выбор задач идёт в одной сессии — pending не сбрасывается.
                 await clean_previous_menu(callback.message, debug)
@@ -5073,6 +5133,62 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         for value in READINESS_DEADLINES
                     ],
                     "dlt", settings["deadline_time"].replace(":", ""),
+                )
+                await _answer_callback(callback)
+                return
+            elif action == "own":
+                await show_own_days(callback.message, actor_id, service_id)
+                await _answer_callback(callback)
+                return
+            elif action in {"ownp", "owns"}:
+                own = pending_inputs[actor_id]
+                parts_arg = (arg or "").split(".")
+                index = int(parts_arg[1]) if len(parts_arg) > 1 and (
+                    parts_arg[1].isdigit()
+                ) else -1
+                if not 0 <= index < len(own["names"]):
+                    raise ValueError("Экран устарел — откройте список заново.")
+                name = own["names"][index]
+                if action == "ownp":
+                    buttons = [
+                        readiness_button(
+                            f"📅 {member_day_label(offset)}", "owns",
+                            service_id, f"{own['token']}.{index}.{offset}",
+                        )
+                        for offset in MEMBER_DAYS
+                    ]
+                    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+                    rows.append([readiness_button(
+                        "↩️ Как у всех", "owns", service_id,
+                        f"{own['token']}.{index}.n",
+                    )])
+                    rows.append([readiness_button(
+                        "⬅️ К списку", "own", service_id
+                    )])
+                    await _send_dialog(
+                        callback.message,
+                        f"📅 Свой день · {name}\n\nВ какой день человек служит "
+                        "каждую неделю относительно воскресенья графика? "
+                        "Например, чт — «вс −3». «Как у всех» — дни служения "
+                        "раздела. Для одной недели — в правке графика.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+                        _dialog_keep_rows=True,
+                        _dialog_keyboard_limit=sum(len(row) for row in rows),
+                        parse_mode=None,
+                    )
+                    await _answer_callback(callback)
+                    return
+                value = parts_arg[2] if len(parts_arg) > 2 else ""
+                offset = None if value == "n" else int(value)
+                registry.set_service_member_day(
+                    actor_id, service_id, name, offset
+                )
+                await show_own_days(
+                    callback.message, actor_id, service_id,
+                    f"✅ {name}: " + (
+                        member_day_label(offset) if offset is not None
+                        else "как у всех"
+                    ),
                 )
                 await _answer_callback(callback)
                 return

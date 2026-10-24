@@ -329,13 +329,15 @@ class SchedulePlanTest(unittest.TestCase):
             self.registry.set_readiness_settings(1001, "sound", day_from=1)
         self.registry.set_service_member_day(1001, "sound", "Алексей", -3)
         plan = self.draft()
-        plan["slots"]["2026-11-01"]["звук"] = ["Алексей"]
+        plan["slots"]["2026-11-01"] = {"звук": ["Алексей"], "сборка": []}
         summary = readiness.summarize(self.registry, self.run, with_plan=False)
         text = schedule_plan.plan_text(
             "ЗВУК", plan, summary, TZ, schedule_plan.window_of(self.registry, "sound")
         )
-        self.assertIn("🗓 01.11 (сб 31.10 – пн 02.11)", text)
-        self.assertIn("• Алексей — чт 29.10", text)
+        # У единственного на дату свой день — общий период не показывается.
+        self.assertIn("🗓 01.11\n   🎚️ звук\n      • Алексей — чт 29.10", text)
+        # Рядом служит Глеб без своего дня — период для него показывается.
+        self.assertIn("🗓 08.11 (сб 07.11 – пн 09.11)", text)
         published = schedule_plan.publication_text(
             self.service(), plan, self.people(), (-1, 1)
         )

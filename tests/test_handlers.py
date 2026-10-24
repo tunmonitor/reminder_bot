@@ -6200,6 +6200,54 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_own_day_from_schedule_section(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.sync_service_rosters({"sound": [
+            RosterMember("Катя Степанова", ("звук",)),
+        ]})
+        handler = self.callback_handler("on_readiness")
+
+        async def press(data):
+            callback = SimpleNamespace(
+                data=data,
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            await handler(callback)
+            return callback
+
+        def find(callback, text):
+            return next(
+                button.callback_data
+                for row in callback.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.text.startswith(text)
+            )
+
+        async def run():
+            section = await press("rdy:open:sound")
+            own = await press(find(section, "📅 Свой день"))
+            self.assertIn("Дни служения для всех", own.message.answer.await_args.args[0])
+            person = await press(find(own, "📅 Катя Степанова"))
+            chosen = await press(find(person, "📅 чт (вс -3)"))
+            self.assertIn(
+                "✅ Катя Степанова: чт (вс -3)",
+                chosen.message.answer.await_args.args[0],
+            )
+            katya = next(
+                item for item in self.registry.list_service_members("sound")
+                if item["name"] == "Катя Степанова"
+            )
+            self.assertEqual(katya["day_offset"], -3)
+            stale = await press(find(person, "📅 пт (вс -2)"))
+            self.assertIn("устарел", stale.answer.await_args.args[0])
+
+        asyncio.run(run())
+
     def test_command_screen_replaces_previous_menu(self):
         handler = self.message_handler("on_services")
 
