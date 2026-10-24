@@ -1,4 +1,6 @@
 import asyncio
+import sqlite3
+from contextlib import closing
 import logging
 import tempfile
 import unittest
@@ -206,6 +208,93 @@ class SchedulePlanTest(unittest.TestCase):
             "Борис",
             [key for tasks in plan["slots"].values()
              for people in tasks.values() for key in people],
+        )
+
+    def test_service_without_tasks_is_one_task(self):
+        self.registry.sync_service_rosters({"office_cleaning": [
+            RosterMember("Анна", ()), RosterMember("Вера", ()),
+            RosterMember("Галя", ()),
+        ]})
+        name = self.registry.get_service("office_cleaning")["name"]
+        people = self.registry.readiness_people("office_cleaning")
+        self.assertEqual({tuple(item["tasks"]) for item in people}, {(name,)})
+        # Пропавший из «Списков» в служение без задач не попадает.
+        self.registry.sync_service_rosters({"office_cleaning": [
+            RosterMember("Анна", ()), RosterMember("Вера", ()),
+        ]})
+        gone = next(
+            item for item in self.registry.readiness_people("office_cleaning")
+            if item["name"] == "Галя"
+        )
+        self.assertEqual(gone["tasks"], [])
+        self.registry.sync_service_rosters({"office_cleaning": [
+            RosterMember("Анна", ()), RosterMember("Вера", ()),
+            RosterMember("Галя", ()),
+        ]})
+        self.registry.set_readiness_settings(
+            1001, "office_cleaning", people_needed=1, people_max=2
+        )
+        tasks = self.registry.plan_tasks("office_cleaning")
+        self.assertEqual(
+            [(task["name"], task["needed"], task["max"], task["position"])
+             for task in tasks],
+            [(name, 1, 2, "s")],
+        )
+        plan = asyncio.run(schedule_plan.build_draft(
+            self.registry, schedule_plan.free_run("office_cleaning", 2026, 11),
+            None, LOG,
+        ))
+        counts = [len(plan["slots"][day][name]) for day in plan["dates"]]
+        # Без опроса свободны все — места до максимума заполнены.
+        self.assertEqual(counts, [2] * 5)
+        load = [len(days) for days in schedule_plan.served_dates(plan["slots"]).values()]
+        self.assertLessEqual(max(load) - min(load), 1)
+        with self.assertRaises(ValueError):
+            self.registry.set_readiness_settings(
+                1001, "office_cleaning", people_needed=3, people_max=2
+            )
+        # Выпавший из «Списков» и возвращённый «➕ В состав» — снова в нём.
+        self.registry.sync_service_rosters({"office_cleaning": [
+            RosterMember("Анна", ()), RosterMember("Вера", ()),
+        ]})
+        self.registry.bind_service_member(
+            1001, "office_cleaning", "Галя", 909, from_readiness=True
+        )
+        galya = next(
+            item for item in self.registry.readiness_people("office_cleaning")
+            if item["name"] == "Галя"
+        )
+        self.assertEqual(galya["tasks"], [name])
+        # Переименование служения — задача графика вслед, правки целы.
+        with closing(sqlite3.connect(self.registry.path)) as connection:
+            connection.execute(
+                "UPDATE services SET name = 'Уборка' WHERE id = 'office_cleaning'"
+            )
+            connection.commit()
+        self.registry.approve_schedule_plan(
+            1001, "office_cleaning", plan["month"], plan["slots"],
+            chat_id=None, message_id=None,
+        )
+        renamed = schedule_plan.sync_implicit_task(self.registry, plan)
+        self.assertEqual(renamed["tasks"][0]["name"], "Уборка")
+        # Опубликован со старым названием — смена названия публикуется
+        # одной строкой.
+        self.assertTrue(renamed["dirty"])
+        self.assertEqual(
+            schedule_plan.plan_changes(renamed["approved"], renamed["slots"], {}),
+            [f"• Задача «{name}» теперь называется «Уборка»"],
+        )
+        # Несколько задач: выключили одну, включили другую — не
+        # переименование.
+        swap = schedule_plan.plan_changes(
+            {"2026-11-01": {"звук": ["А"], "сборка": ["Б"]}},
+            {"2026-11-01": {"звук": ["А"], "спевка": ["Б"]}},
+            {},
+        )
+        self.assertNotIn("теперь называется", " ".join(swap))
+        self.assertEqual(
+            renamed["slots"][plan["dates"][0]]["Уборка"],
+            plan["slots"][plan["dates"][0]][name],
         )
 
     def test_order_only_change_is_not_dirty(self):

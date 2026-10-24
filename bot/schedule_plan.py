@@ -118,15 +118,11 @@ async def last_served(
 
 
 def plan_tasks(registry, service_id: str) -> list[dict]:
-    """Распределяемые задачи в порядке каталога: минимум и максимум."""
+    """Распределяемые задачи в порядке каталога: минимум и максимум
+    (служение без задач — одна задача с его названием)."""
     return [
-        {
-            "name": task["name"],
-            "needed": task["people_needed"],
-            "max": task["people_max"],
-        }
-        for task in registry.list_service_tasks(service_id)
-        if task["enabled"]
+        {"name": task["name"], "needed": task["needed"], "max": task["max"]}
+        for task in registry.plan_tasks(service_id)
     ]
 
 
@@ -196,8 +192,24 @@ async def ensure_plan(
     — новый предложенный."""
     plan = registry.get_schedule_plan(run["service_id"], month_key(*month_of(run)))
     if plan is not None and plan["run_id"] == run["id"]:
-        return plan
+        return sync_implicit_task(registry, plan)
     return await build_draft(registry, run, events_loader, logger)
+
+
+def sync_implicit_task(registry, plan: dict) -> dict:
+    """Служение без задач переименовано в каталоге — задача графика
+    (его название) переименовывается вслед, правки сохраняются."""
+    current = registry.plan_tasks(plan["service_id"])
+    if (
+        len(current) == 1 and current[0]["implicit"]
+        and len(plan["tasks"]) == 1
+        and plan["tasks"][0]["name"] != current[0]["name"]
+    ):
+        return registry.rename_plan_task(
+            plan["service_id"], plan["month"], plan["tasks"][0]["name"],
+            current[0]["name"],
+        )
+    return plan
 
 
 def _names(people: list[dict]) -> dict[str, str]:
@@ -362,8 +374,22 @@ def choice_notes(plan: dict, summary: Summary, key: str, day: str,
 
 
 def plan_changes(old: dict, new: dict, names: dict[str, str]) -> list[str]:
-    """Отличия нового графика от опубликованного — для «обновлён»."""
+    """Отличия нового графика от опубликованного — для «обновлён».
+    Единственная задача сменила название (служение без задач переименовано
+    в каталоге) — одной строкой, люди сравниваются под новым названием.
+    При нескольких задачах смена набора — это выключение и включение, не
+    переименование."""
     lines = []
+    old_tasks = {task for tasks in old.values() for task in tasks}
+    new_tasks = {task for tasks in new.values() for task in tasks}
+    if len(old_tasks) == len(new_tasks) == 1 and old_tasks != new_tasks:
+        (was,), (now,) = old_tasks, new_tasks
+        lines.append(f"• Задача «{was}» теперь называется «{now}»")
+        old = {
+            day: {(now if task == was else task): people
+                  for task, people in tasks.items()}
+            for day, tasks in old.items()
+        }
     for day in sorted(set(old) | set(new)):
         tasks = list(dict.fromkeys([*new.get(day, {}), *old.get(day, {})]))
         for task in tasks:
@@ -420,7 +446,9 @@ def _columns(registry, service_id: str) -> list[ScheduleColumn]:
         None,
     )
     if service is None or not service.columns:
-        return [ScheduleColumn(headers=(service_id,), layout="pairs")]
+        return [ScheduleColumn(
+            headers=(service.name if service else service_id,), layout="pairs",
+        )]
     return list(service.columns)
 
 
@@ -468,14 +496,26 @@ def excel_rows(registry, plan: dict, people: list[dict]) -> list[list]:
     return rows
 
 
+def has_sheet_columns(registry, service_id: str) -> bool:
+    """У служения есть колонки на листе графика (иначе .xlsx не нужен)."""
+    return any(
+        item.id == service_id and item.columns
+        for item in registry.service_catalog()
+    )
+
+
 def excel_text(registry, service: dict, plan: dict, people: list[dict]) -> str:
     year, month = map(int, plan["month"].split("-"))
     names = _names(people)
     lines = [
         f"📋 Для Excel · {service['name']} · лист "
         f"«{_schedule_sheet_name(date(year, month, 1))}»",
-        "Файл ниже — те же назначения по колонкам служения, как на "
-        "листе графика.",
+        (
+            "Файл ниже — те же назначения по колонкам служения, как на "
+            "листе графика."
+            if has_sheet_columns(registry, service["id"])
+            else "У служения нет колонки на листе графика — только текст."
+        ),
         "",
     ]
     for day in plan["dates"]:

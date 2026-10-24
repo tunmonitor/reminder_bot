@@ -1953,8 +1953,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "🔄 Изменить Telegram" if telegram_id else "🔗 Привязать Telegram",
                 "bind", service_id, token,
             )],
-            [member_button("📝 Задачи", "tasks", service_id, token)],
         ]
+        if registry.list_service_tasks(service_id):
+            # У служения без задач все в нём — выбирать нечего.
+            rows.append([member_button("📝 Задачи", "tasks", service_id, token)])
         if member is not None or person is not None:
             # Только в графике — удалять из состава нечего.
             rows.append([
@@ -3352,7 +3354,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         )
 
     def people_label(task: dict) -> str:
-        low, high = task["people_needed"], task["people_max"]
+        # Задача служения (people_needed / people_max) или задача графика
+        # (registry.plan_tasks: needed / max).
+        low = task.get("needed", task.get("people_needed"))
+        high = task.get("max", task.get("people_max"))
         return str(low) if high == low else f"{low}–{high}"
 
     PEOPLE_CHOICES = (
@@ -3373,10 +3378,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if service is None:
             await _send_dialog(message, "Служение не найдено.", parse_mode=None)
             return
-        tasks = [
-            task for task in registry.list_service_tasks(service_id)
-            if task["enabled"]
-        ]
+        # Служение без задач — одна строка с его названием.
+        tasks = registry.plan_tasks(service_id)
         lines = [
             f"👥 {service_label(service)} · нужно людей",
             "",
@@ -3419,7 +3422,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def show_task_people_choice(
         message: Message, service_id: str, task: dict, back: str
     ) -> None:
-        current = (task["people_needed"], task["people_max"])
+        current = (task["needed"], task["max"])
         buttons = [
             readiness_button(
                 f"{'✅' if (low, high) == current else '👥'} "
@@ -3846,7 +3849,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             plan = registry.get_schedule_plan(service_id, key)
             if run is None or run["status"] != "closed":
                 # График без опроса — пока опрос месяца не идёт.
-                return run, plan if plan_current(run, plan) else None
+                if not plan_current(run, plan):
+                    return run, None
+                return run, schedule_plan.sync_implicit_task(registry, plan)
             plan = await schedule_plan.ensure_plan(
                 registry, run,
                 getattr(context, "load_upcoming_service_events", None), debug,
@@ -4051,6 +4056,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             schedule_plan.excel_text(registry, service, plan, people),
             limit=TELEGRAM_TEXT_LIMIT,
         )
+        if not schedule_plan.has_sheet_columns(registry, service["id"]):
+            # У служения нет колонки на листе графика — файл не нужен.
+            return
         data = await asyncio.to_thread(
             schedule_plan.excel_file, registry, service, plan, people
         )
@@ -4959,12 +4967,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "name": name,
                         "dates": answer["dates"],
                         # Список задач экрана: отметка — по индексу в нём.
+                        # Служение без задач — одна «задача» с его названием
+                        # (как в графике Excel), сразу отмечена.
                         "tasks": [
                             task["name"]
-                            for task in registry.list_service_tasks(service_id)
-                            if task["enabled"]
+                            for task in registry.plan_tasks(service_id)
                         ],
-                        "selected": [],
+                        "selected": [
+                            task["name"]
+                            for task in registry.plan_tasks(service_id)
+                            if task["implicit"]
+                        ],
                         "step": "readiness_member",
                         # Кнопки экрана — только для этого человека.
                         "token": secrets.token_urlsafe(6),
@@ -5058,12 +5071,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 return
             elif action in {"ppick", "pset"} and arg:
                 parts_arg = arg.split(".")
-                position = int(parts_arg[0])
                 back = parts_arg[-1] if parts_arg[-1] in {"o", "t"} else "o"
+                # Позиция задачи; «s» — служение без задач.
                 task = next(
                     (
-                        item for item in registry.list_service_tasks(service_id)
-                        if item["position"] == position and item["enabled"]
+                        item for item in registry.plan_tasks(service_id)
+                        if item["position"] == parts_arg[0]
                     ),
                     None,
                 )
@@ -5075,9 +5088,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     )
                 else:
                     low, high = int(parts_arg[1]), int(parts_arg[2])
-                    registry.set_service_task_people_needed(
-                        actor_id, service_id, task["name"], low, high
-                    )
+                    if task["implicit"]:
+                        registry.set_readiness_settings(
+                            actor_id, service_id,
+                            people_needed=low, people_max=high,
+                        )
+                    else:
+                        registry.set_service_task_people_needed(
+                            actor_id, service_id, task["name"], low, high
+                        )
                     await show_task_people(
                         callback.message, service_id, back,
                         f"✅ «{task['name']}»: нужно людей — "
