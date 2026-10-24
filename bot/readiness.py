@@ -178,6 +178,8 @@ class Summary:
     not_answered: list[dict] = field(default_factory=list)
     plan: Plan | None = None
     free_count: dict[str, int] = field(default_factory=dict)
+    # Служение без задач: в тексте люди сразу под датой.
+    implicit: bool = False
 
 
 def summarize(registry, run: dict, *, with_plan: bool = True,
@@ -221,6 +223,7 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
         tasks = {person["key"]: person["tasks"] for person in people}
         # У служения без задач — одна задача с его названием.
         catalog = registry.plan_tasks(run["service_id"])
+        summary.implicit = any(task["implicit"] for task in catalog)
         all_dates = frozenset(date.fromisoformat(day) for day in run["dates"])
         free = {
             name: frozenset(date.fromisoformat(day) for day in dates)
@@ -304,7 +307,7 @@ def progress_text(service_label: str, run: dict, summary: Summary, tz,
                         + ("*" if person in silent else "")
                         for person in people
                     ],
-                    empty="⚠️ некого поставить",
+                    empty="⚠️ некого поставить", bare=summary.implicit,
                 )
         if used_silent:
             lines.append(
@@ -333,8 +336,14 @@ def progress_text(service_label: str, run: dict, summary: Summary, tz,
 
 
 def task_lines(task: str, needed: int, names: list[str],
-               empty: str = "⚠️ никого") -> list[str]:
-    """Задача даты: заголовок и каждый человек на своей строке."""
+               empty: str = "⚠️ никого", *, bare: bool = False) -> list[str]:
+    """Задача даты: заголовок и каждый человек на своей строке. bare —
+    служение без задач: люди сразу под датой, без названия задачи."""
+    if bare:
+        lines = [f"   • {name}" for name in names] or [f"   {empty}"]
+        if names and len(names) < needed:
+            lines.append(f"   ⚠️ {len(names)} из {needed}")
+        return lines
     head = f"   {task_emoji(task)} {task}"
     if not names:
         return [f"{head} — {empty}"]

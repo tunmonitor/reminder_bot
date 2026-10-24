@@ -45,7 +45,8 @@ def revision(plan: dict) -> str:
     """Версия графика для кнопок: правка или пересчёт меняют её, и
     кнопки с прежней версией считаются устаревшими."""
     data = json.dumps(
-        [plan["updated_at"], plan["run_id"], plan["slots"]],
+        [plan["updated_at"], plan["run_id"], plan["slots"],
+         plan.get("days", {})],
         ensure_ascii=False, sort_keys=True,
     )
     return hashlib.sha1(data.encode()).hexdigest()[:6]
@@ -121,9 +122,18 @@ def plan_tasks(registry, service_id: str) -> list[dict]:
     """Распределяемые задачи в порядке каталога: минимум и максимум
     (служение без задач — одна задача с его названием)."""
     return [
-        {"name": task["name"], "needed": task["needed"], "max": task["max"]}
+        {
+            "name": task["name"], "needed": task["needed"], "max": task["max"],
+            "implicit": task["implicit"],
+        }
         for task in registry.plan_tasks(service_id)
     ]
+
+
+def implicit_plan(plan: dict) -> bool:
+    """График служения без задач: одна задача с названием служения —
+    в тексте и правке люди сразу под датой."""
+    return len(plan["tasks"]) == 1 and bool(plan["tasks"][0].get("implicit"))
 
 
 def free_run(service_id: str, year: int, month: int) -> dict:
@@ -203,7 +213,10 @@ def sync_implicit_task(registry, plan: dict) -> dict:
     if (
         len(current) == 1 and current[0]["implicit"]
         and len(plan["tasks"]) == 1
-        and plan["tasks"][0]["name"] != current[0]["name"]
+        and (
+            plan["tasks"][0]["name"] != current[0]["name"]
+            or not plan["tasks"][0].get("implicit")
+        )
     ):
         return registry.rename_plan_task(
             plan["service_id"], plan["month"], plan["tasks"][0]["name"],
@@ -259,9 +272,18 @@ def day_label(day: str, window: tuple[int, int] = (0, 0)) -> str:
     )
 
 
-def person_day(person: dict | None, day: str) -> str:
-    """« — чт 29.10» для человека с личным днём служения."""
-    offset = (person or {}).get("day_offset")
+def day_offset(plan: dict | None, person: dict | None, day: str) -> int | None:
+    """День человека на дату: разовый в графике, иначе личный."""
+    key = (person or {}).get("key")
+    override = (plan or {}).get("days", {}).get(day, {}).get(key)
+    if override is not None:
+        return override
+    return (person or {}).get("day_offset")
+
+
+def person_day(person: dict | None, day: str, plan: dict | None = None) -> str:
+    """« — чт 29.10» для человека с личным (или разовым) днём служения."""
+    offset = day_offset(plan, person, day)
     if offset is None:
         return ""
     return " — " + _weekday_date(date.fromisoformat(day) + timedelta(days=offset))
@@ -310,9 +332,10 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
                 task["name"], task["needed"],
                 [
                     names.get(person, person) + ("*" if person in silent else "")
-                    + person_day(by_key.get(person), day)
+                    + person_day(by_key.get(person), day, plan)
                     for person in people
                 ],
+                bare=implicit_plan(plan),
             )
     # Нагрузка — только админам: сколько воскресений у каждого, по убыванию.
     load = served_dates(plan["slots"])
@@ -455,7 +478,7 @@ def publication_text(service: dict, plan: dict, people: list[dict],
         if person is None:
             return key
         return user_link(person["telegram_id"], person["name"]) + person_day(
-            person, day
+            person, day, plan
         )
 
     lines = [
@@ -467,13 +490,36 @@ def publication_text(service: dict, plan: dict, people: list[dict],
         parts = []
         for task in plan["tasks"]:
             people_keys = plan["slots"].get(day, {}).get(task["name"], [])
+            people_text = (
+                ", ".join(mention(key, day) for key in people_keys) or "—"
+            )
             parts.append(
-                f"{task_emoji(task['name'])} {task['name']}: "
-                + (", ".join(mention(key, day) for key in people_keys) or "—")
+                people_text if implicit_plan(plan)
+                else f"{task_emoji(task['name'])} {task['name']}: {people_text}"
             )
         lines.append(f"🗓 {day_label(day, window)} — " + " · ".join(parts))
     if update:
         changes = plan_changes(plan["approved"], plan["slots"], _names(people))
+        names = _names(people)
+        for day in plan["dates"]:
+            before = plan.get("approved_days", {}).get(day, {})
+            after = plan.get("days", {}).get(day, {})
+            serving = {
+                key for people in plan["slots"].get(day, {}).values()
+                for key in people
+            }
+            for key in sorted(set(before) | set(after)):
+                if before.get(key) == after.get(key) or key not in serving:
+                    continue
+                offset = after.get(key)
+                changes.append(
+                    f"• {_short(day)} {names.get(key, key)}: "
+                    + (
+                        _weekday_date(
+                            date.fromisoformat(day) + timedelta(days=offset)
+                        ) if offset is not None else "день как обычно"
+                    )
+                )
         if plan.get("republish"):
             changes.append("• Изменены дни служения")
         if changes:
@@ -561,7 +607,7 @@ def excel_text(registry, service: dict, plan: dict, people: list[dict]) -> str:
     ]
     for day in plan["dates"]:
         parts = [
-            f"{task['name']} — "
+            ("" if implicit_plan(plan) else f"{task['name']} — ")
             + (", ".join(
                 names.get(key, key)
                 for key in plan["slots"].get(day, {}).get(task["name"], [])
@@ -634,7 +680,7 @@ async def publish(
             return registry.approve_schedule_plan(
                 actor_id, service["id"], plan["month"], plan["slots"],
                 chat_id=chat_id, message_id=sent[0] if sent else None,
-                updated_at=plan["updated_at"],
+                updated_at=plan["updated_at"], days=plan.get("days", {}),
             )
         except Exception as exc:  # noqa: BLE001
             if attempt:

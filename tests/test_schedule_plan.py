@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from openpyxl import load_workbook
 
 from bot import readiness, schedule_plan
+from bot.presentation import task_emoji
 from bot.excel_parser import (
     RosterMember,
     ServiceAssignment,
@@ -244,6 +245,16 @@ class SchedulePlanTest(unittest.TestCase):
             self.registry, schedule_plan.free_run("office_cleaning", 2026, 11),
             None, LOG,
         ))
+        # Служение без задач: люди сразу под датой, без названия служения.
+        summary = schedule_plan.plan_summary(self.registry, plan, None)
+        text = schedule_plan.plan_text("УБОРКА", plan, summary, TZ)
+        self.assertNotIn(f"   {task_emoji(name)} {name}", text)
+        self.assertIn("🗓 01.11\n   • ", text)
+        published = schedule_plan.publication_text(
+            self.registry.get_service("office_cleaning"), plan,
+            self.registry.readiness_people("office_cleaning"),
+        )
+        self.assertNotIn(f"{name}:", published)
         counts = [len(plan["slots"][day][name]) for day in plan["dates"]]
         # Без опроса свободны все — места до максимума заполнены.
         self.assertEqual(counts, [2] * 5)
@@ -346,6 +357,42 @@ class SchedulePlanTest(unittest.TestCase):
         self.assertFalse(self.registry.get_schedule_plan("sound", "2026-11")["dirty"])
         self.registry.set_service_member_day(1001, "sound", "Борис", 0)
         self.assertTrue(self.registry.get_schedule_plan("sound", "2026-11")["dirty"])
+
+    def test_day_for_one_date(self):
+        plan = self.draft()
+        plan["slots"]["2026-11-15"]["звук"] = ["Борис"]
+        plan = self.registry.set_schedule_slots(1001, "sound", "2026-11", plan["slots"])
+        plan = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+        ))
+        self.assertFalse(plan["dirty"])
+        plan = self.registry.set_schedule_day(
+            1001, "sound", "2026-11", "2026-11-15", "Борис", -2
+        )
+        self.assertTrue(plan["dirty"])
+        summary = readiness.summarize(self.registry, self.run, with_plan=False)
+        self.assertIn(
+            "• Борис — пт 13.11",
+            schedule_plan.plan_text("ЗВУК", plan, summary, TZ),
+        )
+        published = schedule_plan.publication_text(
+            self.service(), plan, self.people()
+        )
+        self.assertIn("• 15.11 Борис: пт 13.11", published)
+        plan = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+        ))
+        self.assertFalse(plan["dirty"])
+        plan = self.registry.set_schedule_day(
+            1001, "sound", "2026-11", "2026-11-15", "Борис", None
+        )
+        self.assertEqual(plan["days"], {})
+        self.assertTrue(plan["dirty"])
+        # Пересчёт сбрасывает разовые дни, как и другие правки.
+        self.registry.set_schedule_day(
+            1001, "sound", "2026-11", "2026-11-15", "Борис", -2
+        )
+        self.assertEqual(self.draft()["days"], {})
 
     def test_order_only_change_is_not_dirty(self):
         plan = self.draft()

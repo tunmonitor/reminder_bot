@@ -325,6 +325,10 @@ class ServiceRegistry:
                     message_id INTEGER,
                     -- После утверждения сменились дни служения.
                     republish INTEGER NOT NULL DEFAULT 0,
+                    -- День на дату для человека: дата → ключ → сдвиг от вс;
+                    -- approved_days_json — как опубликовано.
+                    days_json TEXT NOT NULL DEFAULT '{}',
+                    approved_days_json TEXT,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (service_id, month)
                 );
@@ -783,6 +787,8 @@ class ServiceRegistry:
                 ("readiness_settings", "day_to", "INTEGER NOT NULL DEFAULT 0"),
                 ("service_members", "day_offset", "INTEGER"),
                 ("schedule_plans", "republish", "INTEGER NOT NULL DEFAULT 0"),
+                ("schedule_plans", "days_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("schedule_plans", "approved_days_json", "TEXT"),
                 ("service_members", "tasks_manual",
                  "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "poll_stopped", "INTEGER NOT NULL DEFAULT 0"),
@@ -5294,6 +5300,11 @@ class ServiceRegistry:
             plan[name] = json.loads(plan.pop(f"{name}_json"))
         approved = plan.pop("approved_json")
         plan["approved"] = json.loads(approved) if approved else None
+        plan["days"] = json.loads(plan.pop("days_json") or "{}")
+        approved_days = plan.pop("approved_days_json")
+        plan["approved_days"] = (
+            json.loads(approved_days) if approved_days else {}
+        )
         # Правки после утверждения ещё не опубликованы (порядок людей в
         # задаче не важен).
         def normal(slots):
@@ -5306,6 +5317,9 @@ class ServiceRegistry:
         # личный день): опубликованные даты устарели.
         plan["dirty"] = bool(plan.get("republish")) or (
             normal(plan["approved"]) != normal(plan["slots"])
+        ) or (
+            plan["approved"] is not None
+            and plan["approved_days"] != plan["days"]
         )
         return plan
 
@@ -5345,7 +5359,7 @@ class ServiceRegistry:
                 "tasks_json = excluded.tasks_json, "
                 "slots_json = excluded.slots_json, "
                 "last_served_json = excluded.last_served_json, "
-                "note = excluded.note, edited = 0, "
+                "note = excluded.note, edited = 0, days_json = '{}', "
                 "updated_at = excluded.updated_at",
                 (
                     service_id, month, run_id, json.dumps(dates),
@@ -5368,7 +5382,8 @@ class ServiceRegistry:
         if plan is None:
             raise ValueError("График не найден.")
         tasks = [
-            {**task, "name": new} if task["name"] == old else task
+            {**task, "name": new, "implicit": True} if task["name"] == old
+            else task
             for task in plan["tasks"]
         ]
 
@@ -5390,23 +5405,80 @@ class ServiceRegistry:
             )
         return self.get_schedule_plan(service_id, month)
 
-    def set_schedule_slots(
-        self, actor_id: int, service_id: str, month: str, slots: dict,
+    def set_schedule_day(
+        self, actor_id: int, service_id: str, month: str, day: str, key: str,
+        offset: int | None,
     ) -> dict:
-        """Ручная правка графика админом служения («✏️ Изменить»)."""
+        """День служения человека только на эту дату графика (сдвиг от
+        воскресенья; None — как обычно)."""
         _validate_positive_id(actor_id, "actor_id")
+        if offset is not None and (
+            isinstance(offset, bool) or not isinstance(offset, int)
+            or not -6 <= offset <= 6
+        ):
+            raise ValueError("День: от вс −6 до вс +6.")
         with self._connection() as connection:
             self._require_service_editor(connection, actor_id, service_id)
-            cursor = connection.execute(
-                "UPDATE schedule_plans SET slots_json = ?, edited = 1, "
+            row = connection.execute(
+                "SELECT days_json FROM schedule_plans "
+                "WHERE service_id = ? AND month = ?",
+                (service_id, month),
+            ).fetchone()
+            if row is None:
+                raise ValueError("График не найден — откройте его заново.")
+            days = json.loads(row["days_json"] or "{}")
+            if offset is None:
+                days.get(day, {}).pop(key, None)
+                if not days.get(day):
+                    days.pop(day, None)
+            else:
+                days.setdefault(day, {})[key] = offset
+            connection.execute(
+                "UPDATE schedule_plans SET days_json = ?, edited = 1, "
                 "updated_at = ? WHERE service_id = ? AND month = ?",
                 (
-                    json.dumps(slots, ensure_ascii=False), _utc_now(),
+                    json.dumps(days, ensure_ascii=False), _utc_now(),
                     service_id, month,
                 ),
             )
-            if cursor.rowcount == 0:
+        return self.get_schedule_plan(service_id, month)
+
+    def set_schedule_slots(
+        self, actor_id: int, service_id: str, month: str, slots: dict,
+    ) -> dict:
+        """Ручная правка графика админом служения («✏️ Изменить»). Разовые
+        дни убранных из даты людей отбрасываются."""
+        _validate_positive_id(actor_id, "actor_id")
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            row = connection.execute(
+                "SELECT days_json FROM schedule_plans "
+                "WHERE service_id = ? AND month = ?",
+                (service_id, month),
+            ).fetchone()
+            if row is None:
                 raise ValueError("График не найден — откройте его заново.")
+            days = {}
+            for day, people_days in json.loads(row["days_json"] or "{}").items():
+                serving = {
+                    key for people in slots.get(day, {}).values()
+                    for key in people
+                }
+                kept = {
+                    key: offset for key, offset in people_days.items()
+                    if key in serving
+                }
+                if kept:
+                    days[day] = kept
+            connection.execute(
+                "UPDATE schedule_plans SET slots_json = ?, days_json = ?, "
+                "edited = 1, updated_at = ? WHERE service_id = ? AND month = ?",
+                (
+                    json.dumps(slots, ensure_ascii=False),
+                    json.dumps(days, ensure_ascii=False), _utc_now(),
+                    service_id, month,
+                ),
+            )
         return self.get_schedule_plan(service_id, month)
 
     def approve_schedule_plan(
@@ -5419,6 +5491,7 @@ class ServiceRegistry:
         chat_id: int | None,
         message_id: int | None,
         updated_at: str | None = None,
+        days: dict | None = None,
     ) -> dict:
         """«✅ Утвердить»: опубликованная копия = slots. updated_at —
         версия опубликованного графика: если дни служения сменились, пока
@@ -5429,13 +5502,15 @@ class ServiceRegistry:
             cursor = connection.execute(
                 "UPDATE schedule_plans SET approved_json = ?, approved_by = ?, "
                 "approved_at = ?, chat_id = ?, message_id = ?, "
+                "approved_days_json = ?, "
                 "republish = CASE WHEN ? IS NULL OR updated_at = ? THEN 0 "
                 "ELSE republish END "
                 "WHERE service_id = ? AND month = ?",
                 (
                     json.dumps(slots, ensure_ascii=False), actor_id,
-                    _utc_now(), chat_id, message_id, updated_at, updated_at,
-                    service_id, month,
+                    _utc_now(), chat_id, message_id,
+                    json.dumps(days or {}, ensure_ascii=False),
+                    updated_at, updated_at, service_id, month,
                 ),
             )
             if cursor.rowcount == 0:

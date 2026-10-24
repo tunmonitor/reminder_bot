@@ -3865,7 +3865,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     PLAN_ACTIONS = {
         "plan", "precalc", "precalcok", "pedit", "pdate", "ptask", "padd",
-        "prem", "pclear", "pok", "pokok", "pfree", "pnew",
+        "prem", "pclear", "pok", "pokok", "pfree", "pnew", "pday", "pdset",
     }
 
     def plan_month(arg: str | None, now: datetime) -> str | None:
@@ -4060,12 +4060,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         def listed(people: list[str]) -> str:
             return ", ".join(names.get(key, key) for key in people) or "никто"
 
+        implicit = schedule_plan.implicit_plan(plan)
         lines = [
-            f"✏️ {date.fromisoformat(day):%d.%m} · «{task['name']}» "
-            f"(нужно {need})",
+            f"✏️ {date.fromisoformat(day):%d.%m}"
+            + ("" if implicit else f" · «{task['name']}»")
+            + f" (нужно {need})",
             "Сейчас: " + (listed(current) if current else "⚠️ никого"),
             "",
-            f"✅ Свободны и приписаны к задаче: {listed(free)}",
+            ("✅ Свободны: " if implicit
+             else "✅ Свободны и приписаны к задаче: ") + listed(free),
             f"⚪ Не отвечали: {listed(quiet)}",
             f"👥 Остальные из состава: {listed(rest)}",
         ]
@@ -4090,6 +4093,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     f"{token}.{keys.index(key)}",
                 ))
         rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+        by_key = {person["key"]: person for person in summary.people}
+        for index, key in enumerate(current):
+            # День только на эту дату (иначе — свой день человека или вс).
+            offset = schedule_plan.day_offset(plan, by_key.get(key), day)
+            label = member_day_label(offset) if offset is not None else "вс"
+            rows.append([readiness_button(
+                f"📅 {names.get(key, key)} — {label}"[:60],
+                "pday", service["id"], f"{token}.{index}",
+            )])
         rows.append([readiness_button(
             "➕ Другой человек из Telegram", "pnew", service["id"], token
         )])
@@ -4097,9 +4109,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             rows.append([readiness_button(
                 "🚫 Оставить пустым", "pclear", service["id"], token
             )])
-        rows.append([readiness_button(
-            "⬅️ К дате", "pdate", service["id"], plan_arg(plan, day_index),
-        )])
+        rows.append([
+            readiness_button(
+                "⬅️ К датам", "pedit", service["id"],
+                plan["month"].replace("-", ""),
+            ) if implicit else readiness_button(
+                "⬅️ К дате", "pdate", service["id"], plan_arg(plan, day_index),
+            )
+        ])
         await _send_dialog(
             message, "\n".join(lines),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -4354,7 +4371,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         """Действия «📋 График» (этап 5.4–5.5)."""
         registry = service_registry()
         service_id = service["id"]
-        if action in {"padd", "prem", "pclear", "pnew"}:
+        if action in {"padd", "prem", "pclear", "pnew", "pday", "pdset"}:
             pending = pending_inputs.get(actor_id) or {}
             key = plan_month((pending.get("month") or "").replace("-", ""), now)
         else:
@@ -4463,6 +4480,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await show_plan_dates(callback.message, service_id, plan)
         elif action == "pdate" and len(parts) == 2 and parts[1].isdigit() and (
             int(parts[1]) < len(plan["dates"])
+        ) and schedule_plan.implicit_plan(plan):
+            # Служение без задач — сразу выбор людей.
+            await show_plan_slot(
+                callback.message, actor_id, service, run, plan,
+                int(parts[1]), 0,
+            )
+        elif action == "pdate" and len(parts) == 2 and parts[1].isdigit() and (
+            int(parts[1]) < len(plan["dates"])
         ):
             names = {
                 person["key"]: person["name"]
@@ -4479,6 +4504,80 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await show_plan_slot(
                 callback.message, actor_id, service, run, plan,
                 int(parts[1]), int(parts[2]),
+            )
+        elif action == "pday":
+            # День только на эту дату для поставленного человека.
+            pending = pending_inputs[actor_id]
+            index = int(parts[-1]) if parts[-1].isdigit() else -1
+            if not 0 <= index < len(pending["keys"]):
+                raise ValueError("Экран устарел — откройте график заново.")
+            names = {
+                person["key"]: person["name"]
+                for person in registry.readiness_people(service_id)
+            }
+            token = pending["token"]
+            buttons = [
+                readiness_button(
+                    f"📅 {member_day_label(offset)}", "pdset", service_id,
+                    f"{token}.{index}.{offset}",
+                )
+                for offset in MEMBER_DAYS
+            ]
+            rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+            rows.append([readiness_button(
+                "↩️ Как обычно", "pdset", service_id, f"{token}.{index}.n"
+            )])
+            rows.append([readiness_button(
+                "⬅️ К задаче", "pdset", service_id, f"{token}.{index}.back"
+            )])
+            key_person = pending["keys"][index]
+            await _send_dialog(
+                callback.message,
+                f"📅 {names.get(key_person, key_person)} · "
+                f"{date.fromisoformat(pending['day']):%d.%m}\n\nВ какой день "
+                "человек служит на этой неделе? Только для этой даты; «Как "
+                "обычно» — его свой день (или воскресенье).",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+                _dialog_keep_rows=True,
+                _dialog_keyboard_limit=sum(len(row) for row in rows),
+                parse_mode=None,
+            )
+        elif action == "pdset":
+            pending = pending_inputs[actor_id]
+            _, index_text, value = (arg or "..").split(".", 2)
+            index = int(index_text) if index_text.isdigit() else -1
+            if not 0 <= index < len(pending["keys"]):
+                raise ValueError("Экран устарел — откройте график заново.")
+            notice = None
+            if value != "back":
+                offset = None if value == "n" else int(value)
+                async with readiness.service_lock(service_id):
+                    run = registry.get_readiness_run(service_id, key)
+                    plan = registry.get_schedule_plan(service_id, key)
+                    if not plan_current(run, plan) or (
+                        schedule_plan.revision(plan) != pending.get("revision")
+                    ):
+                        raise ValueError(
+                            "График изменился — откройте его заново."
+                        )
+                    plan = registry.set_schedule_day(
+                        actor_id, service_id, key, pending["day"],
+                        pending["keys"][index], offset,
+                    )
+                notice = "✅ День на эту дату: " + (
+                    member_day_label(offset) if offset is not None
+                    else "как обычно"
+                )
+            task_index = next(
+                (i for i, task in enumerate(plan["tasks"])
+                 if task["name"] == pending["task"]),
+                None,
+            )
+            if task_index is None or pending["day"] not in plan["dates"]:
+                raise ValueError("График изменился — откройте его заново.")
+            await show_plan_slot(
+                callback.message, actor_id, service, run, plan,
+                plan["dates"].index(pending["day"]), task_index, notice,
             )
         elif action == "pnew":
             pending = pending_inputs[actor_id]
@@ -4687,7 +4786,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await answer_quietly(callback, "⚠️ Этот экран уже устарел.")
                 return
             plan_pending = member_pending
-            if action in {"padd", "prem", "pclear", "pnew"} and not (
+            if action in {
+                "padd", "prem", "pclear", "pnew", "pday", "pdset",
+            } and not (
                 plan_pending
                 and plan_pending.get("operation") == "readiness_plan"
                 and plan_pending.get("service_id") == service_id
@@ -4695,7 +4796,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ):
                 await answer_quietly(callback, "⚠️ Этот экран уже устарел.")
                 return
-            if action in {"addmt", "addms", "padd", "prem", "pclear", "pnew"}:
+            if action in {
+                "addmt", "addms", "padd", "prem", "pclear", "pnew", "pday",
+                "pdset",
+            }:
                 # Выбор задач идёт в одной сессии — pending не сбрасывается.
                 await clean_previous_menu(callback.message, debug)
                 pending_inputs[actor_id].pop("menu_message_id", None)
