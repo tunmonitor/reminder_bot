@@ -5321,6 +5321,9 @@ class ServiceRegistry:
         plan["days"] = json.loads(plan.pop("days_json") or "{}")
         served = plan.pop("served_offsets_json", None)
         plan["served_offsets"] = json.loads(served) if served else {}
+        # Снимок есть (пусть и пустой — все по воскресеньям) или график
+        # утверждён до появления снимка.
+        plan["served_snapshot"] = served is not None
         approved_days = plan.pop("approved_days_json")
         plan["approved_days"] = (
             json.loads(approved_days) if approved_days else {}
