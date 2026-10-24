@@ -6095,6 +6095,140 @@ class ServiceManagementHandlerTest(unittest.TestCase):
         self.context.bot.stop_poll = AsyncMock()
         asyncio.run(run())
 
+    def test_schedule_without_poll_and_telegram_user(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.set_group_chat(67890, "sound", -1005555, enabled=True)
+        self.registry.sync_service_rosters({"sound": [
+            RosterMember("Алексей", ("звук",)),
+            RosterMember("Борис", ("звук",)),
+        ]})
+        self.context.bot.send_message.return_value = SimpleNamespace(
+            message_id=21
+        )
+        self.context.bot.send_document = AsyncMock()
+        today = datetime.now(ZoneInfo("UTC")).date()
+        year, month = (
+            (today.year + 1, 1) if today.month == 12
+            else (today.year, today.month + 1)
+        )
+        key, month_arg = f"{year:04d}-{month:02d}", f"{year:04d}{month:02d}"
+        handler = self.callback_handler("on_readiness")
+
+        async def press(data):
+            callback = SimpleNamespace(
+                data=data,
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            await handler(callback)
+            return callback
+
+        def text_of(callback):
+            return callback.message.answer.await_args.args[0]
+
+        def data_of(callback, prefix):
+            return next(
+                button.callback_data
+                for row in callback.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith(prefix)
+            )
+
+        async def run():
+            screen = await press("rdy:open:sound")
+            self.assertIn("📅 График · ЗВУК", text_of(screen))
+            skipped = await press(f"rdy:skip:sound:{month_arg}")
+            self.assertIn("Составить без опроса", text_of(skipped))
+            built = await press(data_of(skipped, "rdy:pfree:"))
+            self.assertIn("🧮 Без опроса", text_of(built))
+            plan = self.registry.get_schedule_plan("sound", key)
+            self.assertIsNone(plan["run_id"])
+            first_day = plan["dates"][0]
+            self.assertEqual(len(plan["slots"][first_day]["звук"]), 1)
+            again = await press("rdy:open:sound")
+            self.assertIn("(без опроса)", text_of(again))
+
+            dates = await press(f"rdy:pedit:sound:{month_arg}")
+            day = await press(data_of(dates, "rdy:pdate:"))
+            slot = await press(data_of(day, "rdy:ptask:"))
+            ask_user = await press(data_of(slot, "rdy:pnew:"))
+            markup = ask_user.message.answer.await_args.kwargs["reply_markup"]
+            request = markup.keyboard[0][0].request_users
+            shared = self.message(67890, "")
+            shared.text = None
+            shared.users_shared = SimpleNamespace(
+                request_id=request.request_id,
+                users=[SimpleNamespace(
+                    user_id=777, first_name="Сергей", last_name="Новый",
+                    username="sergey_new",
+                )],
+            )
+            # Однофамилец в составе без Telegram — новому имя с @username.
+            self.registry.sync_service_rosters({"sound": [
+                RosterMember("Алексей", ("звук",)),
+                RosterMember("Борис", ("звук",)),
+                RosterMember("Сергей Новый", ("сборка",)),
+            ]})
+            await self.message_handler("on_users_shared")(shared)
+            self.assertIn(
+                "Поставлен(а): Сергей Новый (@sergey_new)",
+                shared.answer.await_args_list[-1].args[0],
+            )
+            plan = self.registry.get_schedule_plan("sound", key)
+            self.assertEqual(
+                plan["slots"][first_day]["звук"], ["Сергей Новый (@sergey_new)"]
+            )
+            namesake = next(
+                item for item in self.registry.list_service_members("sound")
+                if item["name"] == "Сергей Новый"
+            )
+            self.assertIsNone(namesake["telegram_id"])
+            sergey = next(
+                person for person in self.registry.readiness_people("sound")
+                if person["telegram_id"] == 777
+            )
+            self.assertEqual(sergey["tasks"], ["звук"])
+
+            plan_screen = await press(f"rdy:plan:sound:{month_arg}")
+            ask = await press(data_of(plan_screen, "rdy:pok:"))
+            done = await press(data_of(ask, "rdy:pokok:"))
+            self.assertIn("✅ График утверждён", text_of(done))
+
+        asyncio.run(run())
+
+    def test_command_screen_replaces_previous_menu(self):
+        handler = self.message_handler("on_services")
+
+        async def run():
+            first = self.message(67890, "/services")
+            first.answer = AsyncMock(return_value=SimpleNamespace(message_id=677))
+            second = self.message(67890, "/services")
+            second.answer = AsyncMock(return_value=SimpleNamespace(message_id=678))
+            first.message_id, second.message_id = 10, 11
+            await handler(first)
+            await handler(second)
+            self.context.bot.delete_message.assert_any_await(
+                chat_id=67890, message_id=677
+            )
+            # Запоздавшая более ранняя команда свой экран не показывает и
+            # экран новой не трогает.
+            late = self.message(67890, "/services")
+            late.message_id = 9
+            late.answer = AsyncMock(return_value=SimpleNamespace(message_id=679))
+            await handler(late)
+            late.answer.assert_not_awaited()
+            self.assertNotIn(
+                678,
+                [call.kwargs.get("message_id")
+                 for call in self.context.bot.delete_message.await_args_list],
+            )
+
+        asyncio.run(run())
+
     def test_readiness_plan_edit_and_approve(self):
         from bot.excel_parser import RosterMember
 

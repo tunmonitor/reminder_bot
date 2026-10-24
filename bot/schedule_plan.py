@@ -22,6 +22,7 @@ from .month_summary import month_end, month_key, month_title
 from .presentation import task_emoji
 from .readiness import (
     Summary,
+    month_sundays,
     local_text,
     month_of,
     outside_name,
@@ -129,10 +130,37 @@ def plan_tasks(registry, service_id: str) -> list[dict]:
     ]
 
 
+def free_run(service_id: str, year: int, month: int) -> dict:
+    """Опрос-заглушка графика без опроса: все воскресенья месяца."""
+    return {
+        "id": None, "service_id": service_id,
+        "month": month_key(year, month), "status": "free",
+        "dates": [day.isoformat() for day in month_sundays(year, month)],
+    }
+
+
+def plan_run(plan: dict, run: dict | None) -> dict:
+    """Опрос, по которому составлен график (без опроса — заглушка)."""
+    if plan["run_id"] is None:
+        year, month = map(int, plan["month"].split("-"))
+        return {**free_run(plan["service_id"], year, month),
+                "dates": list(plan["dates"])}
+    return run
+
+
+def plan_summary(registry, plan: dict, run: dict | None) -> Summary:
+    """Состав и ответы для экранов графика; без опроса — все свободны."""
+    return summarize(
+        registry, plan_run(plan, run), with_plan=False,
+        assume_free=plan["run_id"] is None,
+    )
+
+
 async def build_draft(
     registry, run: dict, events_loader, logger: logging.Logger,
 ) -> dict:
-    """Предложенный график по ответам опроса; ручные правки сбрасываются."""
+    """Предложенный график по ответам опроса (run["id"] is None — без
+    опроса, все свободны); ручные правки сбрасываются."""
     year, month = month_of(run)
     people = registry.readiness_people(run["service_id"])
     served, note = await last_served(
@@ -142,6 +170,7 @@ async def build_draft(
     summary = summarize(
         registry, run,
         last_served={key: date.fromisoformat(day) for key, day in served.items()},
+        assume_free=run["id"] is None,
     )
     tasks = plan_tasks(registry, run["service_id"])
     slots = {
@@ -218,8 +247,11 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz) -> str:
         f"📋 График · {service_label} · {month_title(year, month)}",
         status,
         "",
-        f"Ответили {len(summary.answered)} из {len(polled)}"
-        f" · закрыто мест {done} из {total}",
+        (
+            "🧮 Без опроса: все из состава считаются свободными"
+            if plan["run_id"] is None
+            else f"Ответили {len(summary.answered)} из {len(polled)}"
+        ) + f" · закрыто мест {done} из {total}",
     ]
     used_silent = False
     for day in plan["dates"]:

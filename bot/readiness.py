@@ -135,16 +135,25 @@ class Summary:
 
 
 def summarize(registry, run: dict, *, with_plan: bool = True,
-              last_served: dict[str, date] | None = None) -> Summary:
+              last_served: dict[str, date] | None = None,
+              assume_free: bool = False) -> Summary:
     """last_served — последнее служение человека (ключ) в прошлом
-    месяце: для интервала между служениями."""
+    месяце: для интервала между служениями. assume_free — график без
+    опроса: все из состава с задачами свободны во все даты."""
     people = registry.readiness_people(run["service_id"])
     by_id = {
         person["telegram_id"]: person
         for person in people if person["telegram_id"]
     }
     summary = Summary(people=people)
-    for answer in registry.list_readiness_answers(run["id"]):
+    if assume_free:
+        summary.answered = {
+            person["key"]: list(run["dates"])
+            for person in people if person["tasks"]
+        }
+    for answer in (
+        [] if assume_free else registry.list_readiness_answers(run["id"])
+    ):
         person = by_id.get(answer["telegram_id"])
         if person is None or not person["tasks"]:
             # Без задач человека некуда поставить — админ распределяет
@@ -740,7 +749,7 @@ def admin_keyboard(service_id: str, *rows) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         *rows,
         [InlineKeyboardButton(
-            text="🗳 Опрос готовности", callback_data=f"rdy:open:{service_id}"
+            text="📅 График", callback_data=f"rdy:open:{service_id}"
         )],
     ])
 
@@ -918,11 +927,15 @@ def _missed(registry, service_id: str, key: str, settings: dict,
     бот не работал всё окно. Включённый после времени запуска автозапуск
     — не пропуск."""
     enabled_at = settings.get("enabled_at")
-    return (
-        enabled_at is not None
-        and datetime.fromisoformat(enabled_at) <= start
-        and not registry.has_readiness_notice(service_id, key, "launch")
-    )
+    if (
+        enabled_at is None
+        or datetime.fromisoformat(enabled_at) > start
+        or registry.has_readiness_notice(service_id, key, "launch")
+    ):
+        return False
+    # График составлен без опроса — опрос и не должен был идти.
+    plan = registry.get_schedule_plan(service_id, key)
+    return not (plan is not None and plan["run_id"] is None)
 
 
 async def _tick_service(
@@ -968,6 +981,11 @@ async def _tick_service(
         key = month_key(year, month)
         start, deadline = schedule(settings, year, month, tz)
         if registry.get_readiness_run(service["id"], key) is not None:
+            return
+        free_plan = registry.get_schedule_plan(service["id"], key)
+        if free_plan is not None and free_plan["run_id"] is None:
+            # График месяца уже составлен без опроса — автоопрос (и его
+            # превью) заменил бы его по ответам.
             return
         if start - timedelta(days=1) <= now < start:
             if registry.claim_readiness_notice(service["id"], key, "preview"):
