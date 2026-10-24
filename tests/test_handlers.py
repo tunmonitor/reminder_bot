@@ -6095,6 +6095,134 @@ class ServiceManagementHandlerTest(unittest.TestCase):
         self.context.bot.stop_poll = AsyncMock()
         asyncio.run(run())
 
+    def test_readiness_plan_edit_and_approve(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.set_group_chat(67890, "sound", -1005555, enabled=True)
+        self.registry.sync_service_rosters({"sound": [
+            RosterMember("Алексей", ("звук",)),
+            RosterMember("Борис", ("звук",)),
+        ]})
+        self.registry.set_responsible_contact(
+            67890, "sound", "звук", "Алексей", 501
+        )
+        self.registry.set_responsible_contact(
+            67890, "sound", "звук", "Борис", 502
+        )
+        self.context.bot.send_message.return_value = SimpleNamespace(
+            message_id=21
+        )
+        self.context.bot.send_document = AsyncMock()
+        today = datetime.now(ZoneInfo("UTC")).date()
+        year, month = (
+            (today.year + 1, 1) if today.month == 12
+            else (today.year, today.month + 1)
+        )
+        key, month_arg = f"{year:04d}-{month:02d}", f"{year:04d}{month:02d}"
+        from bot.readiness import month_sundays
+
+        dates = [day.isoformat() for day in month_sundays(year, month)]
+        run = self.registry.create_readiness_run(
+            "sound", key, status="open", dates=dates, poll_id="plan-poll",
+        )
+        self.registry.record_readiness_answer(
+            "plan-poll", 501, "", "Алексей", dates[:1]
+        )
+        self.registry.record_readiness_answer(
+            "plan-poll", 502, "", "Борис", dates[1:2]
+        )
+        self.registry.close_readiness_run(run["id"])
+        handler = self.callback_handler("on_readiness")
+
+        async def press(data):
+            callback = SimpleNamespace(
+                data=data,
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            await handler(callback)
+            return callback
+
+        def text_of(callback):
+            return callback.message.answer.await_args.args[0]
+
+        def buttons(callback):
+            return [
+                button
+                for row in callback.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+            ]
+
+        async def run_test():
+            screen = await press("rdy:open:sound")
+            self.assertIn(
+                f"rdy:plan:sound:{month_arg}",
+                [button.callback_data for button in buttons(screen)],
+            )
+            plan_screen = await press(f"rdy:plan:sound:{month_arg}")
+            self.assertIn("📋 График", text_of(plan_screen))
+            self.assertIn("📝 Черновик", text_of(plan_screen))
+            plan = self.registry.get_schedule_plan("sound", key)
+            self.assertEqual(plan["slots"][dates[0]]["звук"], ["Алексей"])
+
+            day = await press(f"rdy:pdate:sound:{month_arg}.0")
+            self.assertIn(
+                f"rdy:ptask:sound:{month_arg}.0.0",
+                [button.callback_data for button in buttons(day)],
+            )
+            slot = await press(f"rdy:ptask:sound:{month_arg}.0.0")
+            self.assertIn("Сейчас: Алексей", text_of(slot))
+            borys = next(
+                button for button in buttons(slot) if button.text == "👥 Борис"
+            )
+            # «Нужно 1» — Борис ставится вместо Алексея.
+            added = await press(borys.callback_data)
+            self.assertIn("Поставлен(а): Борис вместо Алексей", text_of(added))
+            self.assertIn("не отмечал(а)", text_of(added))
+            plan = self.registry.get_schedule_plan("sound", key)
+            self.assertEqual(plan["slots"][dates[0]]["звук"], ["Борис"])
+            self.assertEqual(plan["edited"], 1)
+            stale = await press(borys.callback_data)
+            self.assertIn("устарел", stale.answer.await_args.args[0])
+            remove = next(
+                button for button in buttons(added)
+                if button.text == "❌ Борис"
+            )
+            await press(remove.callback_data)
+            plan = self.registry.get_schedule_plan("sound", key)
+            self.assertEqual(plan["slots"][dates[0]]["звук"], [])
+
+            confirm = await press(f"rdy:precalc:sound:{month_arg}")
+            self.assertIn("Ручные правки сбросятся", text_of(confirm))
+            await press(f"rdy:precalcok:sound:{month_arg}")
+            plan = self.registry.get_schedule_plan("sound", key)
+            self.assertEqual(plan["edited"], 0)
+            self.assertEqual(plan["slots"][dates[0]]["звук"], ["Алексей"])
+
+            ask = await press(f"rdy:pok:sound:{month_arg}")
+            self.assertIn("Утвердить график", text_of(ask))
+            self.context.bot.send_message.reset_mock()
+            done = await press(f"rdy:pokok:sound:{month_arg}")
+            self.assertIn("✅ График утверждён", text_of(done))
+            chats = [
+                call.args[0]
+                for call in self.context.bot.send_message.await_args_list
+            ]
+            self.assertIn(-1005555, chats)
+            self.assertIn(67890, chats)
+            self.context.bot.send_document.assert_awaited_once()
+            plan = self.registry.get_schedule_plan("sound", key)
+            self.assertFalse(plan["dirty"])
+            again = await press(f"rdy:pokok:sound:{month_arg}")
+            self.assertIn("Изменений нет", text_of(again))
+            old = await press("rdy:plan:sound:200001")
+            self.assertIn("Экран устарел", text_of(old))
+
+        asyncio.run(run_test())
+
     def test_service_admin_cannot_open_service_tasks(self):
         async def run():
             self.registry.add_service_admin(67890, "sound", 24680)

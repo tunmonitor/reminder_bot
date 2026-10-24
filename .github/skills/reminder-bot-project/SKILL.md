@@ -415,6 +415,24 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   failed. A failed restart restores the old run without suppressing its
   result. `_send_dialog` keeps the stored back route for messages without
   inline buttons. «➕ В состав» buttons carry `YYYYMM.<telegram_id>`.
+- Step 3 (`bot/schedule_plan.py`): `schedule_plans` (PK service + month;
+  `slots` working copy date → task → person keys, `approved` published copy,
+  `dirty` = they differ; `run_id`, `tasks` with needed/max, `last_served`,
+  `note`, `edited`, `source` poll|excel for step 4). `finish_run` calls
+  `ensure_plan` (rebuilds when `run_id` differs, e.g. after a restart) and
+  sends `plan_text` with `rdy:plan`. `last_served` = previous month's approved
+  plan, else Excel via `events_loader` (= `context.load_upcoming_service_events`,
+  threaded through `run_readiness_tick` → `close_run` → `finish_run`); unique
+  normalized names only. UI actions `PLAN_ACTIONS` in `on_plan_action`:
+  `plan`, `precalc[ok]`, `pedit` → `pdate` (`YYYYMM.d`) → `ptask`
+  (`YYYYMM.d.t`) → pending `readiness_plan` with token + `keys`, `padd` /
+  `prem` / `pclear` (`token.i`); `pok` → `pokok` → `publish` (chat, then
+  `approve_schedule_plan`) and `send_excel_block` (text + `excel_file`
+  .xlsx). Plan months allowed: target month or current month
+  (`plan_month`). Edits run under `service_lock` on a fresh read; one task
+  per day enforced (`busy_on`); `max == 1` replaces.
+- Customer decision 5 (24.10): Excel may stop being filled — step 4 adds a
+  per-service source switch and «📥 Загрузить график из Excel».
 
 ### Rich text, mentions, and message length
 
