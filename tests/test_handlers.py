@@ -6607,6 +6607,11 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.context.bot.get_chat_member = AsyncMock(
                 return_value=SimpleNamespace(status="member")
             )
+            self.context.bot.get_chat.side_effect = asyncio.TimeoutError()
+            slow = self.message(24680, "/service_chat sound -100555 on")
+            await self.message_handler("on_service_chat")(slow)
+            self.assertIn("Не удалось проверить", slow.answer.await_args.args[0])
+            self.context.bot.get_chat.side_effect = None
             channel = self.message(24680, "/service_chat sound -100555 on")
             await self.message_handler("on_service_chat")(channel)
             self.assertIn("не группа", channel.answer.await_args.args[0])

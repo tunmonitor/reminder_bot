@@ -905,7 +905,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     "Это не группа — привязать можно только групповой чат."
                 )
             member = await context.bot.get_chat_member(chat_id, actor_id)
-        except TelegramAPIError as exc:
+        except (TelegramAPIError, asyncio.TimeoutError) as exc:
+            # Сбой или таймаут проверки — понятное сообщение, не падение.
             raise PermissionError(
                 "Не удалось проверить, что вы состоите в этом чате, — "
                 "выберите чат кнопкой."
