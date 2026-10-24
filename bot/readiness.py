@@ -864,7 +864,7 @@ async def finish_run(
         registry.mark_readiness_run(run["id"], closed_announced=True)
     if run["result_sent"]:
         return
-    from .schedule_plan import ensure_plan, plan_text
+    from .schedule_plan import ensure_plan, plan_text, window_of
 
     try:
         # Итог — предложенный график (сохраняется в базе для правки).
@@ -872,7 +872,10 @@ async def finish_run(
         summary = await asyncio.to_thread(
             summarize, registry, run, with_plan=False
         )
-        text = plan_text(service["name"], plan, summary, tz)
+        text = plan_text(
+            service["name"], plan, summary, tz,
+            window_of(registry, service["id"]),
+        )
     except Exception:  # noqa: BLE001
         logger.exception("Не удалось подвести итог опроса готовности")
         # Админам — один раз; итог не отмечается, следующая проверка

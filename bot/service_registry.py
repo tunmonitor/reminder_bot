@@ -267,6 +267,9 @@ class ServiceRegistry:
                     -- «Нужно людей» служения без задач (оно — одна задача).
                     people_needed INTEGER NOT NULL DEFAULT 1,
                     people_max INTEGER,
+                    -- Окно дней служения от воскресенья (Уборка: −1…+1).
+                    day_from INTEGER NOT NULL DEFAULT 0,
+                    day_to INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
                 );
 
@@ -464,6 +467,8 @@ class ServiceRegistry:
                         CHECK (source IN ('excel', 'manual', 'legacy')),
                     -- Задачи заданы в боте: «Списки» их не перезаписывают.
                     tasks_manual INTEGER NOT NULL DEFAULT 0,
+                    -- Личный день служения: сдвиг от воскресенья (чт = −3).
+                    day_offset INTEGER,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (service_id, name)
                 );
@@ -772,6 +777,9 @@ class ServiceRegistry:
                 ("readiness_settings", "people_needed",
                  "INTEGER NOT NULL DEFAULT 1"),
                 ("readiness_settings", "people_max", "INTEGER"),
+                ("readiness_settings", "day_from", "INTEGER NOT NULL DEFAULT 0"),
+                ("readiness_settings", "day_to", "INTEGER NOT NULL DEFAULT 0"),
+                ("service_members", "day_offset", "INTEGER"),
                 ("service_members", "tasks_manual",
                  "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "poll_stopped", "INTEGER NOT NULL DEFAULT 0"),
@@ -3478,7 +3486,7 @@ class ServiceRegistry:
             self._require_service(connection, service_id)
             rows = connection.execute(
                 "SELECT name, telegram_id, username, tasks_json, in_list, "
-                "source, tasks_manual FROM service_members "
+                "source, tasks_manual, day_offset FROM service_members "
                 "WHERE service_id = ? ORDER BY in_list DESC, rowid",
                 (service_id,),
             ).fetchall()
@@ -3491,6 +3499,7 @@ class ServiceRegistry:
                 "in_list": bool(row["in_list"]),
                 "source": row["source"],
                 "tasks_manual": bool(row["tasks_manual"]),
+                "day_offset": row["day_offset"],
             }
             for row in rows
         ]
@@ -3749,6 +3758,31 @@ class ServiceRegistry:
                 {"name": name, "tasks": tasks},
             )
         return tasks
+
+    def set_service_member_day(
+        self, actor_id: int, service_id: str, name: str, offset: int | None,
+    ) -> None:
+        """Личный день служения человека: сдвиг от воскресенья (−6…+6,
+        None — как у всех)."""
+        _validate_positive_id(actor_id, "actor_id")
+        if offset is not None and (
+            isinstance(offset, bool) or not isinstance(offset, int)
+            or not -6 <= offset <= 6
+        ):
+            raise ValueError("Личный день: от вс −6 до вс +6.")
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            cursor = connection.execute(
+                "UPDATE service_members SET day_offset = ?, updated_at = ? "
+                "WHERE service_id = ? AND name = ?",
+                (offset, _utc_now(), service_id, name),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(f"«{name}» нет в составе.")
+            self._audit(
+                connection, actor_id, "service_member_day", service_id,
+                {"name": name, "day_offset": offset},
+            )
 
     def remove_service_member(
         self, actor_id: int, service_id: str, name: str,
@@ -4823,6 +4857,8 @@ class ServiceRegistry:
         "chat_reminder_template": None,
         "people_needed": 1,
         "people_max": None,
+        "day_from": 0,
+        "day_to": 0,
     }
 
     def get_readiness_settings(self, service_id: str) -> dict:
@@ -4831,7 +4867,8 @@ class ServiceRegistry:
                 "SELECT enabled, start_time, duration_days, deadline_time, "
                 "remind_days, enabled_at, intro_template, reminder_template, "
                 "closed_template, chat_reminder_template, people_needed, "
-                "people_max FROM readiness_settings WHERE service_id = ?",
+                "people_max, day_from, day_to "
+                "FROM readiness_settings WHERE service_id = ?",
                 (service_id,),
             ).fetchone()
         if row is None:
@@ -4874,6 +4911,13 @@ class ServiceRegistry:
             raise ValueError("Нужно людей: от 1 до 5, максимум — до 6.")
         if high == low:
             new["people_max"] = None
+        day_from, day_to = new["day_from"], new["day_to"]
+        if (
+            any(isinstance(value, bool) or not isinstance(value, int)
+                for value in (day_from, day_to))
+            or not -6 <= day_from <= 0 <= day_to <= 6
+        ):
+            raise ValueError("Дни служения: от вс −6 до вс +6, включая вс.")
         for key, fields, label in (
             ("intro_template", READINESS_INTRO_FIELDS, "Текст опроса"),
             ("reminder_template", READINESS_REMINDER_FIELDS,
@@ -4903,8 +4947,8 @@ class ServiceRegistry:
                 "start_time, duration_days, deadline_time, remind_days, "
                 "enabled_at, intro_template, reminder_template, "
                 "closed_template, chat_reminder_template, people_needed, "
-                "people_max, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "people_max, day_from, day_to, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id) DO UPDATE SET "
                 "enabled = excluded.enabled, start_time = excluded.start_time, "
                 "duration_days = excluded.duration_days, "
@@ -4917,6 +4961,7 @@ class ServiceRegistry:
                 "chat_reminder_template = excluded.chat_reminder_template, "
                 "people_needed = excluded.people_needed, "
                 "people_max = excluded.people_max, "
+                "day_from = excluded.day_from, day_to = excluded.day_to, "
                 "updated_at = excluded.updated_at",
                 (
                     service_id, int(new["enabled"]), new["start_time"],
@@ -4924,7 +4969,8 @@ class ServiceRegistry:
                     new["remind_days"], new["enabled_at"],
                     new["intro_template"], new["reminder_template"],
                     new["closed_template"], new["chat_reminder_template"],
-                    new["people_needed"], new["people_max"], now,
+                    new["people_needed"], new["people_max"],
+                    new["day_from"], new["day_to"], now,
                 ),
             )
             self._audit(
@@ -4958,7 +5004,7 @@ class ServiceRegistry:
                 implicit = row["name"] if row else None
             members = connection.execute(
                 "SELECT name, telegram_id, username, tasks_json, in_list, "
-                "source FROM service_members WHERE service_id = ? "
+                "source, day_offset FROM service_members WHERE service_id = ? "
                 "ORDER BY in_list DESC, rowid",
                 (service_id,),
             ).fetchall()
@@ -4985,6 +5031,7 @@ class ServiceRegistry:
                 # В составе: в «Списках» или добавлен в боте (пропавший из
                 # «Списков» — нет).
                 "active": bool(row["in_list"]) or row["source"] != "excel",
+                "day_offset": row["day_offset"],
             }
             if row["telegram_id"] in by_id:
                 by_id[row["telegram_id"]]["tasks"] |= person["tasks"]
@@ -5007,6 +5054,7 @@ class ServiceRegistry:
                         "telegram_id": row["telegram_id"],
                         "username": "",
                         "tasks": set(),
+                        "day_offset": None,
                     }
                     people.append(person)
                 by_id[row["telegram_id"]] = person
