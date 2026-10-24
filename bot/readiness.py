@@ -133,7 +133,10 @@ class Summary:
     free_count: dict[str, int] = field(default_factory=dict)
 
 
-def summarize(registry, run: dict, *, with_plan: bool = True) -> Summary:
+def summarize(registry, run: dict, *, with_plan: bool = True,
+              last_served: dict[str, date] | None = None) -> Summary:
+    """last_served — последнее служение человека (ключ) в прошлом
+    месяце: для интервала между служениями."""
     people = registry.readiness_people(run["service_id"])
     by_id = {
         person["telegram_id"]: person
@@ -183,6 +186,7 @@ def summarize(registry, run: dict, *, with_plan: bool = True) -> Summary:
             free=free,
             tasks={name: frozenset(tasks[name]) for name in free},
             reluctant=frozenset(silent),
+            last_served=dict(last_served or {}),
         ))
     return summary
 
@@ -698,14 +702,14 @@ async def notify_admins(
 
 async def close_run(
     bot, registry, run: dict, service: dict, tz, admin_id: int,
-    logger: logging.Logger, text_limit: int,
+    logger: logging.Logger, text_limit: int, events_loader=None,
 ) -> bool:
     """Закрывает опрос и присылает админам итог. False — уже закрыт."""
     if not registry.close_readiness_run(run["id"]):
         return False
     await finish_run(
         bot, registry, registry.get_readiness_run_by_id(run["id"]), service,
-        tz, admin_id, logger, text_limit,
+        tz, admin_id, logger, text_limit, events_loader,
     )
     return True
 
@@ -744,7 +748,7 @@ async def announce_closed(
 
 async def finish_run(
     bot, registry, run: dict, service: dict, tz, admin_id: int,
-    logger: logging.Logger, text_limit: int,
+    logger: logging.Logger, text_limit: int, events_loader=None,
 ) -> None:
     """Шаги закрытия — остановка опроса в чате и итог админам; что не
     удалось, повторяет следующая проверка (без повтора удавшегося)."""
@@ -758,21 +762,37 @@ async def finish_run(
         registry.mark_readiness_run(run["id"], closed_announced=True)
     if run["result_sent"]:
         return
+    from .schedule_plan import ensure_plan, plan_text
+
     try:
-        summary = await asyncio.to_thread(summarize, registry, run)
-        text = progress_text(service["name"], run, summary, tz)
+        # Итог — предложенный график (сохраняется в базе для правки).
+        plan = await ensure_plan(registry, run, events_loader, logger)
+        summary = await asyncio.to_thread(
+            summarize, registry, run, with_plan=False
+        )
+        text = plan_text(service["name"], plan, summary, tz)
     except Exception:  # noqa: BLE001
         logger.exception("Не удалось подвести итог опроса готовности")
-        text = (
-            f"⚠️ {service['name']}: итог посчитать не удалось — откройте "
-            "«📊 Итог опроса»."
+        # Админам — один раз; итог не отмечается, следующая проверка
+        # попробует составить график снова.
+        await notify_admins(
+            bot, registry, service["id"], admin_id,
+            f"⚠️ {service['name']}: опрос завершён, но график составить пока "
+            "не удалось — бот попробует снова, или откройте «📋 График».",
+            logger, text_limit, reply_markup=admin_keyboard(service["id"]),
+            delivery_key=f"resultfail-{run['id']}", month=run["month"],
         )
+        return
     # Одно сообщение: доставка отмечается на получателя целиком (длинный
-    # итог сокращается, полностью — «📊 Итог опроса»).
+    # итог сокращается, полностью — «📋 График»).
     text = fit_one_screen("🗳 Опрос завершён\n\n" + text, text_limit)
+    year, month = month_of(run)
     if await notify_admins(
         bot, registry, service["id"], admin_id, text, logger, text_limit,
-        reply_markup=admin_keyboard(service["id"]),
+        reply_markup=admin_keyboard(service["id"], [InlineKeyboardButton(
+            text="📋 График: правка и утверждение",
+            callback_data=f"rdy:plan:{service['id']}:{year:04d}{month:02d}",
+        )]),
         delivery_key=f"result-{run['id']}", month=run["month"],
     ):
         registry.mark_readiness_run(run["id"], result_sent=True)
@@ -896,7 +916,7 @@ async def _tick_service(
 
 async def _tick_run(
     bot, registry, run: dict, now: datetime, tz, admin_id: int,
-    logger: logging.Logger, text_limit: int,
+    logger: logging.Logger, text_limit: int, events_loader=None,
 ) -> None:
     service = registry.get_service(run["service_id"])
     if service is None:
@@ -919,7 +939,7 @@ async def _tick_run(
         if now >= deadline_of(current):
             await close_run(
                 bot, registry, current, service, tz, admin_id, logger,
-                text_limit,
+                text_limit, events_loader,
             )
         elif reminder_due(current, settings, now):
             # Отметка — на человека после доставки: идемпотентно.
@@ -961,7 +981,7 @@ def settle_parked_run(registry, parked: dict, logger: logging.Logger) -> None:
 
 async def run_readiness_tick(
     bot, registry, now: datetime, tz, admin_id: int,
-    logger: logging.Logger, text_limit: int,
+    logger: logging.Logger, text_limit: int, events_loader=None,
 ) -> None:
     """Раз в минуту: превью накануне, автозапуск, напоминание, срок.
     Сбой одного служения не мешает остальным."""
@@ -983,7 +1003,8 @@ async def run_readiness_tick(
     for run in registry.list_open_readiness_runs():
         try:
             await _tick_run(
-                bot, registry, run, now, tz, admin_id, logger, text_limit
+                bot, registry, run, now, tz, admin_id, logger, text_limit,
+                events_loader,
             )
         except Exception:  # noqa: BLE001
             logger.exception("Сбой опроса готовности %s", run["id"])
@@ -1010,7 +1031,7 @@ async def run_readiness_tick(
                     continue
                 await finish_run(
                     bot, registry, current, service, tz, admin_id, logger,
-                    text_limit,
+                    text_limit, events_loader,
                 )
         except Exception:  # noqa: BLE001
             logger.exception("Сбой закрытия опроса готовности %s", run["id"])

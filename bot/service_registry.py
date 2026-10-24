@@ -288,6 +288,32 @@ class ServiceRegistry:
                     UNIQUE (service_id, month)
                 );
 
+                -- График месяца по итогам опроса (этап 5.4–5.5): рабочая
+                -- копия (slots) и утверждённая (approved — опубликована
+                -- в чате). Отличаются — правки ещё не опубликованы.
+                CREATE TABLE IF NOT EXISTS schedule_plans (
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    month TEXT NOT NULL,
+                    run_id INTEGER,
+                    -- poll — по итогам опроса, excel — загружен из файла.
+                    source TEXT NOT NULL DEFAULT 'poll'
+                        CHECK (source IN ('poll', 'excel')),
+                    dates_json TEXT NOT NULL,
+                    tasks_json TEXT NOT NULL,
+                    slots_json TEXT NOT NULL,
+                    last_served_json TEXT NOT NULL DEFAULT '{}',
+                    note TEXT,
+                    edited INTEGER NOT NULL DEFAULT 0,
+                    approved_json TEXT,
+                    approved_by INTEGER,
+                    approved_at TEXT,
+                    chat_id INTEGER,
+                    message_id INTEGER,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (service_id, month)
+                );
+
                 -- Личные напоминания об опросе — отметка на человека после
                 -- доставки: временный сбой повторяется следующей минутой.
                 CREATE TABLE IF NOT EXISTS readiness_reminders (
@@ -4920,6 +4946,124 @@ class ServiceRegistry:
                 "OR result_sent = 0 OR closed_announced = 0) ORDER BY id"
             ).fetchall()
         return [self._readiness_run(row) for row in rows]
+
+    @staticmethod
+    def _schedule_plan(row) -> dict | None:
+        if row is None:
+            return None
+        plan = dict(row)
+        for name in ("dates", "tasks", "slots", "last_served"):
+            plan[name] = json.loads(plan.pop(f"{name}_json"))
+        approved = plan.pop("approved_json")
+        plan["approved"] = json.loads(approved) if approved else None
+        # Правки после утверждения ещё не опубликованы (порядок людей в
+        # задаче не важен).
+        def normal(slots):
+            return None if slots is None else {
+                day: {task: sorted(people) for task, people in tasks.items()}
+                for day, tasks in slots.items()
+            }
+
+        plan["dirty"] = normal(plan["approved"]) != normal(plan["slots"])
+        return plan
+
+    def get_schedule_plan(self, service_id: str, month: str) -> dict | None:
+        """График месяца: slots — дата → задача → ключи людей
+        (`readiness_people`), approved — опубликованная копия."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM schedule_plans WHERE service_id = ? AND month = ?",
+                (service_id, month),
+            ).fetchone()
+        return self._schedule_plan(row)
+
+    def save_schedule_draft(
+        self,
+        service_id: str,
+        month: str,
+        *,
+        run_id: int | None,
+        dates: list[str],
+        tasks: list[dict],
+        slots: dict,
+        last_served: dict,
+        note: str | None = None,
+    ) -> dict:
+        """Предложенный (пересчитанный) график: рабочая копия заменяется,
+        ручные правки сбрасываются; утверждённая копия остаётся."""
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            connection.execute(
+                "INSERT INTO schedule_plans (service_id, month, run_id, "
+                "dates_json, tasks_json, slots_json, last_served_json, note, "
+                "edited, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?) "
+                "ON CONFLICT(service_id, month) DO UPDATE SET "
+                "run_id = excluded.run_id, source = 'poll', "
+                "dates_json = excluded.dates_json, "
+                "tasks_json = excluded.tasks_json, "
+                "slots_json = excluded.slots_json, "
+                "last_served_json = excluded.last_served_json, "
+                "note = excluded.note, edited = 0, "
+                "updated_at = excluded.updated_at",
+                (
+                    service_id, month, run_id, json.dumps(dates),
+                    json.dumps(tasks, ensure_ascii=False),
+                    json.dumps(slots, ensure_ascii=False),
+                    json.dumps(last_served, ensure_ascii=False),
+                    note, _utc_now(),
+                ),
+            )
+        return self.get_schedule_plan(service_id, month)
+
+    def set_schedule_slots(
+        self, actor_id: int, service_id: str, month: str, slots: dict,
+    ) -> dict:
+        """Ручная правка графика админом служения («✏️ Изменить»)."""
+        _validate_positive_id(actor_id, "actor_id")
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            cursor = connection.execute(
+                "UPDATE schedule_plans SET slots_json = ?, edited = 1, "
+                "updated_at = ? WHERE service_id = ? AND month = ?",
+                (
+                    json.dumps(slots, ensure_ascii=False), _utc_now(),
+                    service_id, month,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("График не найден — откройте его заново.")
+        return self.get_schedule_plan(service_id, month)
+
+    def approve_schedule_plan(
+        self,
+        actor_id: int,
+        service_id: str,
+        month: str,
+        slots: dict,
+        *,
+        chat_id: int | None,
+        message_id: int | None,
+    ) -> dict:
+        """«✅ Утвердить»: опубликованная копия = slots."""
+        _validate_positive_id(actor_id, "actor_id")
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            cursor = connection.execute(
+                "UPDATE schedule_plans SET approved_json = ?, approved_by = ?, "
+                "approved_at = ?, chat_id = ?, message_id = ? "
+                "WHERE service_id = ? AND month = ?",
+                (
+                    json.dumps(slots, ensure_ascii=False), actor_id,
+                    _utc_now(), chat_id, message_id, service_id, month,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("График не найден — откройте его заново.")
+            self._audit(
+                connection, actor_id, "schedule_plan_approved", service_id,
+                {"month": month},
+            )
+        return self.get_schedule_plan(service_id, month)
 
     def reminded_readiness_ids(self, run_id: int) -> set[int]:
         with self._connection() as connection:
