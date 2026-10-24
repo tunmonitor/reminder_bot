@@ -456,6 +456,10 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   `reshow_plan_slot`. `_send_dialog`: a screen sent in reply to a `/command`
   deletes the previous menu screen (`nav_state[actor]["menu"]`), recording the
   new screen before awaiting the delete.
+- Task-less services (catalog `tasks: []`): `ServiceRegistry.plan_tasks` returns
+  one implicit task named after the service (position "s", people_needed /
+  people_max in readiness_settings); `readiness_people` gives everyone that task;
+  `summarize` / `schedule_plan.plan_tasks` / «👥 Нужно людей» use `plan_tasks`.
 - Customer decision 5 (24.10): Excel may stop being filled — step 4 adds a
   per-service source switch and «📥 Загрузить график из Excel».
 

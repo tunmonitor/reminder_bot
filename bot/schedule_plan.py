@@ -118,15 +118,11 @@ async def last_served(
 
 
 def plan_tasks(registry, service_id: str) -> list[dict]:
-    """Распределяемые задачи в порядке каталога: минимум и максимум."""
+    """Распределяемые задачи в порядке каталога: минимум и максимум
+    (служение без задач — одна задача с его названием)."""
     return [
-        {
-            "name": task["name"],
-            "needed": task["people_needed"],
-            "max": task["people_max"],
-        }
-        for task in registry.list_service_tasks(service_id)
-        if task["enabled"]
+        {"name": task["name"], "needed": task["needed"], "max": task["max"]}
+        for task in registry.plan_tasks(service_id)
     ]
 
 
@@ -420,7 +416,9 @@ def _columns(registry, service_id: str) -> list[ScheduleColumn]:
         None,
     )
     if service is None or not service.columns:
-        return [ScheduleColumn(headers=(service_id,), layout="pairs")]
+        return [ScheduleColumn(
+            headers=(service.name if service else service_id,), layout="pairs",
+        )]
     return list(service.columns)
 
 

@@ -264,6 +264,9 @@ class ServiceRegistry:
                     reminder_template TEXT,
                     closed_template TEXT,
                     chat_reminder_template TEXT,
+                    -- «Нужно людей» служения без задач (оно — одна задача).
+                    people_needed INTEGER NOT NULL DEFAULT 1,
+                    people_max INTEGER,
                     updated_at TEXT NOT NULL
                 );
 
@@ -766,6 +769,9 @@ class ServiceRegistry:
                 ("readiness_settings", "reminder_template", "TEXT"),
                 ("readiness_settings", "closed_template", "TEXT"),
                 ("readiness_settings", "chat_reminder_template", "TEXT"),
+                ("readiness_settings", "people_needed",
+                 "INTEGER NOT NULL DEFAULT 1"),
+                ("readiness_settings", "people_max", "INTEGER"),
                 ("service_members", "tasks_manual",
                  "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "poll_stopped", "INTEGER NOT NULL DEFAULT 0"),
@@ -1448,6 +1454,30 @@ class ServiceRegistry:
             }
             for row in rows
         ]
+
+    def plan_tasks(self, service_id: str) -> list[dict]:
+        """Задачи графика: включённые задачи служения; у служения без задач
+        (Уборка, Книги) — одна задача с названием служения и «Нужно людей»
+        из настроек раздела «📅 График»."""
+        tasks = self.list_service_tasks(service_id)
+        if tasks:
+            return [
+                {
+                    "name": task["name"], "needed": task["people_needed"],
+                    "max": task["people_max"], "position": str(task["position"]),
+                    "implicit": False,
+                }
+                for task in tasks if task["enabled"]
+            ]
+        service = self.get_service(service_id)
+        if service is None:
+            return []
+        settings = self.get_readiness_settings(service_id)
+        return [{
+            "name": service["name"], "needed": settings["people_needed"],
+            "max": settings["people_max"] or settings["people_needed"],
+            "position": "s", "implicit": True,
+        }]
 
     def service_catalog(self) -> tuple[ServiceDefinition, ...]:
         """Каталог из файла с задачами в состоянии из БД (для парсера)."""
@@ -4785,6 +4815,8 @@ class ServiceRegistry:
         "reminder_template": None,
         "closed_template": None,
         "chat_reminder_template": None,
+        "people_needed": 1,
+        "people_max": None,
     }
 
     def get_readiness_settings(self, service_id: str) -> dict:
@@ -4792,8 +4824,8 @@ class ServiceRegistry:
             row = connection.execute(
                 "SELECT enabled, start_time, duration_days, deadline_time, "
                 "remind_days, enabled_at, intro_template, reminder_template, "
-                "closed_template, chat_reminder_template "
-                "FROM readiness_settings WHERE service_id = ?",
+                "closed_template, chat_reminder_template, people_needed, "
+                "people_max FROM readiness_settings WHERE service_id = ?",
                 (service_id,),
             ).fetchone()
         if row is None:
@@ -4824,6 +4856,18 @@ class ServiceRegistry:
                 raise ValueError(f"Значение должно быть от {low} до {high}.")
         if new["remind_days"] >= new["duration_days"]:
             new["remind_days"] = new["duration_days"] - 1
+        low, high = new["people_needed"], new["people_max"]
+        if (
+            isinstance(low, bool) or not isinstance(low, int)
+            or not 1 <= low <= 5
+            or high is not None and (
+                isinstance(high, bool) or not isinstance(high, int)
+                or not low <= high <= 6
+            )
+        ):
+            raise ValueError("Нужно людей: от 1 до 5, максимум — до 6.")
+        if high == low:
+            new["people_max"] = None
         for key, fields, label in (
             ("intro_template", READINESS_INTRO_FIELDS, "Текст опроса"),
             ("reminder_template", READINESS_REMINDER_FIELDS,
@@ -4852,8 +4896,9 @@ class ServiceRegistry:
                 "INSERT INTO readiness_settings (service_id, enabled, "
                 "start_time, duration_days, deadline_time, remind_days, "
                 "enabled_at, intro_template, reminder_template, "
-                "closed_template, chat_reminder_template, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "closed_template, chat_reminder_template, people_needed, "
+                "people_max, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id) DO UPDATE SET "
                 "enabled = excluded.enabled, start_time = excluded.start_time, "
                 "duration_days = excluded.duration_days, "
@@ -4864,6 +4909,8 @@ class ServiceRegistry:
                 "reminder_template = excluded.reminder_template, "
                 "closed_template = excluded.closed_template, "
                 "chat_reminder_template = excluded.chat_reminder_template, "
+                "people_needed = excluded.people_needed, "
+                "people_max = excluded.people_max, "
                 "updated_at = excluded.updated_at",
                 (
                     service_id, int(new["enabled"]), new["start_time"],
@@ -4871,7 +4918,7 @@ class ServiceRegistry:
                     new["remind_days"], new["enabled_at"],
                     new["intro_template"], new["reminder_template"],
                     new["closed_template"], new["chat_reminder_template"],
-                    now,
+                    new["people_needed"], new["people_max"], now,
                 ),
             )
             self._audit(
@@ -4893,6 +4940,16 @@ class ServiceRegistry:
                     (service_id,),
                 )
             }
+            # Служение без задач — одна задача с его названием: в ней все.
+            implicit = None
+            if connection.execute(
+                "SELECT 1 FROM service_tasks WHERE service_id = ? LIMIT 1",
+                (service_id,),
+            ).fetchone() is None:
+                row = connection.execute(
+                    "SELECT name FROM services WHERE id = ?", (service_id,)
+                ).fetchone()
+                implicit = row["name"] if row else None
             members = connection.execute(
                 "SELECT name, telegram_id, username, tasks_json "
                 "FROM service_members WHERE service_id = ? "
@@ -4954,7 +5011,8 @@ class ServiceRegistry:
             key = person["name"]
             if names.count(key) > 1:
                 key = f"{key} · {person['telegram_id'] or 'без Telegram'}"
-            result.append({**person, "key": key, "tasks": sorted(person["tasks"])})
+            tasks = {implicit} if implicit else person["tasks"]
+            result.append({**person, "key": key, "tasks": sorted(tasks)})
         return result
 
     def get_nav_hints(self, telegram_id: int) -> list[int]:

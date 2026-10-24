@@ -208,6 +208,37 @@ class SchedulePlanTest(unittest.TestCase):
              for people in tasks.values() for key in people],
         )
 
+    def test_service_without_tasks_is_one_task(self):
+        self.registry.sync_service_rosters({"office_cleaning": [
+            RosterMember("Анна", ()), RosterMember("Вера", ()),
+            RosterMember("Галя", ()),
+        ]})
+        name = self.registry.get_service("office_cleaning")["name"]
+        people = self.registry.readiness_people("office_cleaning")
+        self.assertEqual({tuple(item["tasks"]) for item in people}, {(name,)})
+        self.registry.set_readiness_settings(
+            1001, "office_cleaning", people_needed=1, people_max=2
+        )
+        tasks = self.registry.plan_tasks("office_cleaning")
+        self.assertEqual(
+            [(task["name"], task["needed"], task["max"], task["position"])
+             for task in tasks],
+            [(name, 1, 2, "s")],
+        )
+        plan = asyncio.run(schedule_plan.build_draft(
+            self.registry, schedule_plan.free_run("office_cleaning", 2026, 11),
+            None, LOG,
+        ))
+        counts = [len(plan["slots"][day][name]) for day in plan["dates"]]
+        # Без опроса свободны все — места до максимума заполнены.
+        self.assertEqual(counts, [2] * 5)
+        load = [len(days) for days in schedule_plan.served_dates(plan["slots"]).values()]
+        self.assertLessEqual(max(load) - min(load), 1)
+        with self.assertRaises(ValueError):
+            self.registry.set_readiness_settings(
+                1001, "office_cleaning", people_needed=3, people_max=2
+            )
+
     def test_order_only_change_is_not_dirty(self):
         plan = self.draft()
         slots = plan["slots"]

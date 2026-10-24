@@ -173,10 +173,8 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
     }
     if with_plan:
         tasks = {person["key"]: person["tasks"] for person in people}
-        catalog = [
-            task for task in registry.list_service_tasks(run["service_id"])
-            if task["enabled"]
-        ]
+        # У служения без задач — одна задача с его названием.
+        catalog = registry.plan_tasks(run["service_id"])
         all_dates = frozenset(date.fromisoformat(day) for day in run["dates"])
         free = {
             name: frozenset(date.fromisoformat(day) for day in dates)
@@ -188,10 +186,9 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
         free.update({name: all_dates for name in silent})
         summary.plan = build_plan(PlanInput(
             dates=tuple(sorted(all_dates)),
-            needed={task["name"]: task["people_needed"] for task in catalog},
+            needed={task["name"]: task["needed"] for task in catalog},
             extra={
-                task["name"]: task["people_max"] - task["people_needed"]
-                for task in catalog
+                task["name"]: task["max"] - task["needed"] for task in catalog
             },
             free=free,
             tasks={name: frozenset(tasks[name]) for name in free},
