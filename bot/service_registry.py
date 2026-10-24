@@ -5391,15 +5391,6 @@ class ServiceRegistry:
         переименовано в каталоге). Утверждённая копия — как опубликовано:
         график становится «с правками», и «✅ Утвердить изменения»
         опубликует новое название (одной строкой в списке изменений)."""
-        plan = self.get_schedule_plan(service_id, month)
-        if plan is None:
-            raise ValueError("График не найден.")
-        tasks = [
-            {**task, "name": new, "implicit": True} if task["name"] == old
-            else task
-            for task in plan["tasks"]
-        ]
-
         def renamed(slots: dict) -> str:
             return json.dumps({
                 day: {(new if task == old else task): people
@@ -5407,13 +5398,29 @@ class ServiceRegistry:
                 for day, day_tasks in slots.items()
             }, ensure_ascii=False)
 
+        # Чтение и запись — в одной транзакции: параллельная правка графика
+        # не затрётся старой копией.
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT tasks_json, slots_json FROM schedule_plans "
+                "WHERE service_id = ? AND month = ?",
+                (service_id, month),
+            ).fetchone()
+            if row is None:
+                raise ValueError("График не найден.")
+            tasks = [
+                {**task, "name": new, "implicit": True}
+                if task["name"] == old else task
+                for task in json.loads(row["tasks_json"])
+            ]
             connection.execute(
                 "UPDATE schedule_plans SET tasks_json = ?, slots_json = ?, "
                 "updated_at = ? WHERE service_id = ? AND month = ?",
                 (
                     json.dumps(tasks, ensure_ascii=False),
-                    renamed(plan["slots"]), _utc_now(), service_id, month,
+                    renamed(json.loads(row["slots_json"])), _utc_now(),
+                    service_id, month,
                 ),
             )
         return self.get_schedule_plan(service_id, month)

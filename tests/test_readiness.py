@@ -452,6 +452,18 @@ class ReadinessFlowTest(unittest.TestCase):
         ))
         bot.send_message.assert_not_awaited()
 
+    def test_sent_chat_reminder_skips_summary(self):
+        bot = fake_bot()
+        run = self.launch(bot)
+        asyncio.run(readiness.send_chat_reminder(
+            bot, self.registry, run, self.service(), TZ, LOG,
+        ))
+        with patch.object(readiness, "summarize") as summarize:
+            asyncio.run(readiness.send_chat_reminder(
+                bot, self.registry, run, self.service(), TZ, LOG,
+            ))
+        summarize.assert_not_called()
+
     def test_unreachable_chat_reminder_is_not_reported_sent(self):
         from aiogram.exceptions import TelegramForbiddenError
 

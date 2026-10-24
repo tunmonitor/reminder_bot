@@ -694,6 +694,11 @@ async def send_chat_reminder(
     """Общее напоминание в чат служения ответом на опрос — один раз;
     временный сбой — повтор следующей проверкой."""
     kind = f"chat-reminder-{run['id']}"
+    if not run.get("chat_id") or registry.has_readiness_notice(
+        service["id"], run["month"], kind
+    ):
+        # Уже отправлено (или некуда) — без подсчёта ответов каждую минуту.
+        return
     if not any(
         person["telegram_id"]
         for person in summarize(registry, run, with_plan=False).not_answered

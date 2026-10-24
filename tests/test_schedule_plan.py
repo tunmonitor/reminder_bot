@@ -117,6 +117,19 @@ class SchedulePlanTest(unittest.TestCase):
             self.registry, "sound", 2026, 11, self.people(), loader, LOG,
         ))
         self.assertEqual(served, {"Борис": "2026-10-18"})
+        # Служил не в воскресенье (разовый день пт) — интервал от пятницы.
+        self.registry.set_schedule_day(
+            1001, "sound", "2026-10", "2026-10-18", "Борис", -2
+        )
+        plan = self.registry.get_schedule_plan("sound", "2026-10")
+        self.registry.approve_schedule_plan(
+            1001, "sound", "2026-10", plan["slots"], chat_id=None,
+            message_id=None, days=plan["days"],
+        )
+        served, _ = asyncio.run(schedule_plan.last_served(
+            self.registry, "sound", 2026, 11, self.people(), loader, LOG,
+        ))
+        self.assertEqual(served, {"Борис": "2026-10-16"})
 
     def test_last_served_failure_is_noted(self):
         loader = AsyncMock(side_effect=OSError("disk"))

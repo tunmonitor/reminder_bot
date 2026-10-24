@@ -80,10 +80,21 @@ async def last_served(
     py, pm = previous_month(year, month)
     previous = registry.get_schedule_plan(service_id, month_key(py, pm))
     if previous is not None and previous["approved"] is not None:
-        return {
-            person: days[-1]
-            for person, days in served_dates(previous["approved"]).items()
-        }, None
+        # Фактический день служения: разовый на дату, иначе свой день
+        # человека, иначе воскресенье графика.
+        by_key = {person["key"]: person for person in people}
+        approved_days = previous.get("approved_days") or {}
+        result = {}
+        for person, days in served_dates(previous["approved"]).items():
+            actual = []
+            for day in days:
+                offset = approved_days.get(day, {}).get(person)
+                if offset is None:
+                    offset = (by_key.get(person) or {}).get("day_offset") or 0
+                actual.append(date.fromisoformat(day) + timedelta(days=offset))
+            # Сдвиг последнего воскресенья не уводит дату в новый месяц.
+            result[person] = min(max(actual), month_end(py, pm)).isoformat()
+        return result, None
     if events_loader is None:
         return {}, "прошлый месяц не учтён — график не загружен"
     first, last = date(py, pm, 1), month_end(py, pm)
