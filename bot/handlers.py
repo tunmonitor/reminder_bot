@@ -1645,11 +1645,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         Для каждого человека — задачи в графике месяца и статус привязки.
         """
         schedule_tasks: dict[str, list[str]] = {}
+        # Убранные из состава в этой сессии не возвращаются из графика.
+        removed = set(pending.get("removed_members", ()))
         for task, task_info in pending.get("schedule_assignments", {}).items():
             if task_is_informational(task_info):
                 continue
             for name in task_assignment_names(task_info):
-                schedule_tasks.setdefault(name, []).append(task)
+                if name not in removed:
+                    schedule_tasks.setdefault(name, []).append(task)
         bound = {
             contact["name"]: contact
             for contacts in pending.get("registered_contacts", {}).values()
@@ -2027,6 +2030,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     )
                 else:
                     refresh_registered_contacts(actor_id, service_id)
+                    removed = pending_inputs[actor_id].get("removed_members", [])
+                    if name in removed:
+                        removed.remove(name)
                     await show_member_card(
                         message, actor_id, service_id, name,
                         "✅ Задачи сохранены: " + ", ".join(tasks),
@@ -2050,6 +2056,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
                 refresh_registered_contacts(actor_id, service_id)
                 pending_inputs[actor_id].pop("member_card", None)
+                pending_inputs[actor_id].setdefault(
+                    "removed_members", []
+                ).append(name)
                 notice = f"🗑 «{name}» убран(а) из состава"
                 if in_list:
                     notice += (
@@ -3645,6 +3654,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             reminder = readiness.reminder_line(
                 run, service_registry().get_readiness_settings(service["id"]),
                 datetime.now(context.timezone), context.timezone,
+                readiness.reminder_sent(service_registry(), run),
             )
         text = readiness.progress_text(
             service_label(service), run, summary, context.timezone, reminder,

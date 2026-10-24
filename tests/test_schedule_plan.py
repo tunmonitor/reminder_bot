@@ -181,6 +181,33 @@ class SchedulePlanTest(unittest.TestCase):
             recalculated["approved"]["2026-11-15"]["сборка"], ["Глеб"]
         )
 
+    def test_member_edits_and_removal_keep_plan_and_contacts_consistent(self):
+        plan = self.draft()
+        slots = plan["slots"]
+        slots["2026-11-01"]["звук"] = ["Борис"]
+        self.registry.set_schedule_slots(1001, "sound", "2026-11", slots)
+        # Задачи Алексея заданы в боте: график не возвращает снятую задачу.
+        self.registry.set_service_member_tasks(1001, "sound", "Алексей", ["сборка"])
+        self.registry.ensure_member_contacts("sound", {"звук": ["Алексей"]})
+        alex = next(
+            person for person in self.people() if person["name"] == "Алексей"
+        )
+        self.assertEqual(alex["tasks"], ["сборка"])
+        # Человек только из графика получает запись состава.
+        self.registry.set_service_member_tasks(1001, "sound", "Олег", ["звук"])
+        self.assertIn(
+            "Олег",
+            [item["name"] for item in self.registry.list_service_members("sound")],
+        )
+        # Убранный из состава уходит и из рабочей копии графика.
+        self.registry.remove_service_member(1001, "sound", "Борис")
+        plan = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertNotIn(
+            "Борис",
+            [key for tasks in plan["slots"].values()
+             for people in tasks.values() for key in people],
+        )
+
     def test_order_only_change_is_not_dirty(self):
         plan = self.draft()
         slots = plan["slots"]

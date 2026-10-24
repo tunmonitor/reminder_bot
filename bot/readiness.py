@@ -666,8 +666,10 @@ async def send_chat_reminder(
         registry.release_readiness_notice(service["id"], run["month"], kind)
 
 
-def reminder_line(run: dict, settings: dict, now: datetime, tz) -> str:
-    """Когда напоминание (для «📊 Ход опроса»)."""
+def reminder_line(run: dict, settings: dict, now: datetime, tz,
+                  sent: bool = True) -> str:
+    """Когда напоминание (для «📊 Ход опроса»); sent — хоть одно
+    напоминание (личное или в чат) доставлено."""
     days = settings["remind_days"]
     if days <= 0:
         return "🔔 Напоминание: выключено"
@@ -676,9 +678,23 @@ def reminder_line(run: dict, settings: dict, now: datetime, tz) -> str:
     if datetime.fromisoformat(run["created_at"]) >= remind_at:
         return f"🔔 Напоминания не будет: опрос запущен позже {when}"
     if remind_at <= now:
+        if not sent:
+            return (
+                f"🔔 Напоминание {when}: не отправлено — ответили все с "
+                "Telegram или сбой доставки (бот повторит)"
+            )
         return f"🔔 Напоминание отправлено {when}"
     return (
         f"🔔 Напоминание: {when} — лично не ответившим и общее в чат служения"
+    )
+
+
+def reminder_sent(registry, run: dict) -> bool:
+    """Доставлено ли хоть одно напоминание опроса."""
+    return bool(registry.reminded_readiness_ids(run["id"])) or (
+        registry.has_readiness_notice(
+            run["service_id"], run["month"], f"chat-reminder-{run['id']}"
+        )
     )
 
 

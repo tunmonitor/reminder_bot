@@ -77,6 +77,9 @@ class ReadinessDatesTest(unittest.TestCase):
         self.assertIn("выключено", readiness.reminder_line(
             run, {"remind_days": 0}, before, TZ
         ))
+        self.assertIn("не отправлено", readiness.reminder_line(
+            run, settings, after, TZ, sent=False
+        ))
         late = {**run, "created_at": after.isoformat()}
         self.assertIn("не будет", readiness.reminder_line(
             late, settings, after, TZ

@@ -3619,6 +3619,13 @@ class ServiceRegistry:
                 # Задачи заданы в боте — привязка только к ним (снятые
                 # вручную не возвращаются из графика).
                 all_tasks = roster_tasks
+                placeholders = ", ".join("?" for _ in all_tasks) or "''"
+                connection.execute(
+                    "DELETE FROM responsible_contacts WHERE service_id = ? "
+                    "AND name = ? AND telegram_id = ? "
+                    f"AND task NOT IN ({placeholders})",
+                    (service_id, name, telegram_id, *all_tasks),
+                )
             for task in all_tasks:
                 self._write_contact(
                     connection, actor_id, service_id, task, name,
@@ -3636,6 +3643,9 @@ class ServiceRegistry:
         """Задачи человека в составе задаёт админ служения: дальше «Списки»
         их не меняют. Привязки Telegram — только к выбранным задачам."""
         _validate_positive_id(actor_id, "actor_id")
+        name = name.strip() if isinstance(name, str) else ""
+        if not name or "\x00" in name:
+            raise ValueError("Имя участника обязательно.")
         tasks = list(dict.fromkeys(tasks))
         if not tasks:
             raise ValueError("Выберите хотя бы одну задачу.")
@@ -3661,15 +3671,14 @@ class ServiceRegistry:
                 "WHERE service_id = ? AND name = ? LIMIT 1",
                 (service_id, name),
             ).fetchone()
-            if member is None and contact is None:
-                raise ValueError(f"«{name}» нет в составе.")
             now = _utc_now()
             # Telegram — из состава, иначе из привязок.
             bound = member if member and member["telegram_id"] else contact
             telegram_id = bound["telegram_id"] if bound else None
             username = (bound["username"] if bound else "") or ""
             if member is None:
-                # Был только в привязках «👥 Ответственные» — в состав.
+                # Был только в привязках «👥 Ответственные» или в графике —
+                # в состав.
                 connection.execute(
                     "INSERT INTO service_members (service_id, name, "
                     "telegram_id, username, tasks_json, source, tasks_manual, "
@@ -3728,6 +3737,38 @@ class ServiceRegistry:
             ).rowcount
             if not removed:
                 raise ValueError(f"«{name}» нет в составе.")
+            # Из рабочих копий графиков (опубликованная остаётся — правка
+            # станет видна как неопубликованная).
+            for row in connection.execute(
+                "SELECT month, slots_json FROM schedule_plans "
+                "WHERE service_id = ?",
+                (service_id,),
+            ).fetchall():
+                slots = json.loads(row["slots_json"])
+                changed = False
+                for tasks in slots.values():
+                    for task, people in tasks.items():
+                        # Ключ — имя, при совпадении имён «имя · ID» (как в
+                        # readiness_people); все с этим именем удалены выше.
+                        kept = [
+                            key for key in people
+                            if key != name and not re.fullmatch(
+                                re.escape(name) + r" · (?:\d+|без Telegram)",
+                                key,
+                            )
+                        ]
+                        if kept != people:
+                            tasks[task] = kept
+                            changed = True
+                if changed:
+                    connection.execute(
+                        "UPDATE schedule_plans SET slots_json = ?, edited = 1, "
+                        "updated_at = ? WHERE service_id = ? AND month = ?",
+                        (
+                            json.dumps(slots, ensure_ascii=False), _utc_now(),
+                            service_id, row["month"],
+                        ),
+                    )
             self._cleanup_unbound_user_data(connection, service_id)
             self._audit(
                 connection, actor_id, "service_member_removed", service_id,
@@ -3768,9 +3809,11 @@ class ServiceRegistry:
         под другим именем, которого в графике задачи уже нет (человека
         переименовали), переходит на имя из графика.
         """
+        # Задачи, заданные в боте, график и «Списки» не расширяют.
         member = connection.execute(
             "SELECT telegram_id, username FROM service_members "
-            "WHERE service_id = ? AND name = ? AND telegram_id IS NOT NULL",
+            "WHERE service_id = ? AND name = ? AND telegram_id IS NOT NULL "
+            "AND tasks_manual = 0",
             (service_id, name),
         ).fetchone()
         if member is None:
