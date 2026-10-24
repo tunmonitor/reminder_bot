@@ -263,7 +263,9 @@ class SchedulePlanTest(unittest.TestCase):
         self.assertIn("лист «НОЯБРЬ26»", text)
         self.assertIn("01.11: звук — Алексей, Борис; сборка — пусто", text)
         data = schedule_plan.excel_file(self.registry, self.service(), plan, people)
-        self.assertEqual(load_workbook(BytesIO(data)).active.title, "НОЯБРЬ26")
+        sheet = load_workbook(BytesIO(data)).active
+        self.assertEqual(sheet.title, "НОЯБРЬ26")
+        self.assertEqual(sheet["A2"].number_format, "DD.MM.YYYY")
         # Файл читается тем же парсером, что и лист графика.
         path = Path(self.temp_dir.name) / "plan.xlsx"
         path.write_bytes(data)

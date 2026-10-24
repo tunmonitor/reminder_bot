@@ -13,7 +13,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from datetime import date, datetime
+from datetime import date
 from io import BytesIO
 
 from .excel_parser import _schedule_sheet_name
@@ -458,7 +458,7 @@ def excel_file(registry, service: dict, plan: dict, people: list[dict]) -> bytes
         sheet.append(row)
     for cells in sheet.iter_rows():
         for cell in cells:
-            if isinstance(cell.value, datetime):
+            if isinstance(cell.value, date):
                 cell.number_format = "DD.MM.YYYY"
     buffer = BytesIO()
     workbook.save(buffer)
