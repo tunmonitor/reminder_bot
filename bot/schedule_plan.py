@@ -289,6 +289,21 @@ def person_day(person: dict | None, day: str, plan: dict | None = None) -> str:
     return " — " + _weekday_date(date.fromisoformat(day) + timedelta(days=offset))
 
 
+def date_window(plan: dict, by_key: dict, day: str,
+                window: tuple[int, int]) -> tuple[int, int]:
+    """Окно для заголовка даты: если у всех поставленных на дату свой
+    (или разовый) день, общий период не показывается."""
+    people = [
+        key for tasks in [plan["slots"].get(day, {})]
+        for keys in tasks.values() for key in keys
+    ]
+    if people and all(
+        day_offset(plan, by_key.get(key), day) is not None for key in people
+    ):
+        return (0, 0)
+    return window
+
+
 def window_of(registry, service_id: str) -> tuple[int, int]:
     settings = registry.get_readiness_settings(service_id)
     return settings["day_from"], settings["day_to"]
@@ -324,7 +339,9 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
     ]
     used_silent = False
     for day in plan["dates"]:
-        lines += ["", f"🗓 {day_label(day, window)}"]
+        lines += [
+            "", f"🗓 {day_label(day, date_window(plan, by_key, day, window))}",
+        ]
         for task in plan["tasks"]:
             people = plan["slots"].get(day, {}).get(task["name"], [])
             used_silent |= any(person in silent for person in people)
@@ -497,7 +514,8 @@ def publication_text(service: dict, plan: dict, people: list[dict],
                 people_text if implicit_plan(plan)
                 else f"{task_emoji(task['name'])} {task['name']}: {people_text}"
             )
-        lines.append(f"🗓 {day_label(day, window)} — " + " · ".join(parts))
+        label = day_label(day, date_window(plan, by_key, day, window))
+        lines.append(f"🗓 {label} — " + " · ".join(parts))
     if update:
         changes = plan_changes(plan["approved"], plan["slots"], _names(people))
         names = _names(people)
