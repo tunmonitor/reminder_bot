@@ -4094,10 +4094,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 ))
         rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
         by_key = {person["key"]: person for person in summary.people}
+        # Обычный день служения — окно служения (без него — вс).
+        usual = DAY_WINDOWS.get(
+            schedule_plan.window_of(registry, service["id"]), "свои дни"
+        )
         for index, key in enumerate(current):
-            # День только на эту дату (иначе — свой день человека или вс).
+            # День только на эту дату (иначе — свой день человека или окно).
             offset = schedule_plan.day_offset(plan, by_key.get(key), day)
-            label = member_day_label(offset) if offset is not None else "вс"
+            label = member_day_label(offset) if offset is not None else usual
             rows.append([readiness_button(
                 f"📅 {names.get(key, key)} — {label}"[:60],
                 "pday", service["id"], f"{token}.{index}",
@@ -4536,7 +4540,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 f"📅 {names.get(key_person, key_person)} · "
                 f"{date.fromisoformat(pending['day']):%d.%m}\n\nВ какой день "
                 "человек служит на этой неделе? Только для этой даты; «Как "
-                "обычно» — его свой день (или воскресенье).",
+                "обычно» — его свой день, без него — дни служения ("
+                + DAY_WINDOWS.get(
+                    schedule_plan.window_of(registry, service_id), "свои дни"
+                ) + ").",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
                 _dialog_keep_rows=True,
                 _dialog_keyboard_limit=sum(len(row) for row in rows),

@@ -202,8 +202,15 @@ class SchedulePlanTest(unittest.TestCase):
             "Олег",
             [item["name"] for item in self.registry.list_service_members("sound")],
         )
-        # Убранный из состава уходит и из рабочей копии графика.
+        # Убранный из состава уходит и из рабочей копии графика — вместе
+        # с разовым днём.
+        self.registry.set_schedule_day(
+            1001, "sound", "2026-11", "2026-11-01", "Борис", -1
+        )
         self.registry.remove_service_member(1001, "sound", "Борис")
+        self.assertEqual(
+            self.registry.get_schedule_plan("sound", "2026-11")["days"], {}
+        )
         plan = self.registry.get_schedule_plan("sound", "2026-11")
         self.assertNotIn(
             "Борис",

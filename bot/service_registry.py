@@ -3840,8 +3840,15 @@ class ServiceRegistry:
                 raise ValueError(f"«{name}» нет в составе.")
             # Из рабочих копий графиков (опубликованная остаётся — правка
             # станет видна как неопубликованная).
+            def is_removed(key: str) -> bool:
+                # Ключ — имя, при совпадении имён «имя · ID» (как в
+                # readiness_people); все с этим именем удалены выше.
+                return key == name or bool(re.fullmatch(
+                    re.escape(name) + r" · (?:\d+|без Telegram)", key,
+                ))
+
             for row in connection.execute(
-                "SELECT month, slots_json FROM schedule_plans "
+                "SELECT month, slots_json, days_json FROM schedule_plans "
                 "WHERE service_id = ?",
                 (service_id,),
             ).fetchall():
@@ -3849,24 +3856,30 @@ class ServiceRegistry:
                 changed = False
                 for tasks in slots.values():
                     for task, people in tasks.items():
-                        # Ключ — имя, при совпадении имён «имя · ID» (как в
-                        # readiness_people); все с этим именем удалены выше.
-                        kept = [
-                            key for key in people
-                            if key != name and not re.fullmatch(
-                                re.escape(name) + r" · (?:\d+|без Telegram)",
-                                key,
-                            )
-                        ]
+                        kept = [key for key in people if not is_removed(key)]
                         if kept != people:
                             tasks[task] = kept
                             changed = True
+                # И разовые дни — иначе вернувшийся получил бы старый день.
+                days = {}
+                for day, people_days in json.loads(
+                    row["days_json"] or "{}"
+                ).items():
+                    kept_days = {
+                        key: offset for key, offset in people_days.items()
+                        if not is_removed(key)
+                    }
+                    changed |= kept_days != people_days
+                    if kept_days:
+                        days[day] = kept_days
                 if changed:
                     connection.execute(
-                        "UPDATE schedule_plans SET slots_json = ?, edited = 1, "
-                        "updated_at = ? WHERE service_id = ? AND month = ?",
+                        "UPDATE schedule_plans SET slots_json = ?, "
+                        "days_json = ?, edited = 1, updated_at = ? "
+                        "WHERE service_id = ? AND month = ?",
                         (
-                            json.dumps(slots, ensure_ascii=False), _utc_now(),
+                            json.dumps(slots, ensure_ascii=False),
+                            json.dumps(days, ensure_ascii=False), _utc_now(),
                             service_id, row["month"],
                         ),
                     )
