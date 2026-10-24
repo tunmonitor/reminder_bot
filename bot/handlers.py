@@ -891,6 +891,29 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 or registry.is_service_admin(actor_id, service_id)
             )
         )
+    async def require_chat_member(actor_id: int, chat_id: int) -> None:
+        """Чат по ID вручную: админ служения должен сам состоять в группе
+        (выбор кнопкой Telegram это гарантирует). Супер-администратор — без
+        проверки."""
+        registry = service_registry()
+        if registry is None or registry.is_super_admin(actor_id):
+            return
+        try:
+            member = await context.bot.get_chat_member(chat_id, actor_id)
+        except TelegramAPIError as exc:
+            raise PermissionError(
+                "Не удалось проверить, что вы состоите в этом чате, — "
+                "выберите чат кнопкой."
+            ) from exc
+        status = getattr(member, "status", None)
+        if status not in {
+            "creator", "administrator", "member", "restricted",
+        } or (status == "restricted" and not getattr(member, "is_member", True)):
+            raise PermissionError(
+                "Вы не состоите в этом чате — привязать можно только свой "
+                "групповой чат."
+            )
+
     def is_user_linked(actor_id: int) -> bool:
         """Проверяет, привязан ли пользователь хотя бы к одной задаче."""
         registry = service_registry()
@@ -7654,6 +7677,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             return
         service_id, raw_chat_id, raw_enabled = parts[1:]
+        try:
+            await require_chat_member(message.from_user.id, int(raw_chat_id))
+        except (PermissionError, ValueError) as exc:
+            await _send_dialog(
+                message, _status_text(str(exc), "❌"), parse_mode=None
+            )
+            return
 
         def update_chat(actor_id: int) -> str:
             if raw_enabled not in {"on", "off"}:
@@ -11404,6 +11434,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "-1001234567890 on."
                     )
                 chat_id = int(parts[0])
+                await require_chat_member(message.from_user.id, chat_id)
                 registry.set_group_chat(
                     message.from_user.id,
                     service_id,

@@ -1745,9 +1745,16 @@ class ServiceRegistry:
                     raise ValueError(
                         "Укажите групповой чат (ID группы отрицательный)."
                     )
-                if connection.execute(
+                current = connection.execute(
+                    "SELECT group_chat_id FROM services WHERE id = ?",
+                    (service_id,),
+                ).fetchone()
+                own_chat = current is not None and (
+                    current["group_chat_id"] == group_chat_id
+                )
+                if not own_chat and connection.execute(
                     "SELECT 1 FROM services WHERE group_chat_id = ? "
-                    "AND id != ? AND archived = 0",
+                    "AND id != ?",
                     (group_chat_id, service_id),
                 ).fetchone() is not None:
                     raise PermissionError(

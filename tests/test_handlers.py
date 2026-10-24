@@ -6598,6 +6598,29 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_manual_chat_id_requires_membership_for_service_admin(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 24680)
+            self.context.bot.get_chat_member = AsyncMock(
+                return_value=SimpleNamespace(status="left")
+            )
+            command = self.message(24680, "/service_chat sound -100555 on")
+            await self.message_handler("on_service_chat")(command)
+            self.assertIn("не состоите", command.answer.await_args.args[0])
+            self.assertNotEqual(
+                self.registry.get_service("sound")["group_chat_id"], -100555
+            )
+            self.context.bot.get_chat_member.return_value = SimpleNamespace(
+                status="member"
+            )
+            command = self.message(24680, "/service_chat sound -100555 on")
+            await self.message_handler("on_service_chat")(command)
+            self.assertEqual(
+                self.registry.get_service("sound")["group_chat_id"], -100555
+            )
+
+        asyncio.run(run())
+
     def test_service_card_hub_buttons_open_sections(self):
         async def run():
             for operation, expected in (
