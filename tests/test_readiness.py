@@ -388,6 +388,25 @@ class ReadinessFlowTest(unittest.TestCase):
         ))
         bot.send_message.assert_not_awaited()
 
+    def test_unreachable_chat_reminder_is_not_reported_sent(self):
+        from aiogram.exceptions import TelegramForbiddenError
+
+        bot = fake_bot()
+        run = self.launch(bot)
+        bot.send_message.side_effect = TelegramForbiddenError(
+            method=SimpleNamespace(), message="bot was kicked"
+        )
+        asyncio.run(readiness.send_chat_reminder(
+            bot, self.registry, run, self.service(), TZ, LOG,
+        ))
+        self.assertFalse(readiness.reminder_sent(self.registry, run))
+        bot.send_message.side_effect = None
+        bot.send_message.reset_mock()
+        asyncio.run(readiness.send_chat_reminder(
+            bot, self.registry, run, self.service(), TZ, LOG,
+        ))
+        bot.send_message.assert_not_awaited()
+
     def test_close_retries_stop_and_result(self):
         bot = fake_bot()
         run = self.launch(bot)

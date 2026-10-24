@@ -660,10 +660,13 @@ async def send_chat_reminder(
         )
     except Exception as exc:  # noqa: BLE001
         if unreachable(exc):
+            # Отметка остаётся (без повторов), но доставленным не считается.
             logger.info("Напоминание в чат служения не доставлено: %s", exc)
             return
         logger.warning("Напоминание в чат служения не отправлено", exc_info=True)
         registry.release_readiness_notice(service["id"], run["month"], kind)
+        return
+    registry.claim_readiness_notice(service["id"], run["month"], f"{kind}-sent")
 
 
 def reminder_line(run: dict, settings: dict, now: datetime, tz,
@@ -693,7 +696,7 @@ def reminder_sent(registry, run: dict) -> bool:
     """Доставлено ли хоть одно напоминание опроса."""
     return bool(registry.reminded_readiness_ids(run["id"])) or (
         registry.has_readiness_notice(
-            run["service_id"], run["month"], f"chat-reminder-{run['id']}"
+            run["service_id"], run["month"], f"chat-reminder-{run['id']}-sent"
         )
     )
 
