@@ -773,10 +773,16 @@ async def finish_run(
         text = plan_text(service["name"], plan, summary, tz)
     except Exception:  # noqa: BLE001
         logger.exception("Не удалось подвести итог опроса готовности")
-        text = (
-            f"⚠️ {service['name']}: итог посчитать не удалось — откройте "
-            "«📋 График»."
+        # Админам — один раз; итог не отмечается, следующая проверка
+        # попробует составить график снова.
+        await notify_admins(
+            bot, registry, service["id"], admin_id,
+            f"⚠️ {service['name']}: опрос завершён, но график составить пока "
+            "не удалось — бот попробует снова, или откройте «📋 График».",
+            logger, text_limit, reply_markup=admin_keyboard(service["id"]),
+            delivery_key=f"resultfail-{run['id']}", month=run["month"],
         )
+        return
     # Одно сообщение: доставка отмечается на получателя целиком (длинный
     # итог сокращается, полностью — «📋 График»).
     text = fit_one_screen("🗳 Опрос завершён\n\n" + text, text_limit)

@@ -3430,17 +3430,34 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     }
 
     def plan_month(arg: str | None, now: datetime) -> str | None:
-        """Месяц графика из кнопки: месяц опроса или текущий (график
-        правится и после начала месяца)."""
+        """Месяц графика из кнопки: месяц опроса, текущий или прошлый
+        (график правится и после начала месяца, итог мог прийти позже)."""
         value = (arg or "").split(".")[0]
         if len(value) != 6 or not value.isdigit():
             return None
         key = f"{value[:4]}-{value[4:]}"
         allowed = {
             f"{now.year:04d}-{now.month:02d}",
+            "{:04d}-{:02d}".format(*schedule_plan.previous_month(
+                now.year, now.month
+            )),
             "{:04d}-{:02d}".format(*readiness.target_month(now.date())),
         }
         return key if key in allowed else None
+
+    def plan_arg(plan: dict, *extra) -> str:
+        """Аргумент кнопки: месяц, версия графика и номера даты / задачи."""
+        return ".".join(
+            [plan["month"].replace("-", ""), schedule_plan.revision(plan)]
+            + [str(item) for item in extra]
+        )
+
+    def plan_current(run: dict | None, plan: dict | None) -> bool:
+        """График относится к закрытому опросу, который сейчас у месяца."""
+        return (
+            run is not None and plan is not None and run["status"] == "closed"
+            and plan["run_id"] == run["id"]
+        )
 
     async def load_plan(service_id: str, key: str) -> tuple[dict | None, dict | None]:
         """(опрос, график) закрытого опроса месяца; график создаётся при
@@ -3475,15 +3492,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         service_id = service["id"]
         rows = [[
             readiness_button("✏️ Изменить", "pedit", service_id, month_arg),
-            readiness_button("🔄 Пересчитать", "precalc", service_id, month_arg),
+            readiness_button(
+                "🔄 Пересчитать", "precalc", service_id, plan_arg(plan)
+            ),
         ]]
         if plan["approved"] is None:
             rows.append([
-                readiness_button("✅ Утвердить", "pok", service_id, month_arg)
+                readiness_button("✅ Утвердить", "pok", service_id, plan_arg(plan))
             ])
         elif plan["dirty"]:
             rows.append([readiness_button(
-                "✅ Утвердить изменения", "pok", service_id, month_arg
+                "✅ Утвердить изменения", "pok", service_id, plan_arg(plan)
             )])
         target = "{:04d}{:02d}".format(
             *readiness.target_month(datetime.now(context.timezone).date())
@@ -3518,7 +3537,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 gap.startswith(f"⚠️ {short} ") for gap in schedule_plan.gaps(plan)
             ) else ""
             buttons.append(readiness_button(
-                f"{mark}🗓 {short}", "pdate", service_id, f"{month_arg}.{index}"
+                f"{mark}🗓 {short}", "pdate", service_id, plan_arg(plan, index)
             ))
         rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
         rows.append([readiness_button("⬅️ К графику", "plan", service_id, month_arg)])
@@ -3542,7 +3561,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             shown = ", ".join(names.get(key, key) for key in people) or "⚠️ никого"
             rows.append([readiness_button(
                 f"{task_emoji(task['name'])} {task['name']} — {shown}"[:60],
-                "ptask", service_id, f"{month_arg}.{day_index}.{index}",
+                "ptask", service_id, plan_arg(plan, day_index, index),
             )])
         rows.append([readiness_button("⬅️ К датам", "pedit", service_id, month_arg)])
         await _send_dialog(
@@ -3583,6 +3602,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             # Задача — по имени: пересчёт мог поменять список задач.
             "day": day,
             "task": task["name"],
+            "revision": schedule_plan.revision(plan),
             "keys": keys,
             "step": "readiness_plan",
             "token": token,
@@ -3627,8 +3647,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "🚫 Оставить пустым", "pclear", service["id"], token
             )])
         rows.append([readiness_button(
-            "⬅️ К дате", "pdate", service["id"],
-            f"{plan['month'].replace('-', '')}.{day_index}",
+            "⬅️ К дате", "pdate", service["id"], plan_arg(plan, day_index),
         )])
         await _send_dialog(
             message, "\n".join(lines),
@@ -3686,6 +3705,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await _answer_callback(callback)
             return
         parts = (arg or "").split(".")
+        if action in {"precalc", "precalcok", "pdate", "ptask", "pok", "pokok"}:
+            if len(parts) < 2 or parts[1] != schedule_plan.revision(plan):
+                # Кнопка с прежней версией: график поправили, пересчитали или
+                # опрос перезапустили — действие относилось бы к другому.
+                await show_plan(
+                    callback.message, service, run, plan,
+                    "⚠️ График изменился — проверьте его и повторите",
+                )
+                await _answer_callback(callback)
+                return
+            del parts[1]
         if action == "plan":
             await show_plan(callback.message, service, run, plan)
         elif action == "precalc" and plan["edited"]:
@@ -3697,7 +3727,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "вы его снова не утвердите).",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [readiness_button(
-                        "✅ Да, пересчитать", "precalcok", service_id, month_arg
+                        "✅ Да, пересчитать", "precalcok", service_id,
+                        plan_arg(plan),
                     )],
                     [readiness_button("⬅️ К графику", "plan", service_id, month_arg)],
                 ]),
@@ -3706,15 +3737,32 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
         elif action in {"precalc", "precalcok"}:
             await _answer_callback(callback, "⏳ Считаю…")
+            rev = schedule_plan.revision(plan)
+            notice = "🔄 График пересчитан по ответам и текущим задачам"
             async with readiness.service_lock(service_id):
-                plan = await schedule_plan.build_draft(
-                    registry, run,
-                    getattr(context, "load_upcoming_service_events", None), debug,
-                )
-            await show_plan(
-                callback.message, service, run, plan,
-                "🔄 График пересчитан по ответам и текущим задачам",
-            )
+                # Под блокировкой: опрос мог быть перезапущен, а график —
+                # поправлен другим админом после подтверждения.
+                run = registry.get_readiness_run(service_id, key)
+                plan = registry.get_schedule_plan(service_id, key)
+                if not plan_current(run, plan) or (
+                    schedule_plan.revision(plan) != rev
+                ):
+                    notice = "⚠️ График изменился — проверьте его и повторите"
+                    if run is not None and run["status"] == "closed":
+                        # Опрос перезапущен — показать график нового.
+                        plan = await schedule_plan.ensure_plan(
+                            registry, run, getattr(context, "load_upcoming_service_events", None), debug,
+                        )
+                else:
+                    plan = await schedule_plan.build_draft(
+                        registry, run,
+                        getattr(context, "load_upcoming_service_events", None),
+                        debug,
+                    )
+            if run is None or plan is None or run["status"] != "closed":
+                await show_readiness(callback.message, service_id, notice)
+            else:
+                await show_plan(callback.message, service, run, plan, notice)
             return
         elif action == "pedit":
             await show_plan_dates(callback.message, service_id, plan)
@@ -3742,8 +3790,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             day_index, task_index = pending["day_index"], pending["task_index"]
             notice = None
             async with readiness.service_lock(service_id):
-                # Свежий график: другой админ мог поправить его только что.
+                # Свежий график: другой админ мог поправить его только что,
+                # а опрос — быть перезапущен.
+                run = registry.get_readiness_run(service_id, key)
                 plan = registry.get_schedule_plan(service_id, key)
+                if not plan_current(run, plan) or (
+                    schedule_plan.revision(plan) != pending.get("revision")
+                ):
+                    raise ValueError("График изменился — откройте его заново.")
                 day = pending["day"]
                 task = next(
                     (item for item in plan["tasks"]
@@ -3846,7 +3900,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 callback.message, "\n".join(lines),
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [readiness_button(
-                        "📢 Да, опубликовать", "pokok", service_id, month_arg
+                        "📢 Да, опубликовать", "pokok", service_id,
+                        plan_arg(plan),
                     )],
                     [readiness_button("⬅️ К графику", "plan", service_id, month_arg)],
                 ]),
@@ -3856,9 +3911,21 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
         elif action == "pokok":
             await _answer_callback(callback, "⏳ Публикую…")
+            rev = schedule_plan.revision(plan)
             async with readiness.service_lock(service_id):
+                run = registry.get_readiness_run(service_id, key)
                 plan = registry.get_schedule_plan(service_id, key)
-                if plan["approved"] is not None and not plan["dirty"]:
+                if not plan_current(run, plan) or (
+                    schedule_plan.revision(plan) != rev
+                ):
+                    # Подтверждали другой график — опубликовать без проверки
+                    # нельзя.
+                    notice = "⚠️ График изменился — проверьте его и утвердите снова"
+                    if run is not None and run["status"] == "closed":
+                        plan = await schedule_plan.ensure_plan(
+                            registry, run, getattr(context, "load_upcoming_service_events", None), debug,
+                        )
+                elif plan["approved"] is not None and not plan["dirty"]:
                     notice = "ℹ️ Изменений нет — график уже опубликован"
                 else:
                     try:
@@ -3886,7 +3953,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         except Exception:  # noqa: BLE001
                             debug.exception("Не удалось отправить блок для Excel")
                             notice += "\n⚠️ Блок для Excel отправить не удалось"
-            await show_plan(callback.message, service, run, plan, notice)
+            if run is None or plan is None or run["status"] != "closed":
+                await show_readiness(callback.message, service_id, notice)
+            else:
+                await show_plan(callback.message, service, run, plan, notice)
             return
         else:
             await show_plan(callback.message, service, run, plan, "⚠️ Экран устарел")
@@ -4352,18 +4422,23 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     f"✅ {member['name']} в составе: "
                     + ", ".join(member["selected"])
                 )
-                run = registry.get_readiness_run(service_id, key)
-                plan = registry.get_schedule_plan(service_id, key)
-                if run is not None and run["status"] == "closed" and (
-                    plan is not None
-                ):
-                    if plan["edited"]:
-                        notice += (
-                            "\nℹ️ В графике есть ручные правки — «🔄 "
-                            "Пересчитать», чтобы учесть нового участника"
-                        )
-                    else:
-                        async with readiness.service_lock(service_id):
+                async with readiness.service_lock(service_id):
+                    run = registry.get_readiness_run(service_id, key)
+                    plan = registry.get_schedule_plan(service_id, key)
+                    if run is not None and run["status"] == "closed" and (
+                        plan is not None
+                    ):
+                        if (plan["edited"] or plan["approved"] is not None) and (
+                            plan["run_id"] == run["id"]
+                        ):
+                            # Правки или утверждённый график не пересчитываются
+                            # без спроса.
+                            notice += (
+                                "\nℹ️ График не пересчитан (есть правки или он "
+                                "утверждён) — «🔄 Пересчитать», чтобы учесть "
+                                "нового участника"
+                            )
+                        else:
                             plan = await schedule_plan.build_draft(
                                 registry, run,
                                 getattr(
@@ -4371,7 +4446,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                                 ),
                                 debug,
                             )
-                        notice += "\n🔄 График пересчитан"
+                            notice += "\n🔄 График пересчитан"
+                if run is not None and run["status"] == "closed" and (
+                    plan is not None
+                ):
                     await show_plan(callback.message, service, run, plan, notice)
                     await _answer_callback(callback)
                     return

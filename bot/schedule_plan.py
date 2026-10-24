@@ -10,8 +10,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
-from datetime import date
+from datetime import date, datetime
 from io import BytesIO
 
 from .excel_parser import _schedule_sheet_name
@@ -19,7 +21,7 @@ from .group_send import send_to_service_group
 from .month_summary import month_end, month_key, month_title
 from .presentation import task_emoji
 from .readiness import Summary, local_text, month_of, outside_name, summarize
-from .services import normalized_name
+from .services import ScheduleColumn, normalized_name
 from .ui import send_telegram_screen, user_link
 
 
@@ -29,6 +31,16 @@ LOADER_TIMEOUT = 30
 
 class PublishedNotSaved(RuntimeError):
     """График ушёл в чат, но отметка об утверждении не сохранилась."""
+
+
+def revision(plan: dict) -> str:
+    """Версия графика для кнопок: правка или пересчёт меняют её, и
+    кнопки с прежней версией считаются устаревшими."""
+    data = json.dumps(
+        [plan["updated_at"], plan["run_id"], plan["slots"]],
+        ensure_ascii=False, sort_keys=True,
+    )
+    return hashlib.sha1(data.encode()).hexdigest()[:6]
 
 
 def previous_month(year: int, month: int) -> tuple[int, int]:
@@ -358,35 +370,57 @@ def publication_text(service: dict, plan: dict, people: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _layout(registry, service_id: str) -> str:
+def _columns(registry, service_id: str) -> list[ScheduleColumn]:
     service = next(
         (item for item in registry.service_catalog() if item.id == service_id),
         None,
     )
-    return service.assignment_layout if service is not None else "pairs"
+    if service is None or not service.columns:
+        return [ScheduleColumn(headers=(service_id,), layout="pairs")]
+    return list(service.columns)
 
 
-def excel_rows(registry, plan: dict, people: list[dict]) -> list[list[str]]:
-    """Строки для листа графика: дата — в первой строке блока; у колонок
-    «задача | имя» следующий человек задачи — без повтора задачи."""
+def excel_rows(registry, plan: dict, people: list[dict]) -> list[list]:
+    """Лист как в графике: строка заголовков колонок служения, затем блок
+    каждой даты — дата в первой ячейке колонки, ниже назначения. У колонки
+    со своей задачей («Слайды») — только её люди, остальные задачи — в
+    основной колонке; у «задача | имя» следующий человек задачи — без
+    повтора задачи."""
     names = _names(people)
-    pairs = _layout(registry, plan["service_id"]) == "pairs"
-    rows = []
+    columns = _columns(registry, plan["service_id"])
+    own = {
+        normalized_name(column.task): index
+        for index, column in enumerate(columns) if column.task
+    }
+    main = next(
+        (index for index, column in enumerate(columns) if not column.task), 0
+    )
+    starts, width = [], 0
+    for column in columns:
+        starts.append(width)
+        width += 2 if column.layout == "pairs" else 1
+    header = [""] * width
+    for column, start in zip(columns, starts):
+        header[start] = column.headers[0]
+    rows: list[list] = [header]
     for day in plan["dates"]:
-        first = True
+        cells: list[list[list]] = [[] for _ in columns]
         for task in plan["tasks"]:
-            for index, key in enumerate(
+            index = own.get(normalized_name(task["name"]), main)
+            pairs = columns[index].layout == "pairs"
+            for number, key in enumerate(
                 plan["slots"].get(day, {}).get(task["name"], [])
             ):
-                label = task["name"] if index == 0 else ""
-                rows.append(
-                    [_short(day) if first else ""]
-                    + ([label] if pairs else [])
-                    + [names.get(key, key)]
+                label = task["name"] if number == 0 else ""
+                cells[index].append(
+                    [label, names.get(key, key)] if pairs else [names.get(key, key)]
                 )
-                first = False
-        if first:
-            rows.append([_short(day)] + ([""] if pairs else []) + [""])
+        block = [[""] * width for _ in range(1 + max(map(len, cells)))]
+        for index, start in enumerate(starts):
+            block[0][start] = date.fromisoformat(day)
+            for offset, values in enumerate(cells[index], start=1):
+                block[offset][start:start + len(values)] = values
+        rows += block
     return rows
 
 
@@ -396,7 +430,8 @@ def excel_text(registry, service: dict, plan: dict, people: list[dict]) -> str:
     lines = [
         f"📋 Для Excel · {service['name']} · лист "
         f"«{_schedule_sheet_name(date(year, month, 1))}»",
-        "Файл ниже — те же строки по колонкам служения.",
+        "Файл ниже — те же назначения по колонкам служения, как на "
+        "листе графика.",
         "",
     ]
     for day in plan["dates"]:
@@ -419,10 +454,12 @@ def excel_file(registry, service: dict, plan: dict, people: list[dict]) -> bytes
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = _schedule_sheet_name(date(year, month, 1))
-    pairs = _layout(registry, plan["service_id"]) == "pairs"
-    sheet.append(["Дата"] + (["Задача"] if pairs else []) + [service["name"]])
     for row in excel_rows(registry, plan, people):
         sheet.append(row)
+    for cells in sheet.iter_rows():
+        for cell in cells:
+            if isinstance(cell.value, datetime):
+                cell.number_format = "DD.MM.YYYY"
     buffer = BytesIO()
     workbook.save(buffer)
     return buffer.getvalue()
@@ -450,10 +487,20 @@ async def publish(
         sent.append(message.message_id)
         return message
 
-    await send_telegram_screen(
-        send_chunk, chat_id, publication_text(service, plan, people),
-        limit=text_limit,
-    )
+    try:
+        await send_telegram_screen(
+            send_chunk, chat_id, publication_text(service, plan, people),
+            limit=text_limit,
+        )
+    except BaseException:
+        # Длинный график ушёл не целиком — убрать отправленные части, иначе
+        # повторное «Утвердить» продублировало бы их.
+        for message_id in sent:
+            try:
+                await bot.delete_message(chat_id, message_id)
+            except Exception:  # noqa: BLE001
+                logger.info("Часть графика не удалена", exc_info=True)
+        raise
     for attempt in range(2):
         try:
             return registry.approve_schedule_plan(

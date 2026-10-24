@@ -13,7 +13,12 @@ from zoneinfo import ZoneInfo
 from openpyxl import load_workbook
 
 from bot import readiness, schedule_plan
-from bot.excel_parser import RosterMember, ServiceAssignment, ServiceEvent
+from bot.excel_parser import (
+    RosterMember,
+    ServiceAssignment,
+    ServiceEvent,
+    parse_service_events,
+)
 from bot.service_registry import ServiceRegistry
 
 TZ = ZoneInfo("Europe/Moscow")
@@ -250,17 +255,51 @@ class SchedulePlanTest(unittest.TestCase):
         plan["slots"]["2026-11-01"] = {"звук": ["Алексей", "Борис"], "сборка": []}
         people = self.people()
         rows = schedule_plan.excel_rows(self.registry, plan, people)
-        self.assertEqual(rows[0], ["01.11", "звук", "Алексей"])
-        self.assertEqual(rows[1], ["", "", "Борис"])
+        self.assertEqual(rows[0][:3], ["звук", "", "спевка"])
+        self.assertEqual(rows[1][0], date(2026, 11, 1))
+        self.assertEqual(rows[2][:2], ["звук", "Алексей"])
+        self.assertEqual(rows[3][:2], ["", "Борис"])
         text = schedule_plan.excel_text(self.registry, self.service(), plan, people)
         self.assertIn("лист «НОЯБРЬ26»", text)
         self.assertIn("01.11: звук — Алексей, Борис; сборка — пусто", text)
         data = schedule_plan.excel_file(self.registry, self.service(), plan, people)
-        sheet = load_workbook(BytesIO(data)).active
-        self.assertEqual(sheet.title, "НОЯБРЬ26")
+        self.assertEqual(load_workbook(BytesIO(data)).active.title, "НОЯБРЬ26")
+        # Файл читается тем же парсером, что и лист графика.
+        path = Path(self.temp_dir.name) / "plan.xlsx"
+        path.write_bytes(data)
+        events = parse_service_events(
+            path, date(2026, 11, 1), LOG, self.registry.service_catalog()
+        )["sound"]
+        by_day = {
+            item.event_date: sorted(
+                (row.task, row.name) for row in item.assignments
+            )
+            for item in events
+        }
         self.assertEqual(
-            [cell.value for cell in sheet[2]], ["01.11", "звук", "Алексей"]
+            by_day[date(2026, 11, 1)], [("звук", "Алексей"), ("звук", "Борис")]
         )
+        self.assertEqual(
+            by_day[date(2026, 11, 8)],
+            sorted(
+                (task, name)
+                for task, keys in plan["slots"]["2026-11-08"].items()
+                for name in keys
+            ),
+        )
+
+    def test_excel_rows_put_own_task_in_its_column(self):
+        plan = {
+            "service_id": "broadcast", "dates": ["2026-11-01"],
+            "tasks": [
+                {"name": "Пульт", "needed": 1, "max": None},
+                {"name": "Слайды", "needed": 1, "max": None},
+            ],
+            "slots": {"2026-11-01": {"Пульт": ["Ира"], "Слайды": ["Оля"]}},
+        }
+        rows = schedule_plan.excel_rows(self.registry, plan, [])
+        self.assertEqual(rows[0], ["трансляция", "", "слайды"])
+        self.assertEqual(rows[2], ["Пульт", "Ира", "Оля"])
 
     def test_excel_filled(self):
         events = [event(date(2026, 11, 1), ("звук", "Борис"))]
@@ -287,6 +326,54 @@ class SchedulePlanTest(unittest.TestCase):
         ]
         self.assertIn("rdy:plan:sound:202611", buttons)
         self.assertIsNotNone(self.registry.get_schedule_plan("sound", "2026-11"))
+
+
+    def test_failed_draft_is_retried_without_repeating_notice(self):
+        bot = fake_bot()
+        run = self.registry.get_readiness_run_by_id(self.run["id"])
+        with unittest.mock.patch(
+            "bot.schedule_plan.ensure_plan", side_effect=RuntimeError("db")
+        ):
+            for _ in range(2):
+                asyncio.run(readiness.finish_run(
+                    bot, self.registry, run, self.service(), TZ, 1001, LOG,
+                    4096,
+                ))
+        admin_texts = [
+            call.args[1] for call in bot.send_message.await_args_list
+            if call.args[0] == 1001
+        ]
+        self.assertEqual(len(admin_texts), 1)
+        self.assertIn("график составить пока не удалось", admin_texts[0])
+        self.assertFalse(
+            self.registry.get_readiness_run_by_id(run["id"])["result_sent"]
+        )
+        asyncio.run(readiness.finish_run(
+            bot, self.registry, run, self.service(), TZ, 1001, LOG, 4096,
+        ))
+        self.assertTrue(
+            self.registry.get_readiness_run_by_id(run["id"])["result_sent"]
+        )
+        self.assertIn("📋 График", bot.send_message.await_args.args[1])
+
+    def test_partial_publication_is_removed(self):
+        plan = self.draft()
+        bot = fake_bot()
+        bot.delete_message = AsyncMock()
+        bot.send_message.side_effect = [
+            SimpleNamespace(message_id=31), RuntimeError("network"),
+        ]
+        with unittest.mock.patch(
+            "bot.schedule_plan.publication_text", return_value="x " * 3000
+        ):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(schedule_plan.publish(
+                    bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+                ))
+        bot.delete_message.assert_awaited_once_with(-1005555, 31)
+        self.assertIsNone(
+            self.registry.get_schedule_plan("sound", "2026-11")["approved"]
+        )
 
 
 if __name__ == "__main__":

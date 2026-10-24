@@ -6156,6 +6156,12 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 for button in row
             ]
 
+        def data_of(callback, prefix):
+            return next(
+                button.callback_data for button in buttons(callback)
+                if button.callback_data.startswith(prefix)
+            )
+
         async def run_test():
             screen = await press("rdy:open:sound")
             self.assertIn(
@@ -6168,12 +6174,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             plan = self.registry.get_schedule_plan("sound", key)
             self.assertEqual(plan["slots"][dates[0]]["звук"], ["Алексей"])
 
-            day = await press(f"rdy:pdate:sound:{month_arg}.0")
-            self.assertIn(
-                f"rdy:ptask:sound:{month_arg}.0.0",
-                [button.callback_data for button in buttons(day)],
-            )
-            slot = await press(f"rdy:ptask:sound:{month_arg}.0.0")
+            dates_screen = await press(f"rdy:pedit:sound:{month_arg}")
+            day = await press(data_of(dates_screen, "rdy:pdate:"))
+            slot = await press(data_of(day, "rdy:ptask:"))
             self.assertIn("Сейчас: Алексей", text_of(slot))
             borys = next(
                 button for button in buttons(slot) if button.text == "👥 Борис"
@@ -6195,17 +6198,22 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             plan = self.registry.get_schedule_plan("sound", key)
             self.assertEqual(plan["slots"][dates[0]]["звук"], [])
 
-            confirm = await press(f"rdy:precalc:sound:{month_arg}")
+            plan_screen = await press(f"rdy:plan:sound:{month_arg}")
+            # Кнопка прежней версии графика не срабатывает.
+            outdated = await press(data_of(slot, "rdy:pdate:"))
+            self.assertIn("График изменился", text_of(outdated))
+            confirm = await press(data_of(plan_screen, "rdy:precalc:"))
             self.assertIn("Ручные правки сбросятся", text_of(confirm))
-            await press(f"rdy:precalcok:sound:{month_arg}")
+            await press(data_of(confirm, "rdy:precalcok:"))
             plan = self.registry.get_schedule_plan("sound", key)
             self.assertEqual(plan["edited"], 0)
             self.assertEqual(plan["slots"][dates[0]]["звук"], ["Алексей"])
 
-            ask = await press(f"rdy:pok:sound:{month_arg}")
+            plan_screen = await press(f"rdy:plan:sound:{month_arg}")
+            ask = await press(data_of(plan_screen, "rdy:pok:"))
             self.assertIn("Утвердить график", text_of(ask))
             self.context.bot.send_message.reset_mock()
-            done = await press(f"rdy:pokok:sound:{month_arg}")
+            done = await press(data_of(ask, "rdy:pokok:"))
             self.assertIn("✅ График утверждён", text_of(done))
             chats = [
                 call.args[0]
@@ -6216,7 +6224,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.context.bot.send_document.assert_awaited_once()
             plan = self.registry.get_schedule_plan("sound", key)
             self.assertFalse(plan["dirty"])
-            again = await press(f"rdy:pokok:sound:{month_arg}")
+            again = await press(data_of(ask, "rdy:pokok:"))
             self.assertIn("Изменений нет", text_of(again))
             old = await press("rdy:plan:sound:200001")
             self.assertIn("Экран устарел", text_of(old))
