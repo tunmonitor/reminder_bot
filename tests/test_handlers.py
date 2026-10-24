@@ -6324,6 +6324,22 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertEqual(plan["edited"], 1)
             stale = await press(borys.callback_data)
             self.assertIn("устарел", stale.answer.await_args.args[0])
+            day_button = next(
+                button for button in buttons(added)
+                if button.text.startswith("📅 Борис —")
+            )
+            day_screen = await press(day_button.callback_data)
+            friday = next(
+                button for button in buttons(day_screen)
+                if button.text == "📅 пт (вс -2)"
+            )
+            set_day = await press(friday.callback_data)
+            self.assertIn("✅ День на эту дату: пт", text_of(set_day))
+            self.assertEqual(
+                self.registry.get_schedule_plan("sound", key)["days"],
+                {dates[0]: {"Борис": -2}},
+            )
+            added = set_day
             remove = next(
                 button for button in buttons(added)
                 if button.text == "❌ Борис"
@@ -6331,6 +6347,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             await press(remove.callback_data)
             plan = self.registry.get_schedule_plan("sound", key)
             self.assertEqual(plan["slots"][dates[0]]["звук"], [])
+            # Убранному из даты разовый день больше не нужен.
+            self.assertEqual(plan["days"], {})
 
             plan_screen = await press(f"rdy:plan:sound:{month_arg}")
             # Кнопка прежней версии графика не срабатывает.

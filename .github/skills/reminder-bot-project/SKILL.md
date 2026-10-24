@@ -468,6 +468,13 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   («📅 Свой день», `set_service_member_day`, `mbr:day|dset`); shown via
   `schedule_plan.day_label` / `person_day` in `plan_text` and
   `publication_text` (`window_of`). Reminders by window/personal day — step 4.
+- Task-less plans (`schedule_plan.implicit_plan`, tasks carry `implicit`): text,
+  publication and Excel text show people directly under the date
+  (`task_lines(bare=True)`, `Summary.implicit`); `pdate` jumps to the slot.
+  Per-date day: `schedule_plans.days_json` / `approved_days_json`,
+  `set_schedule_day`, UI `pday`/`pdset` (token.i[.offset|n|back]);
+  `schedule_plan.day_offset` = per-date > personal; `set_schedule_slots` drops
+  overrides of people no longer on that date; revision includes days.
 - Customer decision 5 (24.10): Excel may stop being filled — step 4 adds a
   per-service source switch and «📥 Загрузить график из Excel».
 
