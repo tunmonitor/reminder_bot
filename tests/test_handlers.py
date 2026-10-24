@@ -5965,6 +5965,13 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIn(
                 "Экран устарел", stale.message.answer.await_args.args[0]
             )
+            texts = await press("rdy:texts:sound")
+            self.assertIn("📝 Тексты опроса", texts.message.answer.await_args.args[0])
+            self.assertIn("❓ Вопрос опроса", texts.message.answer.await_args.args[0])
+            question = await press("rdy:tplprev:sound:q")
+            self.assertIn(
+                "Когда можешь служить в", question.message.answer.await_args.args[0]
+            )
             text_screen = await press("rdy:tpl:sound:intro")
             self.assertIn(
                 "Используется встроенный текст",

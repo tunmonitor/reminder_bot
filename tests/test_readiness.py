@@ -135,6 +135,38 @@ class ReadinessDatesTest(unittest.TestCase):
             last_hour + timedelta(hours=1),
         )
 
+    def test_option_labels_and_own_days_note(self):
+        self.assertEqual(readiness.option_label("2026-11-01"), "01.11")
+        self.assertEqual(
+            readiness.option_label("2026-11-01", (-1, 1)), "сб 31.10–пн 02.11"
+        )
+        people = [
+            {"name": "Катя Степанова", "tasks": ["уборка"], "day_offset": -3},
+            {"name": "Анна", "tasks": ["уборка"], "day_offset": None},
+            {"name": "Ушёл", "tasks": [], "day_offset": -1},
+        ]
+        self.assertEqual(
+            readiness.own_days_note(people),
+            "📅 Свой день: Катя Степанова — по четвергам",
+        )
+        self.assertEqual(readiness.own_days_note(people[1:]), "")
+        twins = [
+            {"name": "Аня", "key": "Аня · 1", "tasks": ["у"], "day_offset": -3,
+             "username": "anya1"},
+            {"name": "Аня", "key": "Аня · 2", "tasks": ["у"], "day_offset": -1},
+            {"name": "Вика", "key": "Вика", "tasks": ["у"], "day_offset": -2,
+             "in_roster": False},
+        ]
+        self.assertEqual(
+            readiness.own_days_note(twins),
+            "📅 Свой день: Аня (@anya1) — по четвергам; Аня · 2 — по субботам",
+        )
+        service = {"name": "Звук"}
+        self.assertEqual(
+            readiness.question_text(service, 2026, 11, "👥"),
+            "Когда можешь служить в ноябре?",
+        )
+
     def test_answer_dates(self):
         dates = ["2026-11-01", "2026-11-08"]
         self.assertIsNone(readiness.answer_dates([], dates))
@@ -199,6 +231,32 @@ class ReadinessFlowTest(unittest.TestCase):
             bot, self.registry, self.service(), 2026, 11,
             datetime(2026, 10, 22, 20, 0, tzinfo=TZ), TZ, LOG, 4096,
         ))
+
+    def test_launch_uses_day_window_and_own_day_note(self):
+        self.registry.set_readiness_settings(1001, "sound", day_from=-1, day_to=1)
+        self.registry.set_service_member_day(1001, "sound", "Алексей", -3)
+        bot = fake_bot()
+        self.launch(bot)
+        options = bot.send_poll.await_args.kwargs["options"]
+        self.assertEqual(options[0], "сб 31.10–пн 02.11")
+        intro = bot.send_message.await_args.args[1]
+        self.assertIn("📅 Свой день: Алексей — по четвергам", intro)
+
+    def test_poll_question_template(self):
+        self.registry.set_readiness_settings(
+            1001, "sound", question_template="{service_name}: когда в {month_in}?"
+        )
+        bot = fake_bot()
+        self.launch(bot)
+        self.assertEqual(bot.send_poll.await_args.args[1], "Звук: когда в ноябре?")
+        with self.assertRaises(ValueError):
+            self.registry.set_readiness_settings(
+                1001, "sound", question_template="x" * 301
+            )
+        with self.assertRaises(ValueError):
+            self.registry.set_readiness_settings(
+                1001, "sound", question_template="Когда {deadline}?"
+            )
 
     def test_launch_sends_intro_and_poll_once(self):
         bot = fake_bot()
