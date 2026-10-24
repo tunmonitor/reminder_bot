@@ -6758,8 +6758,18 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertEqual(peter["tasks"], ["звук"])
             self.assertTrue(peter["tasks_manual"])
 
+            day = await self.press_inline(
+                saved.message, "📅 Свой день", "on_member_card"
+            )
+            chosen = await self.press_inline(
+                day.message, "📅 чт (вс -3)", "on_member_card"
+            )
+            self.assertIn(
+                "✅ День служения: чт (вс -3)",
+                chosen.message.answer.await_args.args[0],
+            )
             ask = await self.press_inline(
-                saved.message, "🗑 Удалить из состава", "on_member_card"
+                chosen.message, "🗑 Удалить из состава", "on_member_card"
             )
             self.assertIn("Убрать «Пётр»", ask.message.answer.await_args.args[0])
             done = await self.press_inline(

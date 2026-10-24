@@ -460,6 +460,14 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   one implicit task named after the service (position "s", people_needed /
   people_max in readiness_settings); `readiness_people` gives everyone that task;
   `summarize` / `schedule_plan.plan_tasks` / «👥 Нужно людей» use `plan_tasks`.
+- Planner rotation: `_rotation_penalty` = max(0, ROTATION_WEEKS − weeks from
+  last_served to the month's first date), added once per person (first
+  service of the month) in `assign` cost and `_person_cost`; smaller than a
+  load step so load balance wins. Day window `readiness_settings.day_from/day_to`
+  («📆 Дни служения», `DAY_WINDOWS`), personal day `service_members.day_offset`
+  («📅 Свой день», `set_service_member_day`, `mbr:day|dset`); shown via
+  `schedule_plan.day_label` / `person_day` in `plan_text` and
+  `publication_text` (`window_of`). Reminders by window/personal day — step 4.
 - Customer decision 5 (24.10): Excel may stop being filled — step 4 adds a
   per-service source switch and «📥 Загрузить график из Excel».
 

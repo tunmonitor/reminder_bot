@@ -13,7 +13,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from datetime import date
+from datetime import date, timedelta
 from io import BytesIO
 
 from .excel_parser import _schedule_sheet_name
@@ -240,9 +240,44 @@ def gaps(plan: dict) -> list[str]:
     return lines
 
 
-def plan_text(service_label: str, plan: dict, summary: Summary, tz) -> str:
+WEEKDAYS = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
+
+
+def _weekday_date(day: date) -> str:
+    return f"{WEEKDAYS[day.weekday()]} {day:%d.%m}"
+
+
+def day_label(day: str, window: tuple[int, int] = (0, 0)) -> str:
+    """Дата графика; с окном дней служения — «01.11 (сб 31.10 – пн 02.11)»."""
+    sunday = date.fromisoformat(day)
+    start, end = window
+    if (start, end) == (0, 0):
+        return _short(day)
+    return (
+        f"{_short(day)} ({_weekday_date(sunday + timedelta(days=start))} – "
+        f"{_weekday_date(sunday + timedelta(days=end))})"
+    )
+
+
+def person_day(person: dict | None, day: str) -> str:
+    """« — чт 29.10» для человека с личным днём служения."""
+    offset = (person or {}).get("day_offset")
+    if offset is None:
+        return ""
+    return " — " + _weekday_date(date.fromisoformat(day) + timedelta(days=offset))
+
+
+def window_of(registry, service_id: str) -> tuple[int, int]:
+    settings = registry.get_readiness_settings(service_id)
+    return settings["day_from"], settings["day_to"]
+
+
+def plan_text(service_label: str, plan: dict, summary: Summary, tz,
+              window: tuple[int, int] = (0, 0)) -> str:
+    """window — окно дней служения от воскресенья (Уборка: −1, +1)."""
     year, month = map(int, plan["month"].split("-"))
     names = _names(summary.people)
+    by_key = {person["key"]: person for person in summary.people}
     silent = {person["key"] for person in summary.not_answered}
     polled = [person for person in summary.people if person["tasks"]]
     done, total = covered(plan)
@@ -267,7 +302,7 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz) -> str:
     ]
     used_silent = False
     for day in plan["dates"]:
-        lines += ["", f"🗓 {_short(day)}"]
+        lines += ["", f"🗓 {day_label(day, window)}"]
         for task in plan["tasks"]:
             people = plan["slots"].get(day, {}).get(task["name"], [])
             used_silent |= any(person in silent for person in people)
@@ -275,6 +310,7 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz) -> str:
                 task["name"], task["needed"],
                 [
                     names.get(person, person) + ("*" if person in silent else "")
+                    + person_day(by_key.get(person), day)
                     for person in people
                 ],
             )
@@ -407,17 +443,20 @@ def plan_changes(old: dict, new: dict, names: dict[str, str]) -> list[str]:
     return lines
 
 
-def publication_text(service: dict, plan: dict, people: list[dict]) -> str:
+def publication_text(service: dict, plan: dict, people: list[dict],
+                     window: tuple[int, int] = (0, 0)) -> str:
     """Утверждённый график для чата служения (с упоминаниями)."""
     year, month = map(int, plan["month"].split("-"))
     by_key = {person["key"]: person for person in people}
     update = plan["approved"] is not None
 
-    def mention(key: str) -> str:
+    def mention(key: str, day: str) -> str:
         person = by_key.get(key)
         if person is None:
             return key
-        return user_link(person["telegram_id"], person["name"])
+        return user_link(person["telegram_id"], person["name"]) + person_day(
+            person, day
+        )
 
     lines = [
         f"📅 График {service['name']} на {month_title(year, month)} "
@@ -430,11 +469,13 @@ def publication_text(service: dict, plan: dict, people: list[dict]) -> str:
             people_keys = plan["slots"].get(day, {}).get(task["name"], [])
             parts.append(
                 f"{task_emoji(task['name'])} {task['name']}: "
-                + (", ".join(mention(key) for key in people_keys) or "—")
+                + (", ".join(mention(key, day) for key in people_keys) or "—")
             )
-        lines.append(f"🗓 {_short(day)} — " + " · ".join(parts))
+        lines.append(f"🗓 {day_label(day, window)} — " + " · ".join(parts))
     if update:
         changes = plan_changes(plan["approved"], plan["slots"], _names(people))
+        if plan.get("republish"):
+            changes.append("• Изменены дни служения")
         if changes:
             lines += ["", "Изменения:"] + changes
     return "\n".join(lines)
@@ -573,7 +614,10 @@ async def publish(
 
     try:
         await send_telegram_screen(
-            send_chunk, chat_id, publication_text(service, plan, people),
+            send_chunk, chat_id,
+            publication_text(
+                service, plan, people, window_of(registry, service["id"])
+            ),
             limit=text_limit,
         )
     except BaseException:
@@ -590,6 +634,7 @@ async def publish(
             return registry.approve_schedule_plan(
                 actor_id, service["id"], plan["month"], plan["slots"],
                 chat_id=chat_id, message_id=sent[0] if sent else None,
+                updated_at=plan["updated_at"],
             )
         except Exception as exc:  # noqa: BLE001
             if attempt:

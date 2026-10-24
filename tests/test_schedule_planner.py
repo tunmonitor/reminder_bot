@@ -228,5 +228,27 @@ class SchedulePlannerTest(unittest.TestCase):
         self.assertEqual(plan.covered(), 150)
 
 
+    def test_rotation_when_more_people_than_seats(self):
+        # 4 воскресенья, нужен один: кто служил в прошлом месяце позже,
+        # тот в этом остаётся без служения.
+        dates = SUNDAYS[:4]
+        last = {
+            "Анна": date(2026, 10, 25), "Вера": date(2026, 10, 18),
+            "Галя": date(2026, 10, 11), "Даша": date(2026, 10, 4),
+        }
+        for people, out in (
+            (["Анна", "Вера", "Галя", "Даша", "Ева"], {"Анна"}),
+            (["Анна", "Вера", "Галя", "Даша", "Ева", "Женя"], {"Анна", "Вера"}),
+        ):
+            plan = build_plan(plan_input(
+                {person: set(dates) for person in people},
+                {person: {"уборка"} for person in people},
+                needed={"уборка": 1}, last_served=last, dates=dates,
+            ))
+            served = set(plan.load())
+            self.assertEqual(set(people) - served, out)
+            self.assertEqual(max(plan.load().values()), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

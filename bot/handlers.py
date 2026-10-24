@@ -1888,6 +1888,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return None
         return card
 
+    MEMBER_DAYS = (-6, -5, -4, -3, -2, -1, 0, 1, 2)
+
+    def member_day_label(offset: int) -> str:
+        weekday = schedule_plan.WEEKDAYS[(6 + offset) % 7]
+        return f"{weekday} (вс {offset:+d})"
+
     def member_button(text: str, action: str, service_id: str, token: str,
                       arg: str | None = None) -> InlineKeyboardButton:
         data = f"mbr:{action}:{service_id}:{token}" + (f".{arg}" if arg else "")
@@ -1918,6 +1924,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         token = secrets.token_urlsafe(6)
         pending["member_card"] = {"token": token, "name": name, "tasks": tasks}
         telegram_id = (person or member or {}).get("telegram_id")
+        # Действующий личный день (у человека может быть несколько строк).
+        day_offset = (person or member or {}).get("day_offset")
         username = (person or member or {}).get("username")
         if member is None:
             origin = "⚠️ нет в «Списках» (есть в графике или привязках)"
@@ -1937,6 +1945,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             f"Источник: {origin}",
             "Задачи: " + (", ".join(tasks) or "⚠️ нет — в график не попадает")
             + (" (заданы в боте)" if member and member["tasks_manual"] else ""),
+            "📅 День служения: " + (
+                member_day_label(day_offset)
+                if day_offset is not None else "как у всех"
+            ),
         ]
         scheduled = next(
             (item["schedule_tasks"]
@@ -1957,6 +1969,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if registry.list_service_tasks(service_id):
             # У служения без задач все в нём — выбирать нечего.
             rows.append([member_button("📝 Задачи", "tasks", service_id, token)])
+        if member is not None:
+            rows.append([member_button("📅 Свой день", "day", service_id, token)])
         if member is not None or person is not None:
             # Только в графике — удалять из состава нечего.
             rows.append([
@@ -2082,6 +2096,46 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         message, actor_id, service_id, name,
                         "✅ Задачи сохранены: " + ", ".join(tasks),
                     )
+            elif action == "day":
+                buttons = [
+                    member_button(
+                        f"📅 {member_day_label(offset)}", "dset", service_id,
+                        token, str(offset),
+                    )
+                    for offset in MEMBER_DAYS
+                ]
+                rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+                rows.append([member_button(
+                    "↩️ Как у всех", "dset", service_id, token, "n"
+                )])
+                rows.append([member_button(
+                    "⬅️ К человеку", "card", service_id, token
+                )])
+                await _send_dialog(
+                    message,
+                    f"📅 День служения · {name}\n\nВ какой день человек "
+                    "выполняет служение относительно воскресенья графика? "
+                    "Например, чт — «вс −3». Показывается в графике и "
+                    "публикации.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+                    _dialog_keep_rows=True,
+                    _dialog_keyboard_limit=sum(len(row) for row in rows),
+                    parse_mode=None,
+                )
+            elif action == "dset" and (
+                arg == "n" or arg.lstrip("-").isdigit()
+            ):
+                offset = None if arg == "n" else int(arg)
+                registry.set_service_member_day(
+                    actor_id, service_id, name, offset
+                )
+                await show_member_card(
+                    message, actor_id, service_id, name,
+                    "✅ День служения: " + (
+                        member_day_label(offset) if offset is not None
+                        else "как у всех"
+                    ),
+                )
             elif action == "del":
                 await _send_dialog(
                     message,
@@ -3446,6 +3500,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             parse_mode=None,
         )
 
+    # Окно дней служения от воскресенья (Уборка — сб–пн).
+    DAY_WINDOWS = {
+        (0, 0): "только вс", (-1, 0): "сб–вс", (0, 1): "вс–пн",
+        (-1, 1): "сб–пн", (-2, 0): "пт–вс", (-2, 1): "пт–пн",
+    }
     READINESS_TIMES = ("09:00", "10:00", "12:00", "18:00", "19:00", "20:00")
     READINESS_DEADLINES = ("12:00", "18:00", "20:00", "21:00", "22:00", "23:00")
 
@@ -3587,6 +3646,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "🔕 Выключить" if settings["enabled"] else "🟢 Включить",
                 "toggle", service_id,
             ),
+        ])
+        window = (settings["day_from"], settings["day_to"])
+        lines.append("📆 Дни служения: " + DAY_WINDOWS.get(window, "свои"))
+        rows.append([
+            readiness_button("📆 Дни служения", "days", service_id),
         ])
         rows.append([
             readiness_button("📝 Текст опроса", "tpl", service_id, "intro"),
@@ -3867,7 +3931,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             schedule_plan.plan_summary, service_registry(), plan, run
         )
         text = schedule_plan.plan_text(
-            service_label(service), plan, summary, context.timezone
+            service_label(service), plan, summary, context.timezone,
+            schedule_plan.window_of(service_registry(), service["id"]),
         )
         if notice:
             text = f"{notice}\n\n{text}"
@@ -4900,6 +4965,27 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
                 await _answer_callback(callback)
                 return
+            elif action == "days" and arg is None:
+                await show_readiness_choice(
+                    callback.message, service_id,
+                    "📆 В какие дни выполняется служение? Окно вокруг "
+                    "воскресенья — в графике и публикации (Уборка: сб–пн).",
+                    [(label, f"{low}_{high}") for (low, high), label
+                     in DAY_WINDOWS.items()],
+                    "days",
+                    f"{settings['day_from']}_{settings['day_to']}",
+                )
+                await _answer_callback(callback)
+                return
+            elif action == "days" and arg is not None:
+                low, _, high = arg.partition("_")
+                window = (int(low), int(high))
+                if window not in DAY_WINDOWS:
+                    raise ValueError("Неизвестное окно дней.")
+                registry.set_readiness_settings(
+                    actor_id, service_id, day_from=window[0], day_to=window[1],
+                )
+                notice = f"✅ Дни служения: {DAY_WINDOWS[window]}"
             elif action == "rem" and arg is None:
                 await show_readiness_choice(
                     callback.message, service_id,
@@ -5108,10 +5194,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 # Как сообщение будет выглядеть: месяц и срок опроса этого
                 # месяца (идущего или по расписанию), упоминания состава.
                 run = registry.get_readiness_run(service_id, key)
-                deadline = (
-                    readiness.deadline_of(run)
-                    if run is not None and run.get("deadline")
-                    else readiness.schedule(settings, year, month, tz)[1]
+                deadline = readiness.preview_deadline(
+                    run, settings, year, month, now
                 )
                 if arg == "intro":
                     body = readiness.intro_text(
@@ -5137,8 +5221,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     where = "в чате служения, когда опрос завершён"
                 await _send_dialog(
                     callback.message,
-                    f"👁 Предпросмотр · {where}\n\n"
-                    "──────────────────\n\n" + body,
+                    f"👁 Предпросмотр · {where}\n"
+                    "ℹ️ " + readiness.preview_note(
+                        run, settings, year, month, now
+                    )
+                    + (
+                        " Упоминания — текущий состав."
+                        if arg == "intro" else ""
+                    )
+                    + "\n\n──────────────────\n\n" + body,
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                         readiness_button("⬅️ К тексту", "tpl", service_id, arg)
                     ]]),
