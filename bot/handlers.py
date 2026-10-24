@@ -3568,6 +3568,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         f"▶️ Автозапуск выключен — опрос на {title} не "
                         f"запускался (окно: {when_start} – {when_end})."
                     )
+                elif settings.get("enabled_at") and datetime.fromisoformat(
+                    settings["enabled_at"]
+                ) > start:
+                    # Включён после начала окна — этот месяц не ожидался.
+                    head = (
+                        f"▶️ Автозапуск включён после времени запуска "
+                        f"({when_start}) — опрос на {title} не запускался."
+                    )
                 else:
                     head = (
                         f"▶️ Опрос на {title} ожидался {when_start} – "
@@ -3629,7 +3637,19 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     if free_plan is not None else "."
                 )
             )
-            if missed:
+            if missed and not service.get("enabled", True):
+                lines.append(
+                    "❗ Служение выключено — опрос не запустится. Включите "
+                    "служение или составьте график без опроса («🧮 "
+                    "Составить без опроса») и отправьте его."
+                )
+            elif missed and not service.get("group_chat_id"):
+                lines.append(
+                    "❗ Чат служения не привязан — опрос не запустится. "
+                    "Привяжите чат или составьте график без опроса («🧮 "
+                    "Составить без опроса»)."
+                )
+            elif missed:
                 lines.append(
                     "❗ Сейчас нужно запустить опрос вручную («🗳 Запустить "
                     "опрос») или составить график без опроса («🧮 Составить "

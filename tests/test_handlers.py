@@ -6280,6 +6280,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
 
         async def run():
+            unbound = await open_at(deadline + timedelta(hours=1))
+            self.assertIn("❗ Служение выключено", unbound)
+            self.registry.set_group_chat(67890, "sound", -1005555, enabled=True)
             before = await open_at(start - timedelta(days=2))
             self.assertIn("▶️ Запуск:", before)
             self.assertNotIn("сроки прошли", before)
@@ -6287,8 +6290,21 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIn("Автозапуск выключен", after)
             self.assertIn("❗ Сейчас нужно запустить опрос вручную", after)
             self.registry.set_readiness_settings(67890, "sound", enabled=True)
+            # Включён только что (после окна) — не «ожидался».
+            late = await open_at(deadline + timedelta(hours=1))
+            self.assertIn("Автозапуск включён после времени запуска", late)
+            with closing(sqlite3.connect(self.registry.path)) as connection:
+                connection.execute(
+                    "UPDATE readiness_settings SET enabled_at = ?",
+                    ((start - timedelta(days=5)).isoformat(),),
+                )
+                connection.commit()
             expected = await open_at(deadline + timedelta(hours=1))
             self.assertIn("сроки прошли, опрос не запускался", expected)
+            self.registry.set_group_chat(67890, "sound", -1005555, enabled=False)
+            disabled = await open_at(deadline + timedelta(hours=1))
+            self.assertIn("❗ Служение выключено", disabled)
+            self.registry.set_group_chat(67890, "sound", -1005555, enabled=True)
             # Попытка автозапуска была и не удалась.
             self.registry.claim_readiness_notice(
                 "sound", f"{year:04d}-{month:02d}", "launch"
