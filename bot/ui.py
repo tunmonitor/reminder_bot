@@ -153,6 +153,9 @@ def render_screen_chunks(text: str, limit: int = MAX_SCREEN_UNITS) -> list[str]:
                 current = []
                 current_units = 0
                 extra = visible_units(segment)
+            if not current and not segment.strip():
+                # Пустая строка в начале части — без пустого заголовка.
+                continue
             current.append(segment)
             current_units += extra
     if current:

@@ -21,11 +21,13 @@ from .group_send import send_to_service_group
 from .month_summary import month_end, month_key, month_title
 from .presentation import task_emoji
 from .readiness import (
+    DEFAULT_PLAN_TITLE,
     Summary,
     month_sundays,
     local_text,
     month_of,
     outside_name,
+    render_template,
     summarize,
     task_lines,
 )
@@ -525,10 +527,23 @@ def plan_changes(old: dict, new: dict, names: dict[str, str]) -> list[str]:
     return lines
 
 
+def publication_title(service: dict, month: str, update: bool,
+                      template: str | None = None) -> str:
+    """Заголовок графика в чате служения (шаблон «📝 Тексты»)."""
+    year, month_number = map(int, month.split("-"))
+    return render_template(
+        template or DEFAULT_PLAN_TITLE,
+        service_name=service["name"],
+        month=month_title(year, month_number),
+        status="обновлён" if update else "утверждён",
+    )
+
+
 def publication_text(service: dict, plan: dict, people: list[dict],
-                     window: tuple[int, int] = (0, 0)) -> str:
-    """Утверждённый график для чата служения (с упоминаниями)."""
-    year, month = map(int, plan["month"].split("-"))
+                     window: tuple[int, int] = (0, 0),
+                     title_template: str | None = None) -> str:
+    """Утверждённый график для чата служения (с упоминаниями): дата,
+    под ней задачи — каждая с новой строки."""
     by_key = {person["key"]: person for person in people}
     update = plan["approved"] is not None
 
@@ -541,23 +556,21 @@ def publication_text(service: dict, plan: dict, people: list[dict],
         )
 
     lines = [
-        f"📅 График {service['name']} на {month_title(year, month)} "
-        + ("обновлён" if update else "утверждён"),
-        "",
+        publication_title(service, plan["month"], update, title_template),
     ]
     for day in plan["dates"]:
-        parts = []
         label, shared_day = date_header(plan, by_key, day, window)
+        lines += ["", f"🗓 {label}"]
         for task in plan["tasks"]:
             people_keys = plan["slots"].get(day, {}).get(task["name"], [])
             people_text = ", ".join(
                 mention(key, day, shared_day) for key in people_keys
             ) or "—"
-            parts.append(
-                people_text if implicit_plan(plan)
-                else f"{task_emoji(task['name'])} {task['name']}: {people_text}"
+            lines.append(
+                f"  {people_text}" if implicit_plan(plan)
+                else f"  {task_emoji(task['name'])} {task['name']}: "
+                f"{people_text}"
             )
-        lines.append(f"🗓 {label} — " + " · ".join(parts))
     if update:
         changes = plan_changes(plan["approved"], plan["slots"], _names(people))
         names = _names(people)
@@ -722,7 +735,10 @@ async def publish(
         await send_telegram_screen(
             send_chunk, chat_id,
             publication_text(
-                service, plan, people, window_of(registry, service["id"])
+                service, plan, people, window_of(registry, service["id"]),
+                registry.get_readiness_settings(service["id"])[
+                    "plan_title_template"
+                ],
             ),
             limit=text_limit,
         )

@@ -412,3 +412,12 @@ class CleanPreviousMenuTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScreenChunkBlankLineTest(unittest.TestCase):
+    def test_chunk_never_starts_with_blank_line(self):
+        from bot.ui import render_screen_chunks
+        text = "Заголовок\n" + "\n\n".join("строка %02d" % i for i in range(20))
+        for limit in range(32, 80):
+            for chunk in render_screen_chunks(text, limit):
+                self.assertFalse(chunk.startswith("<b></b>"), (limit, chunk))

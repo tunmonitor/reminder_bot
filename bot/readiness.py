@@ -37,6 +37,7 @@ from .schedule_planner import Plan, PlanInput, build_plan
 from .service_registry import (  # noqa: F401 — шаблоны для экранов
     DEFAULT_READINESS_CHAT_REMINDER,
     DEFAULT_READINESS_CLOSED,
+    DEFAULT_PLAN_TITLE,
     DEFAULT_READINESS_QUESTION,
     DEFAULT_READINESS_INTRO,
     DEFAULT_READINESS_REMINDER,
