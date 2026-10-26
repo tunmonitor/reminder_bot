@@ -497,6 +497,15 @@ class ServiceRegistry:
                     PRIMARY KEY (service_id, name)
                 );
 
+                -- Какой Telegram ID носил @username, когда бот его видел
+                -- (сообщение, нажатие, ответ на опрос): username может
+                -- перейти к другому человеку, правки админа — не наблюдение.
+                CREATE TABLE IF NOT EXISTS seen_usernames (
+                    username TEXT PRIMARY KEY,
+                    telegram_id INTEGER NOT NULL CHECK (telegram_id > 0),
+                    seen_at TEXT NOT NULL
+                );
+
                 -- Привязка только по @username: Telegram ID станет известен,
                 -- когда человек напишет боту (нажмёт кнопку, ответит на
                 -- опрос). task = '' — во всех задачах человека (карточка).
@@ -2596,24 +2605,48 @@ class ServiceRegistry:
             ).fetchone()
         return dict(row) if row else None
 
+    def note_seen_username(self, telegram_id: int, username: str) -> None:
+        """Бот видел @username у этого Telegram ID (сам пользователь, не
+        правка админа). Прежний username этого ID забывается."""
+        _validate_positive_id(telegram_id, "telegram_id")
+        username = (username or "").strip().lstrip("@").casefold()
+        # От наблюдений не зависят задачи планировщика и резервная копия.
+        with self._connection(notify=False) as connection:
+            connection.execute(
+                "DELETE FROM seen_usernames WHERE telegram_id = ? "
+                "AND username != ?",
+                (telegram_id, username),
+            )
+            if username:
+                connection.execute(
+                    "INSERT INTO seen_usernames (username, telegram_id, seen_at) "
+                    "VALUES (?, ?, ?) ON CONFLICT(username) DO UPDATE SET "
+                    "telegram_id = excluded.telegram_id, "
+                    "seen_at = excluded.seen_at",
+                    (username, telegram_id, _utc_now()),
+                )
+
     def known_telegram_id(self, username: str) -> int | None:
-        """Telegram ID по @username из того, что бот уже видел: состав,
-        привязки, админы, ответы на опрос (без учёта регистра)."""
+        """Telegram ID по @username — только по наблюдениям бота: кто
+        писал боту или отвечал на опрос с этим username (самое свежее).
+        Записи, внесённые админом, не в счёт: username мог перейти к
+        другому человеку."""
         username = (username or "").strip().lstrip("@").casefold()
         if not username:
             return None
-        # Самая свежая запись: username мог перейти к другому человеку.
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT telegram_id FROM ("
-                "SELECT telegram_id, updated_at AS seen FROM service_members "
-                "WHERE telegram_id IS NOT NULL AND lower(username) = :name "
-                "UNION ALL SELECT telegram_id, updated_at FROM "
-                "responsible_contacts WHERE lower(username) = :name "
-                "UNION ALL SELECT telegram_id, created_at FROM service_admins "
-                "WHERE lower(username) = :name "
+                "SELECT telegram_id, seen_at AS seen FROM seen_usernames "
+                "WHERE username = :name "
+                # Ответ на опрос не в счёт, если позже бот видел у этого
+                # ID другой username (человек сменил его).
                 "UNION ALL SELECT telegram_id, answered_at FROM "
-                "readiness_answers WHERE lower(username) = :name"
+                "readiness_answers AS answer WHERE lower(username) = :name "
+                "AND NOT EXISTS (SELECT 1 FROM seen_usernames AS seen "
+                "WHERE seen.telegram_id = answer.telegram_id "
+                "AND seen.username != :name "
+                "AND seen.seen_at > answer.answered_at)"
                 ") ORDER BY seen DESC LIMIT 1",
                 {"name": username},
             ).fetchone()
@@ -2634,6 +2667,9 @@ class ServiceRegistry:
         with self._connection() as connection:
             self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
+            # Новая привязка человека заменяет прежние ожидания (любой
+            # задачи): иначе старый username мог бы прийти первым.
+            self._drop_username_binding(connection, service_id, name)
             connection.execute(
                 "INSERT INTO username_bindings (service_id, name, task, "
                 "username, tasks_json, actor_id, created_at) "
@@ -3950,6 +3986,12 @@ class ServiceRegistry:
             connection.execute(
                 "DELETE FROM responsible_contacts WHERE service_id = ? "
                 f"AND name = ? AND task NOT IN ({placeholders})",
+                (service_id, name, *tasks),
+            )
+            # Ожидание по @username для снятой задачи вернуло бы её.
+            connection.execute(
+                "DELETE FROM username_bindings WHERE service_id = ? "
+                f"AND name = ? AND task != '' AND task NOT IN ({placeholders})",
                 (service_id, name, *tasks),
             )
             if telegram_id:

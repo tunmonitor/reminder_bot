@@ -423,17 +423,27 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     # Отложенные привязки по @username: None — перечитать из базы.
     username_waiting: dict[str, set[str] | None] = {"names": None}
+    # Последний виденный username по Telegram ID (чтобы не писать в базу
+    # на каждое сообщение).
+    username_seen: dict[int, str] = {}
 
     async def complete_username_bindings(user) -> None:
         """Человек с ожидаемым @username написал боту — привязываем его
         и сообщаем админу, который задал привязку."""
         username = getattr(user, "username", None) or ""
-        if not username or getattr(user, "is_bot", False):
+        user_id = getattr(user, "id", None)
+        if getattr(user, "is_bot", False) or not isinstance(user_id, int):
             return
         registry = service_registry()
         if registry is None:
             return
         try:
+            # Наблюдение «ID ↔ username» — только при изменении.
+            if username_seen.get(user_id) != username.casefold():
+                registry.note_seen_username(user_id, username)
+                username_seen[user_id] = username.casefold()
+            if not username:
+                return
             if username_waiting["names"] is None:
                 username_waiting["names"] = registry.pending_usernames()
             if username.casefold() not in username_waiting["names"]:
@@ -2068,12 +2078,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "",
             "Telegram: " + (
                 (f"@{username}" if username else f"ID {telegram_id}")
-                if telegram_id else (
-                    f"⏳ ждёт @{waiting} — привяжется, когда он(а) "
-                    "напишет боту"
-                    if (waiting := registry.username_binding(service_id, name))
-                    else "⚪ не привязан"
-                )
+                if telegram_id else "⚪ не привязан"
+            ) + (
+                f"\n⏳ ждёт @{waiting} — привяжется, когда он(а) напишет боту"
+                if (waiting := registry.username_binding(service_id, name))
+                else ""
             ),
             f"Источник: {origin}",
             "Задачи: " + (", ".join(tasks) or "⚠️ нет — в график не попадает")

@@ -6957,6 +6957,16 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 "уже привязан к «Пётр»",
                 self.context.bot.send_message.await_args.kwargs["text"],
             )
+            # Смена Telegram по @username — в карточке и текущий, и ожидаемый.
+            self.registry.add_username_binding(67890, "sound", "Пётр", "", "petr_next")
+            card = await self.press_inline(
+                (await self.open_members()).message, "✅ Пётр · @petr_new",
+                "on_contact_person_choice",
+            )
+            self.assertIn(
+                "Telegram: @petr_new\n⏳ ждёт @petr_next",
+                card.message.answer.await_args.args[0],
+            )
             self.assertNotIn(
                 ("Мария", 77777),
                 {

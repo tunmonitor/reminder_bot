@@ -2259,7 +2259,10 @@ class UsernameBindingTest(unittest.TestCase):
             [("Борис", "звук", 1001)],
         )
         self.assertEqual(registry.take_username_bindings("boris_b"), [])
+        # Правка админа — не наблюдение: ID по ней не подставляется.
         registry.set_responsible_contact(1001, "sound", "звук", "Борис", 555, "Boris_B")
+        self.assertIsNone(registry.known_telegram_id("@boris_b"))
+        registry.note_seen_username(555, "Boris_B")
         self.assertEqual(registry.known_telegram_id("@boris_b"), 555)
 
     def test_binding_by_id_or_removal_drops_pending(self):
@@ -2283,7 +2286,19 @@ class UsernameBindingTest(unittest.TestCase):
         self.assertEqual(registry.take_username_bindings("boris_b"), [])
         with self.assertRaises(ValueError):
             registry.add_username_binding(1001, "sound", "Борис", "", "bad name")
-        # Username перешёл к другому — берётся самая свежая запись.
-        registry.set_responsible_contact(1001, "sound", "звук", "Старый", 111, "foo_user")
-        registry.set_responsible_contact(1001, "sound", "звук", "Новый", 222, "foo_user")
+        # Username перешёл к другому — по последнему наблюдению.
+        registry.note_seen_username(111, "foo_user")
+        registry.note_seen_username(222, "Foo_User")
         self.assertEqual(registry.known_telegram_id("foo_user"), 222)
+        # Сменил username — прежний за ним больше не числится.
+        registry.note_seen_username(222, "bar_user")
+        self.assertIsNone(registry.known_telegram_id("foo_user"))
+        self.assertEqual(registry.known_telegram_id("bar_user"), 222)
+
+    def test_new_binding_replaces_pending_and_task_removal_drops_it(self):
+        registry = self.registry
+        registry.add_username_binding(1001, "sound", "Борис", "", "old_name")
+        registry.add_username_binding(1001, "sound", "Борис", "звук", "new_name")
+        self.assertEqual(registry.pending_usernames(), {"new_name"})
+        registry.set_service_member_tasks(1001, "sound", "Борис", ["сборка"])
+        self.assertEqual(registry.pending_usernames(), set())

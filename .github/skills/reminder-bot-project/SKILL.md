@@ -397,7 +397,9 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   empty. Two passes over the month: required seats for all dates (then
   `improve_plan`), then optional seats only for respondents with no
   service within a week either way; improvement never puts a reluctant
-  person beyond `needed`.
+  person beyond `needed`. `summarize` adds non-respondents (incl. no
+  Telegram) as reluctant; `progress_text` lists respondents with dates and
+  the plan per Sunday and task («*» = non-respondent).
 - Removing an in-list member records `service_member_exclusions`;
   `sync_service_rosters` skips those names until the person is added in
   the bot again (`_clear_member_exclusion`).
@@ -412,9 +414,13 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   Binding by ID or removal drops the pending row. Pending rows expire
   after `USERNAME_BINDING_DAYS` (30); completion is refused (admin gets
   ❌) when the user is already bound to another name in the service;
-  `known_telegram_id` takes the newest record across tables. `summarize` adds non-respondents (incl. no
-  Telegram) as reluctant; `progress_text` lists respondents with dates and
-  the plan per Sunday and task («*» = non-respondent).
+  `known_telegram_id` uses only observations: `seen_usernames` (written
+  by the middleware when a user's username changes, `note_seen_username`
+  forgets the ID's previous username) and `readiness_answers`, newest
+  first; admin-entered usernames don't count. A new pending binding for a
+  person replaces older ones (any task); `set_service_member_tasks` drops
+  pending rows of removed tasks; the card shows a pending username next
+  to the current account.
 - Launch reserves the run row before sending (`attach_readiness_poll`
   after), deletes it on failure. Closing notice is tracked by
   `closed_announced` and retried; the admin result is fitted into one
