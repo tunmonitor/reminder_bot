@@ -484,6 +484,20 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   only `ADMIN_OPERATIONS` (service_admin_add/remove) stay super-admin-only;
   registry uses `_require_service_editor` everywhere else; `/test_notify` —
   main admin only.
+- Readiness poll texts: `question_template` (`readiness.question_text`, fields
+  service_name/month/month_in, ≤300, sent with `question_parse_mode=None`,
+  blank → default); «📝 Тексты» (`show_readiness_texts`, kind "q").
+  Poll options by day window (`readiness.option_label`), intro footnote
+  `own_days_note` (readiness_people `in_roster`, @username for same names).
+- Approved plan snapshot `served_offsets_json` (`schedule_plan.served_offsets`,
+  passed to `approve_schedule_plan`); `last_served` uses it (legacy plans:
+  approved_days, else personal day). Planner: gap under a week counts as
+  1 week; rotation weeks clamped ≥0.
+- Chat binding by service admins: `set_group_chat` — group only (ID<0), not
+  bound to another service (own chat OK); handlers `require_chat_member`
+  (get_chat type group/supergroup + get_chat_member; errors/timeouts →
+  PermissionError) for manual IDs. Interactive loader passes
+  `own_roster_only=True` (sync only that service's «Списки»).
 - User guides: `docs/ADMIN_GUIDE.md` and `docs/VOLUNTEER_GUIDE.md` (Russian,
   schematic screens). Update them together with UI changes.
 - Customer decision 5 (24.10): Excel may stop being filled — step 4 adds a
