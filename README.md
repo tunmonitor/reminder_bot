@@ -1,5 +1,6 @@
 ```markdown
 # reminder_bot
+# дополнительная проверка
 
 Telegram-бот напоминаний по расписанию для Raspberry Pi.
 
