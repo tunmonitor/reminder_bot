@@ -314,7 +314,7 @@ class SchedulePlanTest(unittest.TestCase):
         # Без опроса свободны все: минимум закрыт везде, место сверх
         # минимума — только без служения подряд (трое на 2 места в неделю).
         self.assertTrue(all(1 <= count <= 2 for count in counts))
-        self.assertGreaterEqual(sum(counts), 8)
+        self.assertIn(2, counts)
         for days in schedule_plan.served_dates(plan["slots"]).values():
             for earlier, later in zip(days, days[1:]):
                 self.assertGreater(

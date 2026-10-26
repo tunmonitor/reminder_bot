@@ -195,6 +195,22 @@ class SchedulePlannerTest(unittest.TestCase):
             for earlier, later in zip(days, days[1:]):
                 self.assertGreater((later - earlier).days, 7)
 
+    def test_extra_seat_does_not_force_next_week(self):
+        # Двое на две недели подряд: место сверх минимума 01.11 пустое,
+        # иначе кто-то служил бы и 08.11.
+        dates = SUNDAYS[:2]
+        plan = build_plan(plan_input(
+            {"Анна": set(dates), "Вера": set(dates)},
+            {"Анна": {"звук"}, "Вера": {"звук"}},
+            needed={"звук": 1}, extra={"звук": 1}, dates=dates,
+        ))
+        self.assertEqual(
+            [len(plan.slots[(day, "звук")]) for day in dates], [1, 1]
+        )
+        self.assertNotEqual(
+            plan.slots[(dates[0], "звук")], plan.slots[(dates[1], "звук")]
+        )
+
     def test_respondent_before_non_respondent(self):
         # Ответивший не может 15.11 — там не ответивший; служить подряд
         # никому не приходится, не ответивший ставится и 01.11.

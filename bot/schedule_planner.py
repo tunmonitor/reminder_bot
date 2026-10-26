@@ -25,9 +25,10 @@
 RELUCTANT_WEIGHT: лучше не ответивший, чем служение подряд.
 
 У задачи — минимум людей (`needed`, недобор — ⚠️) и сверх него до
-максимума (`extra`). На каждую дату два прохода: сначала обязательные
-места всех задач (ответившие дешевле не ответивших), затем места сверх
-минимума — только оставшимися ответившими.
+максимума (`extra`). Два прохода по месяцу: сначала обязательные места
+всех задач на все даты (ответившие дешевле не ответивших), затем места
+сверх минимума — только ответившими, у кого нет служения ни за неделю
+до, ни через неделю после (иначе место сверх минимума остаётся пустым).
 """
 from __future__ import annotations
 
@@ -235,7 +236,10 @@ def build_plan(data: PlanInput) -> Plan:
     load: dict[str, int] = {}
     last: dict[str, date] = dict(data.last_served)
 
-    def assign(event_date: date, people: list[str], seats: list[str]) -> set[str]:
+    def assign(
+        event_date: date, people: list[str], seats: list[str],
+        cost: dict[str, int],
+    ) -> None:
         allowed = {
             person: {
                 index for index, task in enumerate(seats)
@@ -243,39 +247,57 @@ def build_plan(data: PlanInput) -> Plan:
             }
             for person in people
         }
-        # Прирост общей стоимости от ещё одного служения человека.
-        cost = {
-            person: LOAD_WEIGHT * (2 * load.get(person, 0) + 1)
-            + _gap_penalty(last.get(person), event_date)
-            + (0 if load.get(person) else _rotation_penalty(data, person))
-            + (RELUCTANT_WEIGHT if person in data.reluctant else 0)
-            for person in people
-        }
         matching = _min_cost_matching(people, seats, allowed, cost)
         for seat, person in sorted(matching.items()):
             plan.slots[(event_date, seats[seat])].append(person)
             load[person] = load.get(person, 0) + 1
             last[person] = event_date
-        return set(matching.values())
 
-    for event_date in sorted(set(data.dates)):
-        people = sorted(
+    def free_on(event_date: date) -> list[str]:
+        return sorted(
             person for person in data.free if event_date in data.free[person]
         )
-        # Сначала минимум задач — все (ответившие дешевле); затем места
-        # сверх минимума — только оставшиеся ответившие и не подряд:
-        # место сверх минимума можно и не закрывать.
-        busy = assign(event_date, people, required)
-        assign(
-            event_date,
-            [
-                person for person in people
-                if person not in busy and person not in data.reluctant
-                and _gap_penalty(last.get(person), event_date)
-                < BACK_TO_BACK_WEIGHT
-            ],
-            optional,
-        )
+
+    # Сначала минимум задач на весь месяц — все (ответившие дешевле).
+    for event_date in sorted(set(data.dates)):
+        people = free_on(event_date)
+        # Прирост общей стоимости от ещё одного служения человека.
+        assign(event_date, people, required, {
+            person: LOAD_WEIGHT * (2 * load.get(person, 0) + 1)
+            + _gap_penalty(last.get(person), event_date)
+            + (0 if load.get(person) else _rotation_penalty(data, person))
+            + (RELUCTANT_WEIGHT if person in data.reluctant else 0)
+            for person in people
+        })
+    improve_plan(plan, data)
+    # Затем места сверх минимума — только ответившими и без служения
+    # подряд ни с прошлой, ни со следующей датой: место сверх минимума
+    # можно и не закрывать, а закрытое не должно вынуждать служить подряд.
+    served: dict[str, set[date]] = {}
+    for (event_date, _), people in plan.slots.items():
+        for person in people:
+            served.setdefault(person, set()).add(event_date)
+    for event_date in sorted(set(data.dates)):
+        people = [
+            person for person in free_on(event_date)
+            if person not in data.reluctant
+            and not any(
+                abs((other - event_date).days) <= 7
+                for other in served.get(person, set())
+            )
+            and _gap_penalty(data.last_served.get(person), event_date)
+            < BACK_TO_BACK_WEIGHT
+        ]
+        assign(event_date, people, optional, {
+            person: _person_cost(
+                data, person, served.get(person, set()) | {event_date}
+            ) - _person_cost(data, person, served.get(person, set()))
+            for person in people
+        })
+        for (day, _), names in plan.slots.items():
+            if day == event_date:
+                for person in names:
+                    served.setdefault(person, set()).add(day)
     improve_plan(plan, data)
     for people in plan.slots.values():
         people.sort()
