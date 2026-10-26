@@ -6889,6 +6889,103 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_member_binding_by_username_only(self):
+        async def run():
+            members = await self.open_members()
+            person = await self.open_person(members.message, "⚪ Пётр · не привязан")
+            self.assertIn(
+                "или только @username", person.message.answer.await_args.args[0]
+            )
+            confirmation = await self.type_text("@Petr_New")
+            text = confirmation.answer.await_args.args[0]
+            self.assertIn("привязать «Пётр» (все его задачи служения) к @Petr_New", text)
+            self.assertIn("Бот ещё не видел", text)
+            result = await self.press_inline(
+                confirmation, "✅ Подтвердить", "on_username_binding"
+            )
+            self.assertIn(
+                "привяжется к @Petr_New", result.message.answer.await_args.args[0]
+            )
+            self.assertEqual(self.registry.username_binding("sound", "Пётр"), "Petr_New")
+
+            # Человек пишет боту (username в другом регистре) — привязан,
+            # админу приходит сообщение.
+            middleware = next(
+                item for item in self.admin_router.message.outer_middleware
+                if item.__name__ == "username_binding_middleware"
+            )
+            handler = AsyncMock()
+            event = SimpleNamespace(
+                from_user=SimpleNamespace(id=77777, username="petr_new", is_bot=False)
+            )
+            await middleware(handler, event, {})
+            handler.assert_awaited_once()
+            member = next(
+                item for item in self.registry.list_service_members("sound")
+                if item["name"] == "Пётр"
+            )
+            self.assertEqual(member["telegram_id"], 77777)
+            self.assertIsNone(self.registry.username_binding("sound", "Пётр"))
+            sent = self.context.bot.send_message.await_args.kwargs
+            self.assertEqual(sent["chat_id"], 67890)
+            self.assertIn("«Пётр» привязан(а)", sent["text"])
+
+            # Username ушёл к другому и вернулся — снова за первым.
+            for user_id in (88888, 77777):
+                await middleware(handler, SimpleNamespace(
+                    from_user=SimpleNamespace(
+                        id=user_id, username="petr_new", is_bot=False
+                    )
+                ), {})
+            self.assertEqual(self.registry.known_telegram_id("petr_new"), 77777)
+
+            # Повторное сообщение — привязок больше нет.
+            self.context.bot.send_message.reset_mock()
+            await middleware(handler, event, {})
+            self.context.bot.send_message.assert_not_awaited()
+
+            # Уже знакомый боту @username — сразу обычное подтверждение с ID.
+            await self.open_person(
+                (await self.open_members()).message, "⚠️ Мария · нет в списке"
+            )
+            confirmation = await self.type_text("@petr_new")
+            self.assertIn("77777", confirmation.answer.await_args.args[0])
+
+            # Пришедший уже привязан к другому имени — не перепривязывается.
+            await self.open_person(
+                (await self.open_members()).message, "⚠️ Мария · нет в списке"
+            )
+            await self.press_inline(
+                await self.type_text("@petr_alt"), "✅ Подтвердить",
+                "on_username_binding",
+            )
+            await middleware(handler, SimpleNamespace(
+                from_user=SimpleNamespace(id=77777, username="petr_alt", is_bot=False)
+            ), {})
+            self.assertIn(
+                "уже привязан к «Пётр»",
+                self.context.bot.send_message.await_args.kwargs["text"],
+            )
+            # Смена Telegram по @username — в карточке и текущий, и ожидаемый.
+            self.registry.add_username_binding(67890, "sound", "Пётр", "", "petr_next")
+            card = await self.press_inline(
+                (await self.open_members()).message, "✅ Пётр · @petr_new",
+                "on_contact_person_choice",
+            )
+            self.assertIn(
+                "Telegram: @petr_new\n⏳ ждёт @petr_next",
+                card.message.answer.await_args.args[0],
+            )
+            self.assertNotIn(
+                ("Мария", 77777),
+                {
+                    (item["name"], item["telegram_id"])
+                    for item in self.registry.list_service_members("sound")
+                },
+            )
+
+        asyncio.run(run())
+
     def test_member_binding_covers_all_schedule_tasks(self):
         async def run():
             members = await self.open_members()

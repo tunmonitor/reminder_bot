@@ -421,6 +421,113 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             observer = getattr(admin_router, observer_name)
         observer.outer_middleware(middleware)
 
+    # Отложенные привязки по @username: None — перечитать из базы.
+    username_waiting: dict[str, set[str] | None] = {"names": None}
+    # Последний виденный username по Telegram ID и владелец username
+    # (чтобы не писать в базу на каждое сообщение).
+    username_seen: dict[int, str] = {}
+    username_owner: dict[str, int] = {}
+
+    async def complete_username_bindings(user) -> None:
+        """Человек с ожидаемым @username написал боту — привязываем его
+        и сообщаем админу, который задал привязку."""
+        username = getattr(user, "username", None) or ""
+        user_id = getattr(user, "id", None)
+        if getattr(user, "is_bot", False) or not isinstance(user_id, int):
+            return
+        registry = service_registry()
+        if registry is None:
+            return
+        try:
+            # Наблюдение «ID ↔ username» — только при изменении (в том
+            # числе когда username вернулся к прежнему владельцу).
+            seen = username.casefold()
+            if username_seen.get(user_id) != seen or (
+                seen and username_owner.get(seen) != user_id
+            ):
+                registry.note_seen_username(user_id, username)
+                previous = username_seen.get(user_id)
+                if previous and username_owner.get(previous) == user_id:
+                    username_owner.pop(previous, None)
+                username_seen[user_id] = seen
+                if seen:
+                    username_owner[seen] = user_id
+            if not username:
+                return
+            if username_waiting["names"] is None:
+                username_waiting["names"] = registry.pending_usernames()
+            if username.casefold() not in username_waiting["names"]:
+                return
+            bindings = registry.take_username_bindings(username)
+        except sqlite3.Error:
+            debug.exception("Не удалось прочитать привязки по username")
+            return
+        username_waiting["names"].discard(username.casefold())
+        for binding in bindings:
+            service_id, name = binding["service_id"], binding["name"]
+            try:
+                # Этот Telegram уже привязан к другому имени в служении —
+                # чужую привязку молча не перезаписываем.
+                bound = registry.service_person(service_id, user.id)
+                if bound is not None and bound["name"] != name:
+                    raise ValueError(
+                        f"этот Telegram уже привязан к «{bound['name']}». "
+                        "Проверьте и привяжите вручную"
+                    )
+                if binding["task"]:
+                    registry.set_responsible_contact(
+                        binding["actor_id"], service_id, binding["task"],
+                        name, user.id, username,
+                    )
+                else:
+                    registry.bind_service_member(
+                        binding["actor_id"], service_id, name, user.id,
+                        username, tasks=binding["tasks"],
+                    )
+            except (PermissionError, ValueError, sqlite3.Error) as exc:
+                debug.warning(
+                    "Привязка по username не выполнена (%s): %s",
+                    service_id, exc,
+                )
+                text = (
+                    f"❌ @{username} написал(а) боту, но привязать "
+                    f"«{name}» не удалось: {exc}"
+                )
+            else:
+                actor_pending = pending_inputs.get(binding["actor_id"]) or {}
+                if actor_pending.get("service_id") == service_id:
+                    refresh_registered_contacts(binding["actor_id"], service_id)
+                service = service_by_id(registry, service_id)
+                text = (
+                    f"✅ @{username} написал(а) боту — «{name}» привязан(а) "
+                    + (f"к задаче «{binding['task']}»" if binding["task"]
+                       else "во всех задачах")
+                    + (f" · {service_label(service)}" if service else "")
+                )
+            try:
+                await context.bot.send_message(
+                    chat_id=binding["actor_id"], text=text, parse_mode=None,
+                )
+            except Exception:  # noqa: BLE001
+                debug.warning(
+                    "Не удалось сообщить о привязке по username", exc_info=True
+                )
+
+    async def username_binding_middleware(handler, event, data):
+        user = getattr(event, "from_user", None) or getattr(event, "user", None)
+        if user is not None:
+            try:
+                await complete_username_bindings(user)
+            except Exception:  # noqa: BLE001
+                debug.exception("Сбой отложенной привязки по username")
+        return await handler(event, data)
+
+    for observer_name in ("callback_query", "message", "poll_answer"):
+        observer = getattr(dispatcher, observer_name, None)
+        if not callable(getattr(observer, "outer_middleware", None)):
+            observer = getattr(admin_router, observer_name)
+        observer.outer_middleware(username_binding_middleware)
+
     session_middleware = getattr(
         getattr(getattr(context, "bot", None), "session", None),
         "middleware",
@@ -1982,6 +2089,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "Telegram: " + (
                 (f"@{username}" if username else f"ID {telegram_id}")
                 if telegram_id else "⚪ не привязан"
+            ) + (
+                f"\n⏳ ждёт @{waiting} — привяжется, когда он(а) напишет боту"
+                if (waiting := registry.username_binding(service_id, name))
+                else ""
             ),
             f"Источник: {origin}",
             "Задачи: " + (", ".join(tasks) or "⚠️ нет — в график не попадает")
@@ -7407,20 +7518,30 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         await _send_dialog(message, f"Нажмите кнопку и выберите пользователя Telegram для имени "
             f"«{contact_name}» {scope}. "
             "Или отправьте Telegram ID, при желании дополнив username "
-            "через пробел: 123456789 @username. "
+            "через пробел: 123456789 @username, — или только @username: "
+            "привязка завершится, когда человек напишет боту. "
             f"«{CONTACT_BACK_TEXT}» — вернуться к выбору человека. "
             "Проверьте выбор — назначение подтвердите на следующем шаге.",
             reply_markup=keyboard,
             parse_mode=None,
         )
 
-    def parse_manual_user(text: str) -> tuple[int, str]:
+    def parse_manual_user(
+        text: str, username_only: bool = False,
+    ) -> tuple[int | None, str]:
+        """«ID [@username]»; username_only — можно и один «@username»
+        (ID тогда None: привязка завершится, когда человек напишет боту)."""
         parts = text.split()
         if len(parts) not in {1, 2}:
             raise ValueError(
                 "Введите Telegram ID и при необходимости username "
                 "через пробел, например: 123456789 @username."
             )
+        if username_only and len(parts) == 1 and parts[0].startswith("@"):
+            username = parts[0][1:]
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", username):
+                raise ValueError("Некорректный Telegram username.")
+            return None, username
         try:
             user_id = int(parts[0])
         except ValueError as exc:
@@ -7516,6 +7637,112 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             reply_markup=keyboard,
             parse_mode=None,
         )
+
+    def contact_member_tasks(actor_id: int, contact_name: str) -> list[str]:
+        """Задачи имени в графике (для привязки во всех задачах человека)."""
+        return sorted(
+            schedule_task
+            for schedule_task, task_info in (
+                pending_inputs.get(actor_id) or {}
+            ).get("schedule_assignments", {}).items()
+            if not task_is_informational(task_info)
+            and contact_name in task_assignment_names(task_info)
+        )
+
+    async def ask_username_binding_confirmation(
+        message: Message, actor_id: int, service_id: str, username: str,
+        task: str | None, contact_name: str,
+    ) -> None:
+        """Привязка только по @username: ID бот узнает, когда человек
+        напишет ему, — до этого привязка ждёт."""
+        token = secrets.token_urlsafe(6)
+        pending_inputs.setdefault(actor_id, {})["username_binding"] = {
+            "token": token, "service_id": service_id, "username": username,
+            "task": task or "", "name": contact_name,
+        }
+        scope = f"задача «{task}»" if task else "все его задачи служения"
+        await _send_dialog(
+            message,
+            f"ℹ️ Подтвердите: привязать «{contact_name}» ({scope}) к "
+            f"@{username}\n\n"
+            "⏳ Бот ещё не видел этого пользователя, поэтому Telegram ID "
+            "пока неизвестен. Привязка завершится, когда он(а) напишет "
+            "боту, нажмёт кнопку или ответит на опрос, — вам придёт "
+            "сообщение. Попросите человека написать боту /start.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="✅ Подтвердить",
+                    callback_data=f"ubind:ok:{service_id}:{token}",
+                ),
+                InlineKeyboardButton(
+                    text="✖️ Отмена",
+                    callback_data=f"ubind:no:{service_id}:{token}",
+                ),
+            ]]),
+            parse_mode=None,
+        )
+
+    @admin_router.callback_query(F.data.startswith("ubind:"))
+    async def on_username_binding(callback: CallbackQuery) -> None:
+        if (
+            not callback.from_user
+            or not callback.message
+            or callback.message.chat.type != ChatType.PRIVATE
+        ):
+            await _answer_callback(callback)
+            return
+        actor_id = callback.from_user.id
+        parts = callback.data.split(":")
+        pending = pending_inputs.get(actor_id) or {}
+        binding = pending.get("username_binding")
+        if (
+            len(parts) != 4 or binding is None
+            or binding["service_id"] != parts[2]
+            or binding["token"] != parts[3]
+        ):
+            await _answer_callback(
+                callback, "⚠️ Запрос устарел. Начните привязку заново."
+            )
+            return
+        pending.pop("username_binding", None)
+        service_id, task, name = (
+            binding["service_id"], binding["task"], binding["name"]
+        )
+        notice = "✅ Назначение отменено."
+        if parts[1] == "ok":
+            registry = service_registry()
+            try:
+                if registry is None:
+                    raise ValueError("Реестр настроек служений недоступен.")
+                registry.add_username_binding(
+                    actor_id, service_id, name, task, binding["username"],
+                    () if task else contact_member_tasks(actor_id, name),
+                )
+            except (PermissionError, ValueError) as exc:
+                notice = _status_text(str(exc), "❌")
+            except sqlite3.Error:
+                debug.exception("Не удалось сохранить привязку по username")
+                notice = "❌ Не удалось сохранить привязку из-за ошибки базы данных."
+            else:
+                username_waiting["names"] = None
+                notice = (
+                    f"⏳ «{name}» привяжется к @{binding['username']}, когда "
+                    "он(а) напишет боту — вам придёт сообщение."
+                )
+        if task:
+            contact_pending = pending_inputs.get(actor_id)
+            if contact_pending is not None:
+                contact_pending["step"] = "choose_contact_person"
+                contact_pending.pop("active_contact_name", None)
+            await offer_contact_name_choices(
+                callback.message, actor_id, service_id, task, notice=notice,
+            )
+        else:
+            await send_member_choices(
+                callback.message, actor_id, service_id,
+                pending.get("member_page", 0), notice=notice,
+            )
+        await _answer_callback(callback)
 
     @admin_router.message(Command("services"))
     async def on_services(message: Message) -> None:
@@ -11499,7 +11726,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     raise ValueError(
                         "Выбор ответственного устарел. Выберите его заново."
                     )
-                user_id, username = parse_manual_user(text)
+                user_id, username = parse_manual_user(text, username_only=True)
+                if user_id is None:
+                    # Бот уже видел этот @username — ID известен.
+                    user_id = registry.known_telegram_id(username)
+                if user_id is None:
+                    await ask_username_binding_confirmation(
+                        message, message.from_user.id, service_id, username,
+                        task, contact_name,
+                    )
+                    return
                 await ask_user_assignment_confirmation(
                     message,
                     message.from_user.id,

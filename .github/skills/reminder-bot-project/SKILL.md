@@ -394,14 +394,33 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   `reluctant` (non-respondents: free on all dates, `RELUCTANT_WEIGHT` per
   service). A one-week gap costs `BACK_TO_BACK_WEIGHT` (100 ×
   `RELUCTANT_WEIGHT`): back-to-back only when a required seat would stay
-  empty; the optional pass skips back-to-back candidates entirely.
-- Removing an in-list member records `service_member_exclusions`;
-  `sync_service_rosters` skips those names until the person is added in
-  the bot again (`_clear_member_exclusion`). Per date two passes: required seats for everyone, then optional
-  seats for remaining respondents only; improvement never puts a reluctant
+  empty. Two passes over the month: required seats for all dates (then
+  `improve_plan`), then optional seats only for respondents with no
+  service within a week either way; improvement never puts a reluctant
   person beyond `needed`. `summarize` adds non-respondents (incl. no
   Telegram) as reluctant; `progress_text` lists respondents with dates and
   the plan per Sunday and task («*» = non-respondent).
+- Removing an in-list member records `service_member_exclusions`;
+  `sync_service_rosters` skips those names until the person is added in
+  the bot again (`_clear_member_exclusion`).
+- Binding by @username only (`parse_manual_user(username_only=True)` in
+  service_contact): a username the bot has seen (`known_telegram_id`)
+  gets the usual ID confirmation; otherwise `ubind:ok|no` saves
+  `username_bindings` (service, name, task '' = all tasks). The outer
+  middleware `username_binding_middleware` (message, callback_query,
+  poll_answer) completes it on the user's next update
+  (`take_username_bindings` → set_responsible_contact /
+  bind_service_member as the admin who set it) and messages that admin.
+  Binding by ID or removal drops the pending row. Pending rows expire
+  after `USERNAME_BINDING_DAYS` (30); completion is refused (admin gets
+  ❌) when the user is already bound to another name in the service;
+  `known_telegram_id` uses only observations: `seen_usernames` (written
+  by the middleware when a user's username changes, `note_seen_username`
+  forgets the ID's previous username) and `readiness_answers`, newest
+  first; admin-entered usernames don't count. A new pending binding for a
+  person replaces older ones (any task); `set_service_member_tasks` drops
+  pending rows of removed tasks; the card shows a pending username next
+  to the current account.
 - Launch reserves the run row before sending (`attach_readiness_poll`
   after), deletes it on failure. Closing notice is tracked by
   `closed_announced` and retried; the admin result is fitted into one
