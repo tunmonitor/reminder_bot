@@ -92,6 +92,10 @@ DEFAULT_READINESS_CHAT_REMINDER = (
     "Кто ещё не отметил воскресенья — проголосуй, пожалуйста, в опросе "
     "выше 🙏"
 )
+# Заголовок утверждённого графика в чате служения; status — «утверждён»
+# или «обновлён».
+PLAN_TITLE_FIELDS = frozenset({"service_name", "month", "status"})
+DEFAULT_PLAN_TITLE = "📅 График {service_name} на {month} {status}"
 # Шаблон по умолчанию для напоминания одной задачи (этап 3.1).
 DEFAULT_TASK_TEMPLATE = (
     "Напоминание о служении «{service_name}» в воскресенье {sunday_date}.\n"
@@ -268,6 +272,7 @@ class ServiceRegistry:
                     closed_template TEXT,
                     chat_reminder_template TEXT,
                     question_template TEXT,
+                    plan_title_template TEXT,
                     -- «Нужно людей» служения без задач (оно — одна задача).
                     people_needed INTEGER NOT NULL DEFAULT 1,
                     people_max INTEGER,
@@ -823,6 +828,7 @@ class ServiceRegistry:
                 ("readiness_settings", "closed_template", "TEXT"),
                 ("readiness_settings", "chat_reminder_template", "TEXT"),
                 ("readiness_settings", "question_template", "TEXT"),
+                ("readiness_settings", "plan_title_template", "TEXT"),
                 ("readiness_settings", "people_needed",
                  "INTEGER NOT NULL DEFAULT 1"),
                 ("readiness_settings", "people_max", "INTEGER"),
@@ -5158,6 +5164,7 @@ class ServiceRegistry:
         "closed_template": None,
         "chat_reminder_template": None,
         "question_template": None,
+        "plan_title_template": None,
         "people_needed": 1,
         "people_max": None,
         "day_from": 0,
@@ -5170,6 +5177,7 @@ class ServiceRegistry:
                 "SELECT enabled, start_time, duration_days, deadline_time, "
                 "remind_days, enabled_at, intro_template, reminder_template, "
                 "closed_template, chat_reminder_template, question_template, "
+                "plan_title_template, "
                 "people_needed, people_max, day_from, day_to "
                 "FROM readiness_settings WHERE service_id = ?",
                 (service_id,),
@@ -5230,6 +5238,7 @@ class ServiceRegistry:
              "Напоминание в чат"),
             ("question_template", READINESS_QUESTION_FIELDS,
              "Вопрос опроса"),
+            ("plan_title_template", PLAN_TITLE_FIELDS, "Заголовок графика"),
         ):
             value = new[key]
             if value is None:
@@ -5253,8 +5262,9 @@ class ServiceRegistry:
                 "start_time, duration_days, deadline_time, remind_days, "
                 "enabled_at, intro_template, reminder_template, "
                 "closed_template, chat_reminder_template, question_template, "
+                "plan_title_template, "
                 "people_needed, people_max, day_from, day_to, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id) DO UPDATE SET "
                 "enabled = excluded.enabled, start_time = excluded.start_time, "
                 "duration_days = excluded.duration_days, "
@@ -5266,6 +5276,7 @@ class ServiceRegistry:
                 "closed_template = excluded.closed_template, "
                 "chat_reminder_template = excluded.chat_reminder_template, "
                 "question_template = excluded.question_template, "
+                "plan_title_template = excluded.plan_title_template, "
                 "people_needed = excluded.people_needed, "
                 "people_max = excluded.people_max, "
                 "day_from = excluded.day_from, day_to = excluded.day_to, "
@@ -5276,7 +5287,7 @@ class ServiceRegistry:
                     new["remind_days"], new["enabled_at"],
                     new["intro_template"], new["reminder_template"],
                     new["closed_template"], new["chat_reminder_template"],
-                    new["question_template"],
+                    new["question_template"], new["plan_title_template"],
                     new["people_needed"], new["people_max"],
                     new["day_from"], new["day_to"], now,
                 ),

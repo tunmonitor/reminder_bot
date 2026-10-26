@@ -279,6 +279,7 @@ TEMPLATE_FIELD_HELP = {
     "month_in": "месяц опроса после «в» (ноябре)",
     "deadline": "срок ответа (дд.мм чч:мм)",
     "people": "упоминания опрашиваемых",
+    "status": "«утверждён» или «обновлён»",
 }
 GROUP_FIELDS = ("service_name", "sunday_date", "task_assignments",
                 "informational_notes")
@@ -288,6 +289,7 @@ READINESS_INTRO_HELP = ("service_name", "month", "deadline", "people")
 READINESS_REMINDER_HELP = ("service_name", "month", "deadline")
 READINESS_CLOSED_HELP = ("service_name", "month")
 READINESS_QUESTION_HELP = ("service_name", "month", "month_in")
+PLAN_TITLE_HELP = ("service_name", "month", "status")
 
 
 def template_fields_help(fields) -> str:
@@ -3926,6 +3928,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "Сообщение в чате служения (ответом на опрос), когда опрос "
             "завершён.", READINESS_CLOSED_HELP,
         ),
+        "pub": (
+            "plan_title_template", "📅 Заголовок графика",
+            "Первая строка графика в чате служения, когда график "
+            "утверждён или обновлён.", PLAN_TITLE_HELP,
+        ),
     }
 
     async def show_readiness_texts(
@@ -3935,8 +3942,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         registry = service_registry()
         settings = registry.get_readiness_settings(service_id)
         rows = []
-        lines = ["📝 Тексты опроса", "", "✏️ — свой текст, ⚪ — встроенный."]
-        for kind in ("intro", "q", "rem", "chat", "done"):
+        lines = ["📝 Тексты опроса и графика", "",
+                 "✏️ — свой текст, ⚪ — встроенный."]
+        for kind in ("intro", "q", "rem", "chat", "done", "pub"):
             field, title, about, _ = READINESS_TEXTS[kind]
             mark = "✏️" if settings[field] else "⚪"
             lines.append(f"{mark} {title} — {about}")
@@ -3968,6 +3976,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "chat": readiness.DEFAULT_READINESS_CHAT_REMINDER,
             "q": readiness.DEFAULT_READINESS_QUESTION,
             "done": readiness.DEFAULT_READINESS_CLOSED,
+            "pub": readiness.DEFAULT_PLAN_TITLE,
         }[kind]
         lines = [
             f"{title} · {service_label(service)}",
@@ -5695,6 +5704,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "в чате служения, ответом на опрос" if arg == "chat"
                         else "лично тем, кто не ответил"
                     )
+                elif arg == "pub":
+                    body = schedule_plan.publication_title(
+                        service, key, False, settings["plan_title_template"],
+                    )
+                    where = "заголовок графика в чате служения"
                 else:
                     body = readiness.closed_text(
                         service, {"month": key}, settings["closed_template"],

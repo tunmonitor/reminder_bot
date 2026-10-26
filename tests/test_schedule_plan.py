@@ -397,7 +397,24 @@ class SchedulePlanTest(unittest.TestCase):
         published = schedule_plan.publication_text(
             self.service(), plan, self.people(), (-1, 1)
         )
-        self.assertIn("🗓 01.11 (чт 29.10) — 🎚️ звук: \x00", published)
+        self.assertIn(
+            "📅 График Звук на ноябрь 2026 утверждён\n\n"
+            "🗓 01.11 (чт 29.10)\n  🎚️ звук: \x00", published,
+        )
+        self.assertIn("\n  🧰 сборка: —\n\n🗓 08.11", published)
+        # Заголовок — свой шаблон из «📝 Тексты».
+        self.registry.set_readiness_settings(
+            1001, "sound",
+            plan_title_template="Служим в {month}: {service_name} ({status})",
+        )
+        self.assertTrue(schedule_plan.publication_text(
+            self.service(), plan, self.people(), (-1, 1),
+            self.registry.get_readiness_settings("sound")["plan_title_template"],
+        ).startswith("Служим в ноябрь 2026: Звук (утверждён)\n\n🗓 01.11"))
+        with self.assertRaises(ValueError):
+            self.registry.set_readiness_settings(
+                1001, "sound", plan_title_template="{deadline}"
+            )
         self.assertIn("\x00 (чт 05.11)", published)
         self.registry.set_service_member_day(1001, "sound", "Алексей", None)
         alex = next(p for p in self.people() if p["name"] == "Алексей")

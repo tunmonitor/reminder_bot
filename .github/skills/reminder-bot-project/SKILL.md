@@ -383,6 +383,12 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - Third readiness text: `closed_template` (`DEFAULT_READINESS_CLOSED`,
   fields `READINESS_CLOSED_FIELDS`), kind `done` in `READINESS_TEXTS`,
   rendered by `readiness.closed_text` in `announce_closed`.
+- Publication title: `plan_title_template` (`DEFAULT_PLAN_TITLE`,
+  `PLAN_TITLE_FIELDS` = service_name, month, status «утверждён» /
+  «обновлён»), kind `pub` in `READINESS_TEXTS`, rendered by
+  `schedule_plan.publication_title`. `publication_text` puts each date
+  on its own line with tasks below it (two-space indent), blank line
+  between dates.
 - Reminder sends treat any Forbidden/BadRequest as final (marked reminded). Preview:
   `rdy:tplprev:<service>:intro|rem`. `launch_run` records all intro chunk
   ids and deletes them all if the poll fails.

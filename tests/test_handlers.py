@@ -5972,6 +5972,18 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             texts = await press("rdy:texts:sound")
             self.assertIn("📝 Тексты опроса", texts.message.answer.await_args.args[0])
             self.assertIn("❓ Вопрос опроса", texts.message.answer.await_args.args[0])
+            self.assertIn("📅 Заголовок графика", texts.message.answer.await_args.args[0])
+            title = await press("rdy:tplprev:sound:pub")
+            self.assertIn(
+                "заголовок графика в чате служения",
+                title.message.answer.await_args.args[0],
+            )
+            self.assertIn(" утверждён", title.message.answer.await_args.args[0])
+            title_edit = await press("rdy:tpledit:sound:pub")
+            self.assertIn(
+                "• {status} — ", title_edit.message.answer.await_args.args[0]
+            )
+            await press("rdy:texts:sound")
             question = await press("rdy:tplprev:sound:q")
             self.assertIn(
                 "Когда можешь служить в", question.message.answer.await_args.args[0]
