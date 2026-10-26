@@ -423,9 +423,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     # Отложенные привязки по @username: None — перечитать из базы.
     username_waiting: dict[str, set[str] | None] = {"names": None}
-    # Последний виденный username по Telegram ID (чтобы не писать в базу
-    # на каждое сообщение).
+    # Последний виденный username по Telegram ID и владелец username
+    # (чтобы не писать в базу на каждое сообщение).
     username_seen: dict[int, str] = {}
+    username_owner: dict[str, int] = {}
 
     async def complete_username_bindings(user) -> None:
         """Человек с ожидаемым @username написал боту — привязываем его
@@ -438,10 +439,19 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if registry is None:
             return
         try:
-            # Наблюдение «ID ↔ username» — только при изменении.
-            if username_seen.get(user_id) != username.casefold():
+            # Наблюдение «ID ↔ username» — только при изменении (в том
+            # числе когда username вернулся к прежнему владельцу).
+            seen = username.casefold()
+            if username_seen.get(user_id) != seen or (
+                seen and username_owner.get(seen) != user_id
+            ):
                 registry.note_seen_username(user_id, username)
-                username_seen[user_id] = username.casefold()
+                previous = username_seen.get(user_id)
+                if previous and username_owner.get(previous) == user_id:
+                    username_owner.pop(previous, None)
+                username_seen[user_id] = seen
+                if seen:
+                    username_owner[seen] = user_id
             if not username:
                 return
             if username_waiting["names"] is None:

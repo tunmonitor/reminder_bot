@@ -6930,6 +6930,15 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertEqual(sent["chat_id"], 67890)
             self.assertIn("«Пётр» привязан(а)", sent["text"])
 
+            # Username ушёл к другому и вернулся — снова за первым.
+            for user_id in (88888, 77777):
+                await middleware(handler, SimpleNamespace(
+                    from_user=SimpleNamespace(
+                        id=user_id, username="petr_new", is_bot=False
+                    )
+                ), {})
+            self.assertEqual(self.registry.known_telegram_id("petr_new"), 77777)
+
             # Повторное сообщение — привязок больше нет.
             self.context.bot.send_message.reset_mock()
             await middleware(handler, event, {})
