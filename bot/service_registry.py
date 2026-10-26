@@ -497,6 +497,21 @@ class ServiceRegistry:
                     PRIMARY KEY (service_id, name)
                 );
 
+                -- Привязка только по @username: Telegram ID станет известен,
+                -- когда человек напишет боту (нажмёт кнопку, ответит на
+                -- опрос). task = '' — во всех задачах человека (карточка).
+                CREATE TABLE IF NOT EXISTS username_bindings (
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    task TEXT NOT NULL DEFAULT '',
+                    username TEXT NOT NULL,
+                    tasks_json TEXT NOT NULL DEFAULT '[]',
+                    actor_id INTEGER NOT NULL CHECK (actor_id > 0),
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (service_id, name, task)
+                );
+
                 -- Ответы на личные напоминания (этап 3.2): «Принял» или
                 -- «Не смогу» по задаче на дату события.
                 CREATE TABLE IF NOT EXISTS service_confirmations (
@@ -2581,6 +2596,124 @@ class ServiceRegistry:
             ).fetchone()
         return dict(row) if row else None
 
+    def known_telegram_id(self, username: str) -> int | None:
+        """Telegram ID по @username из того, что бот уже видел: состав,
+        привязки, админы, ответы на опрос (без учёта регистра)."""
+        username = (username or "").strip().lstrip("@").casefold()
+        if not username:
+            return None
+        # Самая свежая запись: username мог перейти к другому человеку.
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT telegram_id FROM ("
+                "SELECT telegram_id, updated_at AS seen FROM service_members "
+                "WHERE telegram_id IS NOT NULL AND lower(username) = :name "
+                "UNION ALL SELECT telegram_id, updated_at FROM "
+                "responsible_contacts WHERE lower(username) = :name "
+                "UNION ALL SELECT telegram_id, created_at FROM service_admins "
+                "WHERE lower(username) = :name "
+                "UNION ALL SELECT telegram_id, answered_at FROM "
+                "readiness_answers WHERE lower(username) = :name"
+                ") ORDER BY seen DESC LIMIT 1",
+                {"name": username},
+            ).fetchone()
+        return row["telegram_id"] if row else None
+
+    def add_username_binding(
+        self, actor_id: int, service_id: str, name: str, task: str,
+        username: str, tasks=(),
+    ) -> None:
+        """Отложенная привязка «имя (задача) → @username»."""
+        _validate_positive_id(actor_id, "actor_id")
+        name = name.strip() if isinstance(name, str) else ""
+        username = (username or "").strip().lstrip("@")
+        if not name or not re.fullmatch(
+            r"[A-Za-z][A-Za-z0-9_]{4,31}", username
+        ):
+            raise ValueError("Нужны имя и корректный @username.")
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            self._require_service(connection, service_id)
+            connection.execute(
+                "INSERT INTO username_bindings (service_id, name, task, "
+                "username, tasks_json, actor_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(service_id, name, task) DO UPDATE SET "
+                "username = excluded.username, "
+                "tasks_json = excluded.tasks_json, "
+                "actor_id = excluded.actor_id, "
+                "created_at = excluded.created_at",
+                (
+                    service_id, name, task or "", username,
+                    json.dumps(list(tasks), ensure_ascii=False), actor_id,
+                    _utc_now(),
+                ),
+            )
+            self._audit(
+                connection, actor_id, "username_binding_added", service_id,
+                {"name": name, "task": task or "", "username": username},
+            )
+
+    def username_binding(self, service_id: str, name: str) -> str | None:
+        """@username, который ждёт привязки к человеку (любая задача)."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT username FROM username_bindings "
+                "WHERE service_id = ? AND name = ? AND created_at >= ? "
+                "ORDER BY task LIMIT 1",
+                (service_id, name, _username_binding_cutoff()),
+            ).fetchone()
+        return row["username"] if row else None
+
+    def pending_usernames(self) -> set[str]:
+        with self._connection() as connection:
+            return {
+                row["username"].casefold()
+                for row in connection.execute(
+                    "SELECT username FROM username_bindings "
+                    "WHERE created_at >= ?",
+                    (_username_binding_cutoff(),),
+                )
+            }
+
+    def take_username_bindings(self, username: str) -> list[dict]:
+        """Забирает (и удаляет) отложенные привязки этого @username."""
+        username = (username or "").strip().lstrip("@").casefold()
+        if not username:
+            return []
+        with self._connection() as connection:
+            # Просроченные ожидания — опечатка или чужой username — не
+            # привязываются: удаляются вместе со взятыми.
+            rows = connection.execute(
+                "SELECT service_id, name, task, username, tasks_json, actor_id "
+                "FROM username_bindings WHERE lower(username) = ? "
+                "AND created_at >= ? ORDER BY service_id, name, task",
+                (username, _username_binding_cutoff()),
+            ).fetchall()
+            connection.execute(
+                "DELETE FROM username_bindings WHERE lower(username) = ?",
+                (username,),
+            )
+        return [
+            {
+                "service_id": row["service_id"], "name": row["name"],
+                "task": row["task"], "username": row["username"],
+                "tasks": json.loads(row["tasks_json"]),
+                "actor_id": row["actor_id"],
+            }
+            for row in rows
+        ]
+
+    @staticmethod
+    def _drop_username_binding(
+        connection: sqlite3.Connection, service_id: str, name: str,
+    ) -> None:
+        """Человек привязан (или убран) — ожидание по @username не нужно."""
+        connection.execute(
+            "DELETE FROM username_bindings WHERE service_id = ? AND name = ?",
+            (service_id, name),
+        )
+
     def find_service_person_by_username(
         self, service_id: str, username: str
     ) -> dict | None:
@@ -3471,6 +3604,7 @@ class ServiceRegistry:
                 ),
             )
             self._clear_member_exclusion(connection, service_id, name)
+            self._drop_username_binding(connection, service_id, name)
             self._cleanup_unbound_user_data(connection, service_id)
             self._audit(
                 connection, actor_id, "responsible_contact_updated", service_id,
@@ -3746,6 +3880,7 @@ class ServiceRegistry:
                     connection, actor_id, service_id, task, name,
                     telegram_id, username,
                 )
+            self._drop_username_binding(connection, service_id, name)
             self._cleanup_unbound_user_data(connection, service_id)
             self._audit(
                 connection, actor_id, "service_member_bound", service_id,
@@ -3901,6 +4036,7 @@ class ServiceRegistry:
             ).rowcount
             if not removed:
                 raise ValueError(f"«{name}» нет в составе.")
+            self._drop_username_binding(connection, service_id, name)
             if member is not None and member["in_list"]:
                 connection.execute(
                     "INSERT OR IGNORE INTO service_member_exclusions "
@@ -5912,6 +6048,16 @@ def normalize_member_name(name) -> str:
 def _current_month() -> str:
     today = datetime.now(timezone.utc).date()
     return f"{today.year:04d}-{today.month:02d}"
+
+
+USERNAME_BINDING_DAYS = 30
+
+
+def _username_binding_cutoff() -> str:
+    """Привязка по @username ждёт не дольше USERNAME_BINDING_DAYS."""
+    return (
+        datetime.now(timezone.utc) - timedelta(days=USERNAME_BINDING_DAYS)
+    ).isoformat()
 
 
 def _utc_now() -> str:

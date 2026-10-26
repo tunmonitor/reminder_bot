@@ -2235,3 +2235,55 @@ class InteractiveRosterSyncTest(unittest.TestCase):
                 registry, Path("x.xlsx"), "sound", {}, None, MagicMock(), None,
             )
             registry.sync_service_rosters.assert_called_once_with(rosters)
+
+
+class UsernameBindingTest(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.registry = ServiceRegistry(
+            Path(self.temp_dir.name) / "services.sqlite3"
+        )
+        self.registry.initialize(1001, -10001)
+
+    def test_pending_binding_for_task_is_taken_once(self):
+        registry = self.registry
+        with self.assertRaises(PermissionError):
+            registry.add_username_binding(2002, "sound", "Борис", "звук", "boris_b")
+        registry.add_username_binding(1001, "sound", "Борис", "звук", "@Boris_B")
+        self.assertEqual(registry.pending_usernames(), {"boris_b"})
+        self.assertIsNone(registry.known_telegram_id("boris_b"))
+        taken = registry.take_username_bindings("BORIS_B")
+        self.assertEqual(
+            [(item["name"], item["task"], item["actor_id"]) for item in taken],
+            [("Борис", "звук", 1001)],
+        )
+        self.assertEqual(registry.take_username_bindings("boris_b"), [])
+        registry.set_responsible_contact(1001, "sound", "звук", "Борис", 555, "Boris_B")
+        self.assertEqual(registry.known_telegram_id("@boris_b"), 555)
+
+    def test_binding_by_id_or_removal_drops_pending(self):
+        registry = self.registry
+        registry.add_username_binding(1001, "sound", "Борис", "", "boris_b")
+        registry.bind_service_member(1001, "sound", "Борис", 555)
+        self.assertIsNone(registry.username_binding("sound", "Борис"))
+        registry.add_username_binding(1001, "sound", "Борис", "", "boris_b")
+        registry.remove_service_member(1001, "sound", "Борис")
+        self.assertEqual(registry.pending_usernames(), set())
+
+    def test_expired_binding_is_ignored_and_newest_id_wins(self):
+        registry = self.registry
+        registry.add_username_binding(1001, "sound", "Борис", "", "boris_b")
+        with closing(sqlite3.connect(registry.path)) as connection, connection:
+            connection.execute(
+                "UPDATE username_bindings SET created_at = '2000-01-01T00:00:00+00:00'"
+            )
+        self.assertEqual(registry.pending_usernames(), set())
+        self.assertIsNone(registry.username_binding("sound", "Борис"))
+        self.assertEqual(registry.take_username_bindings("boris_b"), [])
+        with self.assertRaises(ValueError):
+            registry.add_username_binding(1001, "sound", "Борис", "", "bad name")
+        # Username перешёл к другому — берётся самая свежая запись.
+        registry.set_responsible_contact(1001, "sound", "звук", "Старый", 111, "foo_user")
+        registry.set_responsible_contact(1001, "sound", "звук", "Новый", 222, "foo_user")
+        self.assertEqual(registry.known_telegram_id("foo_user"), 222)
