@@ -626,6 +626,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     button.text = f"📋 {label}"
 
             if keep_rows:
+                total = sum(len(row) for row in markup.inline_keyboard)
+                if total > keyboard_limit:
+                    # Экран важнее лимита оформления: показать как есть
+                    # (Telegram допускает до 100 кнопок) и записать в лог.
+                    debug.warning(
+                        "Кнопок на экране %s больше лимита %s", total,
+                        keyboard_limit,
+                    )
+                    keyboard_limit = total
                 validate_inline_keyboard(
                     markup.inline_keyboard, max_buttons=keyboard_limit
                 )
@@ -2193,8 +2202,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 notice = f"🗑 «{name}» убран(а) из состава"
                 if in_list:
                     notice += (
-                        "\n⚠️ Он(а) есть в «Списках» Excel — при следующем "
-                        "чтении файла вернётся; уберите и там."
+                        "\nВ «Списках» Excel он(а) остаётся, но бот его "
+                        "больше не вернёт — пока не добавите в боте снова."
                     )
                 await send_member_choices(
                     message, actor_id, service_id,
@@ -2883,7 +2892,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             message,
             text,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-            _dialog_keyboard_limit=12,
+            # Свой текст и соседи — до 13 кнопок: лимит по факту.
+            _dialog_keyboard_limit=sum(len(row) for row in buttons),
             _dialog_keep_rows=True,
             parse_mode=None,
         )

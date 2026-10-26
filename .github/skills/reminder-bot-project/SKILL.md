@@ -392,7 +392,12 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   «🗳 Опрос готовности» or «📋 Задачи служения» (`rdy:people|ppick|pset`).
 - Planner: `PlanInput.extra` (optional seats above the minimum) and
   `reluctant` (non-respondents: free on all dates, `RELUCTANT_WEIGHT` per
-  service). Per date two passes: required seats for everyone, then optional
+  service). A one-week gap costs `BACK_TO_BACK_WEIGHT` (100 ×
+  `RELUCTANT_WEIGHT`): back-to-back only when a required seat would stay
+  empty; the optional pass skips back-to-back candidates entirely.
+- Removing an in-list member records `service_member_exclusions`;
+  `sync_service_rosters` skips those names until the person is added in
+  the bot again (`_clear_member_exclusion`). Per date two passes: required seats for everyone, then optional
   seats for remaining respondents only; improvement never puts a reluctant
   person beyond `needed`. `summarize` adds non-respondents (incl. no
   Telegram) as reluctant; `progress_text` lists respondents with dates and
