@@ -487,6 +487,16 @@ class ServiceRegistry:
                     PRIMARY KEY (service_id, name)
                 );
 
+                -- Убранные из состава в боте: «Списки» Excel их не
+                -- возвращают, пока человека не добавят в боте снова.
+                CREATE TABLE IF NOT EXISTS service_member_exclusions (
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (service_id, name)
+                );
+
                 -- Ответы на личные напоминания (этап 3.2): «Принял» или
                 -- «Не смогу» по задаче на дату события.
                 CREATE TABLE IF NOT EXISTS service_confirmations (
@@ -3460,6 +3470,7 @@ class ServiceRegistry:
                     username.strip().lstrip("@"), _utc_now(),
                 ),
             )
+            self._clear_member_exclusion(connection, service_id, name)
             self._cleanup_unbound_user_data(connection, service_id)
             self._audit(
                 connection, actor_id, "responsible_contact_updated", service_id,
@@ -3557,6 +3568,7 @@ class ServiceRegistry:
         rosters — {service_id: [RosterMember]}. Из файла берутся только
         имена и задачи; Telegram ID и username задаются только в боте. Люди,
         которых больше нет в «Списках», остаются с отметкой «нет в списке».
+        Убранные из состава в боте не возвращаются.
         """
         now = _utc_now()
         with self._connection() as connection:
@@ -3569,6 +3581,17 @@ class ServiceRegistry:
             for service_id, members in rosters.items():
                 if service_id not in active:
                     continue
+                excluded = {
+                    row["name"]
+                    for row in connection.execute(
+                        "SELECT name FROM service_member_exclusions "
+                        "WHERE service_id = ?",
+                        (service_id,),
+                    )
+                }
+                members = [
+                    member for member in members if member.name not in excluded
+                ]
                 names = [member.name for member in members]
                 for member in members:
                     connection.execute(
@@ -3682,6 +3705,7 @@ class ServiceRegistry:
                     "VALUES (?, ?, ?, ?, 'manual', ?)",
                     (service_id, name, telegram_id, username, now),
                 )
+                self._clear_member_exclusion(connection, service_id, name)
                 roster_tasks = []
             else:
                 # «➕ В состав» возвращает выпавшего из «Списков»: он снова
@@ -3779,6 +3803,7 @@ class ServiceRegistry:
                         json.dumps(tasks, ensure_ascii=False), now,
                     ),
                 )
+                self._clear_member_exclusion(connection, service_id, name)
             else:
                 connection.execute(
                     "UPDATE service_members SET tasks_json = ?, "
@@ -3856,7 +3881,8 @@ class ServiceRegistry:
         self, actor_id: int, service_id: str, name: str,
     ) -> bool:
         """Убирает человека из состава служения вместе с привязками к
-        задачам. True — он есть в «Списках» (файл вернёт его при чтении)."""
+        задачам. True — он есть в «Списках»: файл его больше не вернёт,
+        пока человека не добавят в боте снова."""
         _validate_positive_id(actor_id, "actor_id")
         with self._connection() as connection:
             self._require_service_editor(connection, actor_id, service_id)
@@ -3875,6 +3901,12 @@ class ServiceRegistry:
             ).rowcount
             if not removed:
                 raise ValueError(f"«{name}» нет в составе.")
+            if member is not None and member["in_list"]:
+                connection.execute(
+                    "INSERT OR IGNORE INTO service_member_exclusions "
+                    "(service_id, name, created_at) VALUES (?, ?, ?)",
+                    (service_id, name, _utc_now()),
+                )
             # Из рабочих копий графиков (опубликованная остаётся — правка
             # станет видна как неопубликованная).
             def is_removed(key: str) -> bool:
@@ -3926,6 +3958,17 @@ class ServiceRegistry:
                 {"name": name},
             )
         return bool(member and member["in_list"])
+
+    @staticmethod
+    def _clear_member_exclusion(
+        connection: sqlite3.Connection, service_id: str, name: str,
+    ) -> None:
+        """Человека снова добавили в боте — «Списки» снова его ведут."""
+        connection.execute(
+            "DELETE FROM service_member_exclusions "
+            "WHERE service_id = ? AND name = ?",
+            (service_id, name),
+        )
 
     def ensure_member_contacts(self, service_id: str, assignments) -> None:
         """Создаёт привязки «задача + имя» для привязанных людей служения.

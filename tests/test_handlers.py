@@ -7011,7 +7011,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             text = done.message.answer.await_args.args[0]
             self.assertIn("убран(а) из состава", text)
-            self.assertIn("есть в «Списках»", text)
+            self.assertIn("бот его больше не вернёт", text)
             self.assertNotIn(
                 "Пётр",
                 [item["name"] for item in self.registry.list_service_members("sound")],

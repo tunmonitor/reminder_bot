@@ -249,6 +249,22 @@ class SchedulePlanTest(unittest.TestCase):
             [key for tasks in plan["slots"].values()
              for people in tasks.values() for key in people],
         )
+        # «Списки» Excel убранного не возвращают (решение 12).
+        roster = {"sound": [
+            RosterMember("Алексей", ("звук", "сборка")),
+            RosterMember("Борис", ("звук",)),
+        ]}
+        self.registry.sync_service_rosters(roster)
+        names = [m["name"] for m in self.registry.list_service_members("sound")]
+        self.assertNotIn("Борис", names)
+        # Добавили в боте снова — «Списки» снова его ведут.
+        self.registry.bind_service_member(1001, "sound", "Борис", 5005)
+        self.registry.sync_service_rosters(roster)
+        boris = next(
+            m for m in self.registry.list_service_members("sound")
+            if m["name"] == "Борис"
+        )
+        self.assertTrue(boris["in_list"])
 
     def test_service_without_tasks_is_one_task(self):
         self.registry.sync_service_rosters({"office_cleaning": [
@@ -295,8 +311,15 @@ class SchedulePlanTest(unittest.TestCase):
         )
         self.assertNotIn(f"{name}:", published)
         counts = [len(plan["slots"][day][name]) for day in plan["dates"]]
-        # Без опроса свободны все — места до максимума заполнены.
-        self.assertEqual(counts, [2] * 5)
+        # Без опроса свободны все: минимум закрыт везде, место сверх
+        # минимума — только без служения подряд (трое на 2 места в неделю).
+        self.assertTrue(all(1 <= count <= 2 for count in counts))
+        self.assertIn(2, counts)
+        for days in schedule_plan.served_dates(plan["slots"]).values():
+            for earlier, later in zip(days, days[1:]):
+                self.assertGreater(
+                    (date.fromisoformat(later) - date.fromisoformat(earlier)).days, 7
+                )
         load = [len(days) for days in schedule_plan.served_dates(plan["slots"]).values()]
         self.assertLessEqual(max(load) - min(load), 1)
         with self.assertRaises(ValueError):
@@ -367,13 +390,15 @@ class SchedulePlanTest(unittest.TestCase):
             "ЗВУК", plan, summary, TZ, schedule_plan.window_of(self.registry, "sound")
         )
         # У единственного на дату свой день — общий период не показывается.
-        self.assertIn("🗓 01.11\n   🎚️ звук\n      • Алексей — чт 29.10", text)
+        self.assertIn("🗓 01.11 (чт 29.10)\n   🎚️ звук\n      • Алексей\n", text)
+        self.assertIn("      • Алексей (чт 05.11)", text)
         # Рядом служит Глеб без своего дня — период для него показывается.
         self.assertIn("🗓 08.11 (сб 07.11 – пн 09.11)", text)
         published = schedule_plan.publication_text(
             self.service(), plan, self.people(), (-1, 1)
         )
-        self.assertIn("\x00 — чт 29.10", published)
+        self.assertIn("🗓 01.11 (чт 29.10) — 🎚️ звук: \x00", published)
+        self.assertIn("\x00 (чт 05.11)", published)
         self.registry.set_service_member_day(1001, "sound", "Алексей", None)
         alex = next(p for p in self.people() if p["name"] == "Алексей")
         self.assertIsNone(alex["day_offset"])
@@ -413,7 +438,7 @@ class SchedulePlanTest(unittest.TestCase):
         self.assertTrue(plan["dirty"])
         summary = readiness.summarize(self.registry, self.run, with_plan=False)
         self.assertIn(
-            "• Борис — пт 13.11",
+            "• Борис (пт 13.11)",
             schedule_plan.plan_text("ЗВУК", plan, summary, TZ),
         )
         published = schedule_plan.publication_text(
@@ -480,7 +505,8 @@ class SchedulePlanTest(unittest.TestCase):
         self.assertIn("Ответили 3 из 4", text)
         self.assertIn("🗓 01.11", text)
         self.assertIn("👥 Нагрузка (воскресений в месяце):", text)
-        self.assertIn("   3 — Дмитрий (без Telegram)", text)
+        # Глеб отметил 01 и 08 — подряд не ставится, 01.11 у Дмитрия.
+        self.assertIn("   4 — Дмитрий (без Telegram)", text)
         self.assertIn("   🎚️ звук\n      • Борис", text)
         self.assertIn("Дмитрий", text)
 
