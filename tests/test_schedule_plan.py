@@ -449,6 +449,101 @@ class SchedulePlanTest(unittest.TestCase):
         self.registry.set_service_member_day(1001, "sound", "Борис", 0)
         self.assertTrue(self.registry.get_schedule_plan("sound", "2026-11")["dirty"])
 
+    def test_task_day_shows_plan_by_weeks(self):
+        plan = self.draft()
+        plan["slots"]["2026-11-01"] = {"звук": ["Алексей"], "сборка": ["Борис"]}
+        plan = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", plan["slots"]
+        )
+        plan = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+        ))
+        self.assertFalse(plan["dirty"])
+        with self.assertRaises(ValueError):
+            self.registry.set_service_task_day(1001, "sound", "сборка", 7)
+        with self.assertRaises(ValueError):
+            self.registry.set_service_task_day(1001, "sound", "нет такой", -4)
+        self.registry.set_service_task_day(1001, "sound", "сборка", -4)
+        task = next(
+            item for item in self.registry.list_service_tasks("sound")
+            if item["name"] == "сборка"
+        )
+        self.assertEqual(task["day_offset"], -4)
+        # День задачи — в уже составленном графике, утверждённый — заново.
+        plan = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertTrue(plan["dirty"])
+        self.assertEqual(schedule_plan.task_days(plan), {"сборка": -4})
+        self.assertEqual(
+            next(t for t in self.draft()["tasks"] if t["name"] == "сборка")["day"],
+            -4,
+        )
+        summary = readiness.summarize(self.registry, self.run, with_plan=False)
+        text = schedule_plan.plan_text("ЗВУК", plan, summary, TZ)
+        self.assertIn(
+            "🗓 Неделя 26.10–01.11\n   ср 28.10\n     🧰 сборка\n"
+            "        • Борис\n   вс 01.11\n     🎚️ звук\n        • Алексей",
+            text,
+        )
+        published = schedule_plan.publication_text(
+            self.service(), plan, self.people()
+        )
+        self.assertIn(
+            "\n\n🗓 Неделя 26.10–01.11\n  ср 28.10\n    🧰 сборка: ", published
+        )
+        self.assertIn("\n  вс 01.11\n    🎚️ звук: ", published)
+        self.assertIn("• Изменены дни служения", published)
+        # Борис — в среду: интервал следующего месяца считается от неё.
+        self.assertEqual(
+            schedule_plan.served_offsets(plan, self.people())["2026-11-01"],
+            {"Борис": -4},
+        )
+        # Разовый день человека главнее дня задачи — в скобках.
+        plan = self.registry.set_schedule_day(
+            1001, "sound", "2026-11", "2026-11-01", "Борис", -3
+        )
+        self.assertEqual(
+            schedule_plan.slot_offset(plan, {"key": "Борис"}, "2026-11-01",
+                                      "сборка"),
+            -3,
+        )
+        self.assertIn(
+            "• Борис (чт 29.10)",
+            schedule_plan.plan_text("ЗВУК", plan, summary, TZ),
+        )
+        # С окном служения задачи без своего дня — под периодом окна.
+        title, groups = schedule_plan.week_groups(plan, "2026-11-01", (-1, 1))
+        self.assertEqual(title, "Неделя 26.10–02.11")
+        self.assertEqual(
+            [(label, offset) for label, offset, _ in groups],
+            [("ср 28.10", -4), ("сб 31.10 – пн 02.11", None)],
+        )
+        # Только задачи со своим днём — окно служения не растягивает неделю.
+        only_days = {**plan, "tasks": [
+            task for task in plan["tasks"] if task["name"] == "сборка"
+        ]}
+        self.assertEqual(
+            schedule_plan.week_groups(only_days, "2026-11-01", (-1, 1))[0],
+            "Неделя 26.10–01.11",
+        )
+        # Задача, которой нет в графике, не трогает утверждённый график.
+        plan = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+        ))
+        self.assertFalse(plan["dirty"])
+        self.registry.set_service_task_day(1001, "sound", "спевка", -4)
+        self.assertFalse(
+            self.registry.get_schedule_plan("sound", "2026-11")["dirty"]
+        )
+        self.registry.set_service_task_day(1001, "sound", "сборка", None)
+        plan = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertTrue(plan["dirty"])
+        self.assertEqual(schedule_plan.task_days(plan), {})
+        self.assertIn(
+            "🗓 01.11", schedule_plan.publication_text(
+                self.service(), plan, self.people()
+            ),
+        )
+
     def test_day_for_one_date(self):
         plan = self.draft()
         plan["slots"]["2026-11-15"]["звук"] = ["Борис"]

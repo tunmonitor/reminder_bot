@@ -5955,6 +5955,64 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_admin_sets_own_day_for_task(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 24680)
+            opened = SimpleNamespace(
+                data="svc_tasks:open:sound",
+                from_user=SimpleNamespace(id=24680),
+                message=self.message(24680, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_tasks")(opened)
+            days = await self._click(
+                opened.message,
+                lambda button: button.text == "📅 Дни задач",
+                actor_id=24680,
+            )
+            self.assertIn("🎚️ звук — дни служения", days.message.answer.await_args.args[0])
+            pick = await self._click(
+                days.message,
+                lambda button: button.text == "📅 звук",
+                actor_id=24680,
+            )
+            chosen = await self._click(
+                pick.message,
+                lambda button: button.text == "📅 ср (вс -4)",
+                actor_id=24680,
+            )
+            screen = chosen.message.answer.await_args.args[0]
+            self.assertIn("✅ «звук»: ср (вс -4)", screen)
+            self.assertIn("🎚️ звук — ср (вс -4)", screen)
+            self.assertEqual(
+                next(
+                    task for task in self.registry.list_service_tasks("sound")
+                    if task["name"] == "звук"
+                )["day_offset"],
+                -4,
+            )
+            back = await self._click(
+                chosen.message,
+                lambda button: button.text == "📅 звук",
+                actor_id=24680,
+            )
+            reset = await self._click(
+                back.message,
+                lambda button: button.text == "↩️ Дни служения",
+                actor_id=24680,
+            )
+            self.assertIn(
+                "✅ «звук»: дни служения", reset.message.answer.await_args.args[0]
+            )
+            tasks = await self._click(
+                reset.message,
+                lambda button: button.text == "⬅️ К задачам",
+                actor_id=24680,
+            )
+            self.assertIn("ЗВУК · задачи", tasks.message.answer.await_args.args[0])
+
+        asyncio.run(run())
+
     def test_super_admin_sets_people_needed_for_task(self):
         async def run():
             opened = SimpleNamespace(

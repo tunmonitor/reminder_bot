@@ -402,6 +402,14 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   (NULL = minimum, up to 6) — «👥 Нужно людей», set by service admins too
   (`set_service_task_people_needed(actor, service, task, low, high)`) from
   «🗳 Опрос готовности» or «📋 Задачи служения» (`rdy:people|ppick|pset`).
+- `service_tasks.day_offset` — task's own day (−6…+6 from the plan's Sunday,
+  NULL = service days), `set_service_task_day` (also rewrites `tasks_json`
+  of current/future plans and marks approved ones `republish`); UI
+  «📅 Дни задач» `svc_tasks:days|dpick|dset`. Plan tasks carry `day`;
+  `schedule_plan.slot_offset` (override → task day → personal day),
+  `task_days`, `week_groups` / `week_person_day`: any task day switches
+  `plan_text` and `publication_text` to weekly layout. `served_offsets`
+  keeps the latest day per person per date.
 - Planner: `PlanInput.extra` (optional seats above the minimum) and
   `reluctant` (non-respondents: free on all dates, `RELUCTANT_WEIGHT` per
   service). A one-week gap costs `BACK_TO_BACK_WEIGHT` (100 ×

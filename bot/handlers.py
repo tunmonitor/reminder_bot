@@ -3621,9 +3621,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     f" · 👥 {people_label(task)}"
                     if task["people_max"] > 1 else ""
                 )
+                own_day = (
+                    f" · 📅 {member_day_label(task['day_offset'])}"
+                    if task["day_offset"] is not None else ""
+                )
                 lines.append(
                     f"{status} {task_emoji(task['name'])} {task['name']}"
-                    f"{people}{off}{aliases}"
+                    f"{people}{own_day}{off}{aliases}"
                 )
             lines += [
                 "",
@@ -3660,12 +3664,71 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 callback_data=f"rdy:people:{service_id}:t",
             ))
         rows.append(add_row)
+        if any(task["enabled"] for task in tasks):
+            rows.append([InlineKeyboardButton(
+                text="📅 Дни задач",
+                callback_data=f"svc_tasks:days:{service_id}:{session_id}",
+            )])
         rows.append([
             InlineKeyboardButton(
                 text="⬅️ К карточке служения",
                 callback_data=f"service:service_settings:{service_id}",
             )
         ])
+        await _send_dialog(
+            message,
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
+            parse_mode=None,
+        )
+
+    async def show_task_days(
+        message: Message, service_id: str, session_id: str,
+        notice: str | None = None,
+    ) -> None:
+        """«📅 Дни задач»: у задачи свой день недели (спевка — ср, вс −4).
+        Тогда график показывается по неделям."""
+        registry = service_registry()
+        service = service_by_id(registry, service_id)
+        tasks = [
+            task for task in registry.list_service_tasks(service_id)
+            if task["enabled"]
+        ]
+        lines = [
+            f"📅 {service_label(service)} · дни задач",
+            "",
+            "ℹ️ Задача со своим днём выполняется в этот день недели "
+            "воскресенья графика (спевка — ср, «вс −4»). Тогда график "
+            "показывается по неделям: «Неделя 26.10–01.11», под ней дни и "
+            "задачи. Без своего дня — дни служения раздела «📅 График».",
+            "",
+            *(
+                f"{task_emoji(task['name'])} {task['name']} — "
+                + (
+                    member_day_label(task["day_offset"])
+                    if task["day_offset"] is not None else "дни служения"
+                )
+                for task in tasks
+            ),
+        ]
+        if notice:
+            lines = [notice, ""] + lines
+        buttons = [
+            InlineKeyboardButton(
+                text=f"📅 {task['name']}"[:60],
+                callback_data=(
+                    f"svc_tasks:dpick:{service_id}:{task['position']}:"
+                    f"{session_id}"
+                ),
+            )
+            for task in tasks
+        ]
+        rows = layout_buttons(buttons) if buttons else []
+        rows.append([InlineKeyboardButton(
+            text="⬅️ К задачам",
+            callback_data=f"svc_tasks:open:{service_id}",
+        )])
         await _send_dialog(
             message,
             "\n".join(lines),
@@ -4502,9 +4565,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return ", ".join(names.get(key, key) for key in people) or "никто"
 
         implicit = schedule_plan.implicit_plan(plan)
+        task_day = task.get("day")
         lines = [
             f"✏️ {date.fromisoformat(day):%d.%m}"
             + ("" if implicit else f" · «{task['name']}»")
+            + (
+                "" if task_day is None else
+                f" · {member_day_label(task_day)}"
+            )
             + f" (нужно {need})",
             "Сейчас: " + (listed(current) if current else "⚠️ никого"),
             "",
@@ -4540,8 +4608,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             schedule_plan.window_of(registry, service["id"]), "свои дни"
         )
         for index, key in enumerate(current):
-            # День только на эту дату (иначе — свой день человека или окно).
-            offset = schedule_plan.day_offset(plan, by_key.get(key), day)
+            # День только на эту дату (иначе — день задачи, свой день
+            # человека или окно).
+            offset = schedule_plan.slot_offset(
+                plan, by_key.get(key), day, task["name"]
+            )
             label = member_day_label(offset) if offset is not None else usual
             rows.append([readiness_button(
                 f"📅 {names.get(key, key)} — {label}"[:60],
@@ -6087,6 +6158,78 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     f"✅ «{task['name']}» "
                     f"{'выключена' if task['enabled'] else 'включена'}",
                 )
+            elif action == "days" and len(parts) == 4:
+                await show_task_days(callback.message, service_id, session_id)
+            elif action in {"dpick", "dset"} and len(parts) in {5, 6}:
+                position = int(parts[3])
+                task = next(
+                    (
+                        item for item in registry.list_service_tasks(service_id)
+                        if item["position"] == position
+                    ),
+                    None,
+                )
+                if task is None:
+                    raise ValueError("Задача больше не существует.")
+                if action == "dset" and len(parts) == 6:
+                    offset = None if parts[4] == "n" else int(parts[4])
+                    registry.set_service_task_day(
+                        actor_id, service_id, task["name"], offset
+                    )
+                    await show_task_days(
+                        callback.message, service_id, session_id,
+                        f"✅ «{task['name']}»: " + (
+                            member_day_label(offset) if offset is not None
+                            else "дни служения"
+                        ),
+                    )
+                elif action == "dpick" and len(parts) == 5:
+                    current = task["day_offset"]
+                    buttons = [
+                        InlineKeyboardButton(
+                            text=(
+                                f"{'✅' if offset == current else '📅'} "
+                                f"{member_day_label(offset)}"
+                            ),
+                            callback_data=(
+                                f"svc_tasks:dset:{service_id}:{position}:"
+                                f"{offset}:{session_id}"
+                            ),
+                        )
+                        for offset in MEMBER_DAYS
+                    ]
+                    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+                    rows.append([InlineKeyboardButton(
+                        text=(
+                            f"{'✅' if current is None else '↩️'} "
+                            "Дни служения"
+                        ),
+                        callback_data=(
+                            f"svc_tasks:dset:{service_id}:{position}:n:"
+                            f"{session_id}"
+                        ),
+                    )])
+                    rows.append([InlineKeyboardButton(
+                        text="⬅️ К дням задач",
+                        callback_data=(
+                            f"svc_tasks:days:{service_id}:{session_id}"
+                        ),
+                    )])
+                    await _send_dialog(
+                        callback.message,
+                        f"📅 {task_emoji(task['name'])} {task['name']}\n\n"
+                        "В какой день недели выполняется задача относительно "
+                        "воскресенья графика? Например, спевка в среду — "
+                        "«ср (вс −4)». «Дни служения» — как в разделе "
+                        "«📅 График».",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+                        _dialog_keep_rows=True,
+                        _dialog_keyboard_limit=sum(len(row) for row in rows),
+                        parse_mode=None,
+                    )
+                else:
+                    await _answer_callback(callback, "⚠️ Неизвестное действие.")
+                    return
             elif action == "add" and len(parts) == 4:
                 pending["step"] = "add_task"
                 await _send_dialog(

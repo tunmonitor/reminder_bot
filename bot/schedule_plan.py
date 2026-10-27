@@ -147,7 +147,7 @@ def plan_tasks(registry, service_id: str) -> list[dict]:
     return [
         {
             "name": task["name"], "needed": task["needed"], "max": task["max"],
-            "implicit": task["implicit"],
+            "implicit": task["implicit"], "day": task.get("day"),
         }
         for task in registry.plan_tasks(service_id)
     ]
@@ -304,18 +304,92 @@ def day_offset(plan: dict | None, person: dict | None, day: str) -> int | None:
     return (person or {}).get("day_offset")
 
 
+def task_days(plan: dict) -> dict[str, int]:
+    """Свои дни задач графика (спевка — вс −4)."""
+    return {
+        task["name"]: task["day"] for task in plan["tasks"]
+        if task.get("day") is not None
+    }
+
+
+def slot_offset(plan: dict, person: dict | None, day: str,
+                task: str) -> int | None:
+    """День человека в задаче на дату: разовый в графике, иначе день
+    задачи, иначе личный."""
+    key = (person or {}).get("key")
+    override = plan.get("days", {}).get(day, {}).get(key)
+    if override is not None:
+        return override
+    own = task_days(plan).get(task)
+    if own is not None:
+        return own
+    return (person or {}).get("day_offset")
+
+
 def served_offsets(plan: dict, people: list[dict]) -> dict:
-    """Фактический сдвиг дня служения каждого поставленного (разовый или
-    свой день) — снимок при публикации."""
+    """Фактический сдвиг дня служения каждого поставленного (разовый, день
+    задачи или свой день) — снимок при публикации. У человека в нескольких
+    задачах даты — самый поздний день."""
     by_key = {person["key"]: person for person in people}
-    result: dict = {}
+    latest: dict[tuple[str, str], int] = {}
     for day, tasks in plan["slots"].items():
-        for keys in tasks.values():
+        for task, keys in tasks.items():
             for key in keys:
-                offset = day_offset(plan, by_key.get(key), day)
-                if offset:
-                    result.setdefault(day, {})[key] = offset
+                offset = slot_offset(plan, by_key.get(key), day, task) or 0
+                latest[day, key] = max(offset, latest.get((day, key), offset))
+    result: dict = {}
+    for (day, key), offset in latest.items():
+        if offset:
+            result.setdefault(day, {})[key] = offset
     return result
+
+
+def week_groups(plan: dict, day: str, window: tuple[int, int]
+                ) -> tuple[str, list[tuple[str, int | None, list[dict]]]]:
+    """График по неделям (у задач свои дни): «Неделя 26.10–01.11» и дни
+    недели по порядку, у каждого — его задачи. Воскресенье — правая граница
+    недели; задачи без своего дня — в день (или окно) служения. Элемент:
+    подпись дня, сдвиг дня (None — окно служения), задачи."""
+    sunday = date.fromisoformat(day)
+    own = task_days(plan)
+    groups: dict[int | None, list[dict]] = {}
+    base = None if window != (0, 0) else 0
+    for task in plan["tasks"]:
+        groups.setdefault(own.get(task["name"], base), []).append(task)
+    offsets = [offset for offset in groups if offset is not None]
+    last = max([0, window[1] if None in groups else 0, *offsets])
+    title = (
+        f"Неделя {sunday - timedelta(days=6):%d.%m}–"
+        f"{sunday + timedelta(days=last):%d.%m}"
+    )
+    result = []
+    # Окно служения — после задач со своим днём в тот же день.
+    for offset in sorted(
+        groups,
+        key=lambda value: (window[0], 1) if value is None else (value, 0),
+    ):
+        if offset is None:
+            label = (
+                f"{_weekday_date(sunday + timedelta(days=window[0]))} – "
+                f"{_weekday_date(sunday + timedelta(days=window[1]))}"
+            )
+        else:
+            label = _weekday_date(sunday + timedelta(days=offset))
+        result.append((label, offset, groups[offset]))
+    return title, result
+
+
+def week_person_day(plan: dict, person: dict | None, day: str, task: str,
+                    group_offset: int | None) -> str:
+    """День человека в графике по неделям — в скобках, только если он не
+    совпадает с днём строки."""
+    offset = slot_offset(plan, person, day, task)
+    if offset is None or offset == group_offset:
+        return ""
+    return (
+        " (" + _weekday_date(date.fromisoformat(day) + timedelta(days=offset))
+        + ")"
+    )
 
 
 def person_day(person: dict | None, day: str, plan: dict | None = None) -> str:
@@ -383,7 +457,31 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
         ) + f" · закрыто мест {done} из {total}",
     ]
     used_silent = False
+    weekly = bool(task_days(plan))
     for day in plan["dates"]:
+        if weekly:
+            title, groups = week_groups(plan, day, window)
+            lines += ["", f"🗓 {title}"]
+            for label, offset, tasks in groups:
+                lines.append(f"   {label}")
+                for task in tasks:
+                    people = plan["slots"].get(day, {}).get(task["name"], [])
+                    used_silent |= any(person in silent for person in people)
+                    lines += [
+                        "  " + line for line in task_lines(
+                            task["name"], task["needed"],
+                            [
+                                names.get(person, person)
+                                + ("*" if person in silent else "")
+                                + week_person_day(
+                                    plan, by_key.get(person), day,
+                                    task["name"], offset,
+                                )
+                                for person in people
+                            ],
+                        )
+                    ]
+            continue
         header, shared_day = date_header(plan, by_key, day, window)
         lines += ["", f"🗓 {header}"]
         for task in plan["tasks"]:
@@ -564,7 +662,32 @@ def publication_text(service: dict, plan: dict, people: list[dict],
     lines = [
         publication_title(service, plan["month"], update, settings),
     ]
+    weekly = bool(task_days(plan))
     for day in plan["dates"]:
+        if weekly:
+            # У задач свои дни (спевка — ср): неделя, под ней дни и задачи.
+            title, groups = week_groups(plan, day, window)
+            lines += ["", f"🗓 {title}"]
+            for label, offset, tasks in groups:
+                lines.append(f"  {label}")
+                for task in tasks:
+                    people_text = ", ".join(
+                        (
+                            user_link(by_key[key]["telegram_id"],
+                                      by_key[key]["name"])
+                            + week_person_day(
+                                plan, by_key[key], day, task["name"], offset
+                            )
+                        ) if key in by_key else key
+                        for key in plan["slots"].get(day, {}).get(
+                            task["name"], []
+                        )
+                    ) or phrase(settings, "empty")
+                    lines.append(
+                        f"    {task_emoji(task['name'])} {task['name']}: "
+                        f"{people_text}"
+                    )
+            continue
         label, shared_day = date_header(plan, by_key, day, window)
         lines += ["", f"🗓 {label}"]
         for task in plan["tasks"]:
