@@ -35,6 +35,7 @@ class ConfirmationHandlerTest(unittest.TestCase):
                 admin_id=67890,
                 group_chat_id=-100,
                 service_registry=SimpleNamespace(
+                    is_super_admin=lambda actor_id: actor_id == 67890,
                     list_services=MagicMock(
                         return_value=[
                             {
@@ -182,6 +183,7 @@ class ConfirmationHandlerTest(unittest.TestCase):
                 debug_logger=MagicMock(),
                 admin_id=67890,
                 service_registry=SimpleNamespace(
+                    is_super_admin=lambda actor_id: actor_id == 67890,
                     list_services=MagicMock(
                         return_value=[
                             {
@@ -3948,6 +3950,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 debug_logger=MagicMock(),
                 admin_id=67890,
                 service_registry=SimpleNamespace(
+                    is_super_admin=lambda actor_id: actor_id == 67890,
                     list_services=MagicMock(return_value=[sound]),
                     get_service=MagicMock(return_value=sound),
                 ),
@@ -4948,11 +4951,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "menu:service_settings",
                     "menu:service_notify",
                     "menu:service_contact",
-                    "menu:service_sync",
-                    "menu:service_chat",
-                    "menu:service_admin_add",
-                    "menu:service_admin_remove",
-                    "menu:test_notify",
+                    "menu:service_admins",
                 ],
             )
 
@@ -4970,8 +4969,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertEqual(
                 self.callback_data_list(message),
                 ["menu:service_settings", "menu:service_notify",
-                 "menu:service_contact", "menu:service_sync",
-                 "menu:service_chat"],
+                 "menu:service_contact"],
             )
 
         asyncio.run(run())
@@ -5031,6 +5029,35 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 "service:service_notify:sound",
                 self.callback_data_list(callback.message),
             )
+
+        asyncio.run(run())
+
+    def test_start_menu_admins_item_offers_add_and_remove(self):
+        async def run():
+            callback = SimpleNamespace(
+                data="menu:service_admins",
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_start_menu")(callback)
+            self.assertEqual(
+                self.callback_data_list(callback.message),
+                ["menu:service_admin_add", "menu:service_admin_remove",
+                 "menu:start"],
+            )
+            self.registry.add_service_admin(67890, "sound", 24680)
+            denied = SimpleNamespace(
+                data="menu:service_admins",
+                from_user=SimpleNamespace(id=24680),
+                message=self.message(24680, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_start_menu")(denied)
+            self.assertIn(
+                "супер-администратор", denied.message.answer.await_args.args[0]
+            )
+            self.assertEqual(self.callback_data_list(denied.message), [])
 
         asyncio.run(run())
 
@@ -5788,7 +5815,6 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "service:service_chat:sound",
                     "service:service_admin_add:sound",
                     "service:service_admin_remove:sound",
-                    "service:test_notify:sound",
                     "rdy:open:sound",
                     "svc_tasks:open:sound",
                     "service:back_to_services:list",
@@ -5797,6 +5823,15 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIn(
                 "👤 Администраторы · ⚪ не назначены",
                 message.answer.await_args.args[0],
+            )
+            # Проверка доставки — только когда групповой чат назначен.
+            self.registry.set_group_chat(67890, "sound", -200, enabled=True)
+            again = self.message(67890, "/service_settings sound")
+            await self.message_handler("on_service_settings")(again)
+            buttons = self.callback_data_list(again)
+            self.assertEqual(
+                buttons[buttons.index("service:service_chat:sound") + 1],
+                "service:test_notify:sound",
             )
 
         asyncio.run(run())
