@@ -549,7 +549,13 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   after a chat is saved) is open to the service admin; previews go to the
   caller. Start menu (27.10): settings, notify, contacts, and for the super
   admin `menu:service_admins` (submenu with add/remove); sync, chat and
-  delivery check live only in the service card.
+  delivery check live only in the service card. Card (27.10 evening):
+  chat and admin add/remove moved into «⚙️ Настройки»
+  (`service:service_setup`, `service_setup_keyboard`); the delivery check
+  is in the chat screen (`service_chat_keyboard(service_id, actor_id)`);
+  «❓ Помощь» = `service:service_help` (`SERVICE_HELP`). `/service_contact`
+  opens the member list first (`offer_contact_overview(members_first=True)`),
+  the date overview via «🗓 По датам графика».
 - Readiness poll texts: `question_template` (`readiness.question_text`, fields
   service_name/month/month_in, ≤300, sent with `question_parse_mode=None`,
   blank → default); «📝 Тексты» (`show_readiness_texts`, kind "q").

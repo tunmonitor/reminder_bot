@@ -4040,7 +4040,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             markup = opened.message.answer.await_args.kwargs["reply_markup"]
             self.assertEqual(
                 [b.callback_data for row in markup.inline_keyboard for b in row],
-                ["test_action:group:sound", "test_action:preview:sound"],
+                ["test_action:group:sound", "test_action:preview:sound",
+                 "service:service_chat:sound"],
             )
 
             await test_action(callback(24680, "test_action:preview:sound"))
@@ -5885,11 +5886,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "service:service_contact:sound",
                     "service:service_replace:sound",
                     "service:service_sync:sound",
-                    "service:service_chat:sound",
-                    "service:service_admin_add:sound",
-                    "service:service_admin_remove:sound",
                     "rdy:open:sound",
                     "svc_tasks:open:sound",
+                    "service:service_setup:sound",
+                    "service:service_help:sound",
                     "service:back_to_services:list",
                 ],
             )
@@ -5897,14 +5897,41 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 "👤 Администраторы · ⚪ не назначены",
                 message.answer.await_args.args[0],
             )
-            # Проверка доставки — только когда групповой чат назначен.
-            self.registry.set_group_chat(67890, "sound", -200, enabled=True)
-            again = self.message(67890, "/service_settings sound")
-            await self.message_handler("on_service_settings")(again)
-            buttons = self.callback_data_list(again)
+
+            def callback(data, actor_id=67890):
+                return SimpleNamespace(
+                    data=data, from_user=SimpleNamespace(id=actor_id),
+                    message=self.message(actor_id, ""), answer=AsyncMock(),
+                )
+
+            # «⚙️ Настройки»: групповой чат и админы (у суперадмина).
+            setup = callback("service:service_setup:sound")
+            await self.callback_handler("on_service_selected")(setup)
             self.assertEqual(
-                buttons[buttons.index("service:service_chat:sound") + 1],
+                self.callback_data_list(setup.message),
+                ["service:service_chat:sound", "service:service_admin_add:sound",
+                 "service:service_admin_remove:sound",
+                 "service:service_settings:sound"],
+            )
+            # Проверка доставки — в «📡 Групповой чат», когда чат назначен.
+            chat = callback("service:service_chat:sound")
+            await self.callback_handler("on_service_selected")(chat)
+            self.assertNotIn(
+                "service:test_notify:sound", self.callback_data_list(chat.message)
+            )
+            self.registry.set_group_chat(67890, "sound", -200, enabled=True)
+            chat = callback("service:service_chat:sound")
+            await self.callback_handler("on_service_selected")(chat)
+            buttons = self.callback_data_list(chat.message)
+            self.assertEqual(
+                buttons[buttons.index("service:service_chat_set:sound") + 1],
                 "service:test_notify:sound",
+            )
+            helped = callback("service:service_help:sound")
+            await self.callback_handler("on_service_selected")(helped)
+            self.assertIn(
+                "⚙️ Настройки — групповой чат",
+                helped.message.answer.await_args.args[0],
             )
 
         asyncio.run(run())
@@ -6786,8 +6813,21 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 self.callback_data_list(callback.message),
                 ["service:edit_notify:sound", "service:service_contact:sound",
                  "service:service_replace:sound", "service:service_sync:sound",
-                 "service:service_chat:sound", "rdy:open:sound",
-                 "svc_tasks:open:sound", "service:back_to_services:list"],
+                 "rdy:open:sound", "svc_tasks:open:sound",
+                 "service:service_setup:sound", "service:service_help:sound",
+                 "service:back_to_services:list"],
+            )
+            # В «⚙️ Настройки» — только групповой чат, без админов.
+            setup = SimpleNamespace(
+                data="service:service_setup:sound",
+                from_user=SimpleNamespace(id=24680),
+                message=self.message(24680, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_selected")(setup)
+            self.assertEqual(
+                self.callback_data_list(setup.message),
+                ["service:service_chat:sound", "service:service_settings:sound"],
             )
             self.assertIn(
                 "👤 Администраторы · 1",
@@ -6921,7 +6961,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
         )
         message = self.message(67890, "/service_contact sound")
         await self.message_handler("on_service_contact")(message)
-        return message
+        # «👥 Ответственные» открывается списком людей; даты — кнопкой.
+        self.assertIn("👥 Состав · ЗВУК", message.answer.await_args.args[0])
+        dates = await self.press_contact(message, "🗓 По датам графика")
+        return dates.message
 
     async def press_contact(self, source, label):
         button = next(
@@ -6969,7 +7012,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 rows,
                 [
                     ["➡️ 01.11"],
-                    ["✏️ Изменить привязки"],
+                    ["👥 К списку ответственных"],
                     ["🔔 Напоминания"],
                     ["⬅️ К карточке служения"],
                 ],
@@ -6985,7 +7028,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             text = following.message.answer.await_args.args[0]
             self.assertIn("🗓 01.11.2026, вс · 2 из 2", text)
             self.assertIn("• Олег — ⚪ не привязан", text)
-            stale = await self.press_contact(message, "✏️ Изменить привязки")
+            stale = await self.press_contact(message, "👥 К списку ответственных")
             self.assertIn("устарел", stale.answer.await_args.args[0])
             back = await self.press_contact(following.message, "⬅️ 25.10")
             self.assertIn("1 из 2", back.message.answer.await_args.args[0])
@@ -6995,12 +7038,14 @@ class ServiceManagementHandlerTest(unittest.TestCase):
     def test_contact_overview_edit_opens_tasks_and_returns(self):
         async def run():
             message = await self.open_contact_overview()
-            tasks = await self.press_contact(message, "✏️ Изменить привязки")
+            tasks = await self.press_contact(message, "👥 К списку ответственных")
 
             self.assertIn(
                 "👥 Состав · ЗВУК", tasks.message.answer.await_args.args[0]
             )
-            overview = await self.press_contact(tasks.message, "⬅️ К обзору")
+            overview = await self.press_contact(
+                tasks.message, "🗓 По датам графика"
+            )
             self.assertIn(
                 "📊 Привязано 2 из 3", overview.message.answer.await_args.args[0]
             )
@@ -7033,12 +7078,15 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             message = self.message(67890, "/service_contact sound")
             await self.message_handler("on_service_contact")(message)
-
+            self.assertIn("👥 Состав · ЗВУК", message.answer.await_args.args[0])
+            dates = await self.press_contact(message, "🗓 По датам графика")
             self.assertIn(
                 "Не удалось загрузить график по датам",
-                message.answer.await_args.args[0],
+                dates.message.answer.await_args.args[0],
             )
-            tasks = await self.press_contact(message, "✏️ Изменить привязки")
+            tasks = await self.press_contact(
+                dates.message, "👥 К списку ответственных"
+            )
             self.assertIn(
                 "👥 Состав · ЗВУК", tasks.message.answer.await_args.args[0]
             )
@@ -7081,7 +7129,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             ]
         })
         message = await self.open_contact_overview()
-        return await self.press_contact(message, "✏️ Изменить привязки")
+        return await self.press_contact(message, "👥 К списку ответственных")
 
     async def open_person(self, source, label):
         """Человек из «Состава» → карточка → «Привязать Telegram»."""
@@ -7112,7 +7160,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "✅ 🆕 Иван",
                     "⚠️ Мария · нет в списке",
                     "➕ Добавить участника",
-                    "⬅️ К обзору",
+                    "🗓 По датам графика",
+                    "⬅️ К карточке служения",
                 ],
             )
 
