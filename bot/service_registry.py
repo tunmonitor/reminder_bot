@@ -273,6 +273,10 @@ class ServiceRegistry:
                     chat_reminder_template TEXT,
                     question_template TEXT,
                     plan_title_template TEXT,
+                    -- Лимит служений человека в месяц (для всех): минимум и
+                    -- максимум (NULL — без ограничения).
+                    month_min INTEGER NOT NULL DEFAULT 0,
+                    month_max INTEGER,
                     -- «Нужно людей» служения без задач (оно — одна задача).
                     people_needed INTEGER NOT NULL DEFAULT 1,
                     people_max INTEGER,
@@ -488,6 +492,10 @@ class ServiceRegistry:
                     tasks_manual INTEGER NOT NULL DEFAULT 0,
                     -- Личный день служения: сдвиг от воскресенья (чт = −3).
                     day_offset INTEGER,
+                    -- Личный лимит служений в месяц (главнее лимита
+                    -- служения): month_min NULL — как у служения.
+                    month_min INTEGER,
+                    month_max INTEGER,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (service_id, name)
                 );
@@ -835,6 +843,10 @@ class ServiceRegistry:
                 ("readiness_settings", "day_from", "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_settings", "day_to", "INTEGER NOT NULL DEFAULT 0"),
                 ("service_members", "day_offset", "INTEGER"),
+                ("service_members", "month_min", "INTEGER"),
+                ("service_members", "month_max", "INTEGER"),
+                ("readiness_settings", "month_min", "INTEGER NOT NULL DEFAULT 0"),
+                ("readiness_settings", "month_max", "INTEGER"),
                 ("schedule_plans", "republish", "INTEGER NOT NULL DEFAULT 0"),
                 ("schedule_plans", "days_json", "TEXT NOT NULL DEFAULT '{}'"),
                 ("schedule_plans", "approved_days_json", "TEXT"),
@@ -3720,7 +3732,8 @@ class ServiceRegistry:
             self._require_service(connection, service_id)
             rows = connection.execute(
                 "SELECT name, telegram_id, username, tasks_json, in_list, "
-                "source, tasks_manual, day_offset FROM service_members "
+                "source, tasks_manual, day_offset, month_min, month_max "
+                "FROM service_members "
                 "WHERE service_id = ? ORDER BY in_list DESC, rowid",
                 (service_id,),
             ).fetchall()
@@ -3734,6 +3747,7 @@ class ServiceRegistry:
                 "source": row["source"],
                 "tasks_manual": bool(row["tasks_manual"]),
                 "day_offset": row["day_offset"],
+                "month_limit": _member_limit(row),
             }
             for row in rows
         ]
@@ -4058,6 +4072,37 @@ class ServiceRegistry:
             self._audit(
                 connection, actor_id, "service_member_day", service_id,
                 {"name": name, "day_offset": offset},
+            )
+
+    def set_service_member_limit(
+        self, actor_id: int, service_id: str, name: str,
+        limit: tuple[int, int | None] | None,
+    ) -> None:
+        """Личный лимит служений в месяц: (минимум, максимум или None —
+        без верхней границы); None — как у служения."""
+        _validate_positive_id(actor_id, "actor_id")
+        low, high = limit if limit is not None else (None, None)
+        if limit is not None:
+            _validate_month_limit(low, high)
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            row = connection.execute(
+                "SELECT telegram_id FROM service_members "
+                "WHERE service_id = ? AND name = ?",
+                (service_id, name),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"«{name}» нет в составе.")
+            # Человек — Telegram ID: лимит во всех его строках.
+            connection.execute(
+                "UPDATE service_members SET month_min = ?, month_max = ?, "
+                "updated_at = ? WHERE service_id = ? AND (name = ? OR "
+                "(telegram_id IS NOT NULL AND telegram_id = ?))",
+                (low, high, _utc_now(), service_id, name, row["telegram_id"]),
+            )
+            self._audit(
+                connection, actor_id, "service_member_limit", service_id,
+                {"name": name, "month_min": low, "month_max": high},
             )
 
     def remove_service_member(
@@ -5165,6 +5210,8 @@ class ServiceRegistry:
         "chat_reminder_template": None,
         "question_template": None,
         "plan_title_template": None,
+        "month_min": 0,
+        "month_max": None,
         "people_needed": 1,
         "people_max": None,
         "day_from": 0,
@@ -5177,7 +5224,7 @@ class ServiceRegistry:
                 "SELECT enabled, start_time, duration_days, deadline_time, "
                 "remind_days, enabled_at, intro_template, reminder_template, "
                 "closed_template, chat_reminder_template, question_template, "
-                "plan_title_template, "
+                "plan_title_template, month_min, month_max, "
                 "people_needed, people_max, day_from, day_to "
                 "FROM readiness_settings WHERE service_id = ?",
                 (service_id,),
@@ -5229,6 +5276,7 @@ class ServiceRegistry:
             or not -6 <= day_from <= 0 <= day_to <= 6
         ):
             raise ValueError("Дни служения: от вс −6 до вс +6, включая вс.")
+        _validate_month_limit(new["month_min"], new["month_max"])
         for key, fields, label in (
             ("intro_template", READINESS_INTRO_FIELDS, "Текст опроса"),
             ("reminder_template", READINESS_REMINDER_FIELDS,
@@ -5262,9 +5310,9 @@ class ServiceRegistry:
                 "start_time, duration_days, deadline_time, remind_days, "
                 "enabled_at, intro_template, reminder_template, "
                 "closed_template, chat_reminder_template, question_template, "
-                "plan_title_template, "
+                "plan_title_template, month_min, month_max, "
                 "people_needed, people_max, day_from, day_to, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id) DO UPDATE SET "
                 "enabled = excluded.enabled, start_time = excluded.start_time, "
                 "duration_days = excluded.duration_days, "
@@ -5277,6 +5325,8 @@ class ServiceRegistry:
                 "chat_reminder_template = excluded.chat_reminder_template, "
                 "question_template = excluded.question_template, "
                 "plan_title_template = excluded.plan_title_template, "
+                "month_min = excluded.month_min, "
+                "month_max = excluded.month_max, "
                 "people_needed = excluded.people_needed, "
                 "people_max = excluded.people_max, "
                 "day_from = excluded.day_from, day_to = excluded.day_to, "
@@ -5288,6 +5338,7 @@ class ServiceRegistry:
                     new["intro_template"], new["reminder_template"],
                     new["closed_template"], new["chat_reminder_template"],
                     new["question_template"], new["plan_title_template"],
+                    new["month_min"], new["month_max"],
                     new["people_needed"], new["people_max"],
                     new["day_from"], new["day_to"], now,
                 ),
@@ -5327,7 +5378,8 @@ class ServiceRegistry:
                 implicit = row["name"] if row else None
             members = connection.execute(
                 "SELECT name, telegram_id, username, tasks_json, in_list, "
-                "source, day_offset FROM service_members WHERE service_id = ? "
+                "source, day_offset, month_min, month_max "
+                "FROM service_members WHERE service_id = ? "
                 "ORDER BY in_list DESC, rowid",
                 (service_id,),
             ).fetchall()
@@ -5355,13 +5407,15 @@ class ServiceRegistry:
                 # «Списков» — нет).
                 "active": bool(row["in_list"]) or row["source"] != "excel",
                 "day_offset": row["day_offset"],
+                "month_limit": _member_limit(row),
             }
             if row["telegram_id"] in by_id:
                 by_id[row["telegram_id"]]["tasks"] |= person["tasks"]
                 by_id[row["telegram_id"]]["active"] |= person["active"]
-                if by_id[row["telegram_id"]]["day_offset"] is None:
-                    # Личный день — с любой строки этого человека.
-                    by_id[row["telegram_id"]]["day_offset"] = person["day_offset"]
+                # Личный день и лимит — с любой строки этого человека.
+                for field in ("day_offset", "month_limit"):
+                    if by_id[row["telegram_id"]][field] is None:
+                        by_id[row["telegram_id"]][field] = person[field]
                 continue
             people.append(person)
             if row["telegram_id"]:
@@ -5381,6 +5435,7 @@ class ServiceRegistry:
                         "username": "",
                         "tasks": set(),
                         "day_offset": None,
+                        "month_limit": None,
                     }
                     people.append(person)
                 by_id[row["telegram_id"]] = person
@@ -6104,6 +6159,30 @@ def _current_month() -> str:
 
 
 USERNAME_BINDING_DAYS = 30
+# Лимит служений человека в месяц — от 0 до MONTH_LIMIT_MAX.
+MONTH_LIMIT_MAX = 5
+
+
+def _validate_month_limit(low, high) -> None:
+    if (
+        isinstance(low, bool) or not isinstance(low, int)
+        or not 0 <= low <= MONTH_LIMIT_MAX
+        or high is not None and (
+            isinstance(high, bool) or not isinstance(high, int)
+            or not low <= high <= MONTH_LIMIT_MAX
+        )
+    ):
+        raise ValueError(
+            f"Служений в месяц: от 0 до {MONTH_LIMIT_MAX}, минимум не больше "
+            "максимума."
+        )
+
+
+def _member_limit(row) -> tuple[int, int | None] | None:
+    """Личный лимит строки состава; None — как у служения."""
+    if row["month_min"] is None:
+        return None
+    return (row["month_min"], row["month_max"])
 
 
 def _username_binding_cutoff() -> str:

@@ -53,6 +53,11 @@ GAP_PENALTY = {1: BACK_TO_BACK_WEIGHT, 2: 2}
 # меньше 0. Меньше шага нагрузки (2 × LOAD_WEIGHT): ровнее нагрузка
 # главнее чередования.
 ROTATION_WEEKS = 5
+# Лимит служений в месяц (решение 12): максимум — жёсткий (сверх него
+# человек не ставится, даже если отметил все даты), минимум — штраф за
+# каждое недостающее служение: больше шагов нагрузки и интервала в две
+# недели, меньше служения подряд и не ответившего.
+BELOW_MIN_WEIGHT = 50
 # Предел проходов улучшения: план маленький, улучшения быстро кончаются.
 MAX_IMPROVE_ROUNDS = 50
 
@@ -72,6 +77,9 @@ class PlanInput:
     extra: Mapping[str, int] = field(default_factory=dict)
     # Не ответившие на опрос: ставятся после ответивших.
     reluctant: frozenset[str] = frozenset()
+    # Человек → (минимум, максимум) служений в месяц; максимум None — без
+    # ограничения. Нет записи — без лимита.
+    limits: Mapping[str, tuple[int, int | None]] = field(default_factory=dict)
 
 
 @dataclass
@@ -118,6 +126,16 @@ def _gap_penalty(earlier: date | None, later: date) -> int:
         return 0
     # Меньше недели (служение в начале месяца с прошлого) — как неделя.
     return GAP_PENALTY.get(max(1, _weeks(earlier, later)), 0)
+
+
+def _limit(data: PlanInput, person: str) -> tuple[int, int | None]:
+    return data.limits.get(person, (0, None))
+
+
+def _below_max(data: PlanInput, person: str, count: int) -> bool:
+    """Ещё одно служение не превысит месячный максимум человека."""
+    high = _limit(data, person)[1]
+    return high is None or count < high
 
 
 def _rotation_penalty(data: PlanInput, person: str) -> int:
@@ -260,15 +278,22 @@ def build_plan(data: PlanInput) -> Plan:
 
     # Сначала минимум задач на весь месяц — все (ответившие дешевле).
     for event_date in sorted(set(data.dates)):
-        people = free_on(event_date)
-        # Прирост общей стоимости от ещё одного служения человека.
+        people = [
+            person for person in free_on(event_date)
+            if _below_max(data, person, load.get(person, 0))
+        ]
+        # Прирост общей стоимости от ещё одного служения человека (у
+        # недобравшего минимум — дешевле на BELOW_MIN_WEIGHT).
         assign(event_date, people, required, {
             person: LOAD_WEIGHT * (2 * load.get(person, 0) + 1)
             + _gap_penalty(last.get(person), event_date)
             + (0 if load.get(person) else _rotation_penalty(data, person))
             + (RELUCTANT_WEIGHT if person in data.reluctant else 0)
+            + (0 if load.get(person, 0) < _limit(data, person)[0]
+               else BELOW_MIN_WEIGHT)
             for person in people
         })
+    repair_gaps(plan, data)
     improve_plan(plan, data)
     # Затем места сверх минимума — только ответившими и без служения
     # подряд ни с прошлой, ни со следующей датой: место сверх минимума
@@ -287,9 +312,11 @@ def build_plan(data: PlanInput) -> Plan:
             )
             and _gap_penalty(data.last_served.get(person), event_date)
             < BACK_TO_BACK_WEIGHT
+            and _below_max(data, person, len(served.get(person, ())))
         ]
+        # BELOW_MIN_WEIGHT — чтобы стоимость не была отрицательной.
         assign(event_date, people, optional, {
-            person: _person_cost(
+            person: BELOW_MIN_WEIGHT + _person_cost(
                 data, person, served.get(person, set()) | {event_date}
             ) - _person_cost(data, person, served.get(person, set()))
             for person in people
@@ -308,6 +335,7 @@ def _person_cost(data: PlanInput, person: str, dates: Iterable[date]) -> int:
     """Вклад человека в стоимость плана: нагрузка² и штрафы интервала."""
     ordered = sorted(dates)
     total = LOAD_WEIGHT * len(ordered) ** 2
+    total += BELOW_MIN_WEIGHT * max(0, _limit(data, person)[0] - len(ordered))
     if ordered:
         total += _rotation_penalty(data, person)
     if person in data.reluctant:
@@ -317,6 +345,77 @@ def _person_cost(data: PlanInput, person: str, dates: Iterable[date]) -> int:
         total += _gap_penalty(previous, event_date)
         previous = event_date
     return total
+
+
+def repair_gaps(plan: Plan, data: PlanInput) -> None:
+    """Обязательные места, оставшиеся пустыми из-за месячного максимума,
+    закрываются перестановками по всему месяцу: план — поток «исток →
+    человек (до его максимума) → (человек, дата) → место (до минимума
+    задачи) → сток», и он дополняется увеличивающими путями (Форд —
+    Фалкерсон) до максимального. Путь переставляет только людей своей
+    цепочки (другая задача в ту же дату, другая дата), остальные остаются
+    на местах; поиск в ширину — кратчайшие цепочки."""
+    source, sink = ("source",), ("sink",)
+    capacity: dict[tuple, int] = {}
+    edges: dict[tuple, list[tuple]] = {}
+
+    def add(start: tuple, end: tuple, amount: int) -> None:
+        if (start, end) not in capacity:
+            edges.setdefault(start, []).append(end)
+            edges.setdefault(end, []).append(start)
+            capacity.setdefault((end, start), 0)
+        capacity[(start, end)] = capacity.get((start, end), 0) + amount
+
+    seats = sorted(plan.slots)
+    for person in sorted(data.free):
+        high = _limit(data, person)[1]
+        add(source, ("person", person), len(seats) if high is None else high)
+        for event_date in sorted(data.free[person]):
+            add(("person", person), ("day", person, event_date), 1)
+            for key in seats:
+                if key[0] == event_date and _can_serve(
+                    data, person, event_date, key[1]
+                ):
+                    add(("day", person, event_date), ("seat", key), 1)
+    for key in seats:
+        add(("seat", key), sink, plan.needed[key[1]])
+    # Текущий план — уже пущенный поток.
+    for key in seats:
+        for person in plan.slots[key]:
+            for start, end in (
+                (source, ("person", person)),
+                (("person", person), ("day", person, key[0])),
+                (("day", person, key[0]), ("seat", key)),
+                (("seat", key), sink),
+            ):
+                capacity[(start, end)] -= 1
+                capacity[(end, start)] += 1
+    while True:
+        came: dict[tuple, tuple | None] = {source: None}
+        queue = [source]
+        for node in queue:
+            for end in edges.get(node, ()):
+                if end not in came and capacity[(node, end)] > 0:
+                    came[end] = node
+                    queue.append(end)
+        if sink not in came:
+            break
+        node = sink
+        while came[node] is not None:
+            start = came[node]
+            capacity[(start, node)] -= 1
+            capacity[(node, start)] += 1
+            node = start
+    # Назначение — поток по ребру (человек, дата) → место; уже стоявшие
+    # остаются в прежнем порядке, новые — в конце.
+    for key in seats:
+        assigned = {
+            node[1] for node in edges.get(("seat", key), ())
+            if node[0] == "day" and capacity[(("seat", key), node)] > 0
+        }
+        plan.slots[key] = [
+            person for person in plan.slots[key] if person in assigned
+        ] + sorted(assigned - set(plan.slots[key]))
 
 
 def improve_plan(plan: Plan, data: PlanInput) -> None:
@@ -353,11 +452,13 @@ def improve_plan(plan: Plan, data: PlanInput) -> None:
             before_mine = cost_of(person, mine)
             after_mine = cost_of(person, mine - {event_date})
             for other in people_all:
+                theirs = served.get(other, set())
                 if other in busy[event_date] or not _can_serve(
                     data, other, event_date, task
-                ) or (other in data.reluctant and index >= plan.needed[task]):
+                ) or (
+                    other in data.reluctant and index >= plan.needed[task]
+                ) or not _below_max(data, other, len(theirs)):
                     continue
-                theirs = served.get(other, set())
                 delta = (
                     after_mine - before_mine
                     + cost_of(other, theirs | {event_date})

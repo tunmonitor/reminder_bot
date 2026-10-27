@@ -234,6 +234,18 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
         # во все даты, но ставятся после ответивших.
         silent = {person["key"] for person in summary.not_answered}
         free.update({name: all_dates for name in silent})
+        # Лимит служений в месяц: личный главнее лимита служения.
+        settings = registry.get_readiness_settings(run["service_id"])
+        common = (
+            (settings["month_min"], settings["month_max"])
+            if settings["month_min"] or settings["month_max"] is not None
+            else None
+        )
+        limits = {
+            person["key"]: person.get("month_limit") or common
+            for person in people
+            if person.get("month_limit") or common
+        }
         summary.plan = build_plan(PlanInput(
             dates=tuple(sorted(all_dates)),
             needed={task["name"]: task["needed"] for task in catalog},
@@ -244,6 +256,7 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
             tasks={name: frozenset(tasks[name]) for name in free},
             reluctant=frozenset(silent),
             last_served=dict(last_served or {}),
+            limits=limits,
         ))
     return summary
 
