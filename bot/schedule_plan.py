@@ -65,12 +65,13 @@ def _short(day: str) -> str:
 
 
 def served_dates(slots: dict) -> dict[str, list[str]]:
-    """Ключ человека → даты, когда он стоит в графике."""
-    result: dict[str, list[str]] = {}
+    """Ключ человека → даты, когда он стоит в графике (связка задач «в
+    одну неделю» в дату — одна дата)."""
+    result: dict[str, set[str]] = {}
     for day, tasks in slots.items():
         for people in tasks.values():
             for person in people:
-                result.setdefault(person, []).append(day)
+                result.setdefault(person, set()).add(day)
     return {person: sorted(days) for person, days in result.items()}
 
 
@@ -576,13 +577,16 @@ def slot_people(plan: dict, day: str, task: str) -> list[str]:
     return list(plan["slots"].get(day, {}).get(task, []))
 
 
-def busy_on(plan: dict, day: str, task: str) -> dict[str, str]:
-    """Кто уже стоит в этот день на другой задаче: ключ → задача."""
+def busy_on(plan: dict, day: str, task: str,
+            bundles: dict | None = None) -> dict[str, str]:
+    """Кто уже стоит в этот день на другой задаче: ключ → задача. Задача
+    из его связки «в одну неделю» с этой — не занятость."""
     return {
         person: other
         for other, people in plan["slots"].get(day, {}).items()
         if other != task
         for person in people
+        if not {task, other} <= (bundles or {}).get(person, frozenset())
     }
 
 
@@ -591,7 +595,9 @@ def candidates(
 ) -> tuple[list[str], list[str], list[str]]:
     """Кого можно поставить: (свободны и приписаны к задаче, не отвечали,
     остальные из состава). Уже стоящие в этот день — не предлагаются."""
-    taken = set(slot_people(plan, day, task)) | set(busy_on(plan, day, task))
+    taken = set(slot_people(plan, day, task)) | set(
+        busy_on(plan, day, task, summary.bundles)
+    )
     silent = {person["key"] for person in summary.not_answered}
     free, quiet, rest = [], [], []
     for person in summary.people:

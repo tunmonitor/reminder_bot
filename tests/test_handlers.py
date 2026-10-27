@@ -7200,6 +7200,87 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_member_week_tasks(self):
+        async def run():
+            members = await self.open_members()
+            self.registry.set_service_member_tasks(
+                67890, "sound", "Пётр", ["звук", "сборка"]
+            )
+            card = await self.press_inline(
+                members.message, "⚪ Пётр · не привязан", "on_contact_person_choice"
+            )
+            self.assertIn(
+                "🔗 В одну неделю: как у служения — нет",
+                card.message.answer.await_args.args[0],
+            )
+            week = await self.press_inline(
+                card.message, "🔗 В одну неделю", "on_member_card"
+            )
+            one = await self.press_inline(week.message, "⬜ звук", "on_member_card")
+            refused = await self.press_inline(
+                one.message, "✅ Сохранить", "on_member_card"
+            )
+            self.assertIn(
+                "хотя бы две", refused.message.answer.await_args.args[0]
+            )
+            two = await self.press_inline(
+                refused.message, "⬜ сборка", "on_member_card"
+            )
+            saved = await self.press_inline(two.message, "✅ Сохранить", "on_member_card")
+            self.assertIn(
+                "✅ В одну неделю: звук + сборка (личное)",
+                saved.message.answer.await_args.args[0],
+            )
+            person = next(
+                item for item in self.registry.readiness_people("sound")
+                if item["name"] == "Пётр"
+            )
+            self.assertEqual(person["week_tasks"], ["звук", "сборка"])
+            week = await self.press_inline(
+                saved.message, "🔗 В одну неделю", "on_member_card"
+            )
+            await self.press_inline(week.message, "↩️ Как у служения", "on_member_card")
+            person = next(
+                item for item in self.registry.readiness_people("sound")
+                if item["name"] == "Пётр"
+            )
+            self.assertIsNone(person["week_tasks"])
+
+        asyncio.run(run())
+
+    def test_task_same_week_flag(self):
+        async def run():
+            opened = SimpleNamespace(
+                data="svc_tasks:open:sound",
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_tasks")(opened)
+            week = await self._click(
+                opened.message,
+                lambda button: button.text == "🔗 В одну неделю",
+                actor_id=67890,
+            )
+            toggled = await self._click(
+                week.message, lambda button: button.text == "⬜ звук",
+                actor_id=67890,
+            )
+            self.assertIn(
+                "✅ «звук» в связке 🔗", toggled.message.answer.await_args.args[0]
+            )
+            self.assertTrue(next(
+                task for task in self.registry.list_service_tasks("sound")
+                if task["name"] == "звук"
+            )["same_week"])
+            back = await self._click(
+                toggled.message, lambda button: button.text == "⬅️ К задачам",
+                actor_id=67890,
+            )
+            self.assertIn("🎚️ звук · 🔗", back.message.answer.await_args.args[0])
+
+        asyncio.run(run())
+
     def test_member_binding_by_username_only(self):
         async def run():
             members = await self.open_members()

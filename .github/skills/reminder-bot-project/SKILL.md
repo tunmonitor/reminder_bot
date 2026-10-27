@@ -402,6 +402,15 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   (NULL = minimum, up to 6) — «👥 Нужно людей», set by service admins too
   (`set_service_task_people_needed(actor, service, task, low, high)`) from
   «🗳 Опрос готовности» or «📋 Задачи служения» (`rdy:people|ppick|pset`).
+- Week bundles: `service_tasks.same_week` (`set_service_task_same_week`,
+  UI `svc_tasks:week|wtog`) and `service_members.week_tasks_json`
+  (`set_service_member_week_tasks`, None = as service, [] = never,
+  ≥2 tasks; card `mbr:wk|wt|ws|wa|wn`). `readiness.summarize` builds
+  `PlanInput.bundles`; `schedule_planner.build_plan` wraps `_build_plan`
+  with a virtual seat `task\x1ftask` per bundle group (non-bundled people
+  may take it for one task; `_fill_bundle_gaps` fills the rest), and
+  falls back to the plain plan if coverage drops. `Plan.load` and
+  `served_dates` count dates, not slots.
 - `service_tasks.day_offset` — task's own day (−6…+6 from the plan's Sunday,
   NULL = service days), `set_service_task_day` (also rewrites `tasks_json`
   of current/future plans and marks approved ones `republish`); UI
