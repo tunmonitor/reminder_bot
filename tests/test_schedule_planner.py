@@ -428,6 +428,32 @@ class SchedulePlannerTest(unittest.TestCase):
         # A служил 25.10 — на 01.11 лучше не ответивший Q.
         self.assertEqual(plan.slots[(dates[0], "спевка")], ["Q"])
 
+    def test_optional_seat_does_not_force_consecutive_bundle_weeks(self):
+        d1, d2, d3 = (date(2026, 11, 1) + timedelta(weeks=i) for i in range(3))
+        plan = build_plan(PlanInput(
+            (d1, d2, d3), {"a": 1, "b": 1},
+            {
+                "p0": frozenset({d1, d2, d3}), "p1": frozenset({d1, d3}),
+                "p2": frozenset({d2, d3}), "p3": frozenset({d2, d3}),
+            },
+            {
+                "p0": frozenset({"a", "b"}), "p1": frozenset({"a"}),
+                "p2": frozenset({"a"}), "p3": frozenset({"b"}),
+            },
+            extra={"a": 1},
+            bundles={"p0": frozenset({"a", "b"})},
+        ))
+        self.assertEqual(plan.covered_required(), 6)
+        served = {}
+        for (day, _), people in plan.slots.items():
+            for person in people:
+                served.setdefault(person, set()).add(day)
+        # Место сверх минимума не вынуждает служить две недели подряд.
+        self.assertFalse(any(
+            day + timedelta(weeks=1) in days
+            for days in served.values() for day in days
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()
