@@ -293,6 +293,7 @@ def build_plan(data: PlanInput) -> Plan:
                else BELOW_MIN_WEIGHT)
             for person in people
         })
+    repair_gaps(plan, data)
     improve_plan(plan, data)
     # Затем места сверх минимума — только ответившими и без служения
     # подряд ни с прошлой, ни со следующей датой: место сверх минимума
@@ -344,6 +345,77 @@ def _person_cost(data: PlanInput, person: str, dates: Iterable[date]) -> int:
         total += _gap_penalty(previous, event_date)
         previous = event_date
     return total
+
+
+def repair_gaps(plan: Plan, data: PlanInput) -> None:
+    """Обязательные места, оставшиеся пустыми из-за месячного максимума,
+    закрываются перестановками по всему месяцу: план — поток «исток →
+    человек (до его максимума) → (человек, дата) → место (до минимума
+    задачи) → сток», и он дополняется увеличивающими путями (Форд —
+    Фалкерсон) до максимального. Путь переставляет только людей своей
+    цепочки (другая задача в ту же дату, другая дата), остальные остаются
+    на местах; поиск в ширину — кратчайшие цепочки."""
+    source, sink = ("source",), ("sink",)
+    capacity: dict[tuple, int] = {}
+    edges: dict[tuple, list[tuple]] = {}
+
+    def add(start: tuple, end: tuple, amount: int) -> None:
+        if (start, end) not in capacity:
+            edges.setdefault(start, []).append(end)
+            edges.setdefault(end, []).append(start)
+            capacity.setdefault((end, start), 0)
+        capacity[(start, end)] = capacity.get((start, end), 0) + amount
+
+    seats = sorted(plan.slots)
+    for person in sorted(data.free):
+        high = _limit(data, person)[1]
+        add(source, ("person", person), len(seats) if high is None else high)
+        for event_date in sorted(data.free[person]):
+            add(("person", person), ("day", person, event_date), 1)
+            for key in seats:
+                if key[0] == event_date and _can_serve(
+                    data, person, event_date, key[1]
+                ):
+                    add(("day", person, event_date), ("seat", key), 1)
+    for key in seats:
+        add(("seat", key), sink, plan.needed[key[1]])
+    # Текущий план — уже пущенный поток.
+    for key in seats:
+        for person in plan.slots[key]:
+            for start, end in (
+                (source, ("person", person)),
+                (("person", person), ("day", person, key[0])),
+                (("day", person, key[0]), ("seat", key)),
+                (("seat", key), sink),
+            ):
+                capacity[(start, end)] -= 1
+                capacity[(end, start)] += 1
+    while True:
+        came: dict[tuple, tuple | None] = {source: None}
+        queue = [source]
+        for node in queue:
+            for end in edges.get(node, ()):
+                if end not in came and capacity[(node, end)] > 0:
+                    came[end] = node
+                    queue.append(end)
+        if sink not in came:
+            break
+        node = sink
+        while came[node] is not None:
+            start = came[node]
+            capacity[(start, node)] -= 1
+            capacity[(node, start)] += 1
+            node = start
+    # Назначение — поток по ребру (человек, дата) → место; уже стоявшие
+    # остаются в прежнем порядке, новые — в конце.
+    for key in seats:
+        assigned = {
+            node[1] for node in edges.get(("seat", key), ())
+            if node[0] == "day" and capacity[(("seat", key), node)] > 0
+        }
+        plan.slots[key] = [
+            person for person in plan.slots[key] if person in assigned
+        ] + sorted(assigned - set(plan.slots[key]))
 
 
 def improve_plan(plan: Plan, data: PlanInput) -> None:

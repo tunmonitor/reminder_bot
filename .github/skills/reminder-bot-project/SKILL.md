@@ -411,7 +411,10 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   `readiness_people` `month_limit`, else `readiness_settings.month_min/
   max`). Max is hard in both passes and in `improve_plan` replace; min is
   `BELOW_MIN_WEIGHT` per missing service in `_person_cost` (cheaper in
-  pass-1 costs). UI: `rdy:lim` (section) and `mbr:lim|lset` (card);
+  pass-1 costs). After pass 1 `repair_gaps` augments the plan as a max
+  flow (source → person [max] → (person, date) [1] → seat [needed] →
+  sink), so required gaps caused by caps are closed whenever possible;
+  kept people stay in place. UI: `rdy:lim` (section) and `mbr:lim|lset` (card);
   values `n`, `a_b`, `a_x`, `m` (pick min), `m<a>` (pick max), `s` (as
   service).
 - Removing an in-list member records `service_member_exclusions`;

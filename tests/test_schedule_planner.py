@@ -230,6 +230,19 @@ class SchedulePlannerTest(unittest.TestCase):
         ))
         self.assertEqual(plan.load(), {})
 
+    def test_month_max_does_not_leave_avoidable_gap(self):
+        # Анна (максимум 1) свободна 01 и 15, Вера — только 01: Анна
+        # уходит на 15, 01 закрывает Вера.
+        dates = (SUNDAYS[0], SUNDAYS[2])
+        plan = build_plan(plan_input(
+            {"Анна": set(dates), "Вера": {SUNDAYS[0]}},
+            {"Анна": {"звук"}, "Вера": {"звук"}},
+            needed={"звук": 1}, dates=dates, limits={"Анна": (0, 1)},
+        ))
+        self.assertEqual(plan.gaps(), [])
+        self.assertEqual(plan.slots[(SUNDAYS[0], "звук")], ["Вера"])
+        self.assertEqual(plan.slots[(SUNDAYS[2], "звук")], ["Анна"])
+
     def test_month_min_preferred(self):
         # Трое на 3 даты: без лимита — по одному; у Глеба минимум 2 —
         # он получает два служения (не подряд).
