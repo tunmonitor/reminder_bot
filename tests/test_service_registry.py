@@ -2235,3 +2235,154 @@ class InteractiveRosterSyncTest(unittest.TestCase):
                 registry, Path("x.xlsx"), "sound", {}, None, MagicMock(), None,
             )
             registry.sync_service_rosters.assert_called_once_with(rosters)
+
+
+class UsernameBindingTest(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.registry = ServiceRegistry(
+            Path(self.temp_dir.name) / "services.sqlite3"
+        )
+        self.registry.initialize(1001, -10001)
+
+    def test_pending_binding_for_task_is_taken_once(self):
+        registry = self.registry
+        with self.assertRaises(PermissionError):
+            registry.add_username_binding(2002, "sound", "Борис", "звук", "boris_b")
+        registry.add_username_binding(1001, "sound", "Борис", "звук", "@Boris_B")
+        self.assertEqual(registry.pending_usernames(), {"boris_b"})
+        self.assertIsNone(registry.known_telegram_id("boris_b"))
+        taken = registry.take_username_bindings("BORIS_B")
+        self.assertEqual(
+            [(item["name"], item["task"], item["actor_id"]) for item in taken],
+            [("Борис", "звук", 1001)],
+        )
+        self.assertEqual(registry.take_username_bindings("boris_b"), [])
+        # Правка админа — не наблюдение: ID по ней не подставляется.
+        registry.set_responsible_contact(1001, "sound", "звук", "Борис", 555, "Boris_B")
+        self.assertIsNone(registry.known_telegram_id("@boris_b"))
+        registry.note_seen_username(555, "Boris_B")
+        self.assertEqual(registry.known_telegram_id("@boris_b"), 555)
+
+    def test_binding_by_id_or_removal_drops_pending(self):
+        registry = self.registry
+        registry.add_username_binding(1001, "sound", "Борис", "", "boris_b")
+        registry.bind_service_member(1001, "sound", "Борис", 555)
+        self.assertIsNone(registry.username_binding("sound", "Борис"))
+        registry.add_username_binding(1001, "sound", "Борис", "", "boris_b")
+        registry.remove_service_member(1001, "sound", "Борис")
+        self.assertEqual(registry.pending_usernames(), set())
+
+    def test_expired_binding_is_ignored_and_newest_id_wins(self):
+        registry = self.registry
+        registry.add_username_binding(1001, "sound", "Борис", "", "boris_b")
+        with closing(sqlite3.connect(registry.path)) as connection, connection:
+            connection.execute(
+                "UPDATE username_bindings SET created_at = '2000-01-01T00:00:00+00:00'"
+            )
+        self.assertEqual(registry.pending_usernames(), set())
+        self.assertIsNone(registry.username_binding("sound", "Борис"))
+        self.assertEqual(registry.take_username_bindings("boris_b"), [])
+        with self.assertRaises(ValueError):
+            registry.add_username_binding(1001, "sound", "Борис", "", "bad name")
+        # Username перешёл к другому — по последнему наблюдению.
+        registry.note_seen_username(111, "foo_user")
+        registry.note_seen_username(222, "Foo_User")
+        self.assertEqual(registry.known_telegram_id("foo_user"), 222)
+        # Сменил username — прежний за ним больше не числится.
+        registry.note_seen_username(222, "bar_user")
+        self.assertIsNone(registry.known_telegram_id("foo_user"))
+        self.assertEqual(registry.known_telegram_id("bar_user"), 222)
+
+    def test_removed_username_retires_old_poll_answers(self):
+        registry = self.registry
+        with closing(sqlite3.connect(registry.path)) as connection, connection:
+            connection.execute(
+                "INSERT INTO readiness_runs (service_id, month, status, "
+                "created_at) VALUES ('sound', '2026-11', 'closed', "
+                "'2026-10-01T00:00:00+00:00')"
+            )
+            connection.execute(
+                "INSERT INTO readiness_answers (run_id, telegram_id, username, "
+                "dates_json, answered_at) VALUES (1, 111, 'Old_Name', '[]', "
+                "'2026-10-01T00:00:00+00:00')"
+            )
+        self.assertEqual(registry.known_telegram_id("old_name"), 111)
+        # Убрал username — ответ со старым больше не в счёт: его мог
+        # занять другой человек.
+        registry.note_seen_username(111, "")
+        self.assertIsNone(registry.known_telegram_id("old_name"))
+        self.assertIsNone(registry.known_telegram_id("~111"))
+        registry.note_seen_username(222, "old_name")
+        self.assertEqual(registry.known_telegram_id("old_name"), 222)
+
+    def test_removal_excludes_member_missing_from_lists(self):
+        from bot.excel_parser import RosterMember
+
+        registry = self.registry
+        registry.sync_service_rosters({"sound": [RosterMember("Борис", ("звук",))]})
+        # Следующий файл без Бориса — в составе он остаётся, но не в «Списках».
+        registry.sync_service_rosters({"sound": []})
+        boris = next(
+            m for m in registry.list_service_members("sound")
+            if m["name"] == "Борис"
+        )
+        self.assertFalse(boris["in_list"])
+        self.assertFalse(registry.remove_service_member(1001, "sound", "Борис"))
+        registry.sync_service_rosters({"sound": [RosterMember("Борис", ("звук",))]})
+        self.assertNotIn(
+            "Борис", [m["name"] for m in registry.list_service_members("sound")]
+        )
+
+    def test_new_binding_replaces_pending_and_task_removal_drops_it(self):
+        registry = self.registry
+        registry.add_username_binding(1001, "sound", "Борис", "", "old_name")
+        registry.add_username_binding(1001, "sound", "Борис", "звук", "new_name")
+        self.assertEqual(registry.pending_usernames(), {"new_name"})
+        registry.set_service_member_tasks(1001, "sound", "Борис", ["сборка"])
+        self.assertEqual(registry.pending_usernames(), set())
+
+
+class PlanTitleMigrationTest(unittest.TestCase):
+    def test_status_field_split_into_two_titles(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        path = Path(temp_dir.name) / "services.sqlite3"
+        registry = ServiceRegistry(path)
+        registry.initialize(1001, -10001)
+        registry.set_readiness_settings(1001, "sound", enabled=False)
+        with closing(sqlite3.connect(path)) as connection, connection:
+            connection.execute(
+                "UPDATE readiness_settings SET plan_title_template = "
+                "'График {service_name}: {status}' WHERE service_id = 'sound'"
+            )
+            connection.execute(
+                "DELETE FROM catalog_migrations WHERE name = 'plan-title-v2'"
+            )
+        registry = ServiceRegistry(path)
+        registry.initialize(1001, -10001)
+        settings = registry.get_readiness_settings("sound")
+        self.assertEqual(settings["plan_title_template"], "График {service_name}: утверждён")
+        self.assertEqual(settings["plan_update_template"], "График {service_name}: обновлён")
+
+    def test_title_without_status_kept_for_updates(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        path = Path(temp_dir.name) / "services.sqlite3"
+        registry = ServiceRegistry(path)
+        registry.initialize(1001, -10001)
+        registry.set_readiness_settings(1001, "sound", enabled=False)
+        with closing(sqlite3.connect(path)) as connection, connection:
+            connection.execute(
+                "UPDATE readiness_settings SET plan_title_template = "
+                "'Расписание {service_name} на {month}' WHERE service_id = 'sound'"
+            )
+            connection.execute(
+                "DELETE FROM catalog_migrations WHERE name = 'plan-title-v2'"
+            )
+        registry = ServiceRegistry(path)
+        registry.initialize(1001, -10001)
+        settings = registry.get_readiness_settings("sound")
+        self.assertEqual(settings["plan_title_template"], "Расписание {service_name} на {month}")
+        self.assertEqual(settings["plan_update_template"], "Расписание {service_name} на {month}")

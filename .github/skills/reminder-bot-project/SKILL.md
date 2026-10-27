@@ -383,6 +383,18 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - Third readiness text: `closed_template` (`DEFAULT_READINESS_CLOSED`,
   fields `READINESS_CLOSED_FIELDS`), kind `done` in `READINESS_TEXTS`,
   rendered by `readiness.closed_text` in `announce_closed`.
+- Publication titles: `plan_title_template` / `plan_update_template`
+  (`DEFAULT_PLAN_TITLE` / `DEFAULT_PLAN_UPDATE_TITLE`, fields
+  service_name, month), kinds `pub` / `pubupd`, rendered by
+  `schedule_plan.publication_title(service, month, update, settings)`.
+  The old `{status}` field was split by the one-off migration
+  `plan-title-v2`. Short phrases: `READINESS_PHRASES` (name → default,
+  fields, limit, label), stored in `readiness_settings.phrases_json`
+  (`settings["phrases"]`), set via `set_readiness_phrase`, read via
+  `readiness.phrase(settings, name)`; UI kinds `ph.<name>` under
+  «🔤 Фразы» (`rdy:phr`), no preview. `publication_text` puts each date
+  on its own line with tasks below it (two-space indent), blank line
+  between dates.
 - Reminder sends treat any Forbidden/BadRequest as final (marked reminded). Preview:
   `rdy:tplprev:<service>:intro|rem`. `launch_run` records all intro chunk
   ids and deletes them all if the poll fails.
@@ -392,11 +404,49 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   «🗳 Опрос готовности» or «📋 Задачи служения» (`rdy:people|ppick|pset`).
 - Planner: `PlanInput.extra` (optional seats above the minimum) and
   `reluctant` (non-respondents: free on all dates, `RELUCTANT_WEIGHT` per
-  service). Per date two passes: required seats for everyone, then optional
-  seats for remaining respondents only; improvement never puts a reluctant
+  service). A one-week gap costs `BACK_TO_BACK_WEIGHT` (100 ×
+  `RELUCTANT_WEIGHT`): back-to-back only when a required seat would stay
+  empty. Two passes over the month: required seats for all dates (then
+  `improve_plan`), then optional seats only for respondents with no
+  service within a week either way; improvement never puts a reluctant
   person beyond `needed`. `summarize` adds non-respondents (incl. no
   Telegram) as reluctant; `progress_text` lists respondents with dates and
   the plan per Sunday and task («*» = non-respondent).
+- Monthly limit (step 4a): `PlanInput.limits` {key: (min, max|None)} from
+  `summarize` (personal `service_members.month_min/max` via
+  `readiness_people` `month_limit`, else `readiness_settings.month_min/
+  max`). Max is hard in both passes and in `improve_plan` replace; min is
+  `BELOW_MIN_WEIGHT` per missing service in `_person_cost` (cheaper in
+  pass-1 costs). After pass 1 `repair_gaps` augments the plan as a max
+  flow (source → person [max] → (person, date) [1] → seat [needed] →
+  sink), so required gaps caused by caps are closed whenever possible;
+  kept people stay in place. UI: `rdy:lim` (section) and `mbr:lim|lset` (card);
+  values `n`, `a_b`, `a_x`, `m` (pick min), `m<a>` (pick max), `s` (as
+  service).
+- Removing a member (in the lists or not) records
+  `service_member_exclusions`;
+  `sync_service_rosters` skips those names until the person is added in
+  the bot again (`_clear_member_exclusion`).
+- Binding by @username only (`parse_manual_user(username_only=True)` in
+  service_contact): a username the bot has seen (`known_telegram_id`)
+  gets the usual ID confirmation; otherwise `ubind:ok|no` saves
+  `username_bindings` (service, name, task '' = all tasks). The outer
+  middleware `username_binding_middleware` (message, callback_query,
+  poll_answer) completes it on the user's next update
+  (`take_username_bindings` → set_responsible_contact /
+  bind_service_member as the admin who set it) and messages that admin.
+  Binding by ID or removal drops the pending row. Pending rows expire
+  after `USERNAME_BINDING_DAYS` (30); completion is refused (admin gets
+  ❌) when the user is already bound to another name in the service;
+  `known_telegram_id` uses only observations: `seen_usernames` (written
+  by the middleware when a user's username changes, `note_seen_username`
+  forgets the ID's previous username; no username is stored as the marker
+  `~<id>`, which retires that ID's older poll answers and is never looked
+  up) and `readiness_answers`, newest
+  first; admin-entered usernames don't count. A new pending binding for a
+  person replaces older ones (any task); `set_service_member_tasks` drops
+  pending rows of removed tasks; the card shows a pending username next
+  to the current account.
 - Launch reserves the run row before sending (`attach_readiness_poll`
   after), deletes it on failure. Closing notice is tracked by
   `closed_announced` and retried; the admin result is fitted into one
@@ -482,8 +532,27 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - Permissions (24.10): a service admin may do everything for own services
   (chat, contacts/bindings, members, tasks, sync, notify, replace, «📅 График»);
   only `ADMIN_OPERATIONS` (service_admin_add/remove) stay super-admin-only;
-  registry uses `_require_service_editor` everywhere else; `/test_notify` —
-  main admin only.
+  registry uses `_require_service_editor` everywhere else; `/test_notify`
+  command — main admin only, but the card's «🧪 Проверка доставки»
+  (`can_check_delivery`: service admin + group chat set, also offered right
+  after a chat is saved) is open to the service admin; previews go to the
+  caller. Start menu (27.10): settings, notify, contacts, and for the super
+  admin `menu:service_admins` (submenu with add/remove); sync, chat and
+  delivery check live only in the service card.
+- Readiness poll texts: `question_template` (`readiness.question_text`, fields
+  service_name/month/month_in, ≤300, sent with `question_parse_mode=None`,
+  blank → default); «📝 Тексты» (`show_readiness_texts`, kind "q").
+  Poll options by day window (`readiness.option_label`), intro footnote
+  `own_days_note` (readiness_people `in_roster`, @username for same names).
+- Approved plan snapshot `served_offsets_json` (`schedule_plan.served_offsets`,
+  passed to `approve_schedule_plan`); `last_served` uses it (legacy plans:
+  approved_days, else personal day). Planner: gap under a week counts as
+  1 week; rotation weeks clamped ≥0.
+- Chat binding by service admins: `set_group_chat` — group only (ID<0), not
+  bound to another service (own chat OK); handlers `require_chat_member`
+  (get_chat type group/supergroup + get_chat_member; errors/timeouts →
+  PermissionError) for manual IDs. Interactive loader passes
+  `own_roster_only=True` (sync only that service's «Списки»).
 - User guides: `docs/ADMIN_GUIDE.md` and `docs/VOLUNTEER_GUIDE.md` (Russian,
   schematic screens). Update them together with UI changes.
 - Customer decision 5 (24.10): Excel may stop being filled — step 4 adds a

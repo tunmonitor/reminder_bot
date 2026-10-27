@@ -92,6 +92,28 @@ DEFAULT_READINESS_CHAT_REMINDER = (
     "Кто ещё не отметил воскресенья — проголосуй, пожалуйста, в опросе "
     "выше 🙏"
 )
+# Заголовки графика в чате служения: при первой публикации и при
+# обновлении — каждый своим текстом (слова не «зашиты»).
+PLAN_TITLE_FIELDS = frozenset({"service_name", "month"})
+DEFAULT_PLAN_TITLE = "📅 График {service_name} на {month} утверждён"
+DEFAULT_PLAN_UPDATE_TITLE = "📅 График {service_name} на {month} обновлён"
+# Короткие фразы, которые видят участники (раздел «📝 Тексты» → «🔤 Фразы»):
+# имя → (встроенный текст, поля, лимит длины, название).
+READINESS_PHRASES = {
+    "changes": ("Изменения:", frozenset(), 100,
+                "Заголовок списка изменений в обновлённом графике"),
+    "empty": ("—", frozenset(), 50, "Задача без людей в графике"),
+    "nobody": ("никого", frozenset(), 50,
+               "«Никого» в строке изменения («звук: Анна → никого»)"),
+    "usual_day": ("день как обычно", frozenset(), 100,
+                  "Отменён разовый день человека (в изменениях)"),
+    "days_changed": ("• Изменены дни служения", frozenset(), 200,
+                     "Строка изменений, когда изменилось окно дней"),
+    "cant": ("❌ Не смогу в этом месяце", frozenset(), 100,
+             "Последний вариант в опросе"),
+    "own_days": ("📅 Свой день:", frozenset(), 100,
+                 "Начало сноски под текстом опроса"),
+}
 # Шаблон по умолчанию для напоминания одной задачи (этап 3.1).
 DEFAULT_TASK_TEMPLATE = (
     "Напоминание о служении «{service_name}» в воскресенье {sunday_date}.\n"
@@ -268,6 +290,14 @@ class ServiceRegistry:
                     closed_template TEXT,
                     chat_reminder_template TEXT,
                     question_template TEXT,
+                    plan_title_template TEXT,
+                    plan_update_template TEXT,
+                    -- Свои короткие фразы ({имя: текст}), см. READINESS_PHRASES.
+                    phrases_json TEXT NOT NULL DEFAULT '{}',
+                    -- Лимит служений человека в месяц (для всех): минимум и
+                    -- максимум (NULL — без ограничения).
+                    month_min INTEGER NOT NULL DEFAULT 0,
+                    month_max INTEGER,
                     -- «Нужно людей» служения без задач (оно — одна задача).
                     people_needed INTEGER NOT NULL DEFAULT 1,
                     people_max INTEGER,
@@ -483,8 +513,46 @@ class ServiceRegistry:
                     tasks_manual INTEGER NOT NULL DEFAULT 0,
                     -- Личный день служения: сдвиг от воскресенья (чт = −3).
                     day_offset INTEGER,
+                    -- Личный лимит служений в месяц (главнее лимита
+                    -- служения): month_min NULL — как у служения.
+                    month_min INTEGER,
+                    month_max INTEGER,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (service_id, name)
+                );
+
+                -- Убранные из состава в боте: «Списки» Excel их не
+                -- возвращают, пока человека не добавят в боте снова.
+                CREATE TABLE IF NOT EXISTS service_member_exclusions (
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (service_id, name)
+                );
+
+                -- Какой Telegram ID носил @username, когда бот его видел
+                -- (сообщение, нажатие, ответ на опрос): username может
+                -- перейти к другому человеку, правки админа — не наблюдение.
+                CREATE TABLE IF NOT EXISTS seen_usernames (
+                    username TEXT PRIMARY KEY,
+                    telegram_id INTEGER NOT NULL CHECK (telegram_id > 0),
+                    seen_at TEXT NOT NULL
+                );
+
+                -- Привязка только по @username: Telegram ID станет известен,
+                -- когда человек напишет боту (нажмёт кнопку, ответит на
+                -- опрос). task = '' — во всех задачах человека (карточка).
+                CREATE TABLE IF NOT EXISTS username_bindings (
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    task TEXT NOT NULL DEFAULT '',
+                    username TEXT NOT NULL,
+                    tasks_json TEXT NOT NULL DEFAULT '[]',
+                    actor_id INTEGER NOT NULL CHECK (actor_id > 0),
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (service_id, name, task)
                 );
 
                 -- Ответы на личные напоминания (этап 3.2): «Принял» или
@@ -789,12 +857,19 @@ class ServiceRegistry:
                 ("readiness_settings", "closed_template", "TEXT"),
                 ("readiness_settings", "chat_reminder_template", "TEXT"),
                 ("readiness_settings", "question_template", "TEXT"),
+                ("readiness_settings", "plan_title_template", "TEXT"),
+                ("readiness_settings", "plan_update_template", "TEXT"),
+                ("readiness_settings", "phrases_json", "TEXT NOT NULL DEFAULT '{}'"),
                 ("readiness_settings", "people_needed",
                  "INTEGER NOT NULL DEFAULT 1"),
                 ("readiness_settings", "people_max", "INTEGER"),
                 ("readiness_settings", "day_from", "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_settings", "day_to", "INTEGER NOT NULL DEFAULT 0"),
                 ("service_members", "day_offset", "INTEGER"),
+                ("service_members", "month_min", "INTEGER"),
+                ("service_members", "month_max", "INTEGER"),
+                ("readiness_settings", "month_min", "INTEGER NOT NULL DEFAULT 0"),
+                ("readiness_settings", "month_max", "INTEGER"),
                 ("schedule_plans", "republish", "INTEGER NOT NULL DEFAULT 0"),
                 ("schedule_plans", "days_json", "TEXT NOT NULL DEFAULT '{}'"),
                 ("schedule_plans", "approved_days_json", "TEXT"),
@@ -858,6 +933,31 @@ class ServiceRegistry:
             self._migrate_members(connection)
             self._drop_file_telegram_ids(connection)
             self._migrate_service_reminders(connection)
+            self._split_plan_title(connection)
+
+    @staticmethod
+    def _split_plan_title(connection: sqlite3.Connection) -> None:
+        """Однократно: сохранённый заголовок — в два шаблона. Раньше он шёл
+        и в первую публикацию, и в обновления; поле {status} заменяется на
+        «утверждён» и «обновлён» и больше не поддерживается."""
+        if connection.execute(
+            "SELECT 1 FROM catalog_migrations WHERE name = 'plan-title-v2'"
+        ).fetchone():
+            return
+        connection.execute(
+            "UPDATE readiness_settings SET plan_update_template = "
+            "replace(plan_title_template, '{status}', 'обновлён') "
+            "WHERE plan_title_template IS NOT NULL "
+            "AND plan_update_template IS NULL"
+        )
+        connection.execute(
+            "UPDATE readiness_settings SET plan_title_template = "
+            "replace(plan_title_template, '{status}', 'утверждён') "
+            "WHERE plan_title_template LIKE '%{status}%'"
+        )
+        connection.execute(
+            "INSERT INTO catalog_migrations (name) VALUES ('plan-title-v2')"
+        )
 
     @staticmethod
     def _drop_file_telegram_ids(connection: sqlite3.Connection) -> None:
@@ -2571,6 +2671,156 @@ class ServiceRegistry:
             ).fetchone()
         return dict(row) if row else None
 
+    def note_seen_username(self, telegram_id: int, username: str) -> None:
+        """Бот видел @username у этого Telegram ID (сам пользователь, не
+        правка админа). Прежний username этого ID забывается. Без username
+        сохраняется отметка «~ID» (такого username не бывает): старые ответы
+        на опрос этого ID с прежним username больше не в счёт."""
+        _validate_positive_id(telegram_id, "telegram_id")
+        username = (
+            (username or "").strip().lstrip("@").casefold()
+            or f"~{telegram_id}"
+        )
+        # От наблюдений не зависят задачи планировщика и резервная копия.
+        with self._connection(notify=False) as connection:
+            connection.execute(
+                "DELETE FROM seen_usernames WHERE telegram_id = ? "
+                "AND username != ?",
+                (telegram_id, username),
+            )
+            connection.execute(
+                "INSERT INTO seen_usernames (username, telegram_id, seen_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(username) DO UPDATE SET "
+                "telegram_id = excluded.telegram_id, "
+                "seen_at = excluded.seen_at",
+                (username, telegram_id, _utc_now()),
+            )
+
+    def known_telegram_id(self, username: str) -> int | None:
+        """Telegram ID по @username — только по наблюдениям бота: кто
+        писал боту или отвечал на опрос с этим username (самое свежее).
+        Записи, внесённые админом, не в счёт: username мог перейти к
+        другому человеку."""
+        username = (username or "").strip().lstrip("@").casefold()
+        # «~ID» — отметка «без username», не имя.
+        if not username or username.startswith("~"):
+            return None
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT telegram_id FROM ("
+                "SELECT telegram_id, seen_at AS seen FROM seen_usernames "
+                "WHERE username = :name "
+                # Ответ на опрос не в счёт, если позже бот видел у этого
+                # ID другой username (человек сменил его).
+                "UNION ALL SELECT telegram_id, answered_at FROM "
+                "readiness_answers AS answer WHERE lower(username) = :name "
+                "AND NOT EXISTS (SELECT 1 FROM seen_usernames AS seen "
+                "WHERE seen.telegram_id = answer.telegram_id "
+                "AND seen.username != :name "
+                "AND seen.seen_at > answer.answered_at)"
+                ") ORDER BY seen DESC LIMIT 1",
+                {"name": username},
+            ).fetchone()
+        return row["telegram_id"] if row else None
+
+    def add_username_binding(
+        self, actor_id: int, service_id: str, name: str, task: str,
+        username: str, tasks=(),
+    ) -> None:
+        """Отложенная привязка «имя (задача) → @username»."""
+        _validate_positive_id(actor_id, "actor_id")
+        name = name.strip() if isinstance(name, str) else ""
+        username = (username or "").strip().lstrip("@")
+        if not name or not re.fullmatch(
+            r"[A-Za-z][A-Za-z0-9_]{4,31}", username
+        ):
+            raise ValueError("Нужны имя и корректный @username.")
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            self._require_service(connection, service_id)
+            # Новая привязка человека заменяет прежние ожидания (любой
+            # задачи): иначе старый username мог бы прийти первым.
+            self._drop_username_binding(connection, service_id, name)
+            connection.execute(
+                "INSERT INTO username_bindings (service_id, name, task, "
+                "username, tasks_json, actor_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(service_id, name, task) DO UPDATE SET "
+                "username = excluded.username, "
+                "tasks_json = excluded.tasks_json, "
+                "actor_id = excluded.actor_id, "
+                "created_at = excluded.created_at",
+                (
+                    service_id, name, task or "", username,
+                    json.dumps(list(tasks), ensure_ascii=False), actor_id,
+                    _utc_now(),
+                ),
+            )
+            self._audit(
+                connection, actor_id, "username_binding_added", service_id,
+                {"name": name, "task": task or "", "username": username},
+            )
+
+    def username_binding(self, service_id: str, name: str) -> str | None:
+        """@username, который ждёт привязки к человеку (любая задача)."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT username FROM username_bindings "
+                "WHERE service_id = ? AND name = ? AND created_at >= ? "
+                "ORDER BY task LIMIT 1",
+                (service_id, name, _username_binding_cutoff()),
+            ).fetchone()
+        return row["username"] if row else None
+
+    def pending_usernames(self) -> set[str]:
+        with self._connection() as connection:
+            return {
+                row["username"].casefold()
+                for row in connection.execute(
+                    "SELECT username FROM username_bindings "
+                    "WHERE created_at >= ?",
+                    (_username_binding_cutoff(),),
+                )
+            }
+
+    def take_username_bindings(self, username: str) -> list[dict]:
+        """Забирает (и удаляет) отложенные привязки этого @username."""
+        username = (username or "").strip().lstrip("@").casefold()
+        if not username:
+            return []
+        with self._connection() as connection:
+            # Просроченные ожидания — опечатка или чужой username — не
+            # привязываются: удаляются вместе со взятыми.
+            rows = connection.execute(
+                "SELECT service_id, name, task, username, tasks_json, actor_id "
+                "FROM username_bindings WHERE lower(username) = ? "
+                "AND created_at >= ? ORDER BY service_id, name, task",
+                (username, _username_binding_cutoff()),
+            ).fetchall()
+            connection.execute(
+                "DELETE FROM username_bindings WHERE lower(username) = ?",
+                (username,),
+            )
+        return [
+            {
+                "service_id": row["service_id"], "name": row["name"],
+                "task": row["task"], "username": row["username"],
+                "tasks": json.loads(row["tasks_json"]),
+                "actor_id": row["actor_id"],
+            }
+            for row in rows
+        ]
+
+    @staticmethod
+    def _drop_username_binding(
+        connection: sqlite3.Connection, service_id: str, name: str,
+    ) -> None:
+        """Человек привязан (или убран) — ожидание по @username не нужно."""
+        connection.execute(
+            "DELETE FROM username_bindings WHERE service_id = ? AND name = ?",
+            (service_id, name),
+        )
+
     def find_service_person_by_username(
         self, service_id: str, username: str
     ) -> dict | None:
@@ -3460,6 +3710,8 @@ class ServiceRegistry:
                     username.strip().lstrip("@"), _utc_now(),
                 ),
             )
+            self._clear_member_exclusion(connection, service_id, name)
+            self._drop_username_binding(connection, service_id, name)
             self._cleanup_unbound_user_data(connection, service_id)
             self._audit(
                 connection, actor_id, "responsible_contact_updated", service_id,
@@ -3533,7 +3785,8 @@ class ServiceRegistry:
             self._require_service(connection, service_id)
             rows = connection.execute(
                 "SELECT name, telegram_id, username, tasks_json, in_list, "
-                "source, tasks_manual, day_offset FROM service_members "
+                "source, tasks_manual, day_offset, month_min, month_max "
+                "FROM service_members "
                 "WHERE service_id = ? ORDER BY in_list DESC, rowid",
                 (service_id,),
             ).fetchall()
@@ -3547,6 +3800,7 @@ class ServiceRegistry:
                 "source": row["source"],
                 "tasks_manual": bool(row["tasks_manual"]),
                 "day_offset": row["day_offset"],
+                "month_limit": _member_limit(row),
             }
             for row in rows
         ]
@@ -3557,6 +3811,7 @@ class ServiceRegistry:
         rosters — {service_id: [RosterMember]}. Из файла берутся только
         имена и задачи; Telegram ID и username задаются только в боте. Люди,
         которых больше нет в «Списках», остаются с отметкой «нет в списке».
+        Убранные из состава в боте не возвращаются.
         """
         now = _utc_now()
         with self._connection() as connection:
@@ -3569,6 +3824,17 @@ class ServiceRegistry:
             for service_id, members in rosters.items():
                 if service_id not in active:
                     continue
+                excluded = {
+                    row["name"]
+                    for row in connection.execute(
+                        "SELECT name FROM service_member_exclusions "
+                        "WHERE service_id = ?",
+                        (service_id,),
+                    )
+                }
+                members = [
+                    member for member in members if member.name not in excluded
+                ]
                 names = [member.name for member in members]
                 for member in members:
                     connection.execute(
@@ -3682,6 +3948,7 @@ class ServiceRegistry:
                     "VALUES (?, ?, ?, ?, 'manual', ?)",
                     (service_id, name, telegram_id, username, now),
                 )
+                self._clear_member_exclusion(connection, service_id, name)
                 roster_tasks = []
             else:
                 # «➕ В состав» возвращает выпавшего из «Списков»: он снова
@@ -3722,6 +3989,7 @@ class ServiceRegistry:
                     connection, actor_id, service_id, task, name,
                     telegram_id, username,
                 )
+            self._drop_username_binding(connection, service_id, name)
             self._cleanup_unbound_user_data(connection, service_id)
             self._audit(
                 connection, actor_id, "service_member_bound", service_id,
@@ -3779,6 +4047,7 @@ class ServiceRegistry:
                         json.dumps(tasks, ensure_ascii=False), now,
                     ),
                 )
+                self._clear_member_exclusion(connection, service_id, name)
             else:
                 connection.execute(
                     "UPDATE service_members SET tasks_json = ?, "
@@ -3790,6 +4059,12 @@ class ServiceRegistry:
             connection.execute(
                 "DELETE FROM responsible_contacts WHERE service_id = ? "
                 f"AND name = ? AND task NOT IN ({placeholders})",
+                (service_id, name, *tasks),
+            )
+            # Ожидание по @username для снятой задачи вернуло бы её.
+            connection.execute(
+                "DELETE FROM username_bindings WHERE service_id = ? "
+                f"AND name = ? AND task != '' AND task NOT IN ({placeholders})",
                 (service_id, name, *tasks),
             )
             if telegram_id:
@@ -3852,11 +4127,44 @@ class ServiceRegistry:
                 {"name": name, "day_offset": offset},
             )
 
+    def set_service_member_limit(
+        self, actor_id: int, service_id: str, name: str,
+        limit: tuple[int, int | None] | None,
+    ) -> None:
+        """Личный лимит служений в месяц: (минимум, максимум или None —
+        без верхней границы); None — как у служения."""
+        _validate_positive_id(actor_id, "actor_id")
+        low, high = limit if limit is not None else (None, None)
+        if limit is not None:
+            _validate_month_limit(low, high)
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            row = connection.execute(
+                "SELECT telegram_id FROM service_members "
+                "WHERE service_id = ? AND name = ?",
+                (service_id, name),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"«{name}» нет в составе.")
+            # Человек — Telegram ID: лимит во всех его строках.
+            connection.execute(
+                "UPDATE service_members SET month_min = ?, month_max = ?, "
+                "updated_at = ? WHERE service_id = ? AND (name = ? OR "
+                "(telegram_id IS NOT NULL AND telegram_id = ?))",
+                (low, high, _utc_now(), service_id, name, row["telegram_id"]),
+            )
+            self._audit(
+                connection, actor_id, "service_member_limit", service_id,
+                {"name": name, "month_min": low, "month_max": high},
+            )
+
     def remove_service_member(
         self, actor_id: int, service_id: str, name: str,
     ) -> bool:
         """Убирает человека из состава служения вместе с привязками к
-        задачам. True — он есть в «Списках» (файл вернёт его при чтении)."""
+        задачам. Файл его больше не вернёт, пока человека не добавят в боте
+        снова (даже если сейчас его нет в «Списках» — он может появиться
+        там позже). True — он есть в «Списках»."""
         _validate_positive_id(actor_id, "actor_id")
         with self._connection() as connection:
             self._require_service_editor(connection, actor_id, service_id)
@@ -3875,6 +4183,12 @@ class ServiceRegistry:
             ).rowcount
             if not removed:
                 raise ValueError(f"«{name}» нет в составе.")
+            self._drop_username_binding(connection, service_id, name)
+            connection.execute(
+                "INSERT OR IGNORE INTO service_member_exclusions "
+                "(service_id, name, created_at) VALUES (?, ?, ?)",
+                (service_id, name, _utc_now()),
+            )
             # Из рабочих копий графиков (опубликованная остаётся — правка
             # станет видна как неопубликованная).
             def is_removed(key: str) -> bool:
@@ -3926,6 +4240,17 @@ class ServiceRegistry:
                 {"name": name},
             )
         return bool(member and member["in_list"])
+
+    @staticmethod
+    def _clear_member_exclusion(
+        connection: sqlite3.Connection, service_id: str, name: str,
+    ) -> None:
+        """Человека снова добавили в боте — «Списки» снова его ведут."""
+        connection.execute(
+            "DELETE FROM service_member_exclusions "
+            "WHERE service_id = ? AND name = ?",
+            (service_id, name),
+        )
 
     def ensure_member_contacts(self, service_id: str, assignments) -> None:
         """Создаёт привязки «задача + имя» для привязанных людей служения.
@@ -4937,6 +5262,11 @@ class ServiceRegistry:
         "closed_template": None,
         "chat_reminder_template": None,
         "question_template": None,
+        "plan_title_template": None,
+        "plan_update_template": None,
+        "phrases": {},
+        "month_min": 0,
+        "month_max": None,
         "people_needed": 1,
         "people_max": None,
         "day_from": 0,
@@ -4949,13 +5279,31 @@ class ServiceRegistry:
                 "SELECT enabled, start_time, duration_days, deadline_time, "
                 "remind_days, enabled_at, intro_template, reminder_template, "
                 "closed_template, chat_reminder_template, question_template, "
+                "plan_title_template, plan_update_template, phrases_json, "
+                "month_min, month_max, "
                 "people_needed, people_max, day_from, day_to "
                 "FROM readiness_settings WHERE service_id = ?",
                 (service_id,),
             ).fetchone()
         if row is None:
-            return {**self.READINESS_DEFAULTS, "enabled_at": None}
-        return {**dict(row), "enabled": bool(row["enabled"])}
+            return {
+                **self.READINESS_DEFAULTS, "phrases": {}, "enabled_at": None,
+            }
+        settings = {**dict(row), "enabled": bool(row["enabled"])}
+        settings["phrases"] = json.loads(settings.pop("phrases_json") or "{}")
+        return settings
+
+    def set_readiness_phrase(
+        self, actor_id: int, service_id: str, name: str, text: str | None,
+    ) -> dict:
+        """Своя короткая фраза (None — встроенная)."""
+        if name not in READINESS_PHRASES:
+            raise ValueError(f"Неизвестная фраза: {name}.")
+        phrases = dict(self.get_readiness_settings(service_id)["phrases"])
+        phrases[name] = text
+        return self.set_readiness_settings(
+            actor_id, service_id, phrases=phrases
+        )
 
     def set_readiness_settings(
         self, actor_id: int, service_id: str, **changes
@@ -5000,6 +5348,27 @@ class ServiceRegistry:
             or not -6 <= day_from <= 0 <= day_to <= 6
         ):
             raise ValueError("Дни служения: от вс −6 до вс +6, включая вс.")
+        _validate_month_limit(new["month_min"], new["month_max"])
+        if not isinstance(new["phrases"], dict):
+            raise ValueError("Фразы — словарь.")
+        new["phrases"] = {
+            name: text for name, text in new["phrases"].items()
+            if text is not None
+        }
+        for name, text in new["phrases"].items():
+            if name not in READINESS_PHRASES:
+                raise ValueError(f"Неизвестная фраза: {name}.")
+            _, fields, limit, label = READINESS_PHRASES[name]
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError(f"{label}: не может быть пустым.")
+            if len(text) > limit or "\n" in text:
+                raise ValueError(
+                    f"{label}: одной строкой, не больше {limit} символов."
+                )
+            if fields:
+                validate_notification_template(text, fields, label)
+            elif "\x00" in text:
+                raise ValueError(f"{label}: текст содержит недопустимые символы.")
         for key, fields, label in (
             ("intro_template", READINESS_INTRO_FIELDS, "Текст опроса"),
             ("reminder_template", READINESS_REMINDER_FIELDS,
@@ -5009,6 +5378,9 @@ class ServiceRegistry:
              "Напоминание в чат"),
             ("question_template", READINESS_QUESTION_FIELDS,
              "Вопрос опроса"),
+            ("plan_title_template", PLAN_TITLE_FIELDS, "Заголовок графика"),
+            ("plan_update_template", PLAN_TITLE_FIELDS,
+             "Заголовок обновления"),
         ):
             value = new[key]
             if value is None:
@@ -5032,8 +5404,10 @@ class ServiceRegistry:
                 "start_time, duration_days, deadline_time, remind_days, "
                 "enabled_at, intro_template, reminder_template, "
                 "closed_template, chat_reminder_template, question_template, "
+                "plan_title_template, plan_update_template, phrases_json, "
+                "month_min, month_max, "
                 "people_needed, people_max, day_from, day_to, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id) DO UPDATE SET "
                 "enabled = excluded.enabled, start_time = excluded.start_time, "
                 "duration_days = excluded.duration_days, "
@@ -5045,6 +5419,11 @@ class ServiceRegistry:
                 "closed_template = excluded.closed_template, "
                 "chat_reminder_template = excluded.chat_reminder_template, "
                 "question_template = excluded.question_template, "
+                "plan_title_template = excluded.plan_title_template, "
+                "plan_update_template = excluded.plan_update_template, "
+                "phrases_json = excluded.phrases_json, "
+                "month_min = excluded.month_min, "
+                "month_max = excluded.month_max, "
                 "people_needed = excluded.people_needed, "
                 "people_max = excluded.people_max, "
                 "day_from = excluded.day_from, day_to = excluded.day_to, "
@@ -5055,7 +5434,10 @@ class ServiceRegistry:
                     new["remind_days"], new["enabled_at"],
                     new["intro_template"], new["reminder_template"],
                     new["closed_template"], new["chat_reminder_template"],
-                    new["question_template"],
+                    new["question_template"], new["plan_title_template"],
+                    new["plan_update_template"],
+                    json.dumps(new["phrases"], ensure_ascii=False),
+                    new["month_min"], new["month_max"],
                     new["people_needed"], new["people_max"],
                     new["day_from"], new["day_to"], now,
                 ),
@@ -5095,7 +5477,8 @@ class ServiceRegistry:
                 implicit = row["name"] if row else None
             members = connection.execute(
                 "SELECT name, telegram_id, username, tasks_json, in_list, "
-                "source, day_offset FROM service_members WHERE service_id = ? "
+                "source, day_offset, month_min, month_max "
+                "FROM service_members WHERE service_id = ? "
                 "ORDER BY in_list DESC, rowid",
                 (service_id,),
             ).fetchall()
@@ -5123,13 +5506,15 @@ class ServiceRegistry:
                 # «Списков» — нет).
                 "active": bool(row["in_list"]) or row["source"] != "excel",
                 "day_offset": row["day_offset"],
+                "month_limit": _member_limit(row),
             }
             if row["telegram_id"] in by_id:
                 by_id[row["telegram_id"]]["tasks"] |= person["tasks"]
                 by_id[row["telegram_id"]]["active"] |= person["active"]
-                if by_id[row["telegram_id"]]["day_offset"] is None:
-                    # Личный день — с любой строки этого человека.
-                    by_id[row["telegram_id"]]["day_offset"] = person["day_offset"]
+                # Личный день и лимит — с любой строки этого человека.
+                for field in ("day_offset", "month_limit"):
+                    if by_id[row["telegram_id"]][field] is None:
+                        by_id[row["telegram_id"]][field] = person[field]
                 continue
             people.append(person)
             if row["telegram_id"]:
@@ -5149,6 +5534,7 @@ class ServiceRegistry:
                         "username": "",
                         "tasks": set(),
                         "day_offset": None,
+                        "month_limit": None,
                     }
                     people.append(person)
                 by_id[row["telegram_id"]] = person
@@ -5869,6 +6255,40 @@ def normalize_member_name(name) -> str:
 def _current_month() -> str:
     today = datetime.now(timezone.utc).date()
     return f"{today.year:04d}-{today.month:02d}"
+
+
+USERNAME_BINDING_DAYS = 30
+# Лимит служений человека в месяц — от 0 до MONTH_LIMIT_MAX.
+MONTH_LIMIT_MAX = 5
+
+
+def _validate_month_limit(low, high) -> None:
+    if (
+        isinstance(low, bool) or not isinstance(low, int)
+        or not 0 <= low <= MONTH_LIMIT_MAX
+        or high is not None and (
+            isinstance(high, bool) or not isinstance(high, int)
+            or not low <= high <= MONTH_LIMIT_MAX
+        )
+    ):
+        raise ValueError(
+            f"Служений в месяц: от 0 до {MONTH_LIMIT_MAX}, минимум не больше "
+            "максимума."
+        )
+
+
+def _member_limit(row) -> tuple[int, int | None] | None:
+    """Личный лимит строки состава; None — как у служения."""
+    if row["month_min"] is None:
+        return None
+    return (row["month_min"], row["month_max"])
+
+
+def _username_binding_cutoff() -> str:
+    """Привязка по @username ждёт не дольше USERNAME_BINDING_DAYS."""
+    return (
+        datetime.now(timezone.utc) - timedelta(days=USERNAME_BINDING_DAYS)
+    ).isoformat()
 
 
 def _utc_now() -> str:

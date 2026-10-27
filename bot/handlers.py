@@ -89,6 +89,7 @@ from .service_registry import (
     GENERAL_GROUP_TEMPLATE_FIELDS,
     GROUP_TEMPLATE_FIELDS,
     PERSONAL_TEMPLATE_FIELDS,
+    READINESS_PHRASES,
     USER_REMINDER_BODY_LIMIT,
     USER_REMINDERS_PER_SERVICE,
     normalize_member_name,
@@ -288,10 +289,13 @@ READINESS_INTRO_HELP = ("service_name", "month", "deadline", "people")
 READINESS_REMINDER_HELP = ("service_name", "month", "deadline")
 READINESS_CLOSED_HELP = ("service_name", "month")
 READINESS_QUESTION_HELP = ("service_name", "month", "month_in")
+PLAN_TITLE_HELP = ("service_name", "month")
 
 
 def template_fields_help(fields) -> str:
     """Поля шаблона — каждое с новой строки и с пояснением."""
+    if not fields:
+        return "Одной строкой, без полей — текст подставляется как есть."
     return "Доступные поля:\n" + "\n".join(
         f"• {{{field}}} — {TEMPLATE_FIELD_HELP[field]}" for field in fields
     )
@@ -420,6 +424,113 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if not callable(getattr(observer, "outer_middleware", None)):
             observer = getattr(admin_router, observer_name)
         observer.outer_middleware(middleware)
+
+    # Отложенные привязки по @username: None — перечитать из базы.
+    username_waiting: dict[str, set[str] | None] = {"names": None}
+    # Последний виденный username по Telegram ID и владелец username
+    # (чтобы не писать в базу на каждое сообщение).
+    username_seen: dict[int, str] = {}
+    username_owner: dict[str, int] = {}
+
+    async def complete_username_bindings(user) -> None:
+        """Человек с ожидаемым @username написал боту — привязываем его
+        и сообщаем админу, который задал привязку."""
+        username = getattr(user, "username", None) or ""
+        user_id = getattr(user, "id", None)
+        if getattr(user, "is_bot", False) or not isinstance(user_id, int):
+            return
+        registry = service_registry()
+        if registry is None:
+            return
+        try:
+            # Наблюдение «ID ↔ username» — только при изменении (в том
+            # числе когда username вернулся к прежнему владельцу).
+            seen = username.casefold()
+            if username_seen.get(user_id) != seen or (
+                seen and username_owner.get(seen) != user_id
+            ):
+                registry.note_seen_username(user_id, username)
+                previous = username_seen.get(user_id)
+                if previous and username_owner.get(previous) == user_id:
+                    username_owner.pop(previous, None)
+                username_seen[user_id] = seen
+                if seen:
+                    username_owner[seen] = user_id
+            if not username:
+                return
+            if username_waiting["names"] is None:
+                username_waiting["names"] = registry.pending_usernames()
+            if username.casefold() not in username_waiting["names"]:
+                return
+            bindings = registry.take_username_bindings(username)
+        except sqlite3.Error:
+            debug.exception("Не удалось прочитать привязки по username")
+            return
+        username_waiting["names"].discard(username.casefold())
+        for binding in bindings:
+            service_id, name = binding["service_id"], binding["name"]
+            try:
+                # Этот Telegram уже привязан к другому имени в служении —
+                # чужую привязку молча не перезаписываем.
+                bound = registry.service_person(service_id, user.id)
+                if bound is not None and bound["name"] != name:
+                    raise ValueError(
+                        f"этот Telegram уже привязан к «{bound['name']}». "
+                        "Проверьте и привяжите вручную"
+                    )
+                if binding["task"]:
+                    registry.set_responsible_contact(
+                        binding["actor_id"], service_id, binding["task"],
+                        name, user.id, username,
+                    )
+                else:
+                    registry.bind_service_member(
+                        binding["actor_id"], service_id, name, user.id,
+                        username, tasks=binding["tasks"],
+                    )
+            except (PermissionError, ValueError, sqlite3.Error) as exc:
+                debug.warning(
+                    "Привязка по username не выполнена (%s): %s",
+                    service_id, exc,
+                )
+                text = (
+                    f"❌ @{username} написал(а) боту, но привязать "
+                    f"«{name}» не удалось: {exc}"
+                )
+            else:
+                actor_pending = pending_inputs.get(binding["actor_id"]) or {}
+                if actor_pending.get("service_id") == service_id:
+                    refresh_registered_contacts(binding["actor_id"], service_id)
+                service = service_by_id(registry, service_id)
+                text = (
+                    f"✅ @{username} написал(а) боту — «{name}» привязан(а) "
+                    + (f"к задаче «{binding['task']}»" if binding["task"]
+                       else "во всех задачах")
+                    + (f" · {service_label(service)}" if service else "")
+                )
+            try:
+                await context.bot.send_message(
+                    chat_id=binding["actor_id"], text=text, parse_mode=None,
+                )
+            except Exception:  # noqa: BLE001
+                debug.warning(
+                    "Не удалось сообщить о привязке по username", exc_info=True
+                )
+
+    async def username_binding_middleware(handler, event, data):
+        user = getattr(event, "from_user", None) or getattr(event, "user", None)
+        if user is not None:
+            try:
+                await complete_username_bindings(user)
+            except Exception:  # noqa: BLE001
+                debug.exception("Сбой отложенной привязки по username")
+        return await handler(event, data)
+
+    for observer_name in ("callback_query", "message", "poll_answer"):
+        observer = getattr(dispatcher, observer_name, None)
+        if not callable(getattr(observer, "outer_middleware", None)):
+            observer = getattr(admin_router, observer_name)
+        observer.outer_middleware(username_binding_middleware)
 
     session_middleware = getattr(
         getattr(getattr(context, "bot", None), "session", None),
@@ -621,11 +732,21 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "➖", "🗑", "✏️", "1️⃣", "2️⃣", "3️⃣", "4️⃣",
                         "📤", "🔁", "🗓", "🧵", "🚫", "📆", "♾", "▶️", "⏸",
                         "🗳", "⏹", "⏭", "↩️", "🏁", "💬", "⬜", "☑️",
+                        "🔢", "🔤",
                     )
                 ):
                     button.text = f"📋 {label}"
 
             if keep_rows:
+                total = sum(len(row) for row in markup.inline_keyboard)
+                if total > keyboard_limit:
+                    # Экран важнее лимита оформления: показать как есть
+                    # (Telegram допускает до 100 кнопок) и записать в лог.
+                    debug.warning(
+                        "Кнопок на экране %s больше лимита %s", total,
+                        keyboard_limit,
+                    )
+                    keyboard_limit = total
                 validate_inline_keyboard(
                     markup.inline_keyboard, max_buttons=keyboard_limit
                 )
@@ -891,6 +1012,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 or registry.is_service_admin(actor_id, service_id)
             )
         )
+
+    def can_check_delivery(actor_id: int, service_id: str) -> bool:
+        """Проверка доставки — внутри служения, когда групповой чат
+        назначен: её запускает тот, кто настраивает чат."""
+        if not is_service_admin(actor_id, service_id):
+            return False
+        service = service_by_id(service_registry(), service_id)
+        return bool(service and service["group_chat_id"] is not None)
     async def require_chat_member(actor_id: int, chat_id: int) -> None:
         """Чат по ID вручную: админ служения должен сам состоять в группе
         (выбор кнопкой Telegram это гарантирует). Супер-администратор — без
@@ -1350,6 +1479,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ("🔄 Сверить график", "service_sync"),
             ("📡 Групповой чат", "service_chat"),
         ]
+        if can_check_delivery(actor_id, service_id):
+            items.append(("🧪 Проверка доставки", "test_notify"))
         if is_super_admin:
             items.extend(
                 [
@@ -1357,8 +1488,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     ("➖ Снять админа", "service_admin_remove"),
                 ]
             )
-        if actor_id == context.admin_id:
-            items.append(("🧪 Проверка доставки", "test_notify"))
         rows = [
             [
                 InlineKeyboardButton(
@@ -1926,6 +2055,52 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         weekday = schedule_plan.WEEKDAYS[(6 + offset) % 7]
         return f"{weekday} (вс {offset:+d})"
 
+    # Лимит служений в месяц (решение 12): готовые диапазоны и «Вручную» —
+    # минимум, затем максимум кнопками.
+    LIMIT_PRESETS = ((0, 2), (1, 2), (1, 3))
+
+    def month_limit_label(limit) -> str:
+        if limit is None or limit == (0, None):
+            return "без лимита"
+        low, high = limit
+        if high == 0:
+            return "0 — не ставить"
+        if high == low:
+            return f"ровно {low}"
+        return f"от {low}" if high is None else f"{low}–{high}"
+
+    def service_month_limit(registry, service_id: str):
+        """Лимит служения для всех; None — без лимита."""
+        settings = registry.get_readiness_settings(service_id)
+        if not settings["month_min"] and settings["month_max"] is None:
+            return None
+        return (settings["month_min"], settings["month_max"])
+
+    def month_limit_value(value: str):
+        """«n» — без лимита, «1_3» — диапазон, «2_x» — от 2."""
+        if value == "n":
+            return (0, None)
+        low, _, high = value.partition("_")
+        if not low.isdigit() or not (high == "x" or high.isdigit()):
+            raise ValueError("Неизвестный лимит.")
+        return (int(low), None if high == "x" else int(high))
+
+    def month_limit_choices(value: str) -> tuple[str, list[tuple[str, str]]]:
+        """Шаг выбора лимита: «m» — минимум, «m2» — максимум от 2."""
+        if value == "m":
+            return "Минимум служений в месяц:", [
+                (str(low), f"m{low}") for low in range(0, 6)
+            ]
+        if value.startswith("m") and value[1:].isdigit():
+            low = int(value[1:])
+            return f"Минимум {low}. Максимум служений в месяц:", [
+                ("0 — не ставить" if high == 0 else str(high), f"{low}_{high}")
+                for high in range(low, 6)
+            ] + [("без верхней границы", f"{low}_x")]
+        return "", [("без лимита", "n")] + [
+            (f"{low}–{high}", f"{low}_{high}") for low, high in LIMIT_PRESETS
+        ] + [("✏️ Вручную", "m")]
+
     def member_button(text: str, action: str, service_id: str, token: str,
                       arg: str | None = None) -> InlineKeyboardButton:
         data = f"mbr:{action}:{service_id}:{token}" + (f".{arg}" if arg else "")
@@ -1973,6 +2148,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "Telegram: " + (
                 (f"@{username}" if username else f"ID {telegram_id}")
                 if telegram_id else "⚪ не привязан"
+            ) + (
+                f"\n⏳ ждёт @{waiting} — привяжется, когда он(а) напишет боту"
+                if (waiting := registry.username_binding(service_id, name))
+                else ""
             ),
             f"Источник: {origin}",
             "Задачи: " + (", ".join(tasks) or "⚠️ нет — в график не попадает")
@@ -1980,6 +2159,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "📅 День служения: " + (
                 member_day_label(day_offset)
                 if day_offset is not None else "как у всех"
+            ),
+            "🔢 Служений в месяц: " + (
+                month_limit_label(personal) + " (личный)"
+                if (personal := (member or {}).get("month_limit")) is not None
+                else "как у служения — " + month_limit_label(
+                    service_month_limit(registry, service_id)
+                )
             ),
         ]
         scheduled = next(
@@ -2002,7 +2188,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             # У служения без задач все в нём — выбирать нечего.
             rows.append([member_button("📝 Задачи", "tasks", service_id, token)])
         if member is not None:
-            rows.append([member_button("📅 Свой день", "day", service_id, token)])
+            rows.append([
+                member_button("📅 Свой день", "day", service_id, token),
+                member_button("🔢 В месяц", "lim", service_id, token),
+            ])
         if member is not None or person is not None:
             # Только в графике — удалять из состава нечего.
             rows.append([
@@ -2154,6 +2343,51 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     _dialog_keyboard_limit=sum(len(row) for row in rows),
                     parse_mode=None,
                 )
+            elif action == "lim" or (
+                action == "lset" and arg and arg.startswith("m")
+            ):
+                title, options = month_limit_choices(arg or "")
+                buttons = [
+                    member_button(
+                        label if label.startswith("✏️") else f"🔢 {label}",
+                        "lset", service_id, token, value,
+                    )
+                    for label, value in options
+                ]
+                if not title:
+                    buttons.insert(0, member_button(
+                        "↩️ Как у служения", "lset", service_id, token, "s"
+                    ))
+                rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+                rows.append([member_button(
+                    "⬅️ К человеку", "card", service_id, token
+                )])
+                await _send_dialog(
+                    message,
+                    f"🔢 Служений в месяц · {name}\n\n" + (
+                        title or
+                        "Сколько раз в месяц человека можно ставить в "
+                        "график. Максимум — даже если он отметил все даты; "
+                        "минимум — бот старается дать не меньше. Личный "
+                        "лимит главнее лимита служения."
+                    ),
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+                    _dialog_keep_rows=True,
+                    _dialog_keyboard_limit=sum(len(row) for row in rows),
+                    parse_mode=None,
+                )
+            elif action == "lset" and arg:
+                limit = None if arg == "s" else month_limit_value(arg)
+                registry.set_service_member_limit(
+                    actor_id, service_id, name, limit
+                )
+                await show_member_card(
+                    message, actor_id, service_id, name,
+                    "✅ Служений в месяц: " + (
+                        "как у служения" if limit is None
+                        else month_limit_label(limit)
+                    ),
+                )
             elif action == "dset" and (
                 arg == "n" or arg.lstrip("-").isdigit()
             ):
@@ -2193,8 +2427,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 notice = f"🗑 «{name}» убран(а) из состава"
                 if in_list:
                     notice += (
-                        "\n⚠️ Он(а) есть в «Списках» Excel — при следующем "
-                        "чтении файла вернётся; уберите и там."
+                        "\nВ «Списках» Excel он(а) остаётся, но бот его "
+                        "больше не вернёт — пока не добавите в боте снова."
                     )
                 await send_member_choices(
                     message, actor_id, service_id,
@@ -2883,7 +3117,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             message,
             text,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-            _dialog_keyboard_limit=12,
+            # Свой текст и соседи — до 13 кнопок: лимит по факту.
+            _dialog_keyboard_limit=sum(len(row) for row in buttons),
             _dialog_keep_rows=True,
             parse_mode=None,
         )
@@ -3749,9 +3984,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         ])
         window = (settings["day_from"], settings["day_to"])
         lines.append("📆 Дни служения: " + DAY_WINDOWS.get(window, "свои"))
+        lines.append(
+            "🔢 Служений в месяц: "
+            + month_limit_label(service_month_limit(registry, service_id))
+        )
         rows.append([
             readiness_button("📆 Дни служения", "days", service_id),
             readiness_button("📅 Свой день", "own", service_id),
+            readiness_button("🔢 В месяц", "lim", service_id),
         ])
         rows.append([readiness_button("📝 Тексты", "texts", service_id)])
         current_key = f"{now.year:04d}-{now.month:02d}"
@@ -3805,7 +4045,65 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "Сообщение в чате служения (ответом на опрос), когда опрос "
             "завершён.", READINESS_CLOSED_HELP,
         ),
+        "pub": (
+            "plan_title_template", "📅 Заголовок графика",
+            "Первая строка графика в чате служения, когда график "
+            "утверждён.", PLAN_TITLE_HELP,
+        ),
+        "pubupd": (
+            "plan_update_template", "📅 Заголовок обновления",
+            "Первая строка графика в чате служения, когда опубликованный "
+            "график изменили.", PLAN_TITLE_HELP,
+        ),
     }
+    # Короткие фразы — тоже тексты («ph.<имя>»), поле в настройках — phrases.
+    for _name, (_default, _fields, _limit, _label) in READINESS_PHRASES.items():
+        READINESS_TEXTS[f"ph.{_name}"] = (
+            "phrases", f"🔤 «{_default}»", _label, tuple(sorted(_fields)),
+        )
+
+    def readiness_text_value(settings: dict, kind: str) -> str | None:
+        """Свой текст шаблона или фразы (None — встроенный)."""
+        if kind.startswith("ph."):
+            return settings["phrases"].get(kind[3:])
+        return settings[READINESS_TEXTS[kind][0]]
+
+    def save_readiness_text(
+        registry, actor_id: int, service_id: str, kind: str, text: str | None,
+    ) -> None:
+        if kind.startswith("ph."):
+            registry.set_readiness_phrase(actor_id, service_id, kind[3:], text)
+        else:
+            registry.set_readiness_settings(
+                actor_id, service_id, **{READINESS_TEXTS[kind][0]: text}
+            )
+
+    async def show_readiness_phrases(message: Message, service_id: str) -> None:
+        """«🔤 Фразы»: короткие слова и фразы в сообщениях участникам."""
+        settings = service_registry().get_readiness_settings(service_id)
+        lines = [
+            "🔤 Фразы", "",
+            "Короткие слова в сообщениях для участников — их можно заменить "
+            "своими. ✏️ — своя фраза, ⚪ — встроенная.", "",
+        ]
+        rows = []
+        for name, (default, _, _, label) in READINESS_PHRASES.items():
+            own = settings["phrases"].get(name)
+            lines.append(
+                f"{'✏️' if own else '⚪'} {label}: «{own or default}»"
+            )
+            rows.append([readiness_button(
+                f"🔤 {own or default}"[:40], "tpl", service_id, f"ph.{name}"
+            )])
+        rows.append([readiness_button("⬅️ К текстам", "texts", service_id)])
+        await _send_dialog(
+            message, "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keep_rows=True,
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
+            _dialog_text_limit=TELEGRAM_TEXT_LIMIT,
+            parse_mode=None,
+        )
 
     async def show_readiness_texts(
         message: Message, service_id: str,
@@ -3814,12 +4112,19 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         registry = service_registry()
         settings = registry.get_readiness_settings(service_id)
         rows = []
-        lines = ["📝 Тексты опроса", "", "✏️ — свой текст, ⚪ — встроенный."]
-        for kind in ("intro", "q", "rem", "chat", "done"):
+        lines = ["📝 Тексты опроса и графика", "",
+                 "✏️ — свой текст, ⚪ — встроенный."]
+        for kind in ("intro", "q", "rem", "chat", "done", "pub", "pubupd"):
             field, title, about, _ = READINESS_TEXTS[kind]
             mark = "✏️" if settings[field] else "⚪"
             lines.append(f"{mark} {title} — {about}")
             rows.append([readiness_button(title, "tpl", service_id, kind)])
+        own_phrases = len(settings["phrases"])
+        lines.append(
+            "🔤 Фразы — короткие слова в сообщениях участникам"
+            + (f" (своих: {own_phrases})" if own_phrases else "") + "."
+        )
+        rows.append([readiness_button("🔤 Фразы", "phr", service_id)])
         rows.append([readiness_button("⬅️ К разделу «График»", "open", service_id)])
         await _send_dialog(
             message, "\n".join(lines),
@@ -3840,13 +4145,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await _send_dialog(message, "Настройка устарела.", parse_mode=None)
             return
         field, title, about, _ = READINESS_TEXTS[kind]
-        template = registry.get_readiness_settings(service_id)[field]
-        default = {
+        phrase_kind = kind.startswith("ph.")
+        template = readiness_text_value(
+            registry.get_readiness_settings(service_id), kind
+        )
+        default = READINESS_PHRASES[kind[3:]][0] if phrase_kind else {
             "intro": readiness.DEFAULT_READINESS_INTRO,
             "rem": readiness.DEFAULT_READINESS_REMINDER,
             "chat": readiness.DEFAULT_READINESS_CHAT_REMINDER,
             "q": readiness.DEFAULT_READINESS_QUESTION,
             "done": readiness.DEFAULT_READINESS_CLOSED,
+            "pub": readiness.DEFAULT_PLAN_TITLE,
+            "pubupd": readiness.DEFAULT_PLAN_UPDATE_TITLE,
         }[kind]
         lines = [
             f"{title} · {service_label(service)}",
@@ -3860,14 +4170,20 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             lines = [notice, ""] + lines
         rows = [[
             readiness_button("✏️ Изменить", "tpledit", service_id, kind),
-            readiness_button("👁 Предпросмотр", "tplprev", service_id, kind),
         ]]
+        if not phrase_kind:
+            rows[0].append(
+                readiness_button("👁 Предпросмотр", "tplprev", service_id, kind)
+            )
         if template:
             rows[0].append(
                 readiness_button("🔄 Вернуть встроенный", "tplreset",
                                  service_id, kind)
             )
-        rows.append([readiness_button("⬅️ К текстам", "texts", service_id)])
+        rows.append([
+            readiness_button("⬅️ К фразам", "phr", service_id) if phrase_kind
+            else readiness_button("⬅️ К текстам", "texts", service_id)
+        ])
         await _send_dialog(
             message, "\n".join(lines),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -5264,6 +5580,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await show_readiness_texts(callback.message, service_id)
                 await _answer_callback(callback)
                 return
+            elif action == "phr":
+                await show_readiness_phrases(callback.message, service_id)
+                await _answer_callback(callback)
+                return
             elif action == "own":
                 await show_own_days(callback.message, actor_id, service_id)
                 await _answer_callback(callback)
@@ -5320,6 +5640,29 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
                 await _answer_callback(callback)
                 return
+            elif action == "lim" and (arg is None or arg.startswith("m")):
+                title, options = month_limit_choices(arg or "")
+                current = service_month_limit(registry, service_id)
+                await show_readiness_choice(
+                    callback.message, service_id,
+                    "🔢 Служений в месяц для всех в служении\n\n" + (
+                        title or
+                        "Максимум — даже если человек отметил все даты; "
+                        "минимум — бот старается дать не меньше. Личный "
+                        "лимит — в карточке человека, он главнее."
+                    ),
+                    options, "lim",
+                    "n" if current is None else
+                    f"{current[0]}_{'x' if current[1] is None else current[1]}",
+                )
+                await _answer_callback(callback)
+                return
+            elif action == "lim":
+                low, high = month_limit_value(arg)
+                registry.set_readiness_settings(
+                    actor_id, service_id, month_min=low, month_max=high,
+                )
+                notice = "✅ Служений в месяц: " + month_limit_label((low, high))
             elif action == "days" and arg is None:
                 await show_readiness_choice(
                     callback.message, service_id,
@@ -5545,7 +5888,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     )
                 await _answer_callback(callback)
                 return
-            elif action == "tplprev" and arg in READINESS_TEXTS:
+            elif action == "tplprev" and arg in READINESS_TEXTS and not (
+                arg.startswith("ph.")
+            ):
                 # Как сообщение будет выглядеть: месяц и срок опроса этого
                 # месяца (идущего или по расписанию), упоминания состава.
                 run = registry.get_readiness_run(service_id, key)
@@ -5556,6 +5901,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     body = readiness.intro_text(
                         service, registry.readiness_people(service_id),
                         year, month, deadline, tz, settings["intro_template"],
+                        readiness.phrase(settings, "own_days"),
                     )
                     where = "в чате служения перед опросом"
                 elif arg == "q":
@@ -5573,6 +5919,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     where = (
                         "в чате служения, ответом на опрос" if arg == "chat"
                         else "лично тем, кто не ответил"
+                    )
+                elif arg in {"pub", "pubupd"}:
+                    body = schedule_plan.publication_title(
+                        service, key, arg == "pubupd", settings,
+                    )
+                    where = (
+                        "заголовок обновлённого графика в чате служения"
+                        if arg == "pubupd"
+                        else "заголовок графика в чате служения"
                     )
                 else:
                     body = readiness.closed_text(
@@ -5605,9 +5960,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await _answer_callback(callback)
                 return
             elif action == "tplreset" and arg in READINESS_TEXTS:
-                registry.set_readiness_settings(
-                    actor_id, service_id, **{READINESS_TEXTS[arg][0]: None}
-                )
+                save_readiness_text(registry, actor_id, service_id, arg, None)
                 await show_readiness_text(
                     callback.message, service_id, arg,
                     "🔄 Возвращён встроенный текст",
@@ -6865,23 +7218,32 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if not callback_answered:
             await _answer_callback(callback)
 
-    def service_result_keyboard(service_id: str) -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="⚙️ К настройкам служения",
-                        callback_data=f"service:service_settings:{service_id}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="📋 К списку служений",
-                        callback_data="service:back_to_services:list",
-                    )
-                ],
-            ]
-        )
+    def service_result_keyboard(
+        service_id: str, delivery_check: bool = False
+    ) -> InlineKeyboardMarkup:
+        rows = []
+        if delivery_check:
+            rows.append([
+                InlineKeyboardButton(
+                    text="🧪 Проверка доставки",
+                    callback_data=f"service:test_notify:{service_id}",
+                )
+            ])
+        rows.extend([
+            [
+                InlineKeyboardButton(
+                    text="⚙️ К настройкам служения",
+                    callback_data=f"service:service_settings:{service_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📋 К списку служений",
+                    callback_data="service:back_to_services:list",
+                )
+            ],
+        ])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
 
     def test_result_keyboard(service_id: str) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
@@ -7397,20 +7759,30 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         await _send_dialog(message, f"Нажмите кнопку и выберите пользователя Telegram для имени "
             f"«{contact_name}» {scope}. "
             "Или отправьте Telegram ID, при желании дополнив username "
-            "через пробел: 123456789 @username. "
+            "через пробел: 123456789 @username, — или только @username: "
+            "привязка завершится, когда человек напишет боту. "
             f"«{CONTACT_BACK_TEXT}» — вернуться к выбору человека. "
             "Проверьте выбор — назначение подтвердите на следующем шаге.",
             reply_markup=keyboard,
             parse_mode=None,
         )
 
-    def parse_manual_user(text: str) -> tuple[int, str]:
+    def parse_manual_user(
+        text: str, username_only: bool = False,
+    ) -> tuple[int | None, str]:
+        """«ID [@username]»; username_only — можно и один «@username»
+        (ID тогда None: привязка завершится, когда человек напишет боту)."""
         parts = text.split()
         if len(parts) not in {1, 2}:
             raise ValueError(
                 "Введите Telegram ID и при необходимости username "
                 "через пробел, например: 123456789 @username."
             )
+        if username_only and len(parts) == 1 and parts[0].startswith("@"):
+            username = parts[0][1:]
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", username):
+                raise ValueError("Некорректный Telegram username.")
+            return None, username
         try:
             user_id = int(parts[0])
         except ValueError as exc:
@@ -7506,6 +7878,112 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             reply_markup=keyboard,
             parse_mode=None,
         )
+
+    def contact_member_tasks(actor_id: int, contact_name: str) -> list[str]:
+        """Задачи имени в графике (для привязки во всех задачах человека)."""
+        return sorted(
+            schedule_task
+            for schedule_task, task_info in (
+                pending_inputs.get(actor_id) or {}
+            ).get("schedule_assignments", {}).items()
+            if not task_is_informational(task_info)
+            and contact_name in task_assignment_names(task_info)
+        )
+
+    async def ask_username_binding_confirmation(
+        message: Message, actor_id: int, service_id: str, username: str,
+        task: str | None, contact_name: str,
+    ) -> None:
+        """Привязка только по @username: ID бот узнает, когда человек
+        напишет ему, — до этого привязка ждёт."""
+        token = secrets.token_urlsafe(6)
+        pending_inputs.setdefault(actor_id, {})["username_binding"] = {
+            "token": token, "service_id": service_id, "username": username,
+            "task": task or "", "name": contact_name,
+        }
+        scope = f"задача «{task}»" if task else "все его задачи служения"
+        await _send_dialog(
+            message,
+            f"ℹ️ Подтвердите: привязать «{contact_name}» ({scope}) к "
+            f"@{username}\n\n"
+            "⏳ Бот ещё не видел этого пользователя, поэтому Telegram ID "
+            "пока неизвестен. Привязка завершится, когда он(а) напишет "
+            "боту, нажмёт кнопку или ответит на опрос, — вам придёт "
+            "сообщение. Попросите человека написать боту /start.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="✅ Подтвердить",
+                    callback_data=f"ubind:ok:{service_id}:{token}",
+                ),
+                InlineKeyboardButton(
+                    text="✖️ Отмена",
+                    callback_data=f"ubind:no:{service_id}:{token}",
+                ),
+            ]]),
+            parse_mode=None,
+        )
+
+    @admin_router.callback_query(F.data.startswith("ubind:"))
+    async def on_username_binding(callback: CallbackQuery) -> None:
+        if (
+            not callback.from_user
+            or not callback.message
+            or callback.message.chat.type != ChatType.PRIVATE
+        ):
+            await _answer_callback(callback)
+            return
+        actor_id = callback.from_user.id
+        parts = callback.data.split(":")
+        pending = pending_inputs.get(actor_id) or {}
+        binding = pending.get("username_binding")
+        if (
+            len(parts) != 4 or binding is None
+            or binding["service_id"] != parts[2]
+            or binding["token"] != parts[3]
+        ):
+            await _answer_callback(
+                callback, "⚠️ Запрос устарел. Начните привязку заново."
+            )
+            return
+        pending.pop("username_binding", None)
+        service_id, task, name = (
+            binding["service_id"], binding["task"], binding["name"]
+        )
+        notice = "✅ Назначение отменено."
+        if parts[1] == "ok":
+            registry = service_registry()
+            try:
+                if registry is None:
+                    raise ValueError("Реестр настроек служений недоступен.")
+                registry.add_username_binding(
+                    actor_id, service_id, name, task, binding["username"],
+                    () if task else contact_member_tasks(actor_id, name),
+                )
+            except (PermissionError, ValueError) as exc:
+                notice = _status_text(str(exc), "❌")
+            except sqlite3.Error:
+                debug.exception("Не удалось сохранить привязку по username")
+                notice = "❌ Не удалось сохранить привязку из-за ошибки базы данных."
+            else:
+                username_waiting["names"] = None
+                notice = (
+                    f"⏳ «{name}» привяжется к @{binding['username']}, когда "
+                    "он(а) напишет боту — вам придёт сообщение."
+                )
+        if task:
+            contact_pending = pending_inputs.get(actor_id)
+            if contact_pending is not None:
+                contact_pending["step"] = "choose_contact_person"
+                contact_pending.pop("active_contact_name", None)
+            await offer_contact_name_choices(
+                callback.message, actor_id, service_id, task, notice=notice,
+            )
+        else:
+            await send_member_choices(
+                callback.message, actor_id, service_id,
+                pending.get("member_page", 0), notice=notice,
+            )
+        await _answer_callback(callback)
 
     @admin_router.message(Command("services"))
     async def on_services(message: Message) -> None:
@@ -7840,11 +8318,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         "service_settings": "📋 Служения",
         "service_notify": "🔔 Напоминания групп",
         "service_contact": "👥 Ответственные",
-        "service_sync": "🔄 Сверить график",
-        "service_chat": "📡 Групповой чат",
+        "service_admins": "👤 Администраторы",
         "service_admin_add": "👤 Назначить админа",
         "service_admin_remove": "➖ Снять админа",
-        "test_notify": "🧪 Проверка доставки",
         "my_schedule": "📅 Мои служения",
         "my_month": "📆 На месяц",
         "my_notifications": "⏰ Мои уведомления",
@@ -7855,15 +8331,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         actor_id: int, role: str, linked: bool
     ) -> list[str]:
         operations = []
+        # Сверка с Excel, групповой чат и проверка доставки — в карточке
+        # служения: их ведут админы служений.
         if role != ROLE_USER:
             operations.extend([
                 "service_settings", "service_notify", "service_contact",
-                "service_sync", "service_chat",
             ])
         if role == ROLE_SUPER_ADMIN:
-            operations.extend(["service_admin_add", "service_admin_remove"])
-        if actor_id == context.admin_id:
-            operations.append("test_notify")
+            operations.append("service_admins")
         if linked:
             operations.extend(["my_schedule", "my_month", "my_notifications"])
         return operations
@@ -7885,6 +8360,28 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ]
         )
 
+    async def open_service_admins_menu(
+        message: Message, actor_id: int
+    ) -> None:
+        registry = service_registry()
+        if registry is None or not registry.is_super_admin(actor_id):
+            await _send_dialog(
+                message,
+                "❌ Назначать и снимать администраторов может только "
+                "супер-администратор.",
+                parse_mode=None,
+            )
+            return
+        await _send_dialog(
+            message,
+            "👤 Администраторы\nℹ️ Назначьте или снимите администратора "
+            "служения.",
+            reply_markup=start_menu_keyboard(
+                ["service_admin_add", "service_admin_remove", "start"]
+            ),
+            parse_mode=None,
+        )
+
     def start_text(
         actor_id: int, user_name: str, role: str, linked: bool
     ) -> str:
@@ -7893,7 +8390,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 f"👋 Здравствуйте, {user_name}!\n"
                 "Вы — супер-администратор: вам доступны все служения.\n\n"
                 "ℹ️ Выберите раздел кнопкой ниже или командой из меню.\n"
-                "💡 Новое служение настраивается так: групповой чат → "
+                "💡 Новое служение настраивается в его карточке "
+                "(«📋 Служения»): групповой чат и проверка доставки → "
                 "ответственные → напоминания групп."
             )
         if role == ROLE_SERVICE_ADMIN:
@@ -8018,15 +8516,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await open_my_month(callback.message, actor_id)
         elif operation == "start":
             await show_start(callback.message, callback.from_user)
-        elif operation == "test_notify":
-            if actor_id != context.admin_id:
-                await _send_dialog(
-                    callback.message,
-                    "❌ Проверка доставки доступна только главному администратору.",
-                    parse_mode=None,
-                )
-                return
-            await open_test_notify(callback.message, actor_id)
+        elif operation == "service_admins":
+            await open_service_admins_menu(callback.message, actor_id)
         else:
             await request_service_input(
                 callback.message, operation, actor_id=actor_id
@@ -8178,9 +8669,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     parse_mode=None,
                 )
             elif operation == "test_notify":
-                if callback.from_user.id != context.admin_id:
+                if not is_service_admin(callback.from_user.id, service_id):
                     raise PermissionError(
-                        "Проверка доставки доступна только главному администратору."
+                        "Проверка доставки доступна только администратору "
+                        "этого служения."
                     )
                 rows = []
                 if service["group_chat_id"] is not None:
@@ -9268,7 +9760,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         await _send_dialog(
             message,
             "Выберите следующий шаг.",
-            reply_markup=service_result_keyboard(pending[2]),
+            reply_markup=service_result_keyboard(
+                pending[2], delivery_check=True
+            ),
             parse_mode=None,
         )
 
@@ -11365,9 +11859,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 pending_inputs.pop(message.from_user.id, None)
                 return
             try:
-                registry.set_readiness_settings(
-                    message.from_user.id, service_id,
-                    **{READINESS_TEXTS[kind][0]: text},
+                save_readiness_text(
+                    registry, message.from_user.id, service_id, kind, text
                 )
             except PermissionError as exc:
                 pending_inputs.pop(message.from_user.id, None)
@@ -11489,7 +11982,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     raise ValueError(
                         "Выбор ответственного устарел. Выберите его заново."
                     )
-                user_id, username = parse_manual_user(text)
+                user_id, username = parse_manual_user(text, username_only=True)
+                if user_id is None:
+                    # Бот уже видел этот @username — ID известен.
+                    user_id = registry.known_telegram_id(username)
+                if user_id is None:
+                    await ask_username_binding_confirmation(
+                        message, message.from_user.id, service_id, username,
+                        task, contact_name,
+                    )
+                    return
                 await ask_user_assignment_confirmation(
                     message,
                     message.from_user.id,
@@ -11891,7 +12393,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         await _send_dialog(
             message,
             _status_text(response, "✅"),
-            reply_markup=service_result_keyboard(service_id),
+            reply_markup=service_result_keyboard(
+                service_id,
+                delivery_check=operation == "service_chat"
+                and can_check_delivery(message.from_user.id, service_id),
+            ),
             parse_mode=None,
         )
 
@@ -11910,7 +12416,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         await request_service_input(message, "service_sync")
 
     async def execute_test_notification(
-        message: Message, service: dict, action: str
+        message: Message, service: dict, action: str, actor_id: int
     ) -> None:
         if action == "group":
             group_chat_id = service["group_chat_id"]
@@ -11993,7 +12499,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         for chunk in _telegram_text_chunks(plain_text("\n".join(output))):
             try:
                 await context.bot.send_message(
-                    context.admin_id, chunk, parse_mode=None
+                    actor_id, chunk, parse_mode=None
                 )
             except TelegramAPIError:
                 debug.exception(
@@ -12054,7 +12560,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def on_test_notify_action(callback: CallbackQuery) -> None:
         if (
             not callback.from_user
-            or callback.from_user.id != context.admin_id
             or not callback.message
             or callback.message.chat.type != ChatType.PRIVATE
         ):
@@ -12065,6 +12570,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await _answer_callback(callback, "⚠️ Кнопка устарела.")
             return
         _, action, service_id = parts
+        if not is_service_admin(callback.from_user.id, service_id):
+            await _answer_callback(
+                callback,
+                "❌ Проверка доставки доступна только администратору "
+                "этого служения.",
+            )
+            return
         await clean_previous_menu(callback.message, debug)
         registry = service_registry()
         if registry is None:
@@ -12077,7 +12589,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             if action not in {"group", "preview"}:
                 raise ValueError("Неизвестный вид проверки.")
             await execute_test_notification(
-                callback.message, service, action
+                callback.message, service, action, callback.from_user.id
             )
         except (ValueError, sqlite3.Error) as exc:
             await _send_dialog(callback.message, _status_text(str(exc), "❌"), parse_mode=None

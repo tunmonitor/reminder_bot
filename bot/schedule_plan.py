@@ -21,11 +21,15 @@ from .group_send import send_to_service_group
 from .month_summary import month_end, month_key, month_title
 from .presentation import task_emoji
 from .readiness import (
+    DEFAULT_PLAN_TITLE,
+    DEFAULT_PLAN_UPDATE_TITLE,
     Summary,
     month_sundays,
     local_text,
     month_of,
     outside_name,
+    phrase,
+    render_template,
     summarize,
     task_lines,
 )
@@ -315,26 +319,34 @@ def served_offsets(plan: dict, people: list[dict]) -> dict:
 
 
 def person_day(person: dict | None, day: str, plan: dict | None = None) -> str:
-    """« — чт 29.10» для человека с личным (или разовым) днём служения."""
+    """« (чт 29.10)» для человека с личным (или разовым) днём служения —
+    в скобках, как окно у даты."""
     offset = day_offset(plan, person, day)
     if offset is None:
         return ""
-    return " — " + _weekday_date(date.fromisoformat(day) + timedelta(days=offset))
+    return (
+        " (" + _weekday_date(date.fromisoformat(day) + timedelta(days=offset))
+        + ")"
+    )
 
 
-def date_window(plan: dict, by_key: dict, day: str,
-                window: tuple[int, int]) -> tuple[int, int]:
-    """Окно для заголовка даты: если у всех поставленных на дату свой
-    (или разовый) день, общий период не показывается."""
+def date_header(plan: dict, by_key: dict, day: str,
+                window: tuple[int, int]) -> tuple[str, bool]:
+    """Заголовок даты и скрывать ли дни у людей. У всех поставленных один
+    и тот же свой день — он в скобках у даты («29.11 (чт 26.11)»), у имён
+    не повторяется; у всех свои, но разные — дата без периода; иначе —
+    дата с окном служения."""
     people = [
-        key for tasks in [plan["slots"].get(day, {})]
-        for keys in tasks.values() for key in keys
+        key for keys in plan["slots"].get(day, {}).values() for key in keys
     ]
-    if people and all(
-        day_offset(plan, by_key.get(key), day) is not None for key in people
-    ):
-        return (0, 0)
-    return window
+    offsets = {day_offset(plan, by_key.get(key), day) for key in people}
+    if people and None not in offsets and len(offsets) == 1:
+        (offset,) = offsets
+        moment = date.fromisoformat(day) + timedelta(days=offset)
+        return f"{_short(day)} ({_weekday_date(moment)})", True
+    if people and None not in offsets:
+        return _short(day), False
+    return day_label(day, window), False
 
 
 def window_of(registry, service_id: str) -> tuple[int, int]:
@@ -372,9 +384,8 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
     ]
     used_silent = False
     for day in plan["dates"]:
-        lines += [
-            "", f"🗓 {day_label(day, date_window(plan, by_key, day, window))}",
-        ]
+        header, shared_day = date_header(plan, by_key, day, window)
+        lines += ["", f"🗓 {header}"]
         for task in plan["tasks"]:
             people = plan["slots"].get(day, {}).get(task["name"], [])
             used_silent |= any(person in silent for person in people)
@@ -382,7 +393,9 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
                 task["name"], task["needed"],
                 [
                     names.get(person, person) + ("*" if person in silent else "")
-                    + person_day(by_key.get(person), day, plan)
+                    + ("" if shared_day else person_day(
+                        by_key.get(person), day, plan
+                    ))
                     for person in people
                 ],
                 bare=implicit_plan(plan),
@@ -482,7 +495,8 @@ def choice_notes(plan: dict, summary: Summary, key: str, day: str,
     return notes
 
 
-def plan_changes(old: dict, new: dict, names: dict[str, str]) -> list[str]:
+def plan_changes(old: dict, new: dict, names: dict[str, str],
+                 nobody: str = "никого") -> list[str]:
     """Отличия нового графика от опубликованного — для «обновлён».
     Единственная задача сменила название (служение без задач переименовано
     в каталоге) — одной строкой, люди сравниваются под новым названием.
@@ -508,7 +522,7 @@ def plan_changes(old: dict, new: dict, names: dict[str, str]) -> list[str]:
                 continue
 
             def shown(people: list[str]) -> str:
-                return ", ".join(names.get(p, p) for p in people) or "никого"
+                return ", ".join(names.get(p, p) for p in people) or nobody
 
             lines.append(
                 f"• {_short(day)} «{task}»: {shown(before)} → {shown(after)}"
@@ -516,41 +530,58 @@ def plan_changes(old: dict, new: dict, names: dict[str, str]) -> list[str]:
     return lines
 
 
+def publication_title(service: dict, month: str, update: bool,
+                      settings: dict | None = None) -> str:
+    """Заголовок графика в чате служения: при первой публикации или при
+    обновлении (шаблоны «📝 Тексты»)."""
+    year, month_number = map(int, month.split("-"))
+    template = (settings or {}).get(
+        "plan_update_template" if update else "plan_title_template"
+    ) or (DEFAULT_PLAN_UPDATE_TITLE if update else DEFAULT_PLAN_TITLE)
+    return render_template(
+        template,
+        service_name=service["name"],
+        month=month_title(year, month_number),
+    )
+
+
 def publication_text(service: dict, plan: dict, people: list[dict],
-                     window: tuple[int, int] = (0, 0)) -> str:
-    """Утверждённый график для чата служения (с упоминаниями)."""
-    year, month = map(int, plan["month"].split("-"))
+                     window: tuple[int, int] = (0, 0),
+                     settings: dict | None = None) -> str:
+    """Утверждённый график для чата служения (с упоминаниями): дата,
+    под ней задачи — каждая с новой строки."""
     by_key = {person["key"]: person for person in people}
     update = plan["approved"] is not None
 
-    def mention(key: str, day: str) -> str:
+    def mention(key: str, day: str, shared_day: bool = False) -> str:
         person = by_key.get(key)
         if person is None:
             return key
-        return user_link(person["telegram_id"], person["name"]) + person_day(
-            person, day, plan
+        return user_link(person["telegram_id"], person["name"]) + (
+            "" if shared_day else person_day(person, day, plan)
         )
 
     lines = [
-        f"📅 График {service['name']} на {month_title(year, month)} "
-        + ("обновлён" if update else "утверждён"),
-        "",
+        publication_title(service, plan["month"], update, settings),
     ]
     for day in plan["dates"]:
-        parts = []
+        label, shared_day = date_header(plan, by_key, day, window)
+        lines += ["", f"🗓 {label}"]
         for task in plan["tasks"]:
             people_keys = plan["slots"].get(day, {}).get(task["name"], [])
-            people_text = (
-                ", ".join(mention(key, day) for key in people_keys) or "—"
+            people_text = ", ".join(
+                mention(key, day, shared_day) for key in people_keys
+            ) or phrase(settings, "empty")
+            lines.append(
+                f"  {people_text}" if implicit_plan(plan)
+                else f"  {task_emoji(task['name'])} {task['name']}: "
+                f"{people_text}"
             )
-            parts.append(
-                people_text if implicit_plan(plan)
-                else f"{task_emoji(task['name'])} {task['name']}: {people_text}"
-            )
-        label = day_label(day, date_window(plan, by_key, day, window))
-        lines.append(f"🗓 {label} — " + " · ".join(parts))
     if update:
-        changes = plan_changes(plan["approved"], plan["slots"], _names(people))
+        changes = plan_changes(
+            plan["approved"], plan["slots"], _names(people),
+            phrase(settings, "nobody"),
+        )
         names = _names(people)
         for day in plan["dates"]:
             before = plan.get("approved_days", {}).get(day, {})
@@ -568,13 +599,14 @@ def publication_text(service: dict, plan: dict, people: list[dict],
                     + (
                         _weekday_date(
                             date.fromisoformat(day) + timedelta(days=offset)
-                        ) if offset is not None else "день как обычно"
+                        ) if offset is not None
+                        else phrase(settings, "usual_day")
                     )
                 )
         if plan.get("republish"):
-            changes.append("• Изменены дни служения")
+            changes.append(phrase(settings, "days_changed"))
         if changes:
-            lines += ["", "Изменения:"] + changes
+            lines += ["", phrase(settings, "changes")] + changes
     return "\n".join(lines)
 
 
@@ -713,7 +745,8 @@ async def publish(
         await send_telegram_screen(
             send_chunk, chat_id,
             publication_text(
-                service, plan, people, window_of(registry, service["id"])
+                service, plan, people, window_of(registry, service["id"]),
+                registry.get_readiness_settings(service["id"]),
             ),
             limit=text_limit,
         )

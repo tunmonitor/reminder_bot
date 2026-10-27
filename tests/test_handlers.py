@@ -35,6 +35,7 @@ class ConfirmationHandlerTest(unittest.TestCase):
                 admin_id=67890,
                 group_chat_id=-100,
                 service_registry=SimpleNamespace(
+                    is_super_admin=lambda actor_id: actor_id == 67890,
                     list_services=MagicMock(
                         return_value=[
                             {
@@ -182,6 +183,7 @@ class ConfirmationHandlerTest(unittest.TestCase):
                 debug_logger=MagicMock(),
                 admin_id=67890,
                 service_registry=SimpleNamespace(
+                    is_super_admin=lambda actor_id: actor_id == 67890,
                     list_services=MagicMock(
                         return_value=[
                             {
@@ -3948,6 +3950,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 debug_logger=MagicMock(),
                 admin_id=67890,
                 service_registry=SimpleNamespace(
+                    is_super_admin=lambda actor_id: actor_id == 67890,
                     list_services=MagicMock(return_value=[sound]),
                     get_service=MagicMock(return_value=sound),
                 ),
@@ -4001,6 +4004,79 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             preview_callback.answer.assert_awaited_once()
             context.bot.send_message.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_service_admin_runs_delivery_check_for_own_service_only(self):
+        async def run():
+            self.registry.set_group_chat(67890, "sound", -200, enabled=True)
+            self.registry.set_group_chat(67890, "books", -300, enabled=True)
+            self.registry.add_service_admin(67890, "sound", 24680)
+            self.registry.add_service_admin(67890, "books", 13579)
+            self.context.prepare_service_test_previews = AsyncMock(
+                return_value={
+                    "sunday_date": date(2026, 11, 1),
+                    "group_text": "Звук",
+                    "personal_messages": [],
+                    "issues": [],
+                }
+            )
+            test_action = next(
+                item.callback
+                for item in reversed(router.callback_query.handlers)
+                if item.callback.__name__ == "on_test_notify_action"
+            )
+
+            def callback(actor_id, data):
+                return SimpleNamespace(
+                    data=data,
+                    from_user=SimpleNamespace(id=actor_id),
+                    message=self.message(actor_id, ""),
+                    answer=AsyncMock(),
+                )
+
+            opened = callback(24680, "service:test_notify:sound")
+            await self.callback_handler("on_service_selected")(opened)
+            markup = opened.message.answer.await_args.kwargs["reply_markup"]
+            self.assertEqual(
+                [b.callback_data for row in markup.inline_keyboard for b in row],
+                ["test_action:group:sound", "test_action:preview:sound"],
+            )
+
+            await test_action(callback(24680, "test_action:preview:sound"))
+            self.context.prepare_service_test_previews.assert_awaited_once_with(
+                "sound"
+            )
+            self.assertEqual(
+                self.context.bot.send_message.await_args.args[0], 24680
+            )
+            self.context.bot.send_message.reset_mock()
+            await test_action(callback(24680, "test_action:group:sound"))
+            self.assertEqual(
+                self.context.bot.send_message.await_args.args[0], -200
+            )
+
+            # Админ другого служения не запускает ни одну проверку.
+            self.context.bot.send_message.reset_mock()
+            self.context.prepare_service_test_previews.reset_mock()
+            denied = callback(13579, "service:test_notify:sound")
+            await self.callback_handler("on_service_selected")(denied)
+            self.assertIn(
+                "только администратору",
+                denied.message.answer.await_args.args[0],
+            )
+            self.assertIsNone(
+                denied.message.answer.await_args.kwargs.get("reply_markup")
+            )
+            for action in ("group", "preview"):
+                foreign = callback(13579, f"test_action:{action}:sound")
+                await test_action(foreign)
+                foreign.message.answer.assert_not_awaited()
+                self.assertIn(
+                    "только администратору", foreign.answer.await_args.args[0]
+                )
+            self.context.bot.send_message.assert_not_awaited()
+            self.context.prepare_service_test_previews.assert_not_awaited()
 
         asyncio.run(run())
 
@@ -4948,11 +5024,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "menu:service_settings",
                     "menu:service_notify",
                     "menu:service_contact",
-                    "menu:service_sync",
-                    "menu:service_chat",
-                    "menu:service_admin_add",
-                    "menu:service_admin_remove",
-                    "menu:test_notify",
+                    "menu:service_admins",
                 ],
             )
 
@@ -4970,8 +5042,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertEqual(
                 self.callback_data_list(message),
                 ["menu:service_settings", "menu:service_notify",
-                 "menu:service_contact", "menu:service_sync",
-                 "menu:service_chat"],
+                 "menu:service_contact"],
             )
 
         asyncio.run(run())
@@ -5031,6 +5102,35 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 "service:service_notify:sound",
                 self.callback_data_list(callback.message),
             )
+
+        asyncio.run(run())
+
+    def test_start_menu_admins_item_offers_add_and_remove(self):
+        async def run():
+            callback = SimpleNamespace(
+                data="menu:service_admins",
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_start_menu")(callback)
+            self.assertEqual(
+                self.callback_data_list(callback.message),
+                ["menu:service_admin_add", "menu:service_admin_remove",
+                 "menu:start"],
+            )
+            self.registry.add_service_admin(67890, "sound", 24680)
+            denied = SimpleNamespace(
+                data="menu:service_admins",
+                from_user=SimpleNamespace(id=24680),
+                message=self.message(24680, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_start_menu")(denied)
+            self.assertIn(
+                "супер-администратор", denied.message.answer.await_args.args[0]
+            )
+            self.assertEqual(self.callback_data_list(denied.message), [])
 
         asyncio.run(run())
 
@@ -5788,7 +5888,6 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "service:service_chat:sound",
                     "service:service_admin_add:sound",
                     "service:service_admin_remove:sound",
-                    "service:test_notify:sound",
                     "rdy:open:sound",
                     "svc_tasks:open:sound",
                     "service:back_to_services:list",
@@ -5797,6 +5896,15 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIn(
                 "👤 Администраторы · ⚪ не назначены",
                 message.answer.await_args.args[0],
+            )
+            # Проверка доставки — только когда групповой чат назначен.
+            self.registry.set_group_chat(67890, "sound", -200, enabled=True)
+            again = self.message(67890, "/service_settings sound")
+            await self.message_handler("on_service_settings")(again)
+            buttons = self.callback_data_list(again)
+            self.assertEqual(
+                buttons[buttons.index("service:service_chat:sound") + 1],
+                "service:test_notify:sound",
             )
 
         asyncio.run(run())
@@ -5972,6 +6080,69 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             texts = await press("rdy:texts:sound")
             self.assertIn("📝 Тексты опроса", texts.message.answer.await_args.args[0])
             self.assertIn("❓ Вопрос опроса", texts.message.answer.await_args.args[0])
+            self.assertIn("📅 Заголовок графика", texts.message.answer.await_args.args[0])
+            title = await press("rdy:tplprev:sound:pub")
+            self.assertIn(
+                "заголовок графика в чате служения",
+                title.message.answer.await_args.args[0],
+            )
+            self.assertIn(" утверждён", title.message.answer.await_args.args[0])
+            title_edit = await press("rdy:tpledit:sound:pub")
+            self.assertIn(
+                "• {month} — ", title_edit.message.answer.await_args.args[0]
+            )
+            update = await press("rdy:tplprev:sound:pubupd")
+            self.assertIn(" обновлён", update.message.answer.await_args.args[0])
+            # «🔤 Фразы»: своя фраза и возврат встроенной.
+            phrases = await press("rdy:phr:sound")
+            self.assertIn(
+                "⚪ Последний вариант в опросе: «❌ Не смогу в этом месяце»",
+                phrases.message.answer.await_args.args[0],
+            )
+            phrase = await press("rdy:tpl:sound:ph.cant")
+            self.assertNotIn(
+                "Предпросмотр",
+                str(phrase.message.answer.await_args.kwargs["reply_markup"]),
+            )
+            await press("rdy:tpledit:sound:ph.cant")
+            phrase_input = self.message(67890, "🙈 В этом месяце не смогу")
+            await next(
+                item.callback for item in self.admin_router.message.handlers
+                if item.callback.__name__ == "on_service_parameter"
+            )(phrase_input)
+            self.assertIn("✅ Текст сохранён", phrase_input.answer.await_args.args[0])
+            self.assertEqual(
+                self.registry.get_readiness_settings("sound")["phrases"],
+                {"cant": "🙈 В этом месяце не смогу"},
+            )
+            await press("rdy:tplreset:sound:ph.cant")
+            self.assertEqual(
+                self.registry.get_readiness_settings("sound")["phrases"], {}
+            )
+            # Лимит служений в месяц для служения: готовый и «Вручную».
+            limit = await press("rdy:lim:sound")
+            self.assertIn(
+                "Служений в месяц для всех", limit.message.answer.await_args.args[0]
+            )
+            await press("rdy:lim:sound:1_3")
+            settings = self.registry.get_readiness_settings("sound")
+            self.assertEqual((settings["month_min"], settings["month_max"]), (1, 3))
+            manual = await press("rdy:lim:sound:m2")
+            labels = [
+                button.text for row in manual.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard for button in row
+            ]
+            self.assertIn("🕒 без верхней границы", labels)
+            self.assertNotIn("🕒 1", labels)
+            section = await press("rdy:lim:sound:2_x")
+            self.assertIn(
+                "🔢 Служений в месяц: от 2", section.message.answer.await_args.args[0]
+            )
+            await press("rdy:lim:sound:n")
+            settings = self.registry.get_readiness_settings("sound")
+            self.assertEqual((settings["month_min"], settings["month_max"]), (0, None))
+            await press("rdy:texts:sound")
             question = await press("rdy:tplprev:sound:q")
             self.assertIn(
                 "Когда можешь служить в", question.message.answer.await_args.args[0]
@@ -6889,6 +7060,136 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_member_month_limit(self):
+        async def run():
+            members = await self.open_members()
+            card = await self.press_inline(
+                members.message, "⚪ Пётр · не привязан", "on_contact_person_choice"
+            )
+            self.assertIn(
+                "🔢 Служений в месяц: как у служения — без лимита",
+                card.message.answer.await_args.args[0],
+            )
+            choice = await self.press_inline(card.message, "🔢 В месяц", "on_member_card")
+            manual = await self.press_inline(choice.message, "✏️ Вручную", "on_member_card")
+            high = await self.press_inline(manual.message, "🔢 1", "on_member_card")
+            result = await self.press_inline(high.message, "🔢 3", "on_member_card")
+            self.assertIn(
+                "🔢 Служений в месяц: 1–3 (личный)",
+                result.message.answer.await_args.args[0],
+            )
+            person = next(
+                item for item in self.registry.readiness_people("sound")
+                if item["name"] == "Пётр"
+            )
+            self.assertEqual(person["month_limit"], (1, 3))
+            choice = await self.press_inline(result.message, "🔢 В месяц", "on_member_card")
+            await self.press_inline(choice.message, "↩️ Как у служения", "on_member_card")
+            person = next(
+                item for item in self.registry.readiness_people("sound")
+                if item["name"] == "Пётр"
+            )
+            self.assertIsNone(person["month_limit"])
+
+        asyncio.run(run())
+
+    def test_member_binding_by_username_only(self):
+        async def run():
+            members = await self.open_members()
+            person = await self.open_person(members.message, "⚪ Пётр · не привязан")
+            self.assertIn(
+                "или только @username", person.message.answer.await_args.args[0]
+            )
+            confirmation = await self.type_text("@Petr_New")
+            text = confirmation.answer.await_args.args[0]
+            self.assertIn("привязать «Пётр» (все его задачи служения) к @Petr_New", text)
+            self.assertIn("Бот ещё не видел", text)
+            result = await self.press_inline(
+                confirmation, "✅ Подтвердить", "on_username_binding"
+            )
+            self.assertIn(
+                "привяжется к @Petr_New", result.message.answer.await_args.args[0]
+            )
+            self.assertEqual(self.registry.username_binding("sound", "Пётр"), "Petr_New")
+
+            # Человек пишет боту (username в другом регистре) — привязан,
+            # админу приходит сообщение.
+            middleware = next(
+                item for item in self.admin_router.message.outer_middleware
+                if item.__name__ == "username_binding_middleware"
+            )
+            handler = AsyncMock()
+            event = SimpleNamespace(
+                from_user=SimpleNamespace(id=77777, username="petr_new", is_bot=False)
+            )
+            await middleware(handler, event, {})
+            handler.assert_awaited_once()
+            member = next(
+                item for item in self.registry.list_service_members("sound")
+                if item["name"] == "Пётр"
+            )
+            self.assertEqual(member["telegram_id"], 77777)
+            self.assertIsNone(self.registry.username_binding("sound", "Пётр"))
+            sent = self.context.bot.send_message.await_args.kwargs
+            self.assertEqual(sent["chat_id"], 67890)
+            self.assertIn("«Пётр» привязан(а)", sent["text"])
+
+            # Username ушёл к другому и вернулся — снова за первым.
+            for user_id in (88888, 77777):
+                await middleware(handler, SimpleNamespace(
+                    from_user=SimpleNamespace(
+                        id=user_id, username="petr_new", is_bot=False
+                    )
+                ), {})
+            self.assertEqual(self.registry.known_telegram_id("petr_new"), 77777)
+
+            # Повторное сообщение — привязок больше нет.
+            self.context.bot.send_message.reset_mock()
+            await middleware(handler, event, {})
+            self.context.bot.send_message.assert_not_awaited()
+
+            # Уже знакомый боту @username — сразу обычное подтверждение с ID.
+            await self.open_person(
+                (await self.open_members()).message, "⚠️ Мария · нет в списке"
+            )
+            confirmation = await self.type_text("@petr_new")
+            self.assertIn("77777", confirmation.answer.await_args.args[0])
+
+            # Пришедший уже привязан к другому имени — не перепривязывается.
+            await self.open_person(
+                (await self.open_members()).message, "⚠️ Мария · нет в списке"
+            )
+            await self.press_inline(
+                await self.type_text("@petr_alt"), "✅ Подтвердить",
+                "on_username_binding",
+            )
+            await middleware(handler, SimpleNamespace(
+                from_user=SimpleNamespace(id=77777, username="petr_alt", is_bot=False)
+            ), {})
+            self.assertIn(
+                "уже привязан к «Пётр»",
+                self.context.bot.send_message.await_args.kwargs["text"],
+            )
+            # Смена Telegram по @username — в карточке и текущий, и ожидаемый.
+            self.registry.add_username_binding(67890, "sound", "Пётр", "", "petr_next")
+            card = await self.press_inline(
+                (await self.open_members()).message, "✅ Пётр · @petr_new",
+                "on_contact_person_choice",
+            )
+            self.assertIn(
+                "Telegram: @petr_new\n⏳ ждёт @petr_next",
+                card.message.answer.await_args.args[0],
+            )
+            self.assertNotIn(
+                ("Мария", 77777),
+                {
+                    (item["name"], item["telegram_id"])
+                    for item in self.registry.list_service_members("sound")
+                },
+            )
+
+        asyncio.run(run())
+
     def test_member_binding_covers_all_schedule_tasks(self):
         async def run():
             members = await self.open_members()
@@ -7011,7 +7312,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             text = done.message.answer.await_args.args[0]
             self.assertIn("убран(а) из состава", text)
-            self.assertIn("есть в «Списках»", text)
+            self.assertIn("бот его больше не вернёт", text)
             self.assertNotIn(
                 "Пётр",
                 [item["name"] for item in self.registry.list_service_members("sound")],

@@ -8,7 +8,7 @@ SUNDAYS = tuple(date(2026, 11, 1) + timedelta(weeks=week) for week in range(5))
 
 
 def plan_input(free, tasks, needed=None, last_served=None, dates=SUNDAYS,
-               extra=None, reluctant=()):
+               extra=None, reluctant=(), limits=None):
     return PlanInput(
         dates=dates,
         needed=needed or {"звук": 1, "сборка": 1},
@@ -17,6 +17,7 @@ def plan_input(free, tasks, needed=None, last_served=None, dates=SUNDAYS,
         last_served=last_served or {},
         extra=extra or {},
         reluctant=frozenset(reluctant),
+        limits=limits or {},
     )
 
 
@@ -152,8 +153,9 @@ class SchedulePlannerTest(unittest.TestCase):
         ))
         self.assertEqual(plan.slots[(day, "звук")], ["Алексей"])
 
-    def test_respondent_always_before_non_respondent(self):
-        # Ответивший свободен все воскресенья — он и служит, даже подряд.
+    def test_interval_before_response(self):
+        # Ответивший свободен все воскресенья, но служить подряд хуже,
+        # чем поставить не ответившего (решение 12).
         plan = build_plan(plan_input(
             {"Алексей": set(SUNDAYS[:4]), "Борис": set(SUNDAYS[:4])},
             {"Алексей": {"звук"}, "Борис": {"звук"}},
@@ -161,9 +163,101 @@ class SchedulePlannerTest(unittest.TestCase):
         ))
         self.assertEqual(
             [plan.slots[(day, "звук")] for day in SUNDAYS[:4]],
-            [["Алексей"]] * 4,
+            [["Алексей"], ["Борис"], ["Алексей"], ["Борис"]],
         )
-        # Ответивший не может 15.11 — только тогда не ответивший.
+        # Служила в последнее воскресенье октября — 01.11 не ставится,
+        # хотя отметила больше дат.
+        plan = build_plan(plan_input(
+            {"Даша": set(SUNDAYS), "Катя": {SUNDAYS[0], SUNDAYS[1], SUNDAYS[3]}},
+            {"Даша": {"уборка"}, "Катя": {"уборка"}},
+            needed={"уборка": 1}, last_served={"Даша": date(2026, 10, 25)},
+        ))
+        self.assertEqual(plan.slots[(SUNDAYS[0], "уборка")], ["Катя"])
+        # Заменить некем — подряд, но место не пустое.
+        plan = build_plan(plan_input(
+            {"Даша": {SUNDAYS[0]}}, {"Даша": {"уборка"}},
+            needed={"уборка": 1}, dates=(SUNDAYS[0],),
+            last_served={"Даша": date(2026, 10, 25)},
+        ))
+        self.assertEqual(plan.slots[(SUNDAYS[0], "уборка")], ["Даша"])
+
+    def test_extra_seat_not_back_to_back(self):
+        # Место сверх минимума не закрывается служением подряд.
+        people = {name: set(SUNDAYS[:4]) for name in ("Анна", "Вера", "Глеб")}
+        plan = build_plan(plan_input(
+            people, {name: {"звук"} for name in people},
+            needed={"звук": 1}, extra={"звук": 1}, dates=SUNDAYS[:4],
+        ))
+        served = {}
+        for day in SUNDAYS[:4]:
+            for person in plan.slots[(day, "звук")]:
+                served.setdefault(person, []).append(day)
+        for days in served.values():
+            for earlier, later in zip(days, days[1:]):
+                self.assertGreater((later - earlier).days, 7)
+
+    def test_extra_seat_does_not_force_next_week(self):
+        # Двое на две недели подряд: место сверх минимума 01.11 пустое,
+        # иначе кто-то служил бы и 08.11.
+        dates = SUNDAYS[:2]
+        plan = build_plan(plan_input(
+            {"Анна": set(dates), "Вера": set(dates)},
+            {"Анна": {"звук"}, "Вера": {"звук"}},
+            needed={"звук": 1}, extra={"звук": 1}, dates=dates,
+        ))
+        self.assertEqual(
+            [len(plan.slots[(day, "звук")]) for day in dates], [1, 1]
+        )
+        self.assertNotEqual(
+            plan.slots[(dates[0], "звук")], plan.slots[(dates[1], "звук")]
+        )
+
+    def test_month_max_is_hard_even_if_all_dates_marked(self):
+        # Анна отметила всё, но максимум 1 — остальное закрывает Вера,
+        # а где закрыть некем — место пустое.
+        plan = build_plan(plan_input(
+            {"Анна": set(SUNDAYS), "Вера": {SUNDAYS[1], SUNDAYS[3]}},
+            {"Анна": {"звук"}, "Вера": {"звук"}},
+            needed={"звук": 1}, limits={"Анна": (0, 1)},
+        ))
+        self.assertEqual(plan.load()["Анна"], 1)
+        self.assertEqual(plan.load()["Вера"], 2)
+        self.assertEqual(len(plan.gaps()), 2)
+        # Максимум 0 — человек в этом месяце не ставится.
+        plan = build_plan(plan_input(
+            {"Анна": set(SUNDAYS)}, {"Анна": {"звук"}},
+            needed={"звук": 1}, limits={"Анна": (0, 0)},
+        ))
+        self.assertEqual(plan.load(), {})
+
+    def test_month_max_does_not_leave_avoidable_gap(self):
+        # Анна (максимум 1) свободна 01 и 15, Вера — только 01: Анна
+        # уходит на 15, 01 закрывает Вера.
+        dates = (SUNDAYS[0], SUNDAYS[2])
+        plan = build_plan(plan_input(
+            {"Анна": set(dates), "Вера": {SUNDAYS[0]}},
+            {"Анна": {"звук"}, "Вера": {"звук"}},
+            needed={"звук": 1}, dates=dates, limits={"Анна": (0, 1)},
+        ))
+        self.assertEqual(plan.gaps(), [])
+        self.assertEqual(plan.slots[(SUNDAYS[0], "звук")], ["Вера"])
+        self.assertEqual(plan.slots[(SUNDAYS[2], "звук")], ["Анна"])
+
+    def test_month_min_preferred(self):
+        # Трое на 3 даты: без лимита — по одному; у Глеба минимум 2 —
+        # он получает два служения (не подряд).
+        dates = (SUNDAYS[0], SUNDAYS[2], SUNDAYS[4])
+        people = {name: set(dates) for name in ("Анна", "Вера", "Глеб")}
+        tasks = {name: {"звук"} for name in people}
+        plan = build_plan(plan_input(
+            people, tasks, needed={"звук": 1}, dates=dates,
+            limits={"Глеб": (2, 3)},
+        ))
+        self.assertEqual(plan.load()["Глеб"], 2)
+
+    def test_respondent_before_non_respondent(self):
+        # Ответивший не может 15.11 — там не ответивший; служить подряд
+        # никому не приходится, не ответивший ставится и 01.11.
         plan = build_plan(plan_input(
             {
                 "Алексей": {SUNDAYS[0], SUNDAYS[1], SUNDAYS[3]},
@@ -174,7 +268,7 @@ class SchedulePlannerTest(unittest.TestCase):
         ))
         self.assertEqual(
             [plan.slots[(day, "звук")] for day in SUNDAYS[:4]],
-            [["Алексей"], ["Алексей"], ["Борис"], ["Алексей"]],
+            [["Борис"], ["Алексей"], ["Борис"], ["Алексей"]],
         )
 
     def test_range_fills_minimum_first_then_up_to_maximum(self):
