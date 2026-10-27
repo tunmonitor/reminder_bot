@@ -730,6 +730,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "➖", "🗑", "✏️", "1️⃣", "2️⃣", "3️⃣", "4️⃣",
                         "📤", "🔁", "🗓", "🧵", "🚫", "📆", "♾", "▶️", "⏸",
                         "🗳", "⏹", "⏭", "↩️", "🏁", "💬", "⬜", "☑️",
+                        "🔢",
                     )
                 ):
                     button.text = f"📋 {label}"
@@ -2044,6 +2045,52 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         weekday = schedule_plan.WEEKDAYS[(6 + offset) % 7]
         return f"{weekday} (вс {offset:+d})"
 
+    # Лимит служений в месяц (решение 12): готовые диапазоны и «Вручную» —
+    # минимум, затем максимум кнопками.
+    LIMIT_PRESETS = ((0, 2), (1, 2), (1, 3))
+
+    def month_limit_label(limit) -> str:
+        if limit is None or limit == (0, None):
+            return "без лимита"
+        low, high = limit
+        if high == 0:
+            return "0 — не ставить"
+        if high == low:
+            return f"ровно {low}"
+        return f"от {low}" if high is None else f"{low}–{high}"
+
+    def service_month_limit(registry, service_id: str):
+        """Лимит служения для всех; None — без лимита."""
+        settings = registry.get_readiness_settings(service_id)
+        if not settings["month_min"] and settings["month_max"] is None:
+            return None
+        return (settings["month_min"], settings["month_max"])
+
+    def month_limit_value(value: str):
+        """«n» — без лимита, «1_3» — диапазон, «2_x» — от 2."""
+        if value == "n":
+            return (0, None)
+        low, _, high = value.partition("_")
+        if not low.isdigit() or not (high == "x" or high.isdigit()):
+            raise ValueError("Неизвестный лимит.")
+        return (int(low), None if high == "x" else int(high))
+
+    def month_limit_choices(value: str) -> tuple[str, list[tuple[str, str]]]:
+        """Шаг выбора лимита: «m» — минимум, «m2» — максимум от 2."""
+        if value == "m":
+            return "Минимум служений в месяц:", [
+                (str(low), f"m{low}") for low in range(0, 6)
+            ]
+        if value.startswith("m") and value[1:].isdigit():
+            low = int(value[1:])
+            return f"Минимум {low}. Максимум служений в месяц:", [
+                ("0 — не ставить" if high == 0 else str(high), f"{low}_{high}")
+                for high in range(low, 6)
+            ] + [("без верхней границы", f"{low}_x")]
+        return "", [("без лимита", "n")] + [
+            (f"{low}–{high}", f"{low}_{high}") for low, high in LIMIT_PRESETS
+        ] + [("✏️ Вручную", "m")]
+
     def member_button(text: str, action: str, service_id: str, token: str,
                       arg: str | None = None) -> InlineKeyboardButton:
         data = f"mbr:{action}:{service_id}:{token}" + (f".{arg}" if arg else "")
@@ -2103,6 +2150,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 member_day_label(day_offset)
                 if day_offset is not None else "как у всех"
             ),
+            "🔢 Служений в месяц: " + (
+                month_limit_label(personal) + " (личный)"
+                if (personal := (member or {}).get("month_limit")) is not None
+                else "как у служения — " + month_limit_label(
+                    service_month_limit(registry, service_id)
+                )
+            ),
         ]
         scheduled = next(
             (item["schedule_tasks"]
@@ -2124,7 +2178,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             # У служения без задач все в нём — выбирать нечего.
             rows.append([member_button("📝 Задачи", "tasks", service_id, token)])
         if member is not None:
-            rows.append([member_button("📅 Свой день", "day", service_id, token)])
+            rows.append([
+                member_button("📅 Свой день", "day", service_id, token),
+                member_button("🔢 В месяц", "lim", service_id, token),
+            ])
         if member is not None or person is not None:
             # Только в графике — удалять из состава нечего.
             rows.append([
@@ -2275,6 +2332,51 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     _dialog_keep_rows=True,
                     _dialog_keyboard_limit=sum(len(row) for row in rows),
                     parse_mode=None,
+                )
+            elif action == "lim" or (
+                action == "lset" and arg and arg.startswith("m")
+            ):
+                title, options = month_limit_choices(arg or "")
+                buttons = [
+                    member_button(
+                        label if label.startswith("✏️") else f"🔢 {label}",
+                        "lset", service_id, token, value,
+                    )
+                    for label, value in options
+                ]
+                if not title:
+                    buttons.insert(0, member_button(
+                        "↩️ Как у служения", "lset", service_id, token, "s"
+                    ))
+                rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+                rows.append([member_button(
+                    "⬅️ К человеку", "card", service_id, token
+                )])
+                await _send_dialog(
+                    message,
+                    f"🔢 Служений в месяц · {name}\n\n" + (
+                        title or
+                        "Сколько раз в месяц человека можно ставить в "
+                        "график. Максимум — даже если он отметил все даты; "
+                        "минимум — бот старается дать не меньше. Личный "
+                        "лимит главнее лимита служения."
+                    ),
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+                    _dialog_keep_rows=True,
+                    _dialog_keyboard_limit=sum(len(row) for row in rows),
+                    parse_mode=None,
+                )
+            elif action == "lset" and arg:
+                limit = None if arg == "s" else month_limit_value(arg)
+                registry.set_service_member_limit(
+                    actor_id, service_id, name, limit
+                )
+                await show_member_card(
+                    message, actor_id, service_id, name,
+                    "✅ Служений в месяц: " + (
+                        "как у служения" if limit is None
+                        else month_limit_label(limit)
+                    ),
                 )
             elif action == "dset" and (
                 arg == "n" or arg.lstrip("-").isdigit()
@@ -3872,9 +3974,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         ])
         window = (settings["day_from"], settings["day_to"])
         lines.append("📆 Дни служения: " + DAY_WINDOWS.get(window, "свои"))
+        lines.append(
+            "🔢 Служений в месяц: "
+            + month_limit_label(service_month_limit(registry, service_id))
+        )
         rows.append([
             readiness_button("📆 Дни служения", "days", service_id),
             readiness_button("📅 Свой день", "own", service_id),
+            readiness_button("🔢 В месяц", "lim", service_id),
         ])
         rows.append([readiness_button("📝 Тексты", "texts", service_id)])
         current_key = f"{now.year:04d}-{now.month:02d}"
@@ -5450,6 +5557,29 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
                 await _answer_callback(callback)
                 return
+            elif action == "lim" and (arg is None or arg.startswith("m")):
+                title, options = month_limit_choices(arg or "")
+                current = service_month_limit(registry, service_id)
+                await show_readiness_choice(
+                    callback.message, service_id,
+                    "🔢 Служений в месяц для всех в служении\n\n" + (
+                        title or
+                        "Максимум — даже если человек отметил все даты; "
+                        "минимум — бот старается дать не меньше. Личный "
+                        "лимит — в карточке человека, он главнее."
+                    ),
+                    options, "lim",
+                    "n" if current is None else
+                    f"{current[0]}_{'x' if current[1] is None else current[1]}",
+                )
+                await _answer_callback(callback)
+                return
+            elif action == "lim":
+                low, high = month_limit_value(arg)
+                registry.set_readiness_settings(
+                    actor_id, service_id, month_min=low, month_max=high,
+                )
+                notice = "✅ Служений в месяц: " + month_limit_label((low, high))
             elif action == "days" and arg is None:
                 await show_readiness_choice(
                     callback.message, service_id,

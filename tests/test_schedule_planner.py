@@ -8,7 +8,7 @@ SUNDAYS = tuple(date(2026, 11, 1) + timedelta(weeks=week) for week in range(5))
 
 
 def plan_input(free, tasks, needed=None, last_served=None, dates=SUNDAYS,
-               extra=None, reluctant=()):
+               extra=None, reluctant=(), limits=None):
     return PlanInput(
         dates=dates,
         needed=needed or {"звук": 1, "сборка": 1},
@@ -17,6 +17,7 @@ def plan_input(free, tasks, needed=None, last_served=None, dates=SUNDAYS,
         last_served=last_served or {},
         extra=extra or {},
         reluctant=frozenset(reluctant),
+        limits=limits or {},
     )
 
 
@@ -210,6 +211,36 @@ class SchedulePlannerTest(unittest.TestCase):
         self.assertNotEqual(
             plan.slots[(dates[0], "звук")], plan.slots[(dates[1], "звук")]
         )
+
+    def test_month_max_is_hard_even_if_all_dates_marked(self):
+        # Анна отметила всё, но максимум 1 — остальное закрывает Вера,
+        # а где закрыть некем — место пустое.
+        plan = build_plan(plan_input(
+            {"Анна": set(SUNDAYS), "Вера": {SUNDAYS[1], SUNDAYS[3]}},
+            {"Анна": {"звук"}, "Вера": {"звук"}},
+            needed={"звук": 1}, limits={"Анна": (0, 1)},
+        ))
+        self.assertEqual(plan.load()["Анна"], 1)
+        self.assertEqual(plan.load()["Вера"], 2)
+        self.assertEqual(len(plan.gaps()), 2)
+        # Максимум 0 — человек в этом месяце не ставится.
+        plan = build_plan(plan_input(
+            {"Анна": set(SUNDAYS)}, {"Анна": {"звук"}},
+            needed={"звук": 1}, limits={"Анна": (0, 0)},
+        ))
+        self.assertEqual(plan.load(), {})
+
+    def test_month_min_preferred(self):
+        # Трое на 3 даты: без лимита — по одному; у Глеба минимум 2 —
+        # он получает два служения (не подряд).
+        dates = (SUNDAYS[0], SUNDAYS[2], SUNDAYS[4])
+        people = {name: set(dates) for name in ("Анна", "Вера", "Глеб")}
+        tasks = {name: {"звук"} for name in people}
+        plan = build_plan(plan_input(
+            people, tasks, needed={"звук": 1}, dates=dates,
+            limits={"Глеб": (2, 3)},
+        ))
+        self.assertEqual(plan.load()["Глеб"], 2)
 
     def test_respondent_before_non_respondent(self):
         # Ответивший не может 15.11 — там не ответивший; служить подряд

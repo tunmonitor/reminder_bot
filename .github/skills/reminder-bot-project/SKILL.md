@@ -406,6 +406,14 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   person beyond `needed`. `summarize` adds non-respondents (incl. no
   Telegram) as reluctant; `progress_text` lists respondents with dates and
   the plan per Sunday and task («*» = non-respondent).
+- Monthly limit (step 4a): `PlanInput.limits` {key: (min, max|None)} from
+  `summarize` (personal `service_members.month_min/max` via
+  `readiness_people` `month_limit`, else `readiness_settings.month_min/
+  max`). Max is hard in both passes and in `improve_plan` replace; min is
+  `BELOW_MIN_WEIGHT` per missing service in `_person_cost` (cheaper in
+  pass-1 costs). UI: `rdy:lim` (section) and `mbr:lim|lset` (card);
+  values `n`, `a_b`, `a_x`, `m` (pick min), `m<a>` (pick max), `s` (as
+  service).
 - Removing an in-list member records `service_member_exclusions`;
   `sync_service_rosters` skips those names until the person is added in
   the bot again (`_clear_member_exclusion`).

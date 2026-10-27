@@ -5983,6 +5983,29 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIn(
                 "• {status} — ", title_edit.message.answer.await_args.args[0]
             )
+            # Лимит служений в месяц для служения: готовый и «Вручную».
+            limit = await press("rdy:lim:sound")
+            self.assertIn(
+                "Служений в месяц для всех", limit.message.answer.await_args.args[0]
+            )
+            await press("rdy:lim:sound:1_3")
+            settings = self.registry.get_readiness_settings("sound")
+            self.assertEqual((settings["month_min"], settings["month_max"]), (1, 3))
+            manual = await press("rdy:lim:sound:m2")
+            labels = [
+                button.text for row in manual.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard for button in row
+            ]
+            self.assertIn("🕒 без верхней границы", labels)
+            self.assertNotIn("🕒 1", labels)
+            section = await press("rdy:lim:sound:2_x")
+            self.assertIn(
+                "🔢 Служений в месяц: от 2", section.message.answer.await_args.args[0]
+            )
+            await press("rdy:lim:sound:n")
+            settings = self.registry.get_readiness_settings("sound")
+            self.assertEqual((settings["month_min"], settings["month_max"]), (0, None))
             await press("rdy:texts:sound")
             question = await press("rdy:tplprev:sound:q")
             self.assertIn(
@@ -6898,6 +6921,39 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "⬅️ К обзору",
                 ],
             )
+
+        asyncio.run(run())
+
+    def test_member_month_limit(self):
+        async def run():
+            members = await self.open_members()
+            card = await self.press_inline(
+                members.message, "⚪ Пётр · не привязан", "on_contact_person_choice"
+            )
+            self.assertIn(
+                "🔢 Служений в месяц: как у служения — без лимита",
+                card.message.answer.await_args.args[0],
+            )
+            choice = await self.press_inline(card.message, "🔢 В месяц", "on_member_card")
+            manual = await self.press_inline(choice.message, "✏️ Вручную", "on_member_card")
+            high = await self.press_inline(manual.message, "🔢 1", "on_member_card")
+            result = await self.press_inline(high.message, "🔢 3", "on_member_card")
+            self.assertIn(
+                "🔢 Служений в месяц: 1–3 (личный)",
+                result.message.answer.await_args.args[0],
+            )
+            person = next(
+                item for item in self.registry.readiness_people("sound")
+                if item["name"] == "Пётр"
+            )
+            self.assertEqual(person["month_limit"], (1, 3))
+            choice = await self.press_inline(result.message, "🔢 В месяц", "on_member_card")
+            await self.press_inline(choice.message, "↩️ Как у служения", "on_member_card")
+            person = next(
+                item for item in self.registry.readiness_people("sound")
+                if item["name"] == "Пётр"
+            )
+            self.assertIsNone(person["month_limit"])
 
         asyncio.run(run())
 
