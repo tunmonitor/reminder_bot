@@ -747,7 +747,8 @@ def _columns(registry, service_id: str) -> list[ScheduleColumn]:
 
 def excel_rows(registry, plan: dict, people: list[dict]) -> list[list]:
     """Лист как в графике: строка заголовков колонок служения, затем блок
-    каждой даты — дата в первой ячейке колонки, ниже назначения. У колонки
+    каждой даты — дата в первой ячейке колонки, ниже назначения. Задача со
+    своим днём (спевка) — в блоке своего воскресенья, как в файле. У колонки
     со своей задачей («Слайды») — только её люди, остальные задачи — в
     основной колонке; у «задача | имя» следующий человек задачи — без
     повтора задачи."""
@@ -811,9 +812,19 @@ def excel_text(registry, service: dict, plan: dict, people: list[dict]) -> str:
         ),
         "",
     ]
+    own_days = task_days(plan)
     for day in plan["dates"]:
+        # Задача со своим днём — на листе в блоке своего воскресенья (как в
+        # файле), в тексте — с фактическим днём.
         parts = [
-            ("" if implicit_plan(plan) else f"{task['name']} — ")
+            ("" if implicit_plan(plan) else (
+                f"{task['name']} ("
+                + _weekday_date(
+                    date.fromisoformat(day)
+                    + timedelta(days=own_days[task["name"]])
+                ) + ") — "
+                if task["name"] in own_days else f"{task['name']} — "
+            ))
             + (", ".join(
                 names.get(key, key)
                 for key in plan["slots"].get(day, {}).get(task["name"], [])

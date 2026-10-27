@@ -492,6 +492,13 @@ class SchedulePlanTest(unittest.TestCase):
         )
         self.assertIn("\n  вс 01.11\n    🎚️ звук: ", published)
         self.assertIn("• Изменены дни служения", published)
+        # Блок «Для Excel» — с фактическим днём задачи.
+        self.assertIn(
+            "01.11: звук — Алексей; сборка (ср 28.10) — Борис",
+            schedule_plan.excel_text(
+                self.registry, self.service(), plan, self.people()
+            ),
+        )
         # Борис — в среду: интервал следующего месяца считается от неё.
         self.assertEqual(
             schedule_plan.served_offsets(plan, self.people())["2026-11-01"],
