@@ -541,6 +541,20 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
     problems = gaps(plan)
     if problems:
         lines += [""] + problems
+    # Задача без людей во все даты, хотя её выполняют люди состава, —
+    # обычно её включили после составления черновика.
+    able = {task for person in summary.people for task in person["tasks"]}
+    idle = [
+        task["name"] for task in plan["tasks"]
+        if task["name"] in able and not any(
+            plan["slots"].get(day, {}).get(task["name"]) for day in plan["dates"]
+        )
+    ]
+    if idle and plan["approved"] is None and not implicit_plan(plan):
+        lines.append(
+            "ℹ️ Никого во все даты: " + ", ".join(f"«{name}»" for name in idle)
+            + ". Если задачу включили после составления — «🔄 Пересчитать»."
+        )
     if used_silent:
         lines.append(
             "* не ответил(а) — поставлен(а) по общей логике, после ответивших"

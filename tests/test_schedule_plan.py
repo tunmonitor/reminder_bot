@@ -492,6 +492,18 @@ class SchedulePlanTest(unittest.TestCase):
         )
         self.assertIn("\n  вс 01.11\n    🎚️ звук: ", published)
         self.assertIn("• Изменены дни служения", published)
+        # Задача без людей во всех датах черновика — подсказка пересчитать.
+        draft = {**plan, "approved": None, "slots": {
+            day: {**tasks, "сборка": []} for day, tasks in plan["slots"].items()
+        }}
+        self.assertIn(
+            "ℹ️ Никого во все даты: «сборка». Если задачу включили после "
+            "составления — «🔄 Пересчитать».",
+            schedule_plan.plan_text("ЗВУК", draft, summary, TZ),
+        )
+        self.assertNotIn(
+            "Никого во все даты", schedule_plan.plan_text("ЗВУК", plan, summary, TZ)
+        )
         # Блок «Для Excel» — с фактическим днём задачи.
         self.assertIn(
             "01.11: звук — Алексей; сборка (ср 28.10) — Борис",
