@@ -431,7 +431,8 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   kept people stay in place. UI: `rdy:lim` (section) and `mbr:lim|lset` (card);
   values `n`, `a_b`, `a_x`, `m` (pick min), `m<a>` (pick max), `s` (as
   service).
-- Removing an in-list member records `service_member_exclusions`;
+- Removing a member (in the lists or not) records
+  `service_member_exclusions`;
   `sync_service_rosters` skips those names until the person is added in
   the bot again (`_clear_member_exclusion`).
 - Binding by @username only (`parse_manual_user(username_only=True)` in
@@ -447,7 +448,9 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   ❌) when the user is already bound to another name in the service;
   `known_telegram_id` uses only observations: `seen_usernames` (written
   by the middleware when a user's username changes, `note_seen_username`
-  forgets the ID's previous username) and `readiness_answers`, newest
+  forgets the ID's previous username; no username is stored as the marker
+  `~<id>`, which retires that ID's older poll answers and is never looked
+  up) and `readiness_answers`, newest
   first; admin-entered usernames don't count. A new pending binding for a
   person replaces older ones (any task); `set_service_member_tasks` drops
   pending rows of removed tasks; the card shows a pending username next

@@ -2295,6 +2295,46 @@ class UsernameBindingTest(unittest.TestCase):
         self.assertIsNone(registry.known_telegram_id("foo_user"))
         self.assertEqual(registry.known_telegram_id("bar_user"), 222)
 
+    def test_removed_username_retires_old_poll_answers(self):
+        registry = self.registry
+        with closing(sqlite3.connect(registry.path)) as connection, connection:
+            connection.execute(
+                "INSERT INTO readiness_runs (service_id, month, status, "
+                "created_at) VALUES ('sound', '2026-11', 'closed', "
+                "'2026-10-01T00:00:00+00:00')"
+            )
+            connection.execute(
+                "INSERT INTO readiness_answers (run_id, telegram_id, username, "
+                "dates_json, answered_at) VALUES (1, 111, 'Old_Name', '[]', "
+                "'2026-10-01T00:00:00+00:00')"
+            )
+        self.assertEqual(registry.known_telegram_id("old_name"), 111)
+        # Убрал username — ответ со старым больше не в счёт: его мог
+        # занять другой человек.
+        registry.note_seen_username(111, "")
+        self.assertIsNone(registry.known_telegram_id("old_name"))
+        self.assertIsNone(registry.known_telegram_id("~111"))
+        registry.note_seen_username(222, "old_name")
+        self.assertEqual(registry.known_telegram_id("old_name"), 222)
+
+    def test_removal_excludes_member_missing_from_lists(self):
+        from bot.excel_parser import RosterMember
+
+        registry = self.registry
+        registry.sync_service_rosters({"sound": [RosterMember("Борис", ("звук",))]})
+        # Следующий файл без Бориса — в составе он остаётся, но не в «Списках».
+        registry.sync_service_rosters({"sound": []})
+        boris = next(
+            m for m in registry.list_service_members("sound")
+            if m["name"] == "Борис"
+        )
+        self.assertFalse(boris["in_list"])
+        self.assertFalse(registry.remove_service_member(1001, "sound", "Борис"))
+        registry.sync_service_rosters({"sound": [RosterMember("Борис", ("звук",))]})
+        self.assertNotIn(
+            "Борис", [m["name"] for m in registry.list_service_members("sound")]
+        )
+
     def test_new_binding_replaces_pending_and_task_removal_drops_it(self):
         registry = self.registry
         registry.add_username_binding(1001, "sound", "Борис", "", "old_name")

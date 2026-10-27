@@ -2735,9 +2735,14 @@ class ServiceRegistry:
 
     def note_seen_username(self, telegram_id: int, username: str) -> None:
         """Бот видел @username у этого Telegram ID (сам пользователь, не
-        правка админа). Прежний username этого ID забывается."""
+        правка админа). Прежний username этого ID забывается. Без username
+        сохраняется отметка «~ID» (такого username не бывает): старые ответы
+        на опрос этого ID с прежним username больше не в счёт."""
         _validate_positive_id(telegram_id, "telegram_id")
-        username = (username or "").strip().lstrip("@").casefold()
+        username = (
+            (username or "").strip().lstrip("@").casefold()
+            or f"~{telegram_id}"
+        )
         # От наблюдений не зависят задачи планировщика и резервная копия.
         with self._connection(notify=False) as connection:
             connection.execute(
@@ -2745,14 +2750,13 @@ class ServiceRegistry:
                 "AND username != ?",
                 (telegram_id, username),
             )
-            if username:
-                connection.execute(
-                    "INSERT INTO seen_usernames (username, telegram_id, seen_at) "
-                    "VALUES (?, ?, ?) ON CONFLICT(username) DO UPDATE SET "
-                    "telegram_id = excluded.telegram_id, "
-                    "seen_at = excluded.seen_at",
-                    (username, telegram_id, _utc_now()),
-                )
+            connection.execute(
+                "INSERT INTO seen_usernames (username, telegram_id, seen_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(username) DO UPDATE SET "
+                "telegram_id = excluded.telegram_id, "
+                "seen_at = excluded.seen_at",
+                (username, telegram_id, _utc_now()),
+            )
 
     def known_telegram_id(self, username: str) -> int | None:
         """Telegram ID по @username — только по наблюдениям бота: кто
@@ -2760,7 +2764,8 @@ class ServiceRegistry:
         Записи, внесённые админом, не в счёт: username мог перейти к
         другому человеку."""
         username = (username or "").strip().lstrip("@").casefold()
-        if not username:
+        # «~ID» — отметка «без username», не имя.
+        if not username or username.startswith("~"):
             return None
         with self._connection() as connection:
             row = connection.execute(
@@ -4219,8 +4224,9 @@ class ServiceRegistry:
         self, actor_id: int, service_id: str, name: str,
     ) -> bool:
         """Убирает человека из состава служения вместе с привязками к
-        задачам. True — он есть в «Списках»: файл его больше не вернёт,
-        пока человека не добавят в боте снова."""
+        задачам. Файл его больше не вернёт, пока человека не добавят в боте
+        снова (даже если сейчас его нет в «Списках» — он может появиться
+        там позже). True — он есть в «Списках»."""
         _validate_positive_id(actor_id, "actor_id")
         with self._connection() as connection:
             self._require_service_editor(connection, actor_id, service_id)
@@ -4240,12 +4246,11 @@ class ServiceRegistry:
             if not removed:
                 raise ValueError(f"«{name}» нет в составе.")
             self._drop_username_binding(connection, service_id, name)
-            if member is not None and member["in_list"]:
-                connection.execute(
-                    "INSERT OR IGNORE INTO service_member_exclusions "
-                    "(service_id, name, created_at) VALUES (?, ?, ?)",
-                    (service_id, name, _utc_now()),
-                )
+            connection.execute(
+                "INSERT OR IGNORE INTO service_member_exclusions "
+                "(service_id, name, created_at) VALUES (?, ?, ?)",
+                (service_id, name, _utc_now()),
+            )
             # Из рабочих копий графиков (опубликованная остаётся — правка
             # станет видна как неопубликованная).
             def is_removed(key: str) -> bool:
