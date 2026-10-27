@@ -6100,6 +6100,57 @@ class ServiceRegistry:
             )
         return self.get_schedule_plan(service_id, month)
 
+    def import_excel_plan(
+        self, actor_id: int, service_id: str, month: str, *,
+        dates: list[str], tasks: list[dict], slots: dict, days: dict,
+        served_offsets: dict | None = None,
+    ) -> dict:
+        """«📊 График Excel» → «✅ Подтвердить» (решение 15): график месяца
+        из Excel как есть — итоговый график в боте (утверждён, без
+        публикации в чате). Прежний график месяца (по опросу) заменяется;
+        вернуть его — снова «🔄 Пересчитать» в «📅 График»."""
+        _validate_positive_id(actor_id, "actor_id")
+        now = _utc_now()
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            self._require_service(connection, service_id)
+            values = (
+                json.dumps(dates), json.dumps(tasks, ensure_ascii=False),
+                json.dumps(slots, ensure_ascii=False),
+                json.dumps(days, ensure_ascii=False),
+            )
+            connection.execute(
+                "INSERT INTO schedule_plans (service_id, month, run_id, "
+                "source, dates_json, tasks_json, slots_json, "
+                "last_served_json, note, edited, approved_json, approved_by, "
+                "approved_at, chat_id, message_id, republish, days_json, "
+                "approved_days_json, served_offsets_json, updated_at) "
+                "VALUES (?, ?, NULL, 'excel', ?, ?, ?, '{}', NULL, 0, ?, ?, ?, "
+                "NULL, NULL, 0, ?, ?, ?, ?) "
+                "ON CONFLICT(service_id, month) DO UPDATE SET run_id = NULL, "
+                "source = 'excel', dates_json = excluded.dates_json, "
+                "tasks_json = excluded.tasks_json, "
+                "slots_json = excluded.slots_json, last_served_json = '{}', "
+                "note = NULL, edited = 0, approved_json = excluded.approved_json, "
+                "approved_by = excluded.approved_by, "
+                "approved_at = excluded.approved_at, chat_id = NULL, "
+                "message_id = NULL, republish = 0, "
+                "days_json = excluded.days_json, "
+                "approved_days_json = excluded.approved_days_json, "
+                "served_offsets_json = excluded.served_offsets_json, "
+                "updated_at = excluded.updated_at",
+                (
+                    service_id, month, values[0], values[1], values[2],
+                    values[2], actor_id, now, values[3], values[3],
+                    json.dumps(served_offsets or {}, ensure_ascii=False), now,
+                ),
+            )
+            self._audit(
+                connection, actor_id, "schedule_plan_excel", service_id,
+                {"month": month},
+            )
+        return self.get_schedule_plan(service_id, month)
+
     def approve_schedule_plan(
         self,
         actor_id: int,

@@ -5885,7 +5885,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "service:edit_notify:sound",
                     "service:service_contact:sound",
                     "service:service_replace:sound",
-                    "service:service_sync:sound",
+                    "service:service_excel:sound",
                     "rdy:open:sound",
                     "svc_tasks:open:sound",
                     "service:service_setup:sound",
@@ -6812,7 +6812,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertEqual(
                 self.callback_data_list(callback.message),
                 ["service:edit_notify:sound", "service:service_contact:sound",
-                 "service:service_replace:sound", "service:service_sync:sound",
+                 "service:service_replace:sound", "service:service_excel:sound",
                  "rdy:open:sound", "svc_tasks:open:sound",
                  "service:service_setup:sound", "service:service_help:sound",
                  "service:back_to_services:list"],
@@ -7197,6 +7197,86 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 if item["name"] == "Пётр"
             )
             self.assertIsNone(person["month_limit"])
+
+        asyncio.run(run())
+
+    def test_excel_schedule_loads_month_as_final_plan(self):
+        from bot.excel_parser import ServiceAssignment, ServiceEvent
+
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 24680)
+            self.registry.set_responsible_contact(
+                67890, "sound", "звук", "Алексей", 11111, "alex"
+            )
+            self.context.load_upcoming_service_events = AsyncMock(return_value=[
+                ServiceEvent("sound", date(2026, 11, 1), (
+                    ServiceAssignment("звук", "Алексей"),
+                    ServiceAssignment("сборка", "Пётр"),
+                )),
+                ServiceEvent("sound", date(2026, 11, 4), (
+                    ServiceAssignment("спевка", "Вера"),
+                )),
+            ])
+
+            def callback(data):
+                return SimpleNamespace(
+                    data=data, from_user=SimpleNamespace(id=24680),
+                    message=self.message(24680, ""), answer=AsyncMock(),
+                )
+
+            screen = callback("service:service_excel:sound")
+            await self.callback_handler("on_service_selected")(screen)
+            text = "".join(
+                call.args[0] for call in screen.message.answer.await_args_list
+            )
+            self.assertIn("📊 ЗВУК · график Excel", text)
+            self.assertIn("в боте графика нет — напоминания по Excel", text)
+            load = callback("xls:load:sound:202611")
+            await self.callback_handler("on_excel_schedule")(load)
+            preview = load.message.answer.await_args.args[0]
+            self.assertIn("01.11: звук — Алексей; сборка — Пётр", preview)
+            self.assertIn("Не привязаны к Telegram (напоминание не получат): Пётр",
+                          preview)
+            # Спевка в среду без своего дня задачи — пропущена с подсказкой.
+            self.assertIn("ср 04.11 спевка", preview)
+            buttons = {
+                button.text: button.callback_data
+                for row in load.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+            }
+            cancel = callback(buttons["❌ Отмена"])
+            await self.callback_handler("on_excel_schedule")(cancel)
+            self.assertIsNone(self.registry.get_schedule_plan("sound", "2026-11"))
+            stale = callback(buttons["✅ Подтвердить"])
+            await self.callback_handler("on_excel_schedule")(stale)
+            self.assertIn("устарел", "".join(
+                call.args[0] for call in stale.message.answer.await_args_list
+            ))
+            load = callback("xls:load:sound:202611")
+            await self.callback_handler("on_excel_schedule")(load)
+            ok = next(
+                button.callback_data
+                for row in load.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row if button.text == "✅ Подтвердить"
+            )
+            confirmed = callback(ok)
+            await self.callback_handler("on_excel_schedule")(confirmed)
+            self.assertIn(
+                "из Excel — итоговый в боте",
+                "".join(
+                    call.args[0]
+                    for call in confirmed.message.answer.await_args_list
+                ),
+            )
+            plan = self.registry.get_schedule_plan("sound", "2026-11")
+            self.assertEqual(plan["source"], "excel")
+            self.assertEqual(plan["approved"], plan["slots"])
+            self.assertEqual(plan["slots"]["2026-11-01"]["звук"], ["Алексей"])
+            self.assertFalse(plan["dirty"])
 
         asyncio.run(run())
 

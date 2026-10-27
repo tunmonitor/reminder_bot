@@ -402,6 +402,16 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   (NULL = minimum, up to 6) — «👥 Нужно людей», set by service admins too
   (`set_service_task_people_needed(actor, service, task, low, high)`) from
   «🗳 Опрос готовности» or «📋 Задачи служения» (`rdy:people|ppick|pset`).
+- One plan in the bot (decision 15): `import_excel_plan` (source
+  'excel', approved, unpublished) from «📊 График Excel»
+  (`service:service_excel`, `xls:load|ok|no`; `schedule_plan.excel_plan`
+  builds slots/days from Excel events via `week_events`). Approved bot
+  plans override Excel for reminders/replacements/overviews:
+  `app._apply_bot_plans` (in `load_upcoming_service_events` window,
+  `excel_only=True` skips it) and the per-date overlay in
+  `_load_service_task_assignments`; `schedule_plan.plan_events` turns an
+  approved plan into ServiceEvents (own-day tasks on their date).
+  `plan_current` treats an Excel plan as current.
 - Week bundles: `service_tasks.same_week` (`set_service_task_same_week`,
   UI `svc_tasks:week|wtog`) and `service_members.week_tasks_json`
   (`set_service_member_week_tasks`, None = as service, [] = never,
