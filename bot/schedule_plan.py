@@ -386,6 +386,12 @@ def week_events(events: list, own_days: dict[str, int]) -> list[dict]:
     отличный от даты."""
     blocks: dict[date, dict] = {}
     for event in sorted(events, key=lambda item: item.event_date):
+        if not event.assignments:
+            # Дата без назначений — тоже в обзоре.
+            blocks.setdefault(
+                event.event_date,
+                {"date": event.event_date, "assignments": [], "days": {}},
+            )
         for assignment in event.assignments:
             offset = own_days.get(assignment.task)
             sunday = event.event_date
@@ -793,14 +799,18 @@ def excel_rows(registry, plan: dict, people: list[dict]) -> list[list]:
         header[start] = column.headers[0]
     rows: list[list] = [header]
     # Задача со своим днём (спевка — ср) — отдельным блоком своей даты, как
-    # в файле; блоки по порядку дат.
+    # в файле; блоки по порядку дат. Дата другого месяца (среда перед
+    # 01.11 — 28.10) — не на этом листе: она в тексте «Для Excel».
     own_days = task_days(plan)
+    year, month = map(int, plan["month"].split("-"))
     blocks: dict[date, list[list[list]]] = {}
     for day in plan["dates"]:
         for task in plan["tasks"]:
             moment = date.fromisoformat(day) + timedelta(
                 days=own_days.get(task["name"], 0)
             )
+            if (moment.year, moment.month) != (year, month):
+                continue
             cells = blocks.setdefault(moment, [[] for _ in columns])
             index = own.get(normalized_name(task["name"]), main)
             pairs = columns[index].layout == "pairs"
@@ -864,6 +874,25 @@ def excel_text(registry, service: dict, plan: dict, people: list[dict]) -> str:
             for task in plan["tasks"]
         ]
         lines.append(f"{_short(day)}: " + "; ".join(parts))
+    # Своя дата задачи в другом месяце — на листе того месяца.
+    for day in plan["dates"]:
+        for task in plan["tasks"]:
+            if task["name"] not in own_days:
+                continue
+            moment = date.fromisoformat(day) + timedelta(
+                days=own_days[task["name"]]
+            )
+            if (moment.year, moment.month) == (year, month):
+                continue
+            people = ", ".join(
+                names.get(key, key)
+                for key in plan["slots"].get(day, {}).get(task["name"], [])
+            ) or "пусто"
+            lines.append(
+                f"⚠️ {_weekday_date(moment)} {task['name']} — {people}: "
+                f"это лист «{_schedule_sheet_name(moment)}», на листе этого "
+                "месяца её нет."
+            )
     return "\n".join(lines)
 
 

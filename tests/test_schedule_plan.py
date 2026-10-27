@@ -707,10 +707,21 @@ class SchedulePlanTest(unittest.TestCase):
         rows = schedule_plan.excel_rows(self.registry, plan, people)
         dated = [row[0] for row in rows if isinstance(row[0], date)]
         # Среда — своим блоком перед своим воскресеньем.
+        # 28.10 (к 01.11) — октябрь: не на листе ноября, а в тексте.
         self.assertEqual(
-            dated[:4],
-            [date(2026, 10, 28), date(2026, 11, 1), date(2026, 11, 4),
-             date(2026, 11, 8)],
+            dated[:3],
+            [date(2026, 11, 1), date(2026, 11, 4), date(2026, 11, 8)],
+        )
+        plan["slots"]["2026-11-01"]["сборка"] = ["Дмитрий"]
+        self.assertIn(
+            "⚠️ ср 28.10 сборка — Дмитрий: это лист «ОКТЯБРЬ26»",
+            schedule_plan.excel_text(
+                self.registry, self.service(), plan, people
+            ),
+        )
+        self.assertNotIn(
+            date(2026, 10, 28),
+            [r[0] for r in schedule_plan.excel_rows(self.registry, plan, people)],
         )
         path = Path(self.temp_dir.name) / "plan.xlsx"
         path.write_bytes(
@@ -734,6 +745,12 @@ class SchedulePlanTest(unittest.TestCase):
         )
         self.assertEqual(first["days"], {"сборка": date(2026, 11, 4)})
         self.assertNotIn(date(2026, 11, 4), [b["date"] for b in blocks])
+        # Дата без назначений не пропадает.
+        empty = [ServiceEvent("sound", date(2026, 11, 15), ())]
+        self.assertEqual(
+            [b["date"] for b in schedule_plan.week_events(empty, {})],
+            [date(2026, 11, 15)],
+        )
         # Без дня задачи — события как в файле.
         self.assertIn(
             date(2026, 11, 4),
@@ -742,7 +759,8 @@ class SchedulePlanTest(unittest.TestCase):
 
     def test_excel_rows_put_own_task_in_its_column(self):
         plan = {
-            "service_id": "broadcast", "dates": ["2026-11-01"],
+            "service_id": "broadcast", "month": "2026-11",
+            "dates": ["2026-11-01"],
             "tasks": [
                 {"name": "Пульт", "needed": 1, "max": None},
                 {"name": "Слайды", "needed": 1, "max": None},
