@@ -344,22 +344,38 @@ def build_plan(data: PlanInput) -> Plan:
 
 def _fill_bundle_gaps(plan: Plan, data: PlanInput) -> None:
     """Обязательные места связки, которые некем было закрыть вместе, —
-    по отдельности: свободный в дату, без служения в эту дату, в пределах
-    максимума; сначала ответившие, без служения неделей раньше или позже,
-    с меньшей нагрузкой."""
+    по отдельности. Сначала тот, кто в эту дату уже на задаче своей связки
+    (ещё одна задача связки — не лишнее служение); затем свободный в дату,
+    без служения в неё, в пределах максимума: без служения неделей раньше
+    или позже (интервал важнее ответа на опрос), ответившие, без связки с
+    этой задачей, с меньшей нагрузкой."""
     served: dict[str, set[date]] = {}
-    for (event_date, _), people in plan.slots.items():
+    on_date: dict[tuple[str, date], set[str]] = {}
+    for (event_date, task), people in plan.slots.items():
         for person in people:
             served.setdefault(person, set()).add(event_date)
+            on_date.setdefault((person, event_date), set()).add(task)
     for event_date in sorted(set(data.dates)):
         for task, count in data.needed.items():
             people = plan.slots[(event_date, task)]
             while len(people) < count:
+                def extends(person: str) -> bool:
+                    current = on_date.get((person, event_date))
+                    return bool(current) and current | {task} <= data.bundles.get(
+                        person, frozenset()
+                    )
+
                 candidates = [
                     person for person in data.free
                     if _can_serve(data, person, event_date, task)
-                    and event_date not in served.get(person, set())
-                    and _below_max(data, person, len(served.get(person, ())))
+                    and person not in people
+                    and (
+                        extends(person)
+                        or event_date not in served.get(person, set())
+                        and _below_max(
+                            data, person, len(served.get(person, ()))
+                        )
+                    )
                 ]
                 if not candidates:
                     break
@@ -373,13 +389,14 @@ def _fill_bundle_gaps(plan: Plan, data: PlanInput) -> None:
                     # Связавший задачи — по отдельности в последнюю очередь.
                     bound = task in data.bundles.get(person, ())
                     return (
-                        person in data.reluctant, close, bound, len(days),
-                        person,
+                        not extends(person), close, person in data.reluctant,
+                        bound, len(days), person,
                     )
 
                 chosen = min(candidates, key=rank)
                 people.append(chosen)
                 served.setdefault(chosen, set()).add(event_date)
+                on_date.setdefault((chosen, event_date), set()).add(task)
 
 
 def _build_plan(data: PlanInput) -> Plan:

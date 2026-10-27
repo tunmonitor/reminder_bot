@@ -395,6 +395,39 @@ class SchedulePlannerTest(unittest.TestCase):
             (later - earlier).days > 7 for earlier, later in zip(served, served[1:])
         ))
 
+    def test_overlapping_bundles_use_the_available_person(self):
+        day = date(2026, 11, 1)
+        plan = build_plan(PlanInput(
+            (day,), {"a": 1, "b": 1, "c": 1},
+            {"X": frozenset(), "Y": frozenset({day})},
+            {"X": frozenset({"a", "b"}), "Y": frozenset({"b", "c"})},
+            bundles={"X": frozenset({"a", "b"}), "Y": frozenset({"b", "c"})},
+        ))
+        # Y закрывает обе задачи своей связки.
+        self.assertEqual(plan.slots[(day, "b")], ["Y"])
+        self.assertEqual(plan.slots[(day, "c")], ["Y"])
+        self.assertEqual(plan.covered_required(), 2)
+
+    def test_bundle_gap_prefers_interval_over_answer(self):
+        dates = (date(2026, 11, 1), date(2026, 11, 8))
+        plan = build_plan(PlanInput(
+            dates, {"звук": 1, "спевка": 1},
+            {
+                "S": frozenset(dates), "A": frozenset(dates),
+                "Q": frozenset(dates), "L": frozenset(),
+            },
+            {
+                "S": frozenset({"звук"}), "A": frozenset({"спевка"}),
+                "Q": frozenset({"спевка"}),
+                "L": frozenset({"звук", "спевка"}),
+            },
+            last_served={"A": date(2026, 10, 25)},
+            reluctant=frozenset({"Q"}),
+            bundles={"L": frozenset({"звук", "спевка"})},
+        ))
+        # A служил 25.10 — на 01.11 лучше не ответивший Q.
+        self.assertEqual(plan.slots[(dates[0], "спевка")], ["Q"])
+
 
 if __name__ == "__main__":
     unittest.main()
