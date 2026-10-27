@@ -89,6 +89,7 @@ from .service_registry import (
     GENERAL_GROUP_TEMPLATE_FIELDS,
     GROUP_TEMPLATE_FIELDS,
     PERSONAL_TEMPLATE_FIELDS,
+    READINESS_PHRASES,
     USER_REMINDER_BODY_LIMIT,
     USER_REMINDERS_PER_SERVICE,
     normalize_member_name,
@@ -279,7 +280,6 @@ TEMPLATE_FIELD_HELP = {
     "month_in": "месяц опроса после «в» (ноябре)",
     "deadline": "срок ответа (дд.мм чч:мм)",
     "people": "упоминания опрашиваемых",
-    "status": "«утверждён» или «обновлён»",
 }
 GROUP_FIELDS = ("service_name", "sunday_date", "task_assignments",
                 "informational_notes")
@@ -289,11 +289,13 @@ READINESS_INTRO_HELP = ("service_name", "month", "deadline", "people")
 READINESS_REMINDER_HELP = ("service_name", "month", "deadline")
 READINESS_CLOSED_HELP = ("service_name", "month")
 READINESS_QUESTION_HELP = ("service_name", "month", "month_in")
-PLAN_TITLE_HELP = ("service_name", "month", "status")
+PLAN_TITLE_HELP = ("service_name", "month")
 
 
 def template_fields_help(fields) -> str:
     """Поля шаблона — каждое с новой строки и с пояснением."""
+    if not fields:
+        return "Одной строкой, без полей — текст подставляется как есть."
     return "Доступные поля:\n" + "\n".join(
         f"• {{{field}}} — {TEMPLATE_FIELD_HELP[field]}" for field in fields
     )
@@ -730,7 +732,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "➖", "🗑", "✏️", "1️⃣", "2️⃣", "3️⃣", "4️⃣",
                         "📤", "🔁", "🗓", "🧵", "🚫", "📆", "♾", "▶️", "⏸",
                         "🗳", "⏹", "⏭", "↩️", "🏁", "💬", "⬜", "☑️",
-                        "🔢",
+                        "🔢", "🔤",
                     )
                 ):
                     button.text = f"📋 {label}"
@@ -4038,9 +4040,62 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         "pub": (
             "plan_title_template", "📅 Заголовок графика",
             "Первая строка графика в чате служения, когда график "
-            "утверждён или обновлён.", PLAN_TITLE_HELP,
+            "утверждён.", PLAN_TITLE_HELP,
+        ),
+        "pubupd": (
+            "plan_update_template", "📅 Заголовок обновления",
+            "Первая строка графика в чате служения, когда опубликованный "
+            "график изменили.", PLAN_TITLE_HELP,
         ),
     }
+    # Короткие фразы — тоже тексты («ph.<имя>»), поле в настройках — phrases.
+    for _name, (_default, _fields, _limit, _label) in READINESS_PHRASES.items():
+        READINESS_TEXTS[f"ph.{_name}"] = (
+            "phrases", f"🔤 «{_default}»", _label, tuple(sorted(_fields)),
+        )
+
+    def readiness_text_value(settings: dict, kind: str) -> str | None:
+        """Свой текст шаблона или фразы (None — встроенный)."""
+        if kind.startswith("ph."):
+            return settings["phrases"].get(kind[3:])
+        return settings[READINESS_TEXTS[kind][0]]
+
+    def save_readiness_text(
+        registry, actor_id: int, service_id: str, kind: str, text: str | None,
+    ) -> None:
+        if kind.startswith("ph."):
+            registry.set_readiness_phrase(actor_id, service_id, kind[3:], text)
+        else:
+            registry.set_readiness_settings(
+                actor_id, service_id, **{READINESS_TEXTS[kind][0]: text}
+            )
+
+    async def show_readiness_phrases(message: Message, service_id: str) -> None:
+        """«🔤 Фразы»: короткие слова и фразы в сообщениях участникам."""
+        settings = service_registry().get_readiness_settings(service_id)
+        lines = [
+            "🔤 Фразы", "",
+            "Короткие слова в сообщениях для участников — их можно заменить "
+            "своими. ✏️ — своя фраза, ⚪ — встроенная.", "",
+        ]
+        rows = []
+        for name, (default, _, _, label) in READINESS_PHRASES.items():
+            own = settings["phrases"].get(name)
+            lines.append(
+                f"{'✏️' if own else '⚪'} {label}: «{own or default}»"
+            )
+            rows.append([readiness_button(
+                f"🔤 {own or default}"[:40], "tpl", service_id, f"ph.{name}"
+            )])
+        rows.append([readiness_button("⬅️ К текстам", "texts", service_id)])
+        await _send_dialog(
+            message, "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keep_rows=True,
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
+            _dialog_text_limit=TELEGRAM_TEXT_LIMIT,
+            parse_mode=None,
+        )
 
     async def show_readiness_texts(
         message: Message, service_id: str,
@@ -4051,11 +4106,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         rows = []
         lines = ["📝 Тексты опроса и графика", "",
                  "✏️ — свой текст, ⚪ — встроенный."]
-        for kind in ("intro", "q", "rem", "chat", "done", "pub"):
+        for kind in ("intro", "q", "rem", "chat", "done", "pub", "pubupd"):
             field, title, about, _ = READINESS_TEXTS[kind]
             mark = "✏️" if settings[field] else "⚪"
             lines.append(f"{mark} {title} — {about}")
             rows.append([readiness_button(title, "tpl", service_id, kind)])
+        own_phrases = len(settings["phrases"])
+        lines.append(
+            "🔤 Фразы — короткие слова в сообщениях участникам"
+            + (f" (своих: {own_phrases})" if own_phrases else "") + "."
+        )
+        rows.append([readiness_button("🔤 Фразы", "phr", service_id)])
         rows.append([readiness_button("⬅️ К разделу «График»", "open", service_id)])
         await _send_dialog(
             message, "\n".join(lines),
@@ -4076,14 +4137,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await _send_dialog(message, "Настройка устарела.", parse_mode=None)
             return
         field, title, about, _ = READINESS_TEXTS[kind]
-        template = registry.get_readiness_settings(service_id)[field]
-        default = {
+        phrase_kind = kind.startswith("ph.")
+        template = readiness_text_value(
+            registry.get_readiness_settings(service_id), kind
+        )
+        default = READINESS_PHRASES[kind[3:]][0] if phrase_kind else {
             "intro": readiness.DEFAULT_READINESS_INTRO,
             "rem": readiness.DEFAULT_READINESS_REMINDER,
             "chat": readiness.DEFAULT_READINESS_CHAT_REMINDER,
             "q": readiness.DEFAULT_READINESS_QUESTION,
             "done": readiness.DEFAULT_READINESS_CLOSED,
             "pub": readiness.DEFAULT_PLAN_TITLE,
+            "pubupd": readiness.DEFAULT_PLAN_UPDATE_TITLE,
         }[kind]
         lines = [
             f"{title} · {service_label(service)}",
@@ -4097,14 +4162,20 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             lines = [notice, ""] + lines
         rows = [[
             readiness_button("✏️ Изменить", "tpledit", service_id, kind),
-            readiness_button("👁 Предпросмотр", "tplprev", service_id, kind),
         ]]
+        if not phrase_kind:
+            rows[0].append(
+                readiness_button("👁 Предпросмотр", "tplprev", service_id, kind)
+            )
         if template:
             rows[0].append(
                 readiness_button("🔄 Вернуть встроенный", "tplreset",
                                  service_id, kind)
             )
-        rows.append([readiness_button("⬅️ К текстам", "texts", service_id)])
+        rows.append([
+            readiness_button("⬅️ К фразам", "phr", service_id) if phrase_kind
+            else readiness_button("⬅️ К текстам", "texts", service_id)
+        ])
         await _send_dialog(
             message, "\n".join(lines),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -5501,6 +5572,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await show_readiness_texts(callback.message, service_id)
                 await _answer_callback(callback)
                 return
+            elif action == "phr":
+                await show_readiness_phrases(callback.message, service_id)
+                await _answer_callback(callback)
+                return
             elif action == "own":
                 await show_own_days(callback.message, actor_id, service_id)
                 await _answer_callback(callback)
@@ -5805,7 +5880,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     )
                 await _answer_callback(callback)
                 return
-            elif action == "tplprev" and arg in READINESS_TEXTS:
+            elif action == "tplprev" and arg in READINESS_TEXTS and not (
+                arg.startswith("ph.")
+            ):
                 # Как сообщение будет выглядеть: месяц и срок опроса этого
                 # месяца (идущего или по расписанию), упоминания состава.
                 run = registry.get_readiness_run(service_id, key)
@@ -5816,6 +5893,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     body = readiness.intro_text(
                         service, registry.readiness_people(service_id),
                         year, month, deadline, tz, settings["intro_template"],
+                        readiness.phrase(settings, "own_days"),
                     )
                     where = "в чате служения перед опросом"
                 elif arg == "q":
@@ -5834,11 +5912,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "в чате служения, ответом на опрос" if arg == "chat"
                         else "лично тем, кто не ответил"
                     )
-                elif arg == "pub":
+                elif arg in {"pub", "pubupd"}:
                     body = schedule_plan.publication_title(
-                        service, key, False, settings["plan_title_template"],
+                        service, key, arg == "pubupd", settings,
                     )
-                    where = "заголовок графика в чате служения"
+                    where = (
+                        "заголовок обновлённого графика в чате служения"
+                        if arg == "pubupd"
+                        else "заголовок графика в чате служения"
+                    )
                 else:
                     body = readiness.closed_text(
                         service, {"month": key}, settings["closed_template"],
@@ -5870,9 +5952,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await _answer_callback(callback)
                 return
             elif action == "tplreset" and arg in READINESS_TEXTS:
-                registry.set_readiness_settings(
-                    actor_id, service_id, **{READINESS_TEXTS[arg][0]: None}
-                )
+                save_readiness_text(registry, actor_id, service_id, arg, None)
                 await show_readiness_text(
                     callback.message, service_id, arg,
                     "🔄 Возвращён встроенный текст",
@@ -11746,9 +11826,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 pending_inputs.pop(message.from_user.id, None)
                 return
             try:
-                registry.set_readiness_settings(
-                    message.from_user.id, service_id,
-                    **{READINESS_TEXTS[kind][0]: text},
+                save_readiness_text(
+                    registry, message.from_user.id, service_id, kind, text
                 )
             except PermissionError as exc:
                 pending_inputs.pop(message.from_user.id, None)

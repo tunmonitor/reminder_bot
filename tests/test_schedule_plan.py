@@ -405,16 +405,24 @@ class SchedulePlanTest(unittest.TestCase):
         # Заголовок — свой шаблон из «📝 Тексты».
         self.registry.set_readiness_settings(
             1001, "sound",
-            plan_title_template="Служим в {month}: {service_name} ({status})",
+            plan_title_template="График {service_name} на {month} подготовлен",
         )
-        self.assertTrue(schedule_plan.publication_text(
+        self.registry.set_readiness_phrase(1001, "sound", "empty", "пока никого")
+        custom = schedule_plan.publication_text(
             self.service(), plan, self.people(), (-1, 1),
-            self.registry.get_readiness_settings("sound")["plan_title_template"],
-        ).startswith("Служим в ноябрь 2026: Звук (утверждён)\n\n🗓 01.11"))
+            self.registry.get_readiness_settings("sound"),
+        )
+        self.assertTrue(custom.startswith(
+            "График Звук на ноябрь 2026 подготовлен\n\n🗓 01.11"
+        ))
+        self.assertIn("🧰 сборка: пока никого", custom)
+        for bad in ("{deadline}", "{status}"):
+            with self.assertRaises(ValueError):
+                self.registry.set_readiness_settings(
+                    1001, "sound", plan_title_template=bad
+                )
         with self.assertRaises(ValueError):
-            self.registry.set_readiness_settings(
-                1001, "sound", plan_title_template="{deadline}"
-            )
+            self.registry.set_readiness_phrase(1001, "sound", "empty", "две\nстроки")
         self.assertIn("\x00 (чт 05.11)", published)
         self.registry.set_service_member_day(1001, "sound", "Алексей", None)
         alex = next(p for p in self.people() if p["name"] == "Алексей")

@@ -92,10 +92,28 @@ DEFAULT_READINESS_CHAT_REMINDER = (
     "Кто ещё не отметил воскресенья — проголосуй, пожалуйста, в опросе "
     "выше 🙏"
 )
-# Заголовок утверждённого графика в чате служения; status — «утверждён»
-# или «обновлён».
-PLAN_TITLE_FIELDS = frozenset({"service_name", "month", "status"})
-DEFAULT_PLAN_TITLE = "📅 График {service_name} на {month} {status}"
+# Заголовки графика в чате служения: при первой публикации и при
+# обновлении — каждый своим текстом (слова не «зашиты»).
+PLAN_TITLE_FIELDS = frozenset({"service_name", "month"})
+DEFAULT_PLAN_TITLE = "📅 График {service_name} на {month} утверждён"
+DEFAULT_PLAN_UPDATE_TITLE = "📅 График {service_name} на {month} обновлён"
+# Короткие фразы, которые видят участники (раздел «📝 Тексты» → «🔤 Фразы»):
+# имя → (встроенный текст, поля, лимит длины, название).
+READINESS_PHRASES = {
+    "changes": ("Изменения:", frozenset(), 100,
+                "Заголовок списка изменений в обновлённом графике"),
+    "empty": ("—", frozenset(), 50, "Задача без людей в графике"),
+    "nobody": ("никого", frozenset(), 50,
+               "«Никого» в строке изменения («звук: Анна → никого»)"),
+    "usual_day": ("день как обычно", frozenset(), 100,
+                  "Отменён разовый день человека (в изменениях)"),
+    "days_changed": ("• Изменены дни служения", frozenset(), 200,
+                     "Строка изменений, когда изменилось окно дней"),
+    "cant": ("❌ Не смогу в этом месяце", frozenset(), 100,
+             "Последний вариант в опросе"),
+    "own_days": ("📅 Свой день:", frozenset(), 100,
+                 "Начало сноски под текстом опроса"),
+}
 # Шаблон по умолчанию для напоминания одной задачи (этап 3.1).
 DEFAULT_TASK_TEMPLATE = (
     "Напоминание о служении «{service_name}» в воскресенье {sunday_date}.\n"
@@ -273,6 +291,9 @@ class ServiceRegistry:
                     chat_reminder_template TEXT,
                     question_template TEXT,
                     plan_title_template TEXT,
+                    plan_update_template TEXT,
+                    -- Свои короткие фразы ({имя: текст}), см. READINESS_PHRASES.
+                    phrases_json TEXT NOT NULL DEFAULT '{}',
                     -- Лимит служений человека в месяц (для всех): минимум и
                     -- максимум (NULL — без ограничения).
                     month_min INTEGER NOT NULL DEFAULT 0,
@@ -837,6 +858,8 @@ class ServiceRegistry:
                 ("readiness_settings", "chat_reminder_template", "TEXT"),
                 ("readiness_settings", "question_template", "TEXT"),
                 ("readiness_settings", "plan_title_template", "TEXT"),
+                ("readiness_settings", "plan_update_template", "TEXT"),
+                ("readiness_settings", "phrases_json", "TEXT NOT NULL DEFAULT '{}'"),
                 ("readiness_settings", "people_needed",
                  "INTEGER NOT NULL DEFAULT 1"),
                 ("readiness_settings", "people_max", "INTEGER"),
@@ -910,6 +933,31 @@ class ServiceRegistry:
             self._migrate_members(connection)
             self._drop_file_telegram_ids(connection)
             self._migrate_service_reminders(connection)
+            self._split_plan_title(connection)
+
+    @staticmethod
+    def _split_plan_title(connection: sqlite3.Connection) -> None:
+        """Однократно: сохранённый заголовок — в два шаблона. Раньше он шёл
+        и в первую публикацию, и в обновления; поле {status} заменяется на
+        «утверждён» и «обновлён» и больше не поддерживается."""
+        if connection.execute(
+            "SELECT 1 FROM catalog_migrations WHERE name = 'plan-title-v2'"
+        ).fetchone():
+            return
+        connection.execute(
+            "UPDATE readiness_settings SET plan_update_template = "
+            "replace(plan_title_template, '{status}', 'обновлён') "
+            "WHERE plan_title_template IS NOT NULL "
+            "AND plan_update_template IS NULL"
+        )
+        connection.execute(
+            "UPDATE readiness_settings SET plan_title_template = "
+            "replace(plan_title_template, '{status}', 'утверждён') "
+            "WHERE plan_title_template LIKE '%{status}%'"
+        )
+        connection.execute(
+            "INSERT INTO catalog_migrations (name) VALUES ('plan-title-v2')"
+        )
 
     @staticmethod
     def _drop_file_telegram_ids(connection: sqlite3.Connection) -> None:
@@ -5210,6 +5258,8 @@ class ServiceRegistry:
         "chat_reminder_template": None,
         "question_template": None,
         "plan_title_template": None,
+        "plan_update_template": None,
+        "phrases": {},
         "month_min": 0,
         "month_max": None,
         "people_needed": 1,
@@ -5224,14 +5274,31 @@ class ServiceRegistry:
                 "SELECT enabled, start_time, duration_days, deadline_time, "
                 "remind_days, enabled_at, intro_template, reminder_template, "
                 "closed_template, chat_reminder_template, question_template, "
-                "plan_title_template, month_min, month_max, "
+                "plan_title_template, plan_update_template, phrases_json, "
+                "month_min, month_max, "
                 "people_needed, people_max, day_from, day_to "
                 "FROM readiness_settings WHERE service_id = ?",
                 (service_id,),
             ).fetchone()
         if row is None:
-            return {**self.READINESS_DEFAULTS, "enabled_at": None}
-        return {**dict(row), "enabled": bool(row["enabled"])}
+            return {
+                **self.READINESS_DEFAULTS, "phrases": {}, "enabled_at": None,
+            }
+        settings = {**dict(row), "enabled": bool(row["enabled"])}
+        settings["phrases"] = json.loads(settings.pop("phrases_json") or "{}")
+        return settings
+
+    def set_readiness_phrase(
+        self, actor_id: int, service_id: str, name: str, text: str | None,
+    ) -> dict:
+        """Своя короткая фраза (None — встроенная)."""
+        if name not in READINESS_PHRASES:
+            raise ValueError(f"Неизвестная фраза: {name}.")
+        phrases = dict(self.get_readiness_settings(service_id)["phrases"])
+        phrases[name] = text
+        return self.set_readiness_settings(
+            actor_id, service_id, phrases=phrases
+        )
 
     def set_readiness_settings(
         self, actor_id: int, service_id: str, **changes
@@ -5277,6 +5344,26 @@ class ServiceRegistry:
         ):
             raise ValueError("Дни служения: от вс −6 до вс +6, включая вс.")
         _validate_month_limit(new["month_min"], new["month_max"])
+        if not isinstance(new["phrases"], dict):
+            raise ValueError("Фразы — словарь.")
+        new["phrases"] = {
+            name: text for name, text in new["phrases"].items()
+            if text is not None
+        }
+        for name, text in new["phrases"].items():
+            if name not in READINESS_PHRASES:
+                raise ValueError(f"Неизвестная фраза: {name}.")
+            _, fields, limit, label = READINESS_PHRASES[name]
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError(f"{label}: не может быть пустым.")
+            if len(text) > limit or "\n" in text:
+                raise ValueError(
+                    f"{label}: одной строкой, не больше {limit} символов."
+                )
+            if fields:
+                validate_notification_template(text, fields, label)
+            elif "\x00" in text:
+                raise ValueError(f"{label}: текст содержит недопустимые символы.")
         for key, fields, label in (
             ("intro_template", READINESS_INTRO_FIELDS, "Текст опроса"),
             ("reminder_template", READINESS_REMINDER_FIELDS,
@@ -5287,6 +5374,8 @@ class ServiceRegistry:
             ("question_template", READINESS_QUESTION_FIELDS,
              "Вопрос опроса"),
             ("plan_title_template", PLAN_TITLE_FIELDS, "Заголовок графика"),
+            ("plan_update_template", PLAN_TITLE_FIELDS,
+             "Заголовок обновления"),
         ):
             value = new[key]
             if value is None:
@@ -5310,9 +5399,10 @@ class ServiceRegistry:
                 "start_time, duration_days, deadline_time, remind_days, "
                 "enabled_at, intro_template, reminder_template, "
                 "closed_template, chat_reminder_template, question_template, "
-                "plan_title_template, month_min, month_max, "
+                "plan_title_template, plan_update_template, phrases_json, "
+                "month_min, month_max, "
                 "people_needed, people_max, day_from, day_to, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id) DO UPDATE SET "
                 "enabled = excluded.enabled, start_time = excluded.start_time, "
                 "duration_days = excluded.duration_days, "
@@ -5325,6 +5415,8 @@ class ServiceRegistry:
                 "chat_reminder_template = excluded.chat_reminder_template, "
                 "question_template = excluded.question_template, "
                 "plan_title_template = excluded.plan_title_template, "
+                "plan_update_template = excluded.plan_update_template, "
+                "phrases_json = excluded.phrases_json, "
                 "month_min = excluded.month_min, "
                 "month_max = excluded.month_max, "
                 "people_needed = excluded.people_needed, "
@@ -5338,6 +5430,8 @@ class ServiceRegistry:
                     new["intro_template"], new["reminder_template"],
                     new["closed_template"], new["chat_reminder_template"],
                     new["question_template"], new["plan_title_template"],
+                    new["plan_update_template"],
+                    json.dumps(new["phrases"], ensure_ascii=False),
                     new["month_min"], new["month_max"],
                     new["people_needed"], new["people_max"],
                     new["day_from"], new["day_to"], now,

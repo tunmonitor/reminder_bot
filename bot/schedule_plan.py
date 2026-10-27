@@ -22,11 +22,13 @@ from .month_summary import month_end, month_key, month_title
 from .presentation import task_emoji
 from .readiness import (
     DEFAULT_PLAN_TITLE,
+    DEFAULT_PLAN_UPDATE_TITLE,
     Summary,
     month_sundays,
     local_text,
     month_of,
     outside_name,
+    phrase,
     render_template,
     summarize,
     task_lines,
@@ -493,7 +495,8 @@ def choice_notes(plan: dict, summary: Summary, key: str, day: str,
     return notes
 
 
-def plan_changes(old: dict, new: dict, names: dict[str, str]) -> list[str]:
+def plan_changes(old: dict, new: dict, names: dict[str, str],
+                 nobody: str = "никого") -> list[str]:
     """Отличия нового графика от опубликованного — для «обновлён».
     Единственная задача сменила название (служение без задач переименовано
     в каталоге) — одной строкой, люди сравниваются под новым названием.
@@ -519,7 +522,7 @@ def plan_changes(old: dict, new: dict, names: dict[str, str]) -> list[str]:
                 continue
 
             def shown(people: list[str]) -> str:
-                return ", ".join(names.get(p, p) for p in people) or "никого"
+                return ", ".join(names.get(p, p) for p in people) or nobody
 
             lines.append(
                 f"• {_short(day)} «{task}»: {shown(before)} → {shown(after)}"
@@ -528,20 +531,23 @@ def plan_changes(old: dict, new: dict, names: dict[str, str]) -> list[str]:
 
 
 def publication_title(service: dict, month: str, update: bool,
-                      template: str | None = None) -> str:
-    """Заголовок графика в чате служения (шаблон «📝 Тексты»)."""
+                      settings: dict | None = None) -> str:
+    """Заголовок графика в чате служения: при первой публикации или при
+    обновлении (шаблоны «📝 Тексты»)."""
     year, month_number = map(int, month.split("-"))
+    template = (settings or {}).get(
+        "plan_update_template" if update else "plan_title_template"
+    ) or (DEFAULT_PLAN_UPDATE_TITLE if update else DEFAULT_PLAN_TITLE)
     return render_template(
-        template or DEFAULT_PLAN_TITLE,
+        template,
         service_name=service["name"],
         month=month_title(year, month_number),
-        status="обновлён" if update else "утверждён",
     )
 
 
 def publication_text(service: dict, plan: dict, people: list[dict],
                      window: tuple[int, int] = (0, 0),
-                     title_template: str | None = None) -> str:
+                     settings: dict | None = None) -> str:
     """Утверждённый график для чата служения (с упоминаниями): дата,
     под ней задачи — каждая с новой строки."""
     by_key = {person["key"]: person for person in people}
@@ -556,7 +562,7 @@ def publication_text(service: dict, plan: dict, people: list[dict],
         )
 
     lines = [
-        publication_title(service, plan["month"], update, title_template),
+        publication_title(service, plan["month"], update, settings),
     ]
     for day in plan["dates"]:
         label, shared_day = date_header(plan, by_key, day, window)
@@ -565,14 +571,17 @@ def publication_text(service: dict, plan: dict, people: list[dict],
             people_keys = plan["slots"].get(day, {}).get(task["name"], [])
             people_text = ", ".join(
                 mention(key, day, shared_day) for key in people_keys
-            ) or "—"
+            ) or phrase(settings, "empty")
             lines.append(
                 f"  {people_text}" if implicit_plan(plan)
                 else f"  {task_emoji(task['name'])} {task['name']}: "
                 f"{people_text}"
             )
     if update:
-        changes = plan_changes(plan["approved"], plan["slots"], _names(people))
+        changes = plan_changes(
+            plan["approved"], plan["slots"], _names(people),
+            phrase(settings, "nobody"),
+        )
         names = _names(people)
         for day in plan["dates"]:
             before = plan.get("approved_days", {}).get(day, {})
@@ -590,13 +599,14 @@ def publication_text(service: dict, plan: dict, people: list[dict],
                     + (
                         _weekday_date(
                             date.fromisoformat(day) + timedelta(days=offset)
-                        ) if offset is not None else "день как обычно"
+                        ) if offset is not None
+                        else phrase(settings, "usual_day")
                     )
                 )
         if plan.get("republish"):
-            changes.append("• Изменены дни служения")
+            changes.append(phrase(settings, "days_changed"))
         if changes:
-            lines += ["", "Изменения:"] + changes
+            lines += ["", phrase(settings, "changes")] + changes
     return "\n".join(lines)
 
 
@@ -736,9 +746,7 @@ async def publish(
             send_chunk, chat_id,
             publication_text(
                 service, plan, people, window_of(registry, service["id"]),
-                registry.get_readiness_settings(service["id"])[
-                    "plan_title_template"
-                ],
+                registry.get_readiness_settings(service["id"]),
             ),
             limit=text_limit,
         )
