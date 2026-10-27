@@ -490,6 +490,8 @@ class ServiceRegistry:
                     people_needed INTEGER NOT NULL DEFAULT 1
                         CHECK (people_needed BETWEEN 1 AND 5),
                     people_max INTEGER,
+                    -- Свой день задачи: сдвиг от воскресенья (спевка — −4).
+                    day_offset INTEGER,
                     PRIMARY KEY (service_id, name)
                 );
 
@@ -851,6 +853,7 @@ class ServiceRegistry:
             # первого развёртывания.
             for table, column, ddl in (
                 ("service_tasks", "people_max", "INTEGER"),
+                ("service_tasks", "day_offset", "INTEGER"),
                 ("readiness_settings", "enabled_at", "TEXT"),
                 ("readiness_settings", "intro_template", "TEXT"),
                 ("readiness_settings", "reminder_template", "TEXT"),
@@ -1561,7 +1564,7 @@ class ServiceRegistry:
         with self._connection() as connection:
             rows = connection.execute(
                 "SELECT name, position, enabled, aliases_json, source, "
-                "people_needed, people_max FROM service_tasks "
+                "people_needed, people_max, day_offset FROM service_tasks "
                 "WHERE service_id = ? ORDER BY position, name",
                 (service_id,),
             ).fetchall()
@@ -1578,6 +1581,8 @@ class ServiceRegistry:
                     row["people_max"] or row["people_needed"],
                     row["people_needed"],
                 ),
+                # Свой день задачи; None — дни служения раздела «📅 График».
+                "day_offset": row["day_offset"],
             }
             for row in rows
         ]
@@ -1592,7 +1597,7 @@ class ServiceRegistry:
                 {
                     "name": task["name"], "needed": task["people_needed"],
                     "max": task["people_max"], "position": str(task["position"]),
-                    "implicit": False,
+                    "implicit": False, "day": task["day_offset"],
                 }
                 for task in tasks if task["enabled"]
             ]
@@ -1603,7 +1608,7 @@ class ServiceRegistry:
         return [{
             "name": service["name"], "needed": settings["people_needed"],
             "max": settings["people_max"] or settings["people_needed"],
-            "position": "s", "implicit": True,
+            "position": "s", "implicit": True, "day": None,
         }]
 
     def service_catalog(self) -> tuple[ServiceDefinition, ...]:
@@ -1700,6 +1705,63 @@ class ServiceRegistry:
             self._audit(
                 connection, actor_id, "service_task_updated", service_id,
                 {"task": task, "people_needed": count, "people_max": maximum},
+            )
+
+    def set_service_task_day(
+        self, actor_id: int, service_id: str, task: str, offset: int | None,
+    ) -> None:
+        """Свой день задачи (решение 12): сдвиг от воскресенья графика
+        (спевка — вс −4, ср); None — дни служения раздела «📅 График».
+        График показывается по неделям; день переносится в графики текущего
+        и будущих месяцев, утверждённые публикуются заново."""
+        _validate_positive_id(actor_id, "actor_id")
+        if offset is not None and (
+            isinstance(offset, bool) or not isinstance(offset, int)
+            or not -6 <= offset <= 6
+        ):
+            raise ValueError("День задачи: от вс −6 до вс +6.")
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            self._require_service(connection, service_id)
+            row = connection.execute(
+                "SELECT day_offset FROM service_tasks "
+                "WHERE service_id = ? AND name = ?",
+                (service_id, task),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Задача «{task}» не найдена.")
+            if row["day_offset"] == offset:
+                return
+            connection.execute(
+                "UPDATE service_tasks SET day_offset = ? "
+                "WHERE service_id = ? AND name = ?",
+                (offset, service_id, task),
+            )
+            plans = connection.execute(
+                "SELECT month, tasks_json FROM schedule_plans "
+                "WHERE service_id = ? AND month >= ?",
+                (service_id, _current_month()),
+            ).fetchall()
+            for plan in plans:
+                tasks = json.loads(plan["tasks_json"])
+                if not any(item["name"] == task for item in tasks):
+                    continue
+                for item in tasks:
+                    if item["name"] == task:
+                        item["day"] = offset
+                # Утверждённый график с этой задачей — опубликовать заново;
+                # графики без неё не меняются.
+                connection.execute(
+                    "UPDATE schedule_plans SET tasks_json = ?, updated_at = ?, "
+                    "republish = CASE WHEN approved_json IS NOT NULL THEN 1 "
+                    "ELSE republish END "
+                    "WHERE service_id = ? AND month = ?",
+                    (json.dumps(tasks, ensure_ascii=False), _utc_now(),
+                     service_id, plan["month"]),
+                )
+            self._audit(
+                connection, actor_id, "service_task_updated", service_id,
+                {"task": task, "day_offset": offset},
             )
 
     def add_service_task(
@@ -4000,14 +4062,14 @@ class ServiceRegistry:
         self, actor_id: int, service_id: str, name: str, tasks,
     ) -> list[str]:
         """Задачи человека в составе задаёт админ служения: дальше «Списки»
-        их не меняют. Привязки Telegram — только к выбранным задачам."""
+        их не меняют. Привязки Telegram — только к выбранным задачам. Без
+        задач человек остаётся в составе, но в график не попадает (и
+        убирается из составленных графиков)."""
         _validate_positive_id(actor_id, "actor_id")
         name = name.strip() if isinstance(name, str) else ""
         if not name or "\x00" in name:
             raise ValueError("Имя участника обязательно.")
         tasks = list(dict.fromkeys(tasks))
-        if not tasks:
-            raise ValueError("Выберите хотя бы одну задачу.")
         with self._connection() as connection:
             self._require_service_editor(connection, actor_id, service_id)
             known = {
@@ -4055,18 +4117,21 @@ class ServiceRegistry:
                     "WHERE service_id = ? AND name = ?",
                     (json.dumps(tasks, ensure_ascii=False), now, service_id, name),
                 )
-            placeholders = ", ".join("?" for _ in tasks)
+            # json_each: список задач может быть и пустым.
+            chosen = json.dumps(tasks, ensure_ascii=False)
             connection.execute(
                 "DELETE FROM responsible_contacts WHERE service_id = ? "
-                f"AND name = ? AND task NOT IN ({placeholders})",
-                (service_id, name, *tasks),
+                "AND name = ? AND task NOT IN (SELECT value FROM json_each(?))",
+                (service_id, name, chosen),
             )
             # Ожидание по @username для снятой задачи вернуло бы её.
             connection.execute(
                 "DELETE FROM username_bindings WHERE service_id = ? "
-                f"AND name = ? AND task != '' AND task NOT IN ({placeholders})",
-                (service_id, name, *tasks),
+                "AND name = ? AND task != '' "
+                "AND task NOT IN (SELECT value FROM json_each(?))",
+                (service_id, name, chosen),
             )
+            self._drop_from_plans(connection, service_id, name, set(tasks))
             if telegram_id:
                 for task in tasks:
                     self._write_contact(
@@ -4189,57 +4254,71 @@ class ServiceRegistry:
                 "(service_id, name, created_at) VALUES (?, ?, ?)",
                 (service_id, name, _utc_now()),
             )
-            # Из рабочих копий графиков (опубликованная остаётся — правка
-            # станет видна как неопубликованная).
-            def is_removed(key: str) -> bool:
-                # Ключ — имя, при совпадении имён «имя · ID» (как в
-                # readiness_people); все с этим именем удалены выше.
-                return key == name or bool(re.fullmatch(
-                    re.escape(name) + r" · (?:\d+|без Telegram)", key,
-                ))
-
-            for row in connection.execute(
-                "SELECT month, slots_json, days_json FROM schedule_plans "
-                "WHERE service_id = ?",
-                (service_id,),
-            ).fetchall():
-                slots = json.loads(row["slots_json"])
-                changed = False
-                for tasks in slots.values():
-                    for task, people in tasks.items():
-                        kept = [key for key in people if not is_removed(key)]
-                        if kept != people:
-                            tasks[task] = kept
-                            changed = True
-                # И разовые дни — иначе вернувшийся получил бы старый день.
-                days = {}
-                for day, people_days in json.loads(
-                    row["days_json"] or "{}"
-                ).items():
-                    kept_days = {
-                        key: offset for key, offset in people_days.items()
-                        if not is_removed(key)
-                    }
-                    changed |= kept_days != people_days
-                    if kept_days:
-                        days[day] = kept_days
-                if changed:
-                    connection.execute(
-                        "UPDATE schedule_plans SET slots_json = ?, "
-                        "days_json = ?, edited = 1, updated_at = ? "
-                        "WHERE service_id = ? AND month = ?",
-                        (
-                            json.dumps(slots, ensure_ascii=False),
-                            json.dumps(days, ensure_ascii=False), _utc_now(),
-                            service_id, row["month"],
-                        ),
-                    )
+            self._drop_from_plans(connection, service_id, name)
             self._cleanup_unbound_user_data(connection, service_id)
             self._audit(
                 connection, actor_id, "service_member_removed", service_id,
                 {"name": name},
             )
         return bool(member and member["in_list"])
+
+    @staticmethod
+    def _drop_from_plans(
+        connection: sqlite3.Connection, service_id: str, name: str,
+        kept_tasks=None,
+    ) -> None:
+        """Убирает человека из рабочих копий графиков служения: из всех
+        задач или (kept_tasks) из задач, которых у него больше нет.
+        Опубликованная копия остаётся — правка станет видна как
+        неопубликованная."""
+        def is_person(key: str) -> bool:
+            # Ключ — имя, при совпадении имён «имя · ID» (как в
+            # readiness_people).
+            return key == name or bool(re.fullmatch(
+                re.escape(name) + r" · (?:\d+|без Telegram)", key,
+            ))
+
+        for row in connection.execute(
+            "SELECT month, slots_json, days_json FROM schedule_plans "
+            "WHERE service_id = ?",
+            (service_id,),
+        ).fetchall():
+            slots = json.loads(row["slots_json"])
+            changed = False
+            serving: dict[str, set[str]] = {}
+            for day, tasks in slots.items():
+                for task, people in tasks.items():
+                    if kept_tasks is None or task not in kept_tasks:
+                        kept = [key for key in people if not is_person(key)]
+                        if kept != people:
+                            tasks[task] = kept
+                            changed = True
+                    for key in tasks[task]:
+                        serving.setdefault(day, set()).add(key)
+            # И разовые дни там, где его больше нет, — иначе вернувшийся
+            # получил бы старый день.
+            days = {}
+            for day, people_days in json.loads(
+                row["days_json"] or "{}"
+            ).items():
+                kept_days = {
+                    key: offset for key, offset in people_days.items()
+                    if not is_person(key) or key in serving.get(day, set())
+                }
+                changed |= kept_days != people_days
+                if kept_days:
+                    days[day] = kept_days
+            if changed:
+                connection.execute(
+                    "UPDATE schedule_plans SET slots_json = ?, "
+                    "days_json = ?, edited = 1, updated_at = ? "
+                    "WHERE service_id = ? AND month = ?",
+                    (
+                        json.dumps(slots, ensure_ascii=False),
+                        json.dumps(days, ensure_ascii=False), _utc_now(),
+                        service_id, row["month"],
+                    ),
+                )
 
     @staticmethod
     def _clear_member_exclusion(

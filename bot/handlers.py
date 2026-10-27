@@ -193,7 +193,7 @@ CONTACT_NAVIGATION_STEPS = {
     "overview": {"overview", "choose_task", "choose_member"},
     "edit": {"overview"},
     "notify": {"overview"},
-    "card": {"overview"},
+    "card": {"overview", "choose_member"},
     "members": {"choose_member"},
     "add_member": {"choose_member"},
 }
@@ -1420,6 +1420,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await offer_contact_overview(
                 message, actor_id, service_id,
                 force_reload=operation == "service_sync",
+                members_first=operation == "service_contact",
             )
             return
         await _send_dialog(message, prompts[operation], parse_mode=None)
@@ -1470,24 +1471,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     def settings_keyboard(
         service_id: str, actor_id: int
     ) -> InlineKeyboardMarkup:
-        registry = service_registry()
-        is_super_admin = bool(registry and registry.is_super_admin(actor_id))
+        # Групповой чат (с проверкой доставки) и админы — в «⚙️ Настройки».
         items = [
             ("⏰ Напоминания и шаблоны", "edit_notify"),
             ("👥 Ответственные", "service_contact"),
             ("🔁 Замена", "service_replace"),
             ("🔄 Сверить график", "service_sync"),
-            ("📡 Групповой чат", "service_chat"),
         ]
-        if can_check_delivery(actor_id, service_id):
-            items.append(("🧪 Проверка доставки", "test_notify"))
-        if is_super_admin:
-            items.extend(
-                [
-                    ("👤 Назначить админа", "service_admin_add"),
-                    ("➖ Снять админа", "service_admin_remove"),
-                ]
-            )
         rows = [
             [
                 InlineKeyboardButton(
@@ -1513,6 +1503,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
             ]
         )
+        rows.append([
+            InlineKeyboardButton(
+                text="⚙️ Настройки",
+                callback_data=f"service:service_setup:{service_id}",
+            ),
+            InlineKeyboardButton(
+                text="❓ Помощь",
+                callback_data=f"service:service_help:{service_id}",
+            ),
+        ])
         rows.append(
             [
                 InlineKeyboardButton(
@@ -1522,6 +1522,49 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ]
         )
         return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def service_setup_keyboard(
+        service_id: str, actor_id: int
+    ) -> InlineKeyboardMarkup:
+        """«⚙️ Настройки» служения: групповой чат, у супер-администратора —
+        назначение и снятие админов."""
+        registry = service_registry()
+        items = [("📡 Групповой чат", "service_chat")]
+        if registry and registry.is_super_admin(actor_id):
+            items += [
+                ("👤 Назначить админа", "service_admin_add"),
+                ("➖ Снять админа", "service_admin_remove"),
+            ]
+        rows = [
+            [InlineKeyboardButton(
+                text=label, callback_data=f"service:{operation}:{service_id}",
+            )]
+            for label, operation in items
+        ]
+        rows.append([InlineKeyboardButton(
+            text="⬅️ К карточке служения",
+            callback_data=f"service:service_settings:{service_id}",
+        )])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    # «❓ Помощь» карточки служения: что делает каждая кнопка.
+    SERVICE_HELP = (
+        "❓ Кнопки карточки служения\n\n"
+        "⏰ Напоминания и шаблоны — когда и что бот пишет в чат служения и "
+        "ответственным перед датой.\n"
+        "👥 Ответственные — список людей служения: Telegram, задачи, свой "
+        "день, сколько раз в месяц; «🗓 По датам графика» — кто служит в "
+        "ближайшие даты.\n"
+        "🔁 Замена — поставить другого человека на дату.\n"
+        "🔄 Сверить график — перечитать Excel и показать, кто ещё не "
+        "привязан.\n"
+        "📅 График — опрос готовности и график месяца: составить, править, "
+        "утвердить, тексты.\n"
+        "📋 Задачи служения — задачи, сколько людей нужно, дни задач.\n"
+        "⚙️ Настройки — групповой чат и проверка доставки; у "
+        "супер-администратора — назначить и снять админа.\n"
+        "⬅️ К списку служений — выбрать другое служение."
+    )
 
     def keyboard_size(markup: InlineKeyboardMarkup) -> int:
         return sum(len(row) for row in markup.inline_keyboard)
@@ -1589,18 +1632,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         return f"contact_nav:{token}"
 
     def contact_navigation_button(
-        actor_id: int, service_id: str, action: str
+        actor_id: int, service_id: str, action: str, text: str | None = None,
     ) -> InlineKeyboardButton:
         labels = {
             "tasks": "⬅️ К задачам",
             "services": "⬅️ К служениям",
             "finish": "✅ Завершить привязку",
-            "edit": "✏️ Изменить привязки",
+            "edit": "👥 К списку ответственных",
             "notify": "🔔 Напоминания",
             "card": "⬅️ К карточке служения",
             "overview": "⬅️ К обзору",
         }
-        label = labels.get(action) or labels[action.partition(":")[0]]
+        label = text or labels.get(action) or labels[action.partition(":")[0]]
         return InlineKeyboardButton(
             text=label,
             callback_data=contact_navigation_callback(
@@ -1974,17 +2017,21 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 ),
             )
         ])
-        rows.append([
-            contact_navigation_button(
-                actor_id,
-                service_id,
-                (
-                    f"overview:{pending.get('overview_index', 0)}"
-                    if "overview_events" in pending
-                    else "services"
+        if "overview_events" in pending:
+            # «👥 Ответственные» открывается списком людей; кто служит по
+            # датам графика — отдельной кнопкой.
+            rows.append([
+                contact_navigation_button(
+                    actor_id, service_id,
+                    f"overview:{pending.get('overview_index', 0)}",
+                    "🗓 По датам графика",
                 ),
-            )
-        ])
+                contact_navigation_button(actor_id, service_id, "card"),
+            ])
+        else:
+            rows.append([
+                contact_navigation_button(actor_id, service_id, "services")
+            ])
         linked = sum(1 for person in people if person["telegram_id"])
         lines = [
             f"👥 Состав · {service_label(service)}",
@@ -2315,7 +2362,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         removed.remove(name)
                     await show_member_card(
                         message, actor_id, service_id, name,
-                        "✅ Задачи сохранены: " + ", ".join(tasks),
+                        (
+                            "✅ Задачи сохранены: " + ", ".join(tasks)
+                            if tasks else
+                            "✅ Задачи сняты: в составе остаётся, в график не "
+                            "попадает (из составленных графиков убран)"
+                        ),
                     )
             elif action == "day":
                 buttons = [
@@ -2575,7 +2627,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     async def offer_contact_overview(
         message: Message, actor_id: int, service_id: str,
-        force_reload: bool = False,
+        force_reload: bool = False, members_first: bool = False,
     ) -> None:
         """Show who serves on each upcoming date and whether Telegram is linked."""
         loader = getattr(context, "load_upcoming_service_events", None)
@@ -2592,11 +2644,32 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             events = None
         if pending_inputs.get(actor_id) is not pending:
             return
+        # Задача со своим днём (спевка — в файле отдельной средой) — в блоке
+        # своего воскресенья.
+        own_days = {
+            task["name"]: task["day_offset"]
+            for task in service_registry().list_service_tasks(service_id)
+            if task["day_offset"] is not None
+        }
         pending["overview_events"] = (
             None
             if events is None
-            else [event for event in events if event.service_id == service_id]
+            else [
+                SimpleNamespace(
+                    event_date=block["date"],
+                    assignments=tuple(block["assignments"]),
+                    days=block["days"],
+                )
+                for block in schedule_plan.week_events(
+                    [event for event in events if event.service_id == service_id],
+                    own_days,
+                )
+            ]
         )
+        if members_first:
+            pending["overview_index"] = 0
+            await send_member_choices(message, actor_id, service_id)
+            return
         await send_contact_overview(message, actor_id, service_id, 0)
 
     def contact_overview_text(
@@ -2635,8 +2708,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             if assignment.name and assignment.name not in names:
                 names.append(assignment.name)
         linked = total = 0
+        days = getattr(event, "days", {})
         for task, names in names_by_task.items():
-            lines.extend(["", f"{task_emoji(task)} {task}"])
+            moment = days.get(task)
+            lines.extend(["", f"{task_emoji(task)} {task}" + (
+                f" · {_WEEKDAYS[moment.weekday()]} {moment:%d.%m}"
+                if moment else ""
+            )])
             if not names:
                 lines.append("• ⚪ ответственный не указан")
             for name in names:
@@ -3621,9 +3699,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     f" · 👥 {people_label(task)}"
                     if task["people_max"] > 1 else ""
                 )
+                own_day = (
+                    f" · 📅 {member_day_label(task['day_offset'])}"
+                    if task["day_offset"] is not None else ""
+                )
                 lines.append(
                     f"{status} {task_emoji(task['name'])} {task['name']}"
-                    f"{people}{off}{aliases}"
+                    f"{people}{own_day}{off}{aliases}"
                 )
             lines += [
                 "",
@@ -3660,12 +3742,71 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 callback_data=f"rdy:people:{service_id}:t",
             ))
         rows.append(add_row)
+        if any(task["enabled"] for task in tasks):
+            rows.append([InlineKeyboardButton(
+                text="📅 Дни задач",
+                callback_data=f"svc_tasks:days:{service_id}:{session_id}",
+            )])
         rows.append([
             InlineKeyboardButton(
                 text="⬅️ К карточке служения",
                 callback_data=f"service:service_settings:{service_id}",
             )
         ])
+        await _send_dialog(
+            message,
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
+            parse_mode=None,
+        )
+
+    async def show_task_days(
+        message: Message, service_id: str, session_id: str,
+        notice: str | None = None,
+    ) -> None:
+        """«📅 Дни задач»: у задачи свой день недели (спевка — ср, вс −4).
+        Тогда график показывается по неделям."""
+        registry = service_registry()
+        service = service_by_id(registry, service_id)
+        tasks = [
+            task for task in registry.list_service_tasks(service_id)
+            if task["enabled"]
+        ]
+        lines = [
+            f"📅 {service_label(service)} · дни задач",
+            "",
+            "ℹ️ Задача со своим днём выполняется в этот день недели "
+            "воскресенья графика (спевка — ср, «вс −4»). Тогда график "
+            "показывается по неделям: «Неделя 26.10–01.11», под ней дни и "
+            "задачи. Без своего дня — дни служения раздела «📅 График».",
+            "",
+            *(
+                f"{task_emoji(task['name'])} {task['name']} — "
+                + (
+                    member_day_label(task["day_offset"])
+                    if task["day_offset"] is not None else "дни служения"
+                )
+                for task in tasks
+            ),
+        ]
+        if notice:
+            lines = [notice, ""] + lines
+        buttons = [
+            InlineKeyboardButton(
+                text=f"📅 {task['name']}"[:60],
+                callback_data=(
+                    f"svc_tasks:dpick:{service_id}:{task['position']}:"
+                    f"{session_id}"
+                ),
+            )
+            for task in tasks
+        ]
+        rows = layout_buttons(buttons) if buttons else []
+        rows.append([InlineKeyboardButton(
+            text="⬅️ К задачам",
+            callback_data=f"svc_tasks:open:{service_id}",
+        )])
         await _send_dialog(
             message,
             "\n".join(lines),
@@ -4502,9 +4643,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return ", ".join(names.get(key, key) for key in people) or "никто"
 
         implicit = schedule_plan.implicit_plan(plan)
+        task_day = task.get("day")
         lines = [
             f"✏️ {date.fromisoformat(day):%d.%m}"
             + ("" if implicit else f" · «{task['name']}»")
+            + (
+                "" if task_day is None else
+                f" · {member_day_label(task_day)}"
+            )
             + f" (нужно {need})",
             "Сейчас: " + (listed(current) if current else "⚠️ никого"),
             "",
@@ -4540,8 +4686,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             schedule_plan.window_of(registry, service["id"]), "свои дни"
         )
         for index, key in enumerate(current):
-            # День только на эту дату (иначе — свой день человека или окно).
-            offset = schedule_plan.day_offset(plan, by_key.get(key), day)
+            # День только на эту дату (иначе — день задачи, свой день
+            # человека или окно).
+            offset = schedule_plan.slot_offset(
+                plan, by_key.get(key), day, task["name"]
+            )
             label = member_day_label(offset) if offset is not None else usual
             rows.append([readiness_button(
                 f"📅 {names.get(key, key)} — {label}"[:60],
@@ -6087,6 +6236,78 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     f"✅ «{task['name']}» "
                     f"{'выключена' if task['enabled'] else 'включена'}",
                 )
+            elif action == "days" and len(parts) == 4:
+                await show_task_days(callback.message, service_id, session_id)
+            elif action in {"dpick", "dset"} and len(parts) in {5, 6}:
+                position = int(parts[3])
+                task = next(
+                    (
+                        item for item in registry.list_service_tasks(service_id)
+                        if item["position"] == position
+                    ),
+                    None,
+                )
+                if task is None:
+                    raise ValueError("Задача больше не существует.")
+                if action == "dset" and len(parts) == 6:
+                    offset = None if parts[4] == "n" else int(parts[4])
+                    registry.set_service_task_day(
+                        actor_id, service_id, task["name"], offset
+                    )
+                    await show_task_days(
+                        callback.message, service_id, session_id,
+                        f"✅ «{task['name']}»: " + (
+                            member_day_label(offset) if offset is not None
+                            else "дни служения"
+                        ),
+                    )
+                elif action == "dpick" and len(parts) == 5:
+                    current = task["day_offset"]
+                    buttons = [
+                        InlineKeyboardButton(
+                            text=(
+                                f"{'✅' if offset == current else '📅'} "
+                                f"{member_day_label(offset)}"
+                            ),
+                            callback_data=(
+                                f"svc_tasks:dset:{service_id}:{position}:"
+                                f"{offset}:{session_id}"
+                            ),
+                        )
+                        for offset in MEMBER_DAYS
+                    ]
+                    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+                    rows.append([InlineKeyboardButton(
+                        text=(
+                            f"{'✅' if current is None else '↩️'} "
+                            "Дни служения"
+                        ),
+                        callback_data=(
+                            f"svc_tasks:dset:{service_id}:{position}:n:"
+                            f"{session_id}"
+                        ),
+                    )])
+                    rows.append([InlineKeyboardButton(
+                        text="⬅️ К дням задач",
+                        callback_data=(
+                            f"svc_tasks:days:{service_id}:{session_id}"
+                        ),
+                    )])
+                    await _send_dialog(
+                        callback.message,
+                        f"📅 {task_emoji(task['name'])} {task['name']}\n\n"
+                        "В какой день недели выполняется задача относительно "
+                        "воскресенья графика? Например, спевка в среду — "
+                        "«ср (вс −4)». «Дни служения» — как в разделе "
+                        "«📅 График».",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+                        _dialog_keep_rows=True,
+                        _dialog_keyboard_limit=sum(len(row) for row in rows),
+                        parse_mode=None,
+                    )
+                else:
+                    await _answer_callback(callback, "⚠️ Неизвестное действие.")
+                    return
             elif action == "add" and len(parts) == 4:
                 pending["step"] = "add_task"
                 await _send_dialog(
@@ -7440,35 +7661,46 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 parse_mode=None,
             )
 
-    def service_chat_keyboard(service_id: str) -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text=                        "📡 Выбрать или изменить групповой чат",
-                        callback_data=f"service:service_chat_set:{service_id}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="🔴 Отключить служение",
-                        callback_data=f"service:service_chat_disable:{service_id}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="⬅️ К карточке служения",
-                        callback_data=f"service:service_settings:{service_id}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="⬅️ К списку служений",
-                        callback_data="service:back_to_services:list",
-                    )
-                ],
-            ]
-        )
+    def service_chat_keyboard(
+        service_id: str, actor_id: int | None = None
+    ) -> InlineKeyboardMarkup:
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text="📡 Выбрать или изменить групповой чат",
+                    callback_data=f"service:service_chat_set:{service_id}",
+                )
+            ],
+        ]
+        # Проверка доставки — здесь: она про назначенный групповой чат.
+        if actor_id is not None and can_check_delivery(actor_id, service_id):
+            rows.append([
+                InlineKeyboardButton(
+                    text="🧪 Проверка доставки",
+                    callback_data=f"service:test_notify:{service_id}",
+                )
+            ])
+        rows += [
+            [
+                InlineKeyboardButton(
+                    text="🔴 Отключить служение",
+                    callback_data=f"service:service_chat_disable:{service_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ К настройкам",
+                    callback_data=f"service:service_setup:{service_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ К карточке служения",
+                    callback_data=f"service:service_settings:{service_id}",
+                )
+            ],
+        ]
+        return InlineKeyboardMarkup(inline_keyboard=rows)
 
     async def begin_notify_template(
         message: Message, actor_id: int, service_id: str, task: str
@@ -8579,6 +8811,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         if operation not in {
             "service_settings",
+            "service_setup",
+            "service_help",
             "edit_notify",
             "service_admin_add",
             "service_admin_remove",
@@ -8608,6 +8842,33 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await send_service_card(
                     callback.message, callback.from_user.id, service
                 )
+            elif operation == "service_setup":
+                if not is_service_admin(callback.from_user.id, service_id):
+                    raise PermissionError(
+                        "Настройки доступны только администратору этого служения."
+                    )
+                await _send_dialog(
+                    callback.message,
+                    f"⚙️ {service_label(service)} · настройки\n\n"
+                    "📡 Групповой чат — куда бот пишет напоминания, опросы и "
+                    "график; там же проверка доставки и отключение служения.",
+                    reply_markup=service_setup_keyboard(
+                        service_id, callback.from_user.id
+                    ),
+                    parse_mode=None,
+                )
+            elif operation == "service_help":
+                await _send_dialog(
+                    callback.message,
+                    SERVICE_HELP,
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(
+                            text="⬅️ К карточке служения",
+                            callback_data=f"service:service_settings:{service_id}",
+                        )
+                    ]]),
+                    parse_mode=None,
+                )
             elif operation == "service_replace":
                 if not is_service_admin(callback.from_user.id, service_id):
                     raise PermissionError(
@@ -8636,7 +8897,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "Настройки доступны только администратору этого служения."
                     )
                 await _send_dialog(callback.message, f"{service_label(service)}: выберите действие.",
-                    reply_markup=service_chat_keyboard(service_id),
+                    reply_markup=service_chat_keyboard(
+                        service_id, callback.from_user.id
+                    ),
                     parse_mode=None,
                 )
             elif operation == "service_chat_set":
@@ -8688,6 +8951,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     InlineKeyboardButton(
                         text="Показать тексты админу",
                         callback_data=f"test_action:preview:{service_id}",
+                    )
+                ])
+                rows.append([
+                    InlineKeyboardButton(
+                        text="⬅️ К групповому чату",
+                        callback_data=f"service:service_chat:{service_id}",
                     )
                 ])
                 await _send_dialog(callback.message, f"{service_label(service)}: выберите проверку.",
@@ -11934,7 +12203,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     await _send_dialog(
                         message,
                         f"{service_label(service)}: выберите действие.",
-                        reply_markup=service_chat_keyboard(service_id),
+                        reply_markup=service_chat_keyboard(
+                            service_id, message.from_user.id
+                        ),
                         parse_mode=None,
                     )
                     return

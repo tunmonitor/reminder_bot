@@ -216,6 +216,48 @@ class SchedulePlanTest(unittest.TestCase):
             recalculated["approved"]["2026-11-15"]["сборка"], ["Глеб"]
         )
 
+    def test_removing_all_member_tasks_keeps_member_out_of_plan(self):
+        plan = self.draft()
+        slots = plan["slots"]
+        slots["2026-11-01"]["сборка"] = ["Глеб"]
+        slots["2026-11-08"]["звук"] = ["Глеб"]
+        self.registry.set_schedule_slots(1001, "sound", "2026-11", slots)
+        self.registry.set_schedule_day(
+            1001, "sound", "2026-11", "2026-11-08", "Глеб", -1
+        )
+        # Глеб только в привязках («сборка»); сняли сначала одну задачу —
+        # уходит только из неё.
+        self.registry.set_service_member_tasks(1001, "sound", "Глеб", ["звук"])
+        plan = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertNotIn("Глеб", plan["slots"]["2026-11-01"]["сборка"])
+        self.assertIn("Глеб", plan["slots"]["2026-11-08"]["звук"])
+        self.assertEqual(plan["days"], {"2026-11-08": {"Глеб": -1}})
+        # Все задачи сняты: в составе, но не в графике и без привязок.
+        self.assertEqual(
+            self.registry.set_service_member_tasks(1001, "sound", "Глеб", []),
+            [],
+        )
+        plan = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertNotIn(
+            "Глеб",
+            [key for tasks in plan["slots"].values()
+             for people in tasks.values() for key in people],
+        )
+        self.assertEqual(plan["days"], {})
+        gleb = next(
+            m for m in self.registry.list_service_members("sound")
+            if m["name"] == "Глеб"
+        )
+        self.assertEqual(gleb["tasks"], [])
+        self.assertEqual(
+            [p["tasks"] for p in self.people() if p["name"] == "Глеб"], [[]]
+        )
+        # Пересчёт его тоже не ставит.
+        self.assertNotIn("Глеб", [
+            key for tasks in self.draft()["slots"].values()
+            for people in tasks.values() for key in people
+        ])
+
     def test_member_edits_and_removal_keep_plan_and_contacts_consistent(self):
         plan = self.draft()
         slots = plan["slots"]
@@ -449,6 +491,120 @@ class SchedulePlanTest(unittest.TestCase):
         self.registry.set_service_member_day(1001, "sound", "Борис", 0)
         self.assertTrue(self.registry.get_schedule_plan("sound", "2026-11")["dirty"])
 
+    def test_task_day_shows_plan_by_weeks(self):
+        plan = self.draft()
+        plan["slots"]["2026-11-01"] = {"звук": ["Алексей"], "сборка": ["Борис"]}
+        plan = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", plan["slots"]
+        )
+        plan = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+        ))
+        self.assertFalse(plan["dirty"])
+        with self.assertRaises(ValueError):
+            self.registry.set_service_task_day(1001, "sound", "сборка", 7)
+        with self.assertRaises(ValueError):
+            self.registry.set_service_task_day(1001, "sound", "нет такой", -4)
+        self.registry.set_service_task_day(1001, "sound", "сборка", -4)
+        task = next(
+            item for item in self.registry.list_service_tasks("sound")
+            if item["name"] == "сборка"
+        )
+        self.assertEqual(task["day_offset"], -4)
+        # День задачи — в уже составленном графике, утверждённый — заново.
+        plan = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertTrue(plan["dirty"])
+        self.assertEqual(schedule_plan.task_days(plan), {"сборка": -4})
+        self.assertEqual(
+            next(t for t in self.draft()["tasks"] if t["name"] == "сборка")["day"],
+            -4,
+        )
+        summary = readiness.summarize(self.registry, self.run, with_plan=False)
+        text = schedule_plan.plan_text("ЗВУК", plan, summary, TZ)
+        self.assertIn(
+            "🗓 Неделя 26.10–01.11\n   ср 28.10\n     🧰 сборка\n"
+            "        • Борис\n   вс 01.11\n     🎚️ звук\n        • Алексей",
+            text,
+        )
+        published = schedule_plan.publication_text(
+            self.service(), plan, self.people()
+        )
+        self.assertIn(
+            "\n\n🗓 Неделя 26.10–01.11\n  ср 28.10\n    🧰 сборка: ", published
+        )
+        self.assertIn("\n  вс 01.11\n    🎚️ звук: ", published)
+        self.assertIn("• Изменены дни служения", published)
+        # Задача без людей во всех датах черновика — подсказка пересчитать.
+        draft = {**plan, "approved": None, "slots": {
+            day: {**tasks, "сборка": []} for day, tasks in plan["slots"].items()
+        }}
+        self.assertIn(
+            "ℹ️ Никого во все даты: «сборка». Если задачу включили после "
+            "составления — «🔄 Пересчитать».",
+            schedule_plan.plan_text("ЗВУК", draft, summary, TZ),
+        )
+        self.assertNotIn(
+            "Никого во все даты", schedule_plan.plan_text("ЗВУК", plan, summary, TZ)
+        )
+        # Блок «Для Excel» — с фактическим днём задачи.
+        self.assertIn(
+            "01.11: звук — Алексей; сборка (ср 28.10) — Борис",
+            schedule_plan.excel_text(
+                self.registry, self.service(), plan, self.people()
+            ),
+        )
+        # Борис — в среду: интервал следующего месяца считается от неё.
+        self.assertEqual(
+            schedule_plan.served_offsets(plan, self.people())["2026-11-01"],
+            {"Борис": -4},
+        )
+        # Разовый день человека главнее дня задачи — в скобках.
+        plan = self.registry.set_schedule_day(
+            1001, "sound", "2026-11", "2026-11-01", "Борис", -3
+        )
+        self.assertEqual(
+            schedule_plan.slot_offset(plan, {"key": "Борис"}, "2026-11-01",
+                                      "сборка"),
+            -3,
+        )
+        self.assertIn(
+            "• Борис (чт 29.10)",
+            schedule_plan.plan_text("ЗВУК", plan, summary, TZ),
+        )
+        # С окном служения задачи без своего дня — под периодом окна.
+        title, groups = schedule_plan.week_groups(plan, "2026-11-01", (-1, 1))
+        self.assertEqual(title, "Неделя 26.10–02.11")
+        self.assertEqual(
+            [(label, offset) for label, offset, _ in groups],
+            [("ср 28.10", -4), ("сб 31.10 – пн 02.11", None)],
+        )
+        # Только задачи со своим днём — окно служения не растягивает неделю.
+        only_days = {**plan, "tasks": [
+            task for task in plan["tasks"] if task["name"] == "сборка"
+        ]}
+        self.assertEqual(
+            schedule_plan.week_groups(only_days, "2026-11-01", (-1, 1))[0],
+            "Неделя 26.10–01.11",
+        )
+        # Задача, которой нет в графике, не трогает утверждённый график.
+        plan = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+        ))
+        self.assertFalse(plan["dirty"])
+        self.registry.set_service_task_day(1001, "sound", "спевка", -4)
+        self.assertFalse(
+            self.registry.get_schedule_plan("sound", "2026-11")["dirty"]
+        )
+        self.registry.set_service_task_day(1001, "sound", "сборка", None)
+        plan = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertTrue(plan["dirty"])
+        self.assertEqual(schedule_plan.task_days(plan), {})
+        self.assertIn(
+            "🗓 01.11", schedule_plan.publication_text(
+                self.service(), plan, self.people()
+            ),
+        )
+
     def test_day_for_one_date(self):
         plan = self.draft()
         plan["slots"]["2026-11-15"]["звук"] = ["Борис"]
@@ -597,9 +753,96 @@ class SchedulePlanTest(unittest.TestCase):
             ),
         )
 
+    def test_task_day_goes_to_its_own_date_in_excel(self):
+        self.registry.set_service_task_day(1001, "sound", "сборка", -4)
+        plan = self.draft()
+        plan["slots"]["2026-11-08"] = {"звук": ["Алексей"], "сборка": ["Дмитрий"]}
+        people = self.people()
+        rows = schedule_plan.excel_rows(self.registry, plan, people)
+        dated = [row[0] for row in rows if isinstance(row[0], date)]
+        # Среда — своим блоком перед своим воскресеньем.
+        # 28.10 (к 01.11) — октябрь: не на листе ноября, а в тексте.
+        self.assertEqual(
+            dated[:3],
+            [date(2026, 11, 1), date(2026, 11, 4), date(2026, 11, 8)],
+        )
+        plan["slots"]["2026-11-01"]["сборка"] = ["Дмитрий"]
+        self.assertIn(
+            "⚠️ ср 28.10 сборка — Дмитрий: это лист «ОКТЯБРЬ26»",
+            schedule_plan.excel_text(
+                self.registry, self.service(), plan, people
+            ),
+        )
+        self.assertNotIn(
+            date(2026, 10, 28),
+            [r[0] for r in schedule_plan.excel_rows(self.registry, plan, people)],
+        )
+        path = Path(self.temp_dir.name) / "plan.xlsx"
+        path.write_bytes(
+            schedule_plan.excel_file(self.registry, self.service(), plan, people)
+        )
+        events = parse_service_events(
+            path, date(2026, 11, 1), LOG, self.registry.service_catalog()
+        )["sound"]
+        by_day = {
+            item.event_date: sorted((row.task, row.name) for row in item.assignments)
+            for item in events
+        }
+        self.assertEqual(by_day[date(2026, 11, 4)], [("сборка", "Дмитрий")])
+        self.assertEqual(by_day[date(2026, 11, 8)], [("звук", "Алексей")])
+        # Разовый день человека главнее дня задачи и в файле.
+        plan["days"] = {"2026-11-08": {"Дмитрий": 0}}
+        dated = [
+            row[0] for row in schedule_plan.excel_rows(self.registry, plan, people)
+            if isinstance(row[0], date)
+        ]
+        self.assertNotIn(date(2026, 11, 4), dated)
+        # Дмитрий не потерян: в файле — в блоке 08.11 вместе с Алексеем.
+        path.write_bytes(
+            schedule_plan.excel_file(self.registry, self.service(), plan, people)
+        )
+        moved = parse_service_events(
+            path, date(2026, 11, 1), LOG, self.registry.service_catalog()
+        )["sound"]
+        self.assertEqual(
+            next(
+                sorted((row.task, row.name) for row in item.assignments)
+                for item in moved if item.event_date == date(2026, 11, 8)
+            ),
+            [("звук", "Алексей"), ("сборка", "Дмитрий")],
+        )
+        self.assertIn(
+            "08.11: звук — Алексей; сборка (ср 04.11) — Дмитрий (вс 08.11)",
+            schedule_plan.excel_text(
+                self.registry, self.service(), plan, people
+            ),
+        )
+        plan["days"] = {}
+        # «Ответственные»: среда из файла — в блоке своего воскресенья.
+        blocks = schedule_plan.week_events(events, {"сборка": -4})
+        first = next(b for b in blocks if b["date"] == date(2026, 11, 8))
+        self.assertEqual(
+            sorted((row.task, row.name) for row in first["assignments"]),
+            [("звук", "Алексей"), ("сборка", "Дмитрий")],
+        )
+        self.assertEqual(first["days"], {"сборка": date(2026, 11, 4)})
+        self.assertNotIn(date(2026, 11, 4), [b["date"] for b in blocks])
+        # Дата без назначений не пропадает.
+        empty = [ServiceEvent("sound", date(2026, 11, 15), ())]
+        self.assertEqual(
+            [b["date"] for b in schedule_plan.week_events(empty, {})],
+            [date(2026, 11, 15)],
+        )
+        # Без дня задачи — события как в файле.
+        self.assertIn(
+            date(2026, 11, 4),
+            [b["date"] for b in schedule_plan.week_events(events, {})],
+        )
+
     def test_excel_rows_put_own_task_in_its_column(self):
         plan = {
-            "service_id": "broadcast", "dates": ["2026-11-01"],
+            "service_id": "broadcast", "month": "2026-11",
+            "dates": ["2026-11-01"],
             "tasks": [
                 {"name": "Пульт", "needed": 1, "max": None},
                 {"name": "Слайды", "needed": 1, "max": None},
