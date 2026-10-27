@@ -216,6 +216,73 @@ class SchedulePlanTest(unittest.TestCase):
             recalculated["approved"]["2026-11-15"]["сборка"], ["Глеб"]
         )
 
+    def test_week_bundles_from_task_flag_and_member(self):
+        # Алексей — звук и сборка; связка у служения: звук + сборка.
+        with self.assertRaises(ValueError):
+            self.registry.set_service_task_same_week(1001, "sound", "нет", True)
+        self.registry.set_service_task_same_week(1001, "sound", "звук", True)
+        self.registry.set_service_task_same_week(1001, "sound", "сборка", True)
+        flags = {
+            task["name"]: task["same_week"]
+            for task in self.registry.list_service_tasks("sound")
+        }
+        self.assertEqual(flags, {"звук": True, "сборка": True, "спевка": False})
+        plan = self.draft()
+        # 01.11 Алексей берёт обе задачи; 08.11 звук некому, кроме него
+        # (служил неделю назад) — сборку берёт Глеб, связка не навязывается.
+        self.assertEqual(
+            (plan["slots"]["2026-11-01"]["звук"],
+             plan["slots"]["2026-11-01"]["сборка"]),
+            (["Алексей"], ["Алексей"]),
+        )
+        # Правка графика: убранного со второй задачи связки можно вернуть
+        # — задача из его связки не «занятость».
+        edited = {**plan, "slots": {
+            **plan["slots"],
+            "2026-11-01": {"звук": ["Алексей"], "сборка": [], "спевка": []},
+        }}
+        summary = readiness.summarize(self.registry, self.run, with_plan=False)
+        self.assertEqual(
+            summary.bundles, {"Алексей": frozenset({"звук", "сборка"})}
+        )
+        self.assertEqual(
+            schedule_plan.busy_on(edited, "2026-11-01", "сборка", summary.bundles),
+            {},
+        )
+        self.assertEqual(
+            schedule_plan.busy_on(edited, "2026-11-01", "сборка"),
+            {"Алексей": "звук"},
+        )
+        self.assertIn(
+            "Алексей",
+            sum(schedule_plan.candidates(edited, summary, "2026-11-01", "сборка"), []),
+        )
+        # Личная настройка главнее: «не связывать».
+        with self.assertRaises(ValueError):
+            self.registry.set_service_member_week_tasks(
+                1001, "sound", "Алексей", ["звук"]
+            )
+        self.registry.set_service_member_week_tasks(1001, "sound", "Алексей", [])
+        alex_person = next(p for p in self.people() if p["name"] == "Алексей")
+        self.assertEqual(alex_person["week_tasks"], [])
+        plan = self.draft()
+        for day in plan["dates"]:
+            self.assertFalse(
+                "Алексей" in plan["slots"][day]["звук"]
+                and "Алексей" in plan["slots"][day]["сборка"]
+            )
+        self.registry.set_service_member_week_tasks(1001, "sound", "Алексей", None)
+        self.assertIsNone(
+            next(p for p in self.people() if p["name"] == "Алексей")["week_tasks"]
+        )
+        # Нагрузка: связка в дату — одно воскресенье.
+        self.assertEqual(
+            schedule_plan.served_dates(
+                {"2026-11-01": {"звук": ["Алексей"], "сборка": ["Алексей"]}}
+            ),
+            {"Алексей": ["2026-11-01"]},
+        )
+
     def test_removing_all_member_tasks_keeps_member_out_of_plan(self):
         plan = self.draft()
         slots = plan["slots"]

@@ -355,6 +355,46 @@ class SchedulePlannerTest(unittest.TestCase):
         ))
         self.assertEqual(plan.slots[(dates[0], "звук")], ["Вера"])
 
+    def test_bundled_tasks_go_to_one_person_and_count_once(self):
+        dates = tuple(date(2026, 11, 1) + timedelta(weeks=i) for i in range(5))
+        needed = {"звук": 1, "сборка": 1, "спевка": 1}
+        tasks = {
+            name: frozenset({"звук", "спевка"}) for name in "ABCD"
+        } | {"E": frozenset({"сборка"}), "F": frozenset({"сборка"})}
+        free = {name: frozenset(dates) for name in tasks}
+        bundle = frozenset({"звук", "спевка"})
+        plan = build_plan(PlanInput(
+            dates, needed, free, tasks,
+            bundles={name: bundle for name in "ABCD"},
+        ))
+        for day in dates:
+            self.assertEqual(plan.slots[(day, "звук")], plan.slots[(day, "спевка")])
+        load = plan.load()
+        # Связка в дату — одно служение; связавшие — по очереди.
+        self.assertEqual(sum(load[name] for name in "ABCD"), 5)
+        self.assertLessEqual(max(load[name] for name in "ABCD"), 2)
+        self.assertEqual(plan.covered_required(), 15)
+
+    def test_single_bundled_person_is_not_forced_every_week(self):
+        dates = tuple(date(2026, 11, 1) + timedelta(weeks=i) for i in range(4))
+        needed = {"звук": 1, "спевка": 1}
+        tasks = {name: frozenset({"звук", "спевка"}) for name in "ABCD"}
+        free = {name: frozenset(dates) for name in tasks}
+        plan = build_plan(PlanInput(
+            dates, needed, free, tasks,
+            bundles={"A": frozenset({"звук", "спевка"})},
+        ))
+        self.assertEqual(plan.covered_required(), 8)
+        # Не каждую неделю и не две недели подряд.
+        served = sorted(
+            day for day in dates
+            if "A" in plan.slots[(day, "звук")] + plan.slots[(day, "спевка")]
+        )
+        self.assertLess(len(served), 4)
+        self.assertTrue(all(
+            (later - earlier).days > 7 for earlier, later in zip(served, served[1:])
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()

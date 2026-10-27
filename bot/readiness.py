@@ -182,6 +182,29 @@ class Summary:
     free_count: dict[str, int] = field(default_factory=dict)
     # Служение без задач: в тексте люди сразу под датой.
     implicit: bool = False
+    # Ключ → задачи, которые человек берёт в одну неделю (звук + спевка).
+    bundles: dict = field(default_factory=dict)
+
+
+def week_bundles(registry, service_id: str,
+                 people: list[dict] | None = None) -> dict[str, frozenset]:
+    """Задачи «в одну неделю» по людям (ключ): личные (главнее) или
+    отмеченные «🔗» у служения — из задач человека, от двух."""
+    if people is None:
+        people = registry.readiness_people(service_id)
+    linked = {
+        task["name"] for task in registry.list_service_tasks(service_id)
+        if task["same_week"]
+    }
+    bundles = {}
+    for person in people:
+        own = person.get("week_tasks")
+        chosen = frozenset(
+            (linked if own is None else set(own)) & set(person["tasks"])
+        )
+        if len(chosen) > 1:
+            bundles[person["key"]] = chosen
+    return bundles
 
 
 def summarize(registry, run: dict, *, with_plan: bool = True,
@@ -196,6 +219,7 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
         for person in people if person["telegram_id"]
     }
     summary = Summary(people=people)
+    summary.bundles = week_bundles(registry, run["service_id"], people)
     if assume_free:
         summary.answered = {
             person["key"]: list(run["dates"])
@@ -258,6 +282,7 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
             reluctant=frozenset(silent),
             last_served=dict(last_served or {}),
             limits=limits,
+            bundles=summary.bundles,
         ))
     return summary
 
