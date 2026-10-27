@@ -367,6 +367,9 @@ class ServiceRegistry:
                     -- графике (дата → ключ → сдвиг): для интервалов следующего
                     -- месяца, даже если свой день потом изменят.
                     served_offsets_json TEXT,
+                    -- Задачи (с днями) опубликованной копии: напоминания
+                    -- по утверждённому, а не по правкам рабочей копии.
+                    approved_tasks_json TEXT,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (service_id, month)
                 );
@@ -886,6 +889,7 @@ class ServiceRegistry:
                 ("schedule_plans", "days_json", "TEXT NOT NULL DEFAULT '{}'"),
                 ("schedule_plans", "approved_days_json", "TEXT"),
                 ("schedule_plans", "served_offsets_json", "TEXT"),
+                ("schedule_plans", "approved_tasks_json", "TEXT"),
                 ("service_members", "tasks_manual",
                  "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "poll_stopped", "INTEGER NOT NULL DEFAULT 0"),
@@ -5913,6 +5917,10 @@ class ServiceRegistry:
         # Снимок есть (пусть и пустой — все по воскресеньям) или график
         # утверждён до появления снимка.
         plan["served_snapshot"] = served is not None
+        approved_tasks = plan.pop("approved_tasks_json", None)
+        plan["approved_tasks"] = (
+            json.loads(approved_tasks) if approved_tasks else None
+        )
         approved_days = plan.pop("approved_days_json")
         plan["approved_days"] = (
             json.loads(approved_days) if approved_days else {}
@@ -6124,9 +6132,10 @@ class ServiceRegistry:
                 "source, dates_json, tasks_json, slots_json, "
                 "last_served_json, note, edited, approved_json, approved_by, "
                 "approved_at, chat_id, message_id, republish, days_json, "
-                "approved_days_json, served_offsets_json, updated_at) "
+                "approved_days_json, served_offsets_json, approved_tasks_json, "
+                "updated_at) "
                 "VALUES (?, ?, NULL, 'excel', ?, ?, ?, '{}', NULL, 0, ?, ?, ?, "
-                "NULL, NULL, 0, ?, ?, ?, ?) "
+                "NULL, NULL, 0, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id, month) DO UPDATE SET run_id = NULL, "
                 "source = 'excel', dates_json = excluded.dates_json, "
                 "tasks_json = excluded.tasks_json, "
@@ -6138,11 +6147,13 @@ class ServiceRegistry:
                 "days_json = excluded.days_json, "
                 "approved_days_json = excluded.approved_days_json, "
                 "served_offsets_json = excluded.served_offsets_json, "
+                "approved_tasks_json = excluded.approved_tasks_json, "
                 "updated_at = excluded.updated_at",
                 (
                     service_id, month, values[0], values[1], values[2],
                     values[2], actor_id, now, values[3], values[3],
-                    json.dumps(served_offsets or {}, ensure_ascii=False), now,
+                    json.dumps(served_offsets or {}, ensure_ascii=False),
+                    values[1], now,
                 ),
             )
             self._audit(
@@ -6172,6 +6183,7 @@ class ServiceRegistry:
             self._require_service_editor(connection, actor_id, service_id)
             cursor = connection.execute(
                 "UPDATE schedule_plans SET approved_json = ?, approved_by = ?, "
+                "approved_tasks_json = tasks_json, "
                 "approved_at = ?, chat_id = ?, message_id = ?, "
                 "approved_days_json = ?, served_offsets_json = ?, "
                 "republish = CASE WHEN ? IS NULL OR updated_at = ? THEN 0 "

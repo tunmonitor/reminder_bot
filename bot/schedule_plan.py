@@ -391,7 +391,8 @@ def week_events(events: list, own_days: dict[str, int]) -> list[dict]:
             # Дата без назначений — тоже в обзоре.
             blocks.setdefault(
                 event.event_date,
-                {"date": event.event_date, "assignments": [], "days": {}},
+                {"date": event.event_date, "assignments": [], "days": {},
+                 "moments": []},
             )
         for assignment in event.assignments:
             offset = own_days.get(assignment.task)
@@ -401,9 +402,12 @@ def week_events(events: list, own_days: dict[str, int]) -> list[dict]:
                 if candidate.weekday() == 6:
                     sunday = candidate
             block = blocks.setdefault(
-                sunday, {"date": sunday, "assignments": [], "days": {}}
+                sunday,
+                {"date": sunday, "assignments": [], "days": {}, "moments": []},
             )
             block["assignments"].append(assignment)
+            # Дата каждого назначения — как в файле.
+            block["moments"].append(event.event_date)
             if event.event_date != sunday:
                 block["days"][assignment.task] = event.event_date
     return [blocks[day] for day in sorted(blocks)]
@@ -856,7 +860,7 @@ def excel_plan(registry, service_id: str, year: int, month: int,
                     if not item.is_informational and item.name
                 ]
             continue
-        for assignment in block["assignments"]:
+        for assignment, moment in zip(block["assignments"], block["moments"]):
             if (
                 assignment.is_informational or not assignment.name
                 or assignment.task not in names
@@ -873,7 +877,6 @@ def excel_plan(registry, service_id: str, year: int, month: int,
             if assignment.task in own_days:
                 # Задача со своим днём не в свой день (в воскресенье) —
                 # разовый день человека.
-                moment = block["days"].get(assignment.task, block["date"])
                 offset = (moment - block["date"]).days
                 if offset != own_days[assignment.task]:
                     days.setdefault(day, {})[key] = offset
@@ -889,16 +892,29 @@ def plan_events(plan: dict, people: list[dict]) -> list[ServiceEvent]:
     (как в Excel), разовый день человека учитывается."""
     if plan.get("approved") is None:
         return []
+    # Задачи и дни — как утверждено (рабочая копия может быть уже
+    # переименована или с другим днём задачи); утверждён до снимка —
+    # задачи из опубликованной копии, дни — из текущих.
+    tasks = plan.get("approved_tasks")
+    if tasks is None:
+        current = {task["name"]: task for task in plan["tasks"]}
+        tasks = [
+            current.get(name, {"name": name})
+            for name in dict.fromkeys(
+                task for day_tasks in plan["approved"].values()
+                for task in day_tasks
+            )
+        ]
     published = {
-        **plan, "slots": plan["approved"],
+        **plan, "slots": plan["approved"], "tasks": tasks,
         "days": plan.get("approved_days") or {},
     }
     names = _names(people)
     by_key = {person["key"]: person for person in people}
     events: dict[date, list[ServiceAssignment]] = {}
-    for day in plan["dates"]:
+    for day in sorted(plan["approved"]):
         events.setdefault(date.fromisoformat(day), [])
-        for task in plan["tasks"]:
+        for task in tasks:
             for moment, key in task_moments(published, by_key, day, task["name"]):
                 events.setdefault(moment, []).append(
                     ServiceAssignment(task["name"], names.get(key, key))

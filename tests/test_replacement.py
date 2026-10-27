@@ -946,6 +946,55 @@ class BotPlanSourceTest(Base):
             [wednesday], self.registry, EVENT, EVENT + timedelta(days=30),
         )
         self.assertIn(wednesday, shown)
+        # Пометки Excel остаются при графике бота.
+        noted = ServiceEvent("sound", EVENT, (
+            ServiceAssignment("звук", "Алексей"),
+            ServiceAssignment("2я часть членское", "", True),
+        ))
+        shown = app._apply_bot_plans(
+            [noted], self.registry, EVENT, EVENT,
+        )
+        self.assertEqual(
+            sorted((a.task, a.name) for a in shown[0].assignments),
+            [("2я часть членское", ""), ("звук", "Борис")],
+        )
+        result, _ = self.load([noted])
+        self.assertTrue(result["2я часть членское"]["is_informational"])
+
+    def test_previous_month_plan_covers_next_month_date(self):
+        from bot import app
+
+        # Воскресенье — последний день месяца, задача «вс +1».
+        sunday = next(
+            EVENT + timedelta(weeks=week) for week in range(60)
+            if (EVENT + timedelta(weeks=week, days=1)).day == 1
+        )
+        self.registry.set_service_task_day(SUPER, "sound", "звук", 1)
+        month = f"{sunday:%Y-%m}"
+        tasks = [
+            {"name": task["name"], "needed": task["needed"], "max": task["max"],
+             "implicit": task["implicit"], "day": task.get("day")}
+            for task in self.registry.plan_tasks("sound")
+        ]
+        self.registry.save_schedule_draft(
+            "sound", month, run_id=None, dates=[sunday.isoformat()],
+            tasks=tasks, slots={sunday.isoformat(): {"звук": ["Борис"]}},
+            last_served={},
+        )
+        self.registry.approve_schedule_plan(
+            SUPER, "sound", month, {sunday.isoformat(): {"звук": ["Борис"]}},
+            chat_id=None, message_id=None,
+        )
+        monday = sunday + timedelta(days=1)
+        planned, covered = app._bot_plan_events(self.registry, monday, monday)
+        self.assertIn(("sound", monday), covered)
+        self.assertEqual(
+            [
+                (event.event_date, [a.name for a in event.assignments])
+                for event in planned if event.event_date == monday
+            ],
+            [(monday, ["Борис"])],
+        )
 
 
 if __name__ == "__main__":

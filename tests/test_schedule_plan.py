@@ -244,6 +244,23 @@ class SchedulePlanTest(unittest.TestCase):
         self.assertEqual(back[date(2026, 11, 4)], [("сборка", "Дмитрий")])
         self.assertEqual(back[date(2026, 11, 8)], [("звук", "Алексей")])
         self.assertEqual(back[date(2026, 11, 15)], [("сборка", "Незнакомец")])
+        # Смена дня задачи в рабочей копии не трогает утверждённое.
+        self.registry.set_service_task_day(1001, "sound", "сборка", None)
+        plan = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertIn(
+            date(2026, 11, 4),
+            [item.event_date for item in schedule_plan.plan_events(plan, self.people())],
+        )
+        self.registry.set_service_task_day(1001, "sound", "сборка", -4)
+        # Разные дни у людей одной задачи — у каждого свой, как в файле.
+        mixed = schedule_plan.excel_plan(self.registry, "sound", 2026, 11, [
+            event(date(2026, 11, 18), ("сборка", "Дмитрий")),
+            event(date(2026, 11, 22), ("сборка", "Алексей")),
+        ])
+        self.assertEqual(
+            mixed["slots"]["2026-11-22"]["сборка"], ["Дмитрий", "Алексей"]
+        )
+        self.assertEqual(mixed["days"], {"2026-11-22": {"Алексей": 0}})
         # Новый опрос пересчитывает рабочую копию, итоговым остаётся Excel,
         # пока не утвердят.
         draft = self.draft()

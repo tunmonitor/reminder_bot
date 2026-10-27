@@ -7263,6 +7263,29 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 ].inline_keyboard
                 for button in row if button.text == "✅ Подтвердить"
             )
+            # Пока смотрели предпросмотр, график месяца поправили.
+            self.registry.save_schedule_draft(
+                "sound", "2026-11", run_id=None, dates=["2026-11-01"],
+                tasks=[], slots={}, last_served={},
+            )
+            late = callback(ok)
+            await self.callback_handler("on_excel_schedule")(late)
+            self.assertIn("изменился после предпросмотра", "".join(
+                call.args[0] for call in late.message.answer.await_args_list
+            ))
+            self.assertEqual(
+                self.registry.get_schedule_plan("sound", "2026-11")["source"],
+                "poll",
+            )
+            load = callback("xls:load:sound:202611")
+            await self.callback_handler("on_excel_schedule")(load)
+            ok = next(
+                button.callback_data
+                for row in load.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row if button.text == "✅ Подтвердить"
+            )
             confirmed = callback(ok)
             await self.callback_handler("on_excel_schedule")(confirmed)
             self.assertIn(

@@ -45,6 +45,7 @@ if __package__:
         parse_schedule,
         SheetEmptyError,
         SheetNotFoundError,
+        ServiceEvent,
         parse_service_events,
         parse_service_rosters,
         resolve_assignments,
@@ -109,6 +110,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         parse_schedule,
         SheetEmptyError,
         SheetNotFoundError,
+        ServiceEvent,
         parse_service_events,
         parse_service_rosters,
         resolve_assignments,
@@ -634,10 +636,17 @@ async def _load_service_task_assignments(
                         plan_tasks.setdefault(assignment.task, set()).add(
                             assignment.name
                         )
+                notes = {
+                    task: info for task, info in result.items()
+                    if info["is_informational"]
+                }
                 result = {
                     task: {"names": sorted(names), "is_informational": False}
                     for task, names in sorted(plan_tasks.items())
                 }
+                # Пометки Excel остаются: график бота заменяет только людей.
+                for task, info in notes.items():
+                    result.setdefault(task, info)
         if raw_out is not None:
             # Назначения из графика без замен: отчёт админам применяет
             # действующие замены сам при каждом обновлении.
@@ -785,8 +794,9 @@ def _bot_plan_events(registry, first: date, last: date) -> tuple[list, set]:
     if registry is None:
         return [], set()
     months = []
-    # Своя дата задачи (среда) — может быть до первого воскресенья месяца.
-    month = first.replace(day=1)
+    # Своя дата задачи (среда) — может быть до первого воскресенья месяца,
+    # а «вс +1» — уже в следующем: месяцы с запасом в обе стороны.
+    month = (first - timedelta(days=7)).replace(day=1)
     while month <= last + timedelta(days=7):
         months.append(f"{month:%Y-%m}")
         month = (month + timedelta(days=32)).replace(day=1)
@@ -825,11 +835,34 @@ def _apply_bot_plans(events: list, registry, first: date, last: date) -> list:
         return events
     if not covered:
         return events
-    kept = [event for event in events if not _covered(event, covered)]
+    kept, notes = [], {}
+    for event in events:
+        if not _covered(event, covered):
+            kept.append(event)
+            continue
+        # Пометки Excel («📌 2я часть членское») остаются: график бота
+        # заменяет только людей.
+        informational = [a for a in event.assignments if a.is_informational]
+        if informational:
+            notes.setdefault((event.service_id, event.event_date), []).extend(
+                informational
+            )
+    merged = []
+    for event in planned:
+        if not first <= event.event_date <= last:
+            continue
+        extra = notes.pop((event.service_id, event.event_date), [])
+        merged.append(
+            dataclass_replace(
+                event, assignments=tuple(event.assignments) + tuple(extra)
+            ) if extra else event
+        )
+    merged += [
+        ServiceEvent(service_id, day, tuple(extra))
+        for (service_id, day), extra in notes.items()
+    ]
     return sorted(
-        kept + [
-            event for event in planned if first <= event.event_date <= last
-        ],
+        kept + merged,
         key=lambda event: (event.event_date, event.service_id),
     )
 

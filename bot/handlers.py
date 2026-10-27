@@ -1567,6 +1567,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         "⬅️ К списку служений — выбрать другое служение."
     )
 
+    def plan_version(plan: dict | None) -> tuple | None:
+        """Версия графика месяца: рабочая и утверждённая копии."""
+        if plan is None:
+            return None
+        return (plan["updated_at"], plan["approved_at"], plan["source"])
+
     def excel_months() -> list[tuple[int, int]]:
         """Месяцы экрана «📊 График Excel»: текущий и следующий."""
         today = datetime.now(context.timezone).date()
@@ -6497,6 +6503,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                               "задаче «📅 Дни задач»): "
                               + ", ".join(loaded["skipped"])]
                 current = registry.get_schedule_plan(service_id, key)
+                # Версия графика месяца на момент предпросмотра: если его
+                # успели поправить или утвердить — подтвердить нельзя.
+                pending_inputs[actor_id]["version"] = plan_version(current)
                 if current is not None and current["source"] != "excel":
                     lines += ["", (
                         "⚠️ Утверждённый график по опросу будет заменён."
@@ -6545,6 +6554,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 return
             loaded = pending["loaded"]
             async with readiness.service_lock(service_id):
+                if plan_version(registry.get_schedule_plan(
+                    service_id, pending["month"]
+                )) != pending.get("version"):
+                    raise ValueError(
+                        "График месяца изменился после предпросмотра — "
+                        "загрузите Excel заново."
+                    )
                 # Фактический день каждого — для интервалов следующего
                 # месяца (как снимок при публикации).
                 offsets = schedule_plan.served_offsets(
