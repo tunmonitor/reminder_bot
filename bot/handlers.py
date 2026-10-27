@@ -1560,7 +1560,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         "привязан.\n"
         "📅 График — опрос готовности и график месяца: составить, править, "
         "утвердить, тексты.\n"
-        "📋 Задачи служения — задачи, сколько людей нужно, дни задач.\n"
+        "📋 Задачи служения — задачи, сколько людей нужно, дни задач, "
+        "задачи «в одну неделю».\n"
         "⚙️ Настройки — групповой чат и проверка доставки; у "
         "супер-администратора — назначить и снять админа.\n"
         "⬅️ К списку служений — выбрать другое служение."
@@ -2153,6 +2154,66 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         data = f"mbr:{action}:{service_id}:{token}" + (f".{arg}" if arg else "")
         return InlineKeyboardButton(text=text, callback_data=data)
 
+    def member_week_label(
+        registry: Any, service_id: str, own: list[str] | None,
+        tasks: list[str],
+    ) -> str:
+        """Задачи человека «в одну неделю»: личные или как у служения."""
+        if own is not None:
+            if not own:
+                return "не связывать"
+            working = [task for task in own if task in tasks]
+            return " + ".join(own) + (
+                " (личное)" if len(working) > 1
+                else " (личное, не действует — у человека нет двух из них)"
+            )
+        linked = [
+            task["name"] for task in registry.list_service_tasks(service_id)
+            if task["same_week"] and task["name"] in tasks
+        ]
+        return "как у служения — " + (
+            " + ".join(linked) if len(linked) > 1 else "нет"
+        )
+
+    async def show_member_week(
+        message: Message, actor_id: int, service_id: str,
+        notice: str | None = None,
+    ) -> None:
+        """«🔗 В одну неделю» человека: какие его задачи он берёт вместе."""
+        card = pending_inputs[actor_id]["member_card"]
+        selected = card["week_sel"]
+        token = card["token"]
+        lines = [
+            f"🔗 В одну неделю · {card['name']}",
+            "",
+            "Отметьте задачи, которые человек берёт вместе в одну неделю "
+            "(звук в вс и спевка в ср) — хотя бы две. «↩️ Как у служения» — "
+            "по отметкам «🔗» в задачах служения.",
+        ]
+        if notice:
+            lines = [notice, ""] + lines
+        buttons = [
+            member_button(
+                f"{'☑️' if task in selected else '⬜'} {task}"[:60],
+                "wt", service_id, token, str(index),
+            )
+            for index, task in enumerate(card["tasks"])
+        ]
+        rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+        rows.append([member_button("✅ Сохранить", "ws", service_id, token)])
+        rows.append([
+            member_button("↩️ Как у служения", "wa", service_id, token),
+            member_button("🚫 Не связывать", "wn", service_id, token),
+        ])
+        rows.append([member_button("⬅️ К человеку", "card", service_id, token)])
+        await _send_dialog(
+            message, "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keep_rows=True,
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
+            parse_mode=None,
+        )
+
     async def show_member_card(
         message: Message, actor_id: int, service_id: str, name: str,
         notice: str | None = None,
@@ -2215,6 +2276,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
             ),
         ]
+        if len(tasks) > 1:
+            lines.append("🔗 В одну неделю: " + member_week_label(
+                registry, service_id, (member or {}).get("week_tasks"), tasks,
+            ))
         scheduled = next(
             (item["schedule_tasks"]
              for item in contact_members(registry, pending, service_id)
@@ -2239,6 +2304,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 member_button("📅 Свой день", "day", service_id, token),
                 member_button("🔢 В месяц", "lim", service_id, token),
             ])
+            if len(tasks) > 1:
+                rows.append([
+                    member_button("🔗 В одну неделю", "wk", service_id, token)
+                ])
         if member is not None or person is not None:
             # Только в графике — удалять из состава нечего.
             rows.append([
@@ -2367,6 +2436,55 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             if tasks else
                             "✅ Задачи сняты: в составе остаётся, в график не "
                             "попадает (из составленных графиков убран)"
+                        ),
+                    )
+            elif action == "wk":
+                member = next(
+                    (item for item in registry.list_service_members(service_id)
+                     if item["name"] == name),
+                    None,
+                )
+                own = (member or {}).get("week_tasks")
+                card["week_sel"] = [
+                    task for task in card["tasks"]
+                    if task in (own if own is not None else [
+                        item["name"]
+                        for item in registry.list_service_tasks(service_id)
+                        if item["same_week"]
+                    ])
+                ]
+                await show_member_week(message, actor_id, service_id)
+            elif action == "wt" and arg.isdigit() and "week_sel" in card:
+                index = int(arg)
+                if index < len(card["tasks"]):
+                    task = card["tasks"][index]
+                    selected = card["week_sel"]
+                    if task in selected:
+                        selected.remove(task)
+                    else:
+                        selected.append(task)
+                await show_member_week(message, actor_id, service_id)
+            elif action in {"ws", "wa", "wn"} and "week_sel" in card:
+                chosen = {
+                    "ws": [t for t in card["tasks"] if t in card["week_sel"]],
+                    "wa": None,
+                    "wn": [],
+                }[action]
+                try:
+                    registry.set_service_member_week_tasks(
+                        actor_id, service_id, name, chosen
+                    )
+                except ValueError as exc:
+                    await show_member_week(
+                        message, actor_id, service_id,
+                        _status_text(str(exc), "⚠️"),
+                    )
+                else:
+                    card.pop("week_sel", None)
+                    await show_member_card(
+                        message, actor_id, service_id, name,
+                        "✅ В одну неделю: " + member_week_label(
+                            registry, service_id, chosen, card["tasks"],
                         ),
                     )
             elif action == "day":
@@ -3703,9 +3821,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     f" · 📅 {member_day_label(task['day_offset'])}"
                     if task["day_offset"] is not None else ""
                 )
+                linked = " · 🔗" if task["same_week"] else ""
                 lines.append(
                     f"{status} {task_emoji(task['name'])} {task['name']}"
-                    f"{people}{own_day}{off}{aliases}"
+                    f"{people}{own_day}{linked}{off}{aliases}"
                 )
             lines += [
                 "",
@@ -3743,10 +3862,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ))
         rows.append(add_row)
         if any(task["enabled"] for task in tasks):
-            rows.append([InlineKeyboardButton(
-                text="📅 Дни задач",
-                callback_data=f"svc_tasks:days:{service_id}:{session_id}",
-            )])
+            rows.append([
+                InlineKeyboardButton(
+                    text="📅 Дни задач",
+                    callback_data=f"svc_tasks:days:{service_id}:{session_id}",
+                ),
+                InlineKeyboardButton(
+                    text="🔗 В одну неделю",
+                    callback_data=f"svc_tasks:week:{service_id}:{session_id}",
+                ),
+            ])
         rows.append([
             InlineKeyboardButton(
                 text="⬅️ К карточке служения",
@@ -3797,6 +3922,52 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 text=f"📅 {task['name']}"[:60],
                 callback_data=(
                     f"svc_tasks:dpick:{service_id}:{task['position']}:"
+                    f"{session_id}"
+                ),
+            )
+            for task in tasks
+        ]
+        rows = layout_buttons(buttons) if buttons else []
+        rows.append([InlineKeyboardButton(
+            text="⬅️ К задачам",
+            callback_data=f"svc_tasks:open:{service_id}",
+        )])
+        await _send_dialog(
+            message,
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
+            parse_mode=None,
+        )
+
+    async def show_task_week(
+        message: Message, service_id: str, session_id: str,
+        notice: str | None = None,
+    ) -> None:
+        """«🔗 В одну неделю»: отмеченные задачи один человек берёт вместе
+        (звук в вс и спевка в ср) — у всех, у кого они есть; личная
+        настройка в карточке человека главнее."""
+        registry = service_registry()
+        service = service_by_id(registry, service_id)
+        tasks = [
+            task for task in registry.list_service_tasks(service_id)
+            if task["enabled"]
+        ]
+        lines = [
+            f"🔗 {service_label(service)} · в одну неделю",
+            "",
+            "ℹ️ Отмеченные задачи один человек берёт вместе в одну неделю "
+            "(звук в вс и спевка в ср) — у всех, у кого есть обе. Если "
+            "вместе некем — по отдельности. Для одного человека — "
+            "«🔗 В одну неделю» в его карточке («👥 Ответственные»).",
+        ]
+        if notice:
+            lines = [notice, ""] + lines
+        buttons = [
+            InlineKeyboardButton(
+                text=f"{'🔗' if task['same_week'] else '⬜'} {task['name']}"[:60],
+                callback_data=(
+                    f"svc_tasks:wtog:{service_id}:{task['position']}:"
                     f"{session_id}"
                 ),
             )
@@ -4620,7 +4791,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         free, quiet, rest = schedule_plan.candidates(
             plan, summary, day, task["name"]
         )
-        busy = schedule_plan.busy_on(plan, day, task["name"])
+        busy = schedule_plan.busy_on(plan, day, task["name"], summary.bundles)
         token = secrets.token_urlsafe(6)
         keys = current + free + quiet + rest
         pending_inputs[actor_id] = {
@@ -4796,7 +4967,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 notice = "✅ Убран(а) из задачи"
             elif person in people:
                 notice = "ℹ️ Уже стоит на этой задаче"
-            elif person in schedule_plan.busy_on(plan, day, task["name"]):
+            elif person in schedule_plan.busy_on(
+                plan, day, task["name"],
+                readiness.week_bundles(registry, service_id),
+            ):
                 notice = "⚠️ В этот день уже на другой задаче — одна задача в день"
             else:
                 limit = task["max"] or task["needed"]
@@ -6238,6 +6412,27 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
             elif action == "days" and len(parts) == 4:
                 await show_task_days(callback.message, service_id, session_id)
+            elif action == "week" and len(parts) == 4:
+                await show_task_week(callback.message, service_id, session_id)
+            elif action == "wtog" and len(parts) == 5:
+                position = int(parts[3])
+                task = next(
+                    (
+                        item for item in registry.list_service_tasks(service_id)
+                        if item["position"] == position
+                    ),
+                    None,
+                )
+                if task is None:
+                    raise ValueError("Задача больше не существует.")
+                registry.set_service_task_same_week(
+                    actor_id, service_id, task["name"], not task["same_week"]
+                )
+                await show_task_week(
+                    callback.message, service_id, session_id,
+                    f"✅ «{task['name']}» "
+                    + ("не в связке" if task["same_week"] else "в связке 🔗"),
+                )
             elif action in {"dpick", "dset"} and len(parts) in {5, 6}:
                 position = int(parts[3])
                 task = next(

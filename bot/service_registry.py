@@ -492,6 +492,10 @@ class ServiceRegistry:
                     people_max INTEGER,
                     -- Свой день задачи: сдвиг от воскресенья (спевка — −4).
                     day_offset INTEGER,
+                    -- «🔗 В одну неделю»: отмеченные задачи один человек
+                    -- берёт вместе (звук + спевка).
+                    same_week INTEGER NOT NULL DEFAULT 0
+                        CHECK (same_week IN (0, 1)),
                     PRIMARY KEY (service_id, name)
                 );
 
@@ -519,6 +523,9 @@ class ServiceRegistry:
                     -- служения): month_min NULL — как у служения.
                     month_min INTEGER,
                     month_max INTEGER,
+                    -- Задачи «в одну неделю» (звук + спевка): JSON-список;
+                    -- NULL — как у служения (задачи с отметкой «🔗»).
+                    week_tasks_json TEXT,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (service_id, name)
                 );
@@ -854,6 +861,8 @@ class ServiceRegistry:
             for table, column, ddl in (
                 ("service_tasks", "people_max", "INTEGER"),
                 ("service_tasks", "day_offset", "INTEGER"),
+                ("service_tasks", "same_week", "INTEGER NOT NULL DEFAULT 0"),
+                ("service_members", "week_tasks_json", "TEXT"),
                 ("readiness_settings", "enabled_at", "TEXT"),
                 ("readiness_settings", "intro_template", "TEXT"),
                 ("readiness_settings", "reminder_template", "TEXT"),
@@ -1564,8 +1573,9 @@ class ServiceRegistry:
         with self._connection() as connection:
             rows = connection.execute(
                 "SELECT name, position, enabled, aliases_json, source, "
-                "people_needed, people_max, day_offset FROM service_tasks "
-                "WHERE service_id = ? ORDER BY position, name",
+                "people_needed, people_max, day_offset, same_week "
+                "FROM service_tasks WHERE service_id = ? "
+                "ORDER BY position, name",
                 (service_id,),
             ).fetchall()
         return [
@@ -1583,6 +1593,7 @@ class ServiceRegistry:
                 ),
                 # Свой день задачи; None — дни служения раздела «📅 График».
                 "day_offset": row["day_offset"],
+                "same_week": bool(row["same_week"]),
             }
             for row in rows
         ]
@@ -1762,6 +1773,29 @@ class ServiceRegistry:
             self._audit(
                 connection, actor_id, "service_task_updated", service_id,
                 {"task": task, "day_offset": offset},
+            )
+
+    def set_service_task_same_week(
+        self, actor_id: int, service_id: str, task: str, flag: bool,
+    ) -> None:
+        """«🔗 В одну неделю»: отмеченные задачи служения один человек
+        берёт вместе (у кого они есть; личная настройка главнее)."""
+        _validate_positive_id(actor_id, "actor_id")
+        if not isinstance(flag, bool):
+            raise ValueError("Отметка — логическое значение.")
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            self._require_service(connection, service_id)
+            cursor = connection.execute(
+                "UPDATE service_tasks SET same_week = ? "
+                "WHERE service_id = ? AND name = ?",
+                (int(flag), service_id, task),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(f"Задача «{task}» не найдена.")
+            self._audit(
+                connection, actor_id, "service_task_updated", service_id,
+                {"task": task, "same_week": flag},
             )
 
     def add_service_task(
@@ -3847,8 +3881,8 @@ class ServiceRegistry:
             self._require_service(connection, service_id)
             rows = connection.execute(
                 "SELECT name, telegram_id, username, tasks_json, in_list, "
-                "source, tasks_manual, day_offset, month_min, month_max "
-                "FROM service_members "
+                "source, tasks_manual, day_offset, month_min, month_max, "
+                "week_tasks_json FROM service_members "
                 "WHERE service_id = ? ORDER BY in_list DESC, rowid",
                 (service_id,),
             ).fetchall()
@@ -3863,6 +3897,7 @@ class ServiceRegistry:
                 "tasks_manual": bool(row["tasks_manual"]),
                 "day_offset": row["day_offset"],
                 "month_limit": _member_limit(row),
+                "week_tasks": _week_tasks(row),
             }
             for row in rows
         ]
@@ -4190,6 +4225,51 @@ class ServiceRegistry:
             self._audit(
                 connection, actor_id, "service_member_day", service_id,
                 {"name": name, "day_offset": offset},
+            )
+
+    def set_service_member_week_tasks(
+        self, actor_id: int, service_id: str, name: str,
+        tasks: list[str] | None,
+    ) -> None:
+        """Задачи, которые человек берёт в одну неделю (звук + спевка):
+        список от двух задач, [] — не связывать, None — как у служения
+        (задачи с отметкой «🔗 В одну неделю»)."""
+        _validate_positive_id(actor_id, "actor_id")
+        if tasks is not None:
+            tasks = list(dict.fromkeys(tasks))
+            if len(tasks) == 1:
+                raise ValueError("В одну неделю — хотя бы две задачи.")
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            known = {
+                row["name"] for row in connection.execute(
+                    "SELECT name FROM service_tasks WHERE service_id = ?",
+                    (service_id,),
+                )
+            }
+            unknown = [task for task in tasks or () if task not in known]
+            if unknown:
+                raise ValueError(f"Задача «{unknown[0]}» не найдена.")
+            row = connection.execute(
+                "SELECT telegram_id FROM service_members "
+                "WHERE service_id = ? AND name = ?",
+                (service_id, name),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"«{name}» нет в составе.")
+            value = None if tasks is None else json.dumps(
+                tasks, ensure_ascii=False
+            )
+            # Человек — Telegram ID: во всех его строках.
+            connection.execute(
+                "UPDATE service_members SET week_tasks_json = ?, updated_at = ? "
+                "WHERE service_id = ? AND (name = ? OR (telegram_id IS NOT NULL "
+                "AND telegram_id = ?))",
+                (value, _utc_now(), service_id, name, row["telegram_id"]),
+            )
+            self._audit(
+                connection, actor_id, "service_member_week_tasks", service_id,
+                {"name": name, "week_tasks": tasks},
             )
 
     def set_service_member_limit(
@@ -5556,7 +5636,7 @@ class ServiceRegistry:
                 implicit = row["name"] if row else None
             members = connection.execute(
                 "SELECT name, telegram_id, username, tasks_json, in_list, "
-                "source, day_offset, month_min, month_max "
+                "source, day_offset, month_min, month_max, week_tasks_json "
                 "FROM service_members WHERE service_id = ? "
                 "ORDER BY in_list DESC, rowid",
                 (service_id,),
@@ -5586,12 +5666,13 @@ class ServiceRegistry:
                 "active": bool(row["in_list"]) or row["source"] != "excel",
                 "day_offset": row["day_offset"],
                 "month_limit": _member_limit(row),
+                "week_tasks": _week_tasks(row),
             }
             if row["telegram_id"] in by_id:
                 by_id[row["telegram_id"]]["tasks"] |= person["tasks"]
                 by_id[row["telegram_id"]]["active"] |= person["active"]
                 # Личный день и лимит — с любой строки этого человека.
-                for field in ("day_offset", "month_limit"):
+                for field in ("day_offset", "month_limit", "week_tasks"):
                     if by_id[row["telegram_id"]][field] is None:
                         by_id[row["telegram_id"]][field] = person[field]
                 continue
@@ -5614,6 +5695,7 @@ class ServiceRegistry:
                         "tasks": set(),
                         "day_offset": None,
                         "month_limit": None,
+                        "week_tasks": None,
                     }
                     people.append(person)
                 by_id[row["telegram_id"]] = person
@@ -6329,6 +6411,12 @@ def normalize_member_name(name) -> str:
     if not name or len(name) > 60 or "\x00" in name:
         raise ValueError("Имя участника: от 1 до 60 символов.")
     return name
+
+
+def _week_tasks(row) -> list[str] | None:
+    """Задачи человека «в одну неделю»; None — как у служения."""
+    value = row["week_tasks_json"]
+    return None if value is None else json.loads(value)
 
 
 def _current_month() -> str:
