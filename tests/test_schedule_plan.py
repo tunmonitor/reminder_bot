@@ -216,6 +216,48 @@ class SchedulePlanTest(unittest.TestCase):
             recalculated["approved"]["2026-11-15"]["сборка"], ["Глеб"]
         )
 
+    def test_removing_all_member_tasks_keeps_member_out_of_plan(self):
+        plan = self.draft()
+        slots = plan["slots"]
+        slots["2026-11-01"]["сборка"] = ["Глеб"]
+        slots["2026-11-08"]["звук"] = ["Глеб"]
+        self.registry.set_schedule_slots(1001, "sound", "2026-11", slots)
+        self.registry.set_schedule_day(
+            1001, "sound", "2026-11", "2026-11-08", "Глеб", -1
+        )
+        # Глеб только в привязках («сборка»); сняли сначала одну задачу —
+        # уходит только из неё.
+        self.registry.set_service_member_tasks(1001, "sound", "Глеб", ["звук"])
+        plan = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertNotIn("Глеб", plan["slots"]["2026-11-01"]["сборка"])
+        self.assertIn("Глеб", plan["slots"]["2026-11-08"]["звук"])
+        self.assertEqual(plan["days"], {"2026-11-08": {"Глеб": -1}})
+        # Все задачи сняты: в составе, но не в графике и без привязок.
+        self.assertEqual(
+            self.registry.set_service_member_tasks(1001, "sound", "Глеб", []),
+            [],
+        )
+        plan = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertNotIn(
+            "Глеб",
+            [key for tasks in plan["slots"].values()
+             for people in tasks.values() for key in people],
+        )
+        self.assertEqual(plan["days"], {})
+        gleb = next(
+            m for m in self.registry.list_service_members("sound")
+            if m["name"] == "Глеб"
+        )
+        self.assertEqual(gleb["tasks"], [])
+        self.assertEqual(
+            [p["tasks"] for p in self.people() if p["name"] == "Глеб"], [[]]
+        )
+        # Пересчёт его тоже не ставит.
+        self.assertNotIn("Глеб", [
+            key for tasks in self.draft()["slots"].values()
+            for people in tasks.values() for key in people
+        ])
+
     def test_member_edits_and_removal_keep_plan_and_contacts_consistent(self):
         plan = self.draft()
         slots = plan["slots"]

@@ -2362,7 +2362,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         removed.remove(name)
                     await show_member_card(
                         message, actor_id, service_id, name,
-                        "✅ Задачи сохранены: " + ", ".join(tasks),
+                        (
+                            "✅ Задачи сохранены: " + ", ".join(tasks)
+                            if tasks else
+                            "✅ Задачи сняты: в составе остаётся, в график не "
+                            "попадает (из составленных графиков убран)"
+                        ),
                     )
             elif action == "day":
                 buttons = [
