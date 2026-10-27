@@ -937,8 +937,9 @@ class ServiceRegistry:
 
     @staticmethod
     def _split_plan_title(connection: sqlite3.Connection) -> None:
-        """Однократно: заголовок с полем {status} — в два шаблона
-        («утверждён» и «обновлён»), поле {status} больше не поддерживается."""
+        """Однократно: сохранённый заголовок — в два шаблона. Раньше он шёл
+        и в первую публикацию, и в обновления; поле {status} заменяется на
+        «утверждён» и «обновлён» и больше не поддерживается."""
         if connection.execute(
             "SELECT 1 FROM catalog_migrations WHERE name = 'plan-title-v2'"
         ).fetchone():
@@ -946,7 +947,7 @@ class ServiceRegistry:
         connection.execute(
             "UPDATE readiness_settings SET plan_update_template = "
             "replace(plan_title_template, '{status}', 'обновлён') "
-            "WHERE plan_title_template LIKE '%{status}%' "
+            "WHERE plan_title_template IS NOT NULL "
             "AND plan_update_template IS NULL"
         )
         connection.execute(

@@ -2325,3 +2325,24 @@ class PlanTitleMigrationTest(unittest.TestCase):
         settings = registry.get_readiness_settings("sound")
         self.assertEqual(settings["plan_title_template"], "График {service_name}: утверждён")
         self.assertEqual(settings["plan_update_template"], "График {service_name}: обновлён")
+
+    def test_title_without_status_kept_for_updates(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        path = Path(temp_dir.name) / "services.sqlite3"
+        registry = ServiceRegistry(path)
+        registry.initialize(1001, -10001)
+        registry.set_readiness_settings(1001, "sound", enabled=False)
+        with closing(sqlite3.connect(path)) as connection, connection:
+            connection.execute(
+                "UPDATE readiness_settings SET plan_title_template = "
+                "'Расписание {service_name} на {month}' WHERE service_id = 'sound'"
+            )
+            connection.execute(
+                "DELETE FROM catalog_migrations WHERE name = 'plan-title-v2'"
+            )
+        registry = ServiceRegistry(path)
+        registry.initialize(1001, -10001)
+        settings = registry.get_readiness_settings("sound")
+        self.assertEqual(settings["plan_title_template"], "Расписание {service_name} на {month}")
+        self.assertEqual(settings["plan_update_template"], "Расписание {service_name} на {month}")
