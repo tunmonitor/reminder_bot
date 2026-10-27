@@ -2592,10 +2592,27 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             events = None
         if pending_inputs.get(actor_id) is not pending:
             return
+        # Задача со своим днём (спевка — в файле отдельной средой) — в блоке
+        # своего воскресенья.
+        own_days = {
+            task["name"]: task["day_offset"]
+            for task in service_registry().list_service_tasks(service_id)
+            if task["day_offset"] is not None
+        }
         pending["overview_events"] = (
             None
             if events is None
-            else [event for event in events if event.service_id == service_id]
+            else [
+                SimpleNamespace(
+                    event_date=block["date"],
+                    assignments=tuple(block["assignments"]),
+                    days=block["days"],
+                )
+                for block in schedule_plan.week_events(
+                    [event for event in events if event.service_id == service_id],
+                    own_days,
+                )
+            ]
         )
         await send_contact_overview(message, actor_id, service_id, 0)
 
@@ -2635,8 +2652,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             if assignment.name and assignment.name not in names:
                 names.append(assignment.name)
         linked = total = 0
+        days = getattr(event, "days", {})
         for task, names in names_by_task.items():
-            lines.extend(["", f"{task_emoji(task)} {task}"])
+            moment = days.get(task)
+            lines.extend(["", f"{task_emoji(task)} {task}" + (
+                f" · {_WEEKDAYS[moment.weekday()]} {moment:%d.%m}"
+                if moment else ""
+            )])
             if not names:
                 lines.append("• ⚪ ответственный не указан")
             for name in names:

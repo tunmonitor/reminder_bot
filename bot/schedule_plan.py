@@ -379,6 +379,29 @@ def week_groups(plan: dict, day: str, window: tuple[int, int]
     return title, result
 
 
+def week_events(events: list, own_days: dict[str, int]) -> list[dict]:
+    """События графика Excel по воскресеньям: задача со своим днём (спевка
+    — вс −4, в файле — отдельной средой) — в блоке своего воскресенья.
+    Элемент: дата (воскресенье), назначения и фактический день задач,
+    отличный от даты."""
+    blocks: dict[date, dict] = {}
+    for event in sorted(events, key=lambda item: item.event_date):
+        for assignment in event.assignments:
+            offset = own_days.get(assignment.task)
+            sunday = event.event_date
+            if offset is not None and event.event_date.weekday() != 6:
+                candidate = event.event_date - timedelta(days=offset)
+                if candidate.weekday() == 6:
+                    sunday = candidate
+            block = blocks.setdefault(
+                sunday, {"date": sunday, "assignments": [], "days": {}}
+            )
+            block["assignments"].append(assignment)
+            if event.event_date != sunday:
+                block["days"][assignment.task] = event.event_date
+    return [blocks[day] for day in sorted(blocks)]
+
+
 def week_person_day(plan: dict, person: dict | None, day: str, task: str,
                     group_offset: int | None) -> str:
     """День человека в графике по неделям — в скобках, только если он не
@@ -748,7 +771,7 @@ def _columns(registry, service_id: str) -> list[ScheduleColumn]:
 def excel_rows(registry, plan: dict, people: list[dict]) -> list[list]:
     """Лист как в графике: строка заголовков колонок служения, затем блок
     каждой даты — дата в первой ячейке колонки, ниже назначения. Задача со
-    своим днём (спевка) — в блоке своего воскресенья, как в файле. У колонки
+    своим днём (спевка) — блоком своей даты (среды), как в файле. У колонки
     со своей задачей («Слайды») — только её люди, остальные задачи — в
     основной колонке; у «задача | имя» следующий человек задачи — без
     повтора задачи."""
@@ -769,9 +792,16 @@ def excel_rows(registry, plan: dict, people: list[dict]) -> list[list]:
     for column, start in zip(columns, starts):
         header[start] = column.headers[0]
     rows: list[list] = [header]
+    # Задача со своим днём (спевка — ср) — отдельным блоком своей даты, как
+    # в файле; блоки по порядку дат.
+    own_days = task_days(plan)
+    blocks: dict[date, list[list[list]]] = {}
     for day in plan["dates"]:
-        cells: list[list[list]] = [[] for _ in columns]
         for task in plan["tasks"]:
+            moment = date.fromisoformat(day) + timedelta(
+                days=own_days.get(task["name"], 0)
+            )
+            cells = blocks.setdefault(moment, [[] for _ in columns])
             index = own.get(normalized_name(task["name"]), main)
             pairs = columns[index].layout == "pairs"
             for number, key in enumerate(
@@ -781,9 +811,11 @@ def excel_rows(registry, plan: dict, people: list[dict]) -> list[list]:
                 cells[index].append(
                     [label, names.get(key, key)] if pairs else [names.get(key, key)]
                 )
+    for moment in sorted(blocks):
+        cells = blocks[moment]
         block = [[""] * width for _ in range(1 + max(map(len, cells)))]
         for index, start in enumerate(starts):
-            block[0][start] = date.fromisoformat(day)
+            block[0][start] = moment
             for offset, values in enumerate(cells[index], start=1):
                 block[offset][start:start + len(values)] = values
         rows += block
@@ -814,8 +846,8 @@ def excel_text(registry, service: dict, plan: dict, people: list[dict]) -> str:
     ]
     own_days = task_days(plan)
     for day in plan["dates"]:
-        # Задача со своим днём — на листе в блоке своего воскресенья (как в
-        # файле), в тексте — с фактическим днём.
+        # Задача со своим днём — в строке своего воскресенья с фактическим
+        # днём (на листе — блоком своей даты).
         parts = [
             ("" if implicit_plan(plan) else (
                 f"{task['name']} ("

@@ -409,7 +409,10 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   `schedule_plan.slot_offset` (override → task day → personal day),
   `task_days`, `week_groups` / `week_person_day`: any task day switches
   `plan_text` and `publication_text` to weekly layout. `served_offsets`
-  keeps the latest day per person per date.
+  keeps the latest day per person per date. Excel has own-day tasks as
+  separate dates: `excel_rows` writes them as blocks of their own date,
+  `week_events` folds such Excel events into their Sunday for the
+  «👥 Ответственные» overview (`days` → «· ср 11.11»).
 - Planner: `PlanInput.extra` (optional seats above the minimum) and
   `reluctant` (non-respondents: free on all dates, `RELUCTANT_WEIGHT` per
   service). A one-week gap costs `BACK_TO_BACK_WEIGHT` (100 ×

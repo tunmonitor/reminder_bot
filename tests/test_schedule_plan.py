@@ -699,6 +699,47 @@ class SchedulePlanTest(unittest.TestCase):
             ),
         )
 
+    def test_task_day_goes_to_its_own_date_in_excel(self):
+        self.registry.set_service_task_day(1001, "sound", "сборка", -4)
+        plan = self.draft()
+        plan["slots"]["2026-11-08"] = {"звук": ["Алексей"], "сборка": ["Дмитрий"]}
+        people = self.people()
+        rows = schedule_plan.excel_rows(self.registry, plan, people)
+        dated = [row[0] for row in rows if isinstance(row[0], date)]
+        # Среда — своим блоком перед своим воскресеньем.
+        self.assertEqual(
+            dated[:4],
+            [date(2026, 10, 28), date(2026, 11, 1), date(2026, 11, 4),
+             date(2026, 11, 8)],
+        )
+        path = Path(self.temp_dir.name) / "plan.xlsx"
+        path.write_bytes(
+            schedule_plan.excel_file(self.registry, self.service(), plan, people)
+        )
+        events = parse_service_events(
+            path, date(2026, 11, 1), LOG, self.registry.service_catalog()
+        )["sound"]
+        by_day = {
+            item.event_date: sorted((row.task, row.name) for row in item.assignments)
+            for item in events
+        }
+        self.assertEqual(by_day[date(2026, 11, 4)], [("сборка", "Дмитрий")])
+        self.assertEqual(by_day[date(2026, 11, 8)], [("звук", "Алексей")])
+        # «Ответственные»: среда из файла — в блоке своего воскресенья.
+        blocks = schedule_plan.week_events(events, {"сборка": -4})
+        first = next(b for b in blocks if b["date"] == date(2026, 11, 8))
+        self.assertEqual(
+            sorted((row.task, row.name) for row in first["assignments"]),
+            [("звук", "Алексей"), ("сборка", "Дмитрий")],
+        )
+        self.assertEqual(first["days"], {"сборка": date(2026, 11, 4)})
+        self.assertNotIn(date(2026, 11, 4), [b["date"] for b in blocks])
+        # Без дня задачи — события как в файле.
+        self.assertIn(
+            date(2026, 11, 4),
+            [b["date"] for b in schedule_plan.week_events(events, {})],
+        )
+
     def test_excel_rows_put_own_task_in_its_column(self):
         plan = {
             "service_id": "broadcast", "dates": ["2026-11-01"],
