@@ -454,6 +454,36 @@ class SchedulePlannerTest(unittest.TestCase):
             for days in served.values() for day in days
         ))
 
+    def test_bundle_extras_are_matched_together_and_respect_minimum(self):
+        day = date(2026, 11, 1)
+        bundle = frozenset({"звук", "спевка"})
+        base = dict(
+            dates=(day,),
+            needed={"звук": 1, "спевка": 1, "a": 1, "b": 1},
+            tasks={
+                "L": bundle, "Da": frozenset({"a"}), "Db": frozenset({"b"}),
+                "P": frozenset({"a", "b"}), "Q": frozenset({"a"}),
+            },
+            extra={"a": 1, "b": 1},
+            bundles={"L": bundle},
+            last_served={"P": date(2026, 10, 18), "Q": date(2026, 10, 18)},
+        )
+        free = {name: frozenset({day}) for name in base["tasks"]}
+        plan = build_plan(PlanInput(free=free, **base))
+        # P может обе задачи, Q — только «a»: заняты оба места сверх минимума.
+        self.assertEqual(
+            sorted(plan.slots[(day, "a")] + plan.slots[(day, "b")]),
+            ["Da", "Db", "P", "Q"],
+        )
+        # Недобравший месячный минимум — первым на место сверх минимума.
+        tasks = dict(base["tasks"], Q=frozenset({"a", "b"}))
+        plan = build_plan(PlanInput(
+            free={name: frozenset({day}) for name in ("L", "Da", "Db", "P", "Q")},
+            limits={"Q": (1, None)},
+            **dict(base, tasks=tasks, extra={"a": 1, "b": 0}),
+        ))
+        self.assertIn("Q", plan.slots[(day, "a")])
+
 
 if __name__ == "__main__":
     unittest.main()

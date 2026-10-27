@@ -401,38 +401,57 @@ def _fill_bundle_gaps(plan: Plan, data: PlanInput) -> None:
 
 def _fill_optional(plan: Plan, data: PlanInput) -> None:
     """Места сверх минимума при связках — как второй проход основного
-    алгоритма: только ответившие, без служения ни за неделю до, ни через
-    неделю после, в пределах максимума; сначала с меньшей нагрузкой."""
+    алгоритма: на каждую дату все такие места вместе (паросочетание
+    минимальной стоимости), только ответившие, без служения ни за неделю
+    до, ни через неделю после, в пределах максимума; стоимость — прирост
+    стоимости плана человека (недобравший минимум — дешевле)."""
     served: dict[str, set[date]] = {}
     for (event_date, _), people in plan.slots.items():
         for person in people:
             served.setdefault(person, set()).add(event_date)
     for event_date in sorted(set(data.dates)):
-        for task, extra in data.extra.items():
-            if task not in data.needed:
-                continue
-            people = plan.slots[(event_date, task)]
-            while len(people) < data.needed[task] + extra:
-                candidates = [
-                    person for person in data.free
-                    if _can_serve(data, person, event_date, task)
-                    and person not in data.reluctant
-                    and not any(
-                        abs((other - event_date).days) <= 7
-                        for other in served.get(person, set())
-                    )
-                    and _gap_penalty(data.last_served.get(person), event_date)
-                    < BACK_TO_BACK_WEIGHT
-                    and _below_max(data, person, len(served.get(person, ())))
-                ]
-                if not candidates:
-                    break
-                chosen = min(
-                    candidates,
-                    key=lambda person: (len(served.get(person, ())), person),
-                )
-                people.append(chosen)
-                served.setdefault(chosen, set()).add(event_date)
+        seats = [
+            task
+            for task, extra in data.extra.items() if task in data.needed
+            for _ in range(max(
+                0,
+                data.needed[task] + extra
+                - len(plan.slots[(event_date, task)]),
+            ))
+        ]
+        if not seats:
+            continue
+        people = [
+            person for person in sorted(data.free)
+            if event_date in data.free[person]
+            and person not in data.reluctant
+            and not any(
+                abs((other - event_date).days) <= 7
+                for other in served.get(person, set())
+            )
+            and _gap_penalty(data.last_served.get(person), event_date)
+            < BACK_TO_BACK_WEIGHT
+            and _below_max(data, person, len(served.get(person, ())))
+        ]
+        allowed = {
+            person: {
+                index for index, task in enumerate(seats)
+                if _can_serve(data, person, event_date, task)
+            }
+            for person in people
+        }
+        # BELOW_MIN_WEIGHT — чтобы стоимость не была отрицательной.
+        cost = {
+            person: BELOW_MIN_WEIGHT + _person_cost(
+                data, person, served.get(person, set()) | {event_date}
+            ) - _person_cost(data, person, served.get(person, set()))
+            for person in people
+        }
+        for seat, person in sorted(
+            _min_cost_matching(people, seats, allowed, cost).items()
+        ):
+            plan.slots[(event_date, seats[seat])].append(person)
+            served.setdefault(person, set()).add(event_date)
 
 
 def _build_plan(data: PlanInput) -> Plan:
