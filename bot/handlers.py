@@ -1012,6 +1012,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 or registry.is_service_admin(actor_id, service_id)
             )
         )
+
+    def can_check_delivery(actor_id: int, service_id: str) -> bool:
+        """Проверка доставки — внутри служения, когда групповой чат
+        назначен: её запускает тот, кто настраивает чат."""
+        if not is_service_admin(actor_id, service_id):
+            return False
+        service = service_by_id(service_registry(), service_id)
+        return bool(service and service["group_chat_id"] is not None)
     async def require_chat_member(actor_id: int, chat_id: int) -> None:
         """Чат по ID вручную: админ служения должен сам состоять в группе
         (выбор кнопкой Telegram это гарантирует). Супер-администратор — без
@@ -1471,6 +1479,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ("🔄 Сверить график", "service_sync"),
             ("📡 Групповой чат", "service_chat"),
         ]
+        if can_check_delivery(actor_id, service_id):
+            items.append(("🧪 Проверка доставки", "test_notify"))
         if is_super_admin:
             items.extend(
                 [
@@ -1478,8 +1488,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     ("➖ Снять админа", "service_admin_remove"),
                 ]
             )
-        if actor_id == context.admin_id:
-            items.append(("🧪 Проверка доставки", "test_notify"))
         rows = [
             [
                 InlineKeyboardButton(
@@ -7210,23 +7218,32 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if not callback_answered:
             await _answer_callback(callback)
 
-    def service_result_keyboard(service_id: str) -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="⚙️ К настройкам служения",
-                        callback_data=f"service:service_settings:{service_id}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="📋 К списку служений",
-                        callback_data="service:back_to_services:list",
-                    )
-                ],
-            ]
-        )
+    def service_result_keyboard(
+        service_id: str, delivery_check: bool = False
+    ) -> InlineKeyboardMarkup:
+        rows = []
+        if delivery_check:
+            rows.append([
+                InlineKeyboardButton(
+                    text="🧪 Проверка доставки",
+                    callback_data=f"service:test_notify:{service_id}",
+                )
+            ])
+        rows.extend([
+            [
+                InlineKeyboardButton(
+                    text="⚙️ К настройкам служения",
+                    callback_data=f"service:service_settings:{service_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📋 К списку служений",
+                    callback_data="service:back_to_services:list",
+                )
+            ],
+        ])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
 
     def test_result_keyboard(service_id: str) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
@@ -8301,11 +8318,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         "service_settings": "📋 Служения",
         "service_notify": "🔔 Напоминания групп",
         "service_contact": "👥 Ответственные",
-        "service_sync": "🔄 Сверить график",
-        "service_chat": "📡 Групповой чат",
+        "service_admins": "👤 Администраторы",
         "service_admin_add": "👤 Назначить админа",
         "service_admin_remove": "➖ Снять админа",
-        "test_notify": "🧪 Проверка доставки",
         "my_schedule": "📅 Мои служения",
         "my_month": "📆 На месяц",
         "my_notifications": "⏰ Мои уведомления",
@@ -8316,15 +8331,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         actor_id: int, role: str, linked: bool
     ) -> list[str]:
         operations = []
+        # Сверка с Excel, групповой чат и проверка доставки — в карточке
+        # служения: их ведут админы служений.
         if role != ROLE_USER:
             operations.extend([
                 "service_settings", "service_notify", "service_contact",
-                "service_sync", "service_chat",
             ])
         if role == ROLE_SUPER_ADMIN:
-            operations.extend(["service_admin_add", "service_admin_remove"])
-        if actor_id == context.admin_id:
-            operations.append("test_notify")
+            operations.append("service_admins")
         if linked:
             operations.extend(["my_schedule", "my_month", "my_notifications"])
         return operations
@@ -8346,6 +8360,28 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ]
         )
 
+    async def open_service_admins_menu(
+        message: Message, actor_id: int
+    ) -> None:
+        registry = service_registry()
+        if registry is None or not registry.is_super_admin(actor_id):
+            await _send_dialog(
+                message,
+                "❌ Назначать и снимать администраторов может только "
+                "супер-администратор.",
+                parse_mode=None,
+            )
+            return
+        await _send_dialog(
+            message,
+            "👤 Администраторы\nℹ️ Назначьте или снимите администратора "
+            "служения.",
+            reply_markup=start_menu_keyboard(
+                ["service_admin_add", "service_admin_remove", "start"]
+            ),
+            parse_mode=None,
+        )
+
     def start_text(
         actor_id: int, user_name: str, role: str, linked: bool
     ) -> str:
@@ -8354,7 +8390,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 f"👋 Здравствуйте, {user_name}!\n"
                 "Вы — супер-администратор: вам доступны все служения.\n\n"
                 "ℹ️ Выберите раздел кнопкой ниже или командой из меню.\n"
-                "💡 Новое служение настраивается так: групповой чат → "
+                "💡 Новое служение настраивается в его карточке "
+                "(«📋 Служения»): групповой чат и проверка доставки → "
                 "ответственные → напоминания групп."
             )
         if role == ROLE_SERVICE_ADMIN:
@@ -8479,15 +8516,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await open_my_month(callback.message, actor_id)
         elif operation == "start":
             await show_start(callback.message, callback.from_user)
-        elif operation == "test_notify":
-            if actor_id != context.admin_id:
-                await _send_dialog(
-                    callback.message,
-                    "❌ Проверка доставки доступна только главному администратору.",
-                    parse_mode=None,
-                )
-                return
-            await open_test_notify(callback.message, actor_id)
+        elif operation == "service_admins":
+            await open_service_admins_menu(callback.message, actor_id)
         else:
             await request_service_input(
                 callback.message, operation, actor_id=actor_id
@@ -8639,9 +8669,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     parse_mode=None,
                 )
             elif operation == "test_notify":
-                if callback.from_user.id != context.admin_id:
+                if not is_service_admin(callback.from_user.id, service_id):
                     raise PermissionError(
-                        "Проверка доставки доступна только главному администратору."
+                        "Проверка доставки доступна только администратору "
+                        "этого служения."
                     )
                 rows = []
                 if service["group_chat_id"] is not None:
@@ -9729,7 +9760,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         await _send_dialog(
             message,
             "Выберите следующий шаг.",
-            reply_markup=service_result_keyboard(pending[2]),
+            reply_markup=service_result_keyboard(
+                pending[2], delivery_check=True
+            ),
             parse_mode=None,
         )
 
@@ -12360,7 +12393,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         await _send_dialog(
             message,
             _status_text(response, "✅"),
-            reply_markup=service_result_keyboard(service_id),
+            reply_markup=service_result_keyboard(
+                service_id,
+                delivery_check=operation == "service_chat"
+                and can_check_delivery(message.from_user.id, service_id),
+            ),
             parse_mode=None,
         )
 
@@ -12379,7 +12416,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         await request_service_input(message, "service_sync")
 
     async def execute_test_notification(
-        message: Message, service: dict, action: str
+        message: Message, service: dict, action: str, actor_id: int
     ) -> None:
         if action == "group":
             group_chat_id = service["group_chat_id"]
@@ -12462,7 +12499,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         for chunk in _telegram_text_chunks(plain_text("\n".join(output))):
             try:
                 await context.bot.send_message(
-                    context.admin_id, chunk, parse_mode=None
+                    actor_id, chunk, parse_mode=None
                 )
             except TelegramAPIError:
                 debug.exception(
@@ -12523,7 +12560,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def on_test_notify_action(callback: CallbackQuery) -> None:
         if (
             not callback.from_user
-            or callback.from_user.id != context.admin_id
             or not callback.message
             or callback.message.chat.type != ChatType.PRIVATE
         ):
@@ -12534,6 +12570,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await _answer_callback(callback, "⚠️ Кнопка устарела.")
             return
         _, action, service_id = parts
+        if not is_service_admin(callback.from_user.id, service_id):
+            await _answer_callback(
+                callback,
+                "❌ Проверка доставки доступна только администратору "
+                "этого служения.",
+            )
+            return
         await clean_previous_menu(callback.message, debug)
         registry = service_registry()
         if registry is None:
@@ -12546,7 +12589,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             if action not in {"group", "preview"}:
                 raise ValueError("Неизвестный вид проверки.")
             await execute_test_notification(
-                callback.message, service, action
+                callback.message, service, action, callback.from_user.id
             )
         except (ValueError, sqlite3.Error) as exc:
             await _send_dialog(callback.message, _status_text(str(exc), "❌"), parse_mode=None

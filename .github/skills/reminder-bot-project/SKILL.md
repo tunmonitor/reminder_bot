@@ -529,8 +529,13 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - Permissions (24.10): a service admin may do everything for own services
   (chat, contacts/bindings, members, tasks, sync, notify, replace, «📅 График»);
   only `ADMIN_OPERATIONS` (service_admin_add/remove) stay super-admin-only;
-  registry uses `_require_service_editor` everywhere else; `/test_notify` —
-  main admin only.
+  registry uses `_require_service_editor` everywhere else; `/test_notify`
+  command — main admin only, but the card's «🧪 Проверка доставки»
+  (`can_check_delivery`: service admin + group chat set, also offered right
+  after a chat is saved) is open to the service admin; previews go to the
+  caller. Start menu (27.10): settings, notify, contacts, and for the super
+  admin `menu:service_admins` (submenu with add/remove); sync, chat and
+  delivery check live only in the service card.
 - Readiness poll texts: `question_template` (`readiness.question_text`, fields
   service_name/month/month_in, ≤300, sent with `question_parse_mode=None`,
   blank → default); «📝 Тексты» (`show_readiness_texts`, kind "q").

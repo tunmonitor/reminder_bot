@@ -35,6 +35,7 @@ class ConfirmationHandlerTest(unittest.TestCase):
                 admin_id=67890,
                 group_chat_id=-100,
                 service_registry=SimpleNamespace(
+                    is_super_admin=lambda actor_id: actor_id == 67890,
                     list_services=MagicMock(
                         return_value=[
                             {
@@ -182,6 +183,7 @@ class ConfirmationHandlerTest(unittest.TestCase):
                 debug_logger=MagicMock(),
                 admin_id=67890,
                 service_registry=SimpleNamespace(
+                    is_super_admin=lambda actor_id: actor_id == 67890,
                     list_services=MagicMock(
                         return_value=[
                             {
@@ -3948,6 +3950,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 debug_logger=MagicMock(),
                 admin_id=67890,
                 service_registry=SimpleNamespace(
+                    is_super_admin=lambda actor_id: actor_id == 67890,
                     list_services=MagicMock(return_value=[sound]),
                     get_service=MagicMock(return_value=sound),
                 ),
@@ -4001,6 +4004,79 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             preview_callback.answer.assert_awaited_once()
             context.bot.send_message.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_service_admin_runs_delivery_check_for_own_service_only(self):
+        async def run():
+            self.registry.set_group_chat(67890, "sound", -200, enabled=True)
+            self.registry.set_group_chat(67890, "books", -300, enabled=True)
+            self.registry.add_service_admin(67890, "sound", 24680)
+            self.registry.add_service_admin(67890, "books", 13579)
+            self.context.prepare_service_test_previews = AsyncMock(
+                return_value={
+                    "sunday_date": date(2026, 11, 1),
+                    "group_text": "Звук",
+                    "personal_messages": [],
+                    "issues": [],
+                }
+            )
+            test_action = next(
+                item.callback
+                for item in reversed(router.callback_query.handlers)
+                if item.callback.__name__ == "on_test_notify_action"
+            )
+
+            def callback(actor_id, data):
+                return SimpleNamespace(
+                    data=data,
+                    from_user=SimpleNamespace(id=actor_id),
+                    message=self.message(actor_id, ""),
+                    answer=AsyncMock(),
+                )
+
+            opened = callback(24680, "service:test_notify:sound")
+            await self.callback_handler("on_service_selected")(opened)
+            markup = opened.message.answer.await_args.kwargs["reply_markup"]
+            self.assertEqual(
+                [b.callback_data for row in markup.inline_keyboard for b in row],
+                ["test_action:group:sound", "test_action:preview:sound"],
+            )
+
+            await test_action(callback(24680, "test_action:preview:sound"))
+            self.context.prepare_service_test_previews.assert_awaited_once_with(
+                "sound"
+            )
+            self.assertEqual(
+                self.context.bot.send_message.await_args.args[0], 24680
+            )
+            self.context.bot.send_message.reset_mock()
+            await test_action(callback(24680, "test_action:group:sound"))
+            self.assertEqual(
+                self.context.bot.send_message.await_args.args[0], -200
+            )
+
+            # Админ другого служения не запускает ни одну проверку.
+            self.context.bot.send_message.reset_mock()
+            self.context.prepare_service_test_previews.reset_mock()
+            denied = callback(13579, "service:test_notify:sound")
+            await self.callback_handler("on_service_selected")(denied)
+            self.assertIn(
+                "только администратору",
+                denied.message.answer.await_args.args[0],
+            )
+            self.assertIsNone(
+                denied.message.answer.await_args.kwargs.get("reply_markup")
+            )
+            for action in ("group", "preview"):
+                foreign = callback(13579, f"test_action:{action}:sound")
+                await test_action(foreign)
+                foreign.message.answer.assert_not_awaited()
+                self.assertIn(
+                    "только администратору", foreign.answer.await_args.args[0]
+                )
+            self.context.bot.send_message.assert_not_awaited()
+            self.context.prepare_service_test_previews.assert_not_awaited()
 
         asyncio.run(run())
 
@@ -4948,11 +5024,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "menu:service_settings",
                     "menu:service_notify",
                     "menu:service_contact",
-                    "menu:service_sync",
-                    "menu:service_chat",
-                    "menu:service_admin_add",
-                    "menu:service_admin_remove",
-                    "menu:test_notify",
+                    "menu:service_admins",
                 ],
             )
 
@@ -4970,8 +5042,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertEqual(
                 self.callback_data_list(message),
                 ["menu:service_settings", "menu:service_notify",
-                 "menu:service_contact", "menu:service_sync",
-                 "menu:service_chat"],
+                 "menu:service_contact"],
             )
 
         asyncio.run(run())
@@ -5031,6 +5102,35 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 "service:service_notify:sound",
                 self.callback_data_list(callback.message),
             )
+
+        asyncio.run(run())
+
+    def test_start_menu_admins_item_offers_add_and_remove(self):
+        async def run():
+            callback = SimpleNamespace(
+                data="menu:service_admins",
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_start_menu")(callback)
+            self.assertEqual(
+                self.callback_data_list(callback.message),
+                ["menu:service_admin_add", "menu:service_admin_remove",
+                 "menu:start"],
+            )
+            self.registry.add_service_admin(67890, "sound", 24680)
+            denied = SimpleNamespace(
+                data="menu:service_admins",
+                from_user=SimpleNamespace(id=24680),
+                message=self.message(24680, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_start_menu")(denied)
+            self.assertIn(
+                "супер-администратор", denied.message.answer.await_args.args[0]
+            )
+            self.assertEqual(self.callback_data_list(denied.message), [])
 
         asyncio.run(run())
 
@@ -5788,7 +5888,6 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "service:service_chat:sound",
                     "service:service_admin_add:sound",
                     "service:service_admin_remove:sound",
-                    "service:test_notify:sound",
                     "rdy:open:sound",
                     "svc_tasks:open:sound",
                     "service:back_to_services:list",
@@ -5797,6 +5896,15 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIn(
                 "👤 Администраторы · ⚪ не назначены",
                 message.answer.await_args.args[0],
+            )
+            # Проверка доставки — только когда групповой чат назначен.
+            self.registry.set_group_chat(67890, "sound", -200, enabled=True)
+            again = self.message(67890, "/service_settings sound")
+            await self.message_handler("on_service_settings")(again)
+            buttons = self.callback_data_list(again)
+            self.assertEqual(
+                buttons[buttons.index("service:service_chat:sound") + 1],
+                "service:test_notify:sound",
             )
 
         asyncio.run(run())
