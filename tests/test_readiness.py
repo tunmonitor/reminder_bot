@@ -242,6 +242,20 @@ class ReadinessFlowTest(unittest.TestCase):
         intro = bot.send_message.await_args.args[1]
         self.assertIn("📅 Свой день: Алексей — по четвергам", intro)
 
+    def test_launch_uses_own_phrases(self):
+        self.registry.set_service_member_day(1001, "sound", "Алексей", -3)
+        self.registry.set_readiness_phrase(1001, "sound", "cant", "🙈 Пропускаю месяц")
+        self.registry.set_readiness_phrase(1001, "sound", "own_days", "🗓 Особые дни:")
+        bot = fake_bot()
+        self.launch(bot)
+        self.assertEqual(
+            bot.send_poll.await_args.kwargs["options"][-1], "🙈 Пропускаю месяц"
+        )
+        self.assertIn(
+            "🗓 Особые дни: Алексей — по четвергам",
+            bot.send_message.await_args.args[1],
+        )
+
     def test_poll_question_template(self):
         self.registry.set_readiness_settings(
             1001, "sound", question_template="{service_name}: когда в {month_in}?"
@@ -267,7 +281,7 @@ class ReadinessFlowTest(unittest.TestCase):
         poll = bot.send_poll.await_args
         self.assertEqual(poll.args[1], "Когда можешь служить в ноябре?")
         self.assertEqual(
-            poll.kwargs["options"][-1], readiness.CANT_OPTION
+            poll.kwargs["options"][-1], "❌ Не смогу в этом месяце"
         )
         self.assertTrue(poll.kwargs["allows_multiple_answers"])
         intro = bot.send_message.await_args.args[1]

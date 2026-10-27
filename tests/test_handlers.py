@@ -5981,7 +5981,35 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIn(" утверждён", title.message.answer.await_args.args[0])
             title_edit = await press("rdy:tpledit:sound:pub")
             self.assertIn(
-                "• {status} — ", title_edit.message.answer.await_args.args[0]
+                "• {month} — ", title_edit.message.answer.await_args.args[0]
+            )
+            update = await press("rdy:tplprev:sound:pubupd")
+            self.assertIn(" обновлён", update.message.answer.await_args.args[0])
+            # «🔤 Фразы»: своя фраза и возврат встроенной.
+            phrases = await press("rdy:phr:sound")
+            self.assertIn(
+                "⚪ Последний вариант в опросе: «❌ Не смогу в этом месяце»",
+                phrases.message.answer.await_args.args[0],
+            )
+            phrase = await press("rdy:tpl:sound:ph.cant")
+            self.assertNotIn(
+                "Предпросмотр",
+                str(phrase.message.answer.await_args.kwargs["reply_markup"]),
+            )
+            await press("rdy:tpledit:sound:ph.cant")
+            phrase_input = self.message(67890, "🙈 В этом месяце не смогу")
+            await next(
+                item.callback for item in self.admin_router.message.handlers
+                if item.callback.__name__ == "on_service_parameter"
+            )(phrase_input)
+            self.assertIn("✅ Текст сохранён", phrase_input.answer.await_args.args[0])
+            self.assertEqual(
+                self.registry.get_readiness_settings("sound")["phrases"],
+                {"cant": "🙈 В этом месяце не смогу"},
+            )
+            await press("rdy:tplreset:sound:ph.cant")
+            self.assertEqual(
+                self.registry.get_readiness_settings("sound")["phrases"], {}
             )
             # Лимит служений в месяц для служения: готовый и «Вручную».
             limit = await press("rdy:lim:sound")

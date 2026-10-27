@@ -383,10 +383,16 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - Third readiness text: `closed_template` (`DEFAULT_READINESS_CLOSED`,
   fields `READINESS_CLOSED_FIELDS`), kind `done` in `READINESS_TEXTS`,
   rendered by `readiness.closed_text` in `announce_closed`.
-- Publication title: `plan_title_template` (`DEFAULT_PLAN_TITLE`,
-  `PLAN_TITLE_FIELDS` = service_name, month, status «утверждён» /
-  «обновлён»), kind `pub` in `READINESS_TEXTS`, rendered by
-  `schedule_plan.publication_title`. `publication_text` puts each date
+- Publication titles: `plan_title_template` / `plan_update_template`
+  (`DEFAULT_PLAN_TITLE` / `DEFAULT_PLAN_UPDATE_TITLE`, fields
+  service_name, month), kinds `pub` / `pubupd`, rendered by
+  `schedule_plan.publication_title(service, month, update, settings)`.
+  The old `{status}` field was split by the one-off migration
+  `plan-title-v2`. Short phrases: `READINESS_PHRASES` (name → default,
+  fields, limit, label), stored in `readiness_settings.phrases_json`
+  (`settings["phrases"]`), set via `set_readiness_phrase`, read via
+  `readiness.phrase(settings, name)`; UI kinds `ph.<name>` under
+  «🔤 Фразы» (`rdy:phr`), no preview. `publication_text` puts each date
   on its own line with tasks below it (two-space indent), blank line
   between dates.
 - Reminder sends treat any Forbidden/BadRequest as final (marked reminded). Preview:

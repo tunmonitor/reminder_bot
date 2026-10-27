@@ -38,13 +38,14 @@ from .service_registry import (  # noqa: F401 — шаблоны для экра
     DEFAULT_READINESS_CHAT_REMINDER,
     DEFAULT_READINESS_CLOSED,
     DEFAULT_PLAN_TITLE,
+    DEFAULT_PLAN_UPDATE_TITLE,
+    READINESS_PHRASES,
     DEFAULT_READINESS_QUESTION,
     DEFAULT_READINESS_INTRO,
     DEFAULT_READINESS_REMINDER,
 )
 from .ui import send_telegram_screen, user_link
 
-CANT_OPTION = "❌ Не смогу в этом месяце"
 MONTHS_IN = (
     "январе", "феврале", "марте", "апреле", "мае", "июне",
     "июле", "августе", "сентябре", "октябре", "ноябре", "декабре",
@@ -366,6 +367,12 @@ def task_lines(task: str, needed: int, names: list[str],
     return [head] + [f"      • {name}" for name in names]
 
 
+def phrase(settings: dict | None, name: str) -> str:
+    """Короткая фраза служения («📝 Тексты» → «🔤 Фразы») или встроенная."""
+    own = ((settings or {}).get("phrases") or {}).get(name)
+    return own or READINESS_PHRASES[name][0]
+
+
 class _Values(dict):
     def __missing__(self, key: str) -> str:
         return "{" + key + "}"
@@ -403,7 +410,7 @@ def option_label(day: str, window: tuple[int, int] = (0, 0)) -> str:
     )
 
 
-def own_days_note(people: list[dict]) -> str:
+def own_days_note(people: list[dict], title: str | None = None) -> str:
     """Сноска к опросу: у кого свой день служения."""
     def label(person: dict) -> str:
         # Однофамильцы различаются: @username, иначе ключ состава.
@@ -421,11 +428,13 @@ def own_days_note(people: list[dict]) -> str:
         if person["tasks"] and person.get("day_offset") is not None
         and person.get("in_roster", True)
     ]
-    return ("📅 Свой день: " + "; ".join(own)) if own else ""
+    title = title or READINESS_PHRASES["own_days"][0]
+    return (f"{title} " + "; ".join(own)) if own else ""
 
 
 def intro_text(service: dict, people: list[dict], year: int, month: int,
-               deadline: datetime, tz, template: str | None = None) -> str:
+               deadline: datetime, tz, template: str | None = None,
+               own_days_label: str | None = None) -> str:
     mentions = [
         user_link(person["telegram_id"], person["name"])
         if person["telegram_id"] else person["name"]
@@ -439,7 +448,7 @@ def intro_text(service: dict, people: list[dict], year: int, month: int,
         people=", ".join(mentions),
     )
     # У кого свой день — сноской после текста (шаблон не нужно менять).
-    note = own_days_note(people)
+    note = own_days_note(people, own_days_label)
     return f"{text}\n\n{note}" if note else text
 
 
@@ -538,7 +547,7 @@ async def launch_run(
             send_chunk, chat_id,
             intro_text(
                 service, people, year, month, deadline, tz,
-                settings.get("intro_template"),
+                settings.get("intro_template"), phrase(settings, "own_days"),
             ),
             limit=text_limit,
         )
@@ -551,7 +560,7 @@ async def launch_run(
             service, registry=registry, logger=logger,
             options=[
                 *(option_label(day, window) for day in dates),
-                CANT_OPTION,
+                phrase(settings, "cant"),
             ],
             is_anonymous=False,
             allows_multiple_answers=True,

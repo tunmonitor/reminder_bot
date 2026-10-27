@@ -2302,3 +2302,26 @@ class UsernameBindingTest(unittest.TestCase):
         self.assertEqual(registry.pending_usernames(), {"new_name"})
         registry.set_service_member_tasks(1001, "sound", "Борис", ["сборка"])
         self.assertEqual(registry.pending_usernames(), set())
+
+
+class PlanTitleMigrationTest(unittest.TestCase):
+    def test_status_field_split_into_two_titles(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        path = Path(temp_dir.name) / "services.sqlite3"
+        registry = ServiceRegistry(path)
+        registry.initialize(1001, -10001)
+        registry.set_readiness_settings(1001, "sound", enabled=False)
+        with closing(sqlite3.connect(path)) as connection, connection:
+            connection.execute(
+                "UPDATE readiness_settings SET plan_title_template = "
+                "'График {service_name}: {status}' WHERE service_id = 'sound'"
+            )
+            connection.execute(
+                "DELETE FROM catalog_migrations WHERE name = 'plan-title-v2'"
+            )
+        registry = ServiceRegistry(path)
+        registry.initialize(1001, -10001)
+        settings = registry.get_readiness_settings("sound")
+        self.assertEqual(settings["plan_title_template"], "График {service_name}: утверждён")
+        self.assertEqual(settings["plan_update_template"], "График {service_name}: обновлён")
