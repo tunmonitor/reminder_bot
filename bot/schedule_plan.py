@@ -788,6 +788,24 @@ def _columns(registry, service_id: str) -> list[ScheduleColumn]:
     return list(service.columns)
 
 
+def task_moments(plan: dict, by_key: dict, day: str,
+                 task: str) -> list[tuple[date, str]]:
+    """Люди задачи на дату и фактический день каждого для Excel: у задачи
+    со своим днём — день задачи или разовый день человека, иначе
+    воскресенье графика."""
+    sunday = date.fromisoformat(day)
+    own = task in task_days(plan)
+    return [
+        (
+            sunday + timedelta(
+                days=slot_offset(plan, by_key.get(key), day, task) or 0
+            ) if own else sunday,
+            key,
+        )
+        for key in plan["slots"].get(day, {}).get(task, [])
+    ]
+
+
 def excel_rows(registry, plan: dict, people: list[dict]) -> list[list]:
     """Лист как в графике: строка заголовков колонок служения, затем блок
     каждой даты — дата в первой ячейке колонки, ниже назначения. Задача со
@@ -815,26 +833,27 @@ def excel_rows(registry, plan: dict, people: list[dict]) -> list[list]:
     # Задача со своим днём (спевка — ср) — отдельным блоком своей даты, как
     # в файле; блоки по порядку дат. Дата другого месяца (среда перед
     # 01.11 — 28.10) — не на этом листе: она в тексте «Для Excel».
-    own_days = task_days(plan)
+    by_key = {person["key"]: person for person in people}
     year, month = map(int, plan["month"].split("-"))
     blocks: dict[date, list[list[list]]] = {}
     for day in plan["dates"]:
         for task in plan["tasks"]:
-            moment = date.fromisoformat(day) + timedelta(
-                days=own_days.get(task["name"], 0)
-            )
-            if (moment.year, moment.month) != (year, month):
-                continue
-            cells = blocks.setdefault(moment, [[] for _ in columns])
             index = own.get(normalized_name(task["name"]), main)
             pairs = columns[index].layout == "pairs"
-            for number, key in enumerate(
-                plan["slots"].get(day, {}).get(task["name"], [])
-            ):
-                label = task["name"] if number == 0 else ""
+            # Задача на дату может разойтись по дням (разовый день
+            # человека): название задачи — у первого в каждом блоке.
+            labelled: set[date] = set()
+            for moment, key in task_moments(plan, by_key, day, task["name"]):
+                if (moment.year, moment.month) != (year, month):
+                    continue
+                cells = blocks.setdefault(moment, [[] for _ in columns])
+                label = "" if moment in labelled else task["name"]
+                labelled.add(moment)
                 cells[index].append(
                     [label, names.get(key, key)] if pairs else [names.get(key, key)]
                 )
+        # Дата графика — блоком, даже если в неё никого.
+        blocks.setdefault(date.fromisoformat(day), [[] for _ in columns])
     for moment in sorted(blocks):
         cells = blocks[moment]
         block = [[""] * width for _ in range(1 + max(map(len, cells)))]
@@ -869,44 +888,40 @@ def excel_text(registry, service: dict, plan: dict, people: list[dict]) -> str:
         "",
     ]
     own_days = task_days(plan)
+    by_key = {person["key"]: person for person in people}
+    outside = []
     for day in plan["dates"]:
         # Задача со своим днём — в строке своего воскресенья с фактическим
-        # днём (на листе — блоком своей даты).
-        parts = [
-            ("" if implicit_plan(plan) else (
-                f"{task['name']} ("
-                + _weekday_date(
-                    date.fromisoformat(day)
-                    + timedelta(days=own_days[task["name"]])
-                ) + ") — "
-                if task["name"] in own_days else f"{task['name']} — "
-            ))
-            + (", ".join(
-                names.get(key, key)
-                for key in plan["slots"].get(day, {}).get(task["name"], [])
-            ) or "пусто")
-            for task in plan["tasks"]
-        ]
-        lines.append(f"{_short(day)}: " + "; ".join(parts))
-    # Своя дата задачи в другом месяце — на листе того месяца.
-    for day in plan["dates"]:
+        # днём (на листе — блоком своей даты); разовый день человека — в
+        # скобках у имени.
+        parts = []
         for task in plan["tasks"]:
-            if task["name"] not in own_days:
-                continue
-            moment = date.fromisoformat(day) + timedelta(
-                days=own_days[task["name"]]
+            moments = task_moments(plan, by_key, day, task["name"])
+            usual = date.fromisoformat(day) + timedelta(
+                days=own_days.get(task["name"], 0)
             )
-            if (moment.year, moment.month) == (year, month):
-                continue
-            people = ", ".join(
-                names.get(key, key)
-                for key in plan["slots"].get(day, {}).get(task["name"], [])
-            ) or "пусто"
-            lines.append(
-                f"⚠️ {_weekday_date(moment)} {task['name']} — {people}: "
-                f"это лист «{_schedule_sheet_name(moment)}», на листе этого "
-                "месяца её нет."
+            head = "" if implicit_plan(plan) else (
+                f"{task['name']} ({_weekday_date(usual)}) — "
+                if task["name"] in own_days else f"{task['name']} — "
             )
+            parts.append(head + (", ".join(
+                names.get(key, key) + (
+                    f" ({_weekday_date(moment)})" if moment != usual else ""
+                )
+                for moment, key in moments
+            ) or "пусто"))
+            # Своя дата задачи в другом месяце — на листе того месяца.
+            outside += [
+                (moment, task["name"], names.get(key, key))
+                for moment, key in moments
+                if (moment.year, moment.month) != (year, month)
+            ]
+        lines.append(f"{_short(day)}: " + "; ".join(parts))
+    for moment, task, name in outside:
+        lines.append(
+            f"⚠️ {_weekday_date(moment)} {task} — {name}: это лист "
+            f"«{_schedule_sheet_name(moment)}», на листе этого месяца её нет."
+        )
     return "\n".join(lines)
 
 

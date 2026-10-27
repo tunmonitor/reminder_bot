@@ -748,6 +748,20 @@ class SchedulePlanTest(unittest.TestCase):
         }
         self.assertEqual(by_day[date(2026, 11, 4)], [("сборка", "Дмитрий")])
         self.assertEqual(by_day[date(2026, 11, 8)], [("звук", "Алексей")])
+        # Разовый день человека главнее дня задачи и в файле.
+        plan["days"] = {"2026-11-08": {"Дмитрий": 0}}
+        dated = [
+            row[0] for row in schedule_plan.excel_rows(self.registry, plan, people)
+            if isinstance(row[0], date)
+        ]
+        self.assertNotIn(date(2026, 11, 4), dated)
+        self.assertIn(
+            "08.11: звук — Алексей; сборка (ср 04.11) — Дмитрий (вс 08.11)",
+            schedule_plan.excel_text(
+                self.registry, self.service(), plan, people
+            ),
+        )
+        plan["days"] = {}
         # «Ответственные»: среда из файла — в блоке своего воскресенья.
         blocks = schedule_plan.week_events(events, {"сборка": -4})
         first = next(b for b in blocks if b["date"] == date(2026, 11, 8))
