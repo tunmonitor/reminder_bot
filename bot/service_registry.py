@@ -490,6 +490,8 @@ class ServiceRegistry:
                     people_needed INTEGER NOT NULL DEFAULT 1
                         CHECK (people_needed BETWEEN 1 AND 5),
                     people_max INTEGER,
+                    -- Свой день задачи: сдвиг от воскресенья (спевка — −4).
+                    day_offset INTEGER,
                     PRIMARY KEY (service_id, name)
                 );
 
@@ -851,6 +853,7 @@ class ServiceRegistry:
             # первого развёртывания.
             for table, column, ddl in (
                 ("service_tasks", "people_max", "INTEGER"),
+                ("service_tasks", "day_offset", "INTEGER"),
                 ("readiness_settings", "enabled_at", "TEXT"),
                 ("readiness_settings", "intro_template", "TEXT"),
                 ("readiness_settings", "reminder_template", "TEXT"),
@@ -1561,7 +1564,7 @@ class ServiceRegistry:
         with self._connection() as connection:
             rows = connection.execute(
                 "SELECT name, position, enabled, aliases_json, source, "
-                "people_needed, people_max FROM service_tasks "
+                "people_needed, people_max, day_offset FROM service_tasks "
                 "WHERE service_id = ? ORDER BY position, name",
                 (service_id,),
             ).fetchall()
@@ -1578,6 +1581,8 @@ class ServiceRegistry:
                     row["people_max"] or row["people_needed"],
                     row["people_needed"],
                 ),
+                # Свой день задачи; None — дни служения раздела «📅 График».
+                "day_offset": row["day_offset"],
             }
             for row in rows
         ]
@@ -1592,7 +1597,7 @@ class ServiceRegistry:
                 {
                     "name": task["name"], "needed": task["people_needed"],
                     "max": task["people_max"], "position": str(task["position"]),
-                    "implicit": False,
+                    "implicit": False, "day": task["day_offset"],
                 }
                 for task in tasks if task["enabled"]
             ]
@@ -1603,7 +1608,7 @@ class ServiceRegistry:
         return [{
             "name": service["name"], "needed": settings["people_needed"],
             "max": settings["people_max"] or settings["people_needed"],
-            "position": "s", "implicit": True,
+            "position": "s", "implicit": True, "day": None,
         }]
 
     def service_catalog(self) -> tuple[ServiceDefinition, ...]:
@@ -1700,6 +1705,63 @@ class ServiceRegistry:
             self._audit(
                 connection, actor_id, "service_task_updated", service_id,
                 {"task": task, "people_needed": count, "people_max": maximum},
+            )
+
+    def set_service_task_day(
+        self, actor_id: int, service_id: str, task: str, offset: int | None,
+    ) -> None:
+        """Свой день задачи (решение 12): сдвиг от воскресенья графика
+        (спевка — вс −4, ср); None — дни служения раздела «📅 График».
+        График показывается по неделям; день переносится в графики текущего
+        и будущих месяцев, утверждённые публикуются заново."""
+        _validate_positive_id(actor_id, "actor_id")
+        if offset is not None and (
+            isinstance(offset, bool) or not isinstance(offset, int)
+            or not -6 <= offset <= 6
+        ):
+            raise ValueError("День задачи: от вс −6 до вс +6.")
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            self._require_service(connection, service_id)
+            row = connection.execute(
+                "SELECT day_offset FROM service_tasks "
+                "WHERE service_id = ? AND name = ?",
+                (service_id, task),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Задача «{task}» не найдена.")
+            if row["day_offset"] == offset:
+                return
+            connection.execute(
+                "UPDATE service_tasks SET day_offset = ? "
+                "WHERE service_id = ? AND name = ?",
+                (offset, service_id, task),
+            )
+            plans = connection.execute(
+                "SELECT month, tasks_json FROM schedule_plans "
+                "WHERE service_id = ? AND month >= ?",
+                (service_id, _current_month()),
+            ).fetchall()
+            for plan in plans:
+                tasks = json.loads(plan["tasks_json"])
+                if not any(item["name"] == task for item in tasks):
+                    continue
+                for item in tasks:
+                    if item["name"] == task:
+                        item["day"] = offset
+                # Утверждённый график с этой задачей — опубликовать заново;
+                # графики без неё не меняются.
+                connection.execute(
+                    "UPDATE schedule_plans SET tasks_json = ?, updated_at = ?, "
+                    "republish = CASE WHEN approved_json IS NOT NULL THEN 1 "
+                    "ELSE republish END "
+                    "WHERE service_id = ? AND month = ?",
+                    (json.dumps(tasks, ensure_ascii=False), _utc_now(),
+                     service_id, plan["month"]),
+                )
+            self._audit(
+                connection, actor_id, "service_task_updated", service_id,
+                {"task": task, "day_offset": offset},
             )
 
     def add_service_task(

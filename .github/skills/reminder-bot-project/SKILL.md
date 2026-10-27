@@ -402,6 +402,17 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   (NULL = minimum, up to 6) — «👥 Нужно людей», set by service admins too
   (`set_service_task_people_needed(actor, service, task, low, high)`) from
   «🗳 Опрос готовности» or «📋 Задачи служения» (`rdy:people|ppick|pset`).
+- `service_tasks.day_offset` — task's own day (−6…+6 from the plan's Sunday,
+  NULL = service days), `set_service_task_day` (also rewrites `tasks_json`
+  of current/future plans and marks approved ones `republish`); UI
+  «📅 Дни задач» `svc_tasks:days|dpick|dset`. Plan tasks carry `day`;
+  `schedule_plan.slot_offset` (override → task day → personal day),
+  `task_days`, `week_groups` / `week_person_day`: any task day switches
+  `plan_text` and `publication_text` to weekly layout. `served_offsets`
+  keeps the latest day per person per date. Excel has own-day tasks as
+  separate dates: `excel_rows` writes them as blocks of their own date,
+  `week_events` folds such Excel events into their Sunday for the
+  «👥 Ответственные» overview (`days` → «· ср 11.11»).
 - Planner: `PlanInput.extra` (optional seats above the minimum) and
   `reluctant` (non-respondents: free on all dates, `RELUCTANT_WEIGHT` per
   service). A one-week gap costs `BACK_TO_BACK_WEIGHT` (100 ×
@@ -538,7 +549,13 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   after a chat is saved) is open to the service admin; previews go to the
   caller. Start menu (27.10): settings, notify, contacts, and for the super
   admin `menu:service_admins` (submenu with add/remove); sync, chat and
-  delivery check live only in the service card.
+  delivery check live only in the service card. Card (27.10 evening):
+  chat and admin add/remove moved into «⚙️ Настройки»
+  (`service:service_setup`, `service_setup_keyboard`); the delivery check
+  is in the chat screen (`service_chat_keyboard(service_id, actor_id)`);
+  «❓ Помощь» = `service:service_help` (`SERVICE_HELP`). `/service_contact`
+  opens the member list first (`offer_contact_overview(members_first=True)`),
+  the date overview via «🗓 По датам графика».
 - Readiness poll texts: `question_template` (`readiness.question_text`, fields
   service_name/month/month_in, ≤300, sent with `question_parse_mode=None`,
   blank → default); «📝 Тексты» (`show_readiness_texts`, kind "q").
