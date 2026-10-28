@@ -3104,17 +3104,20 @@ class ServiceRegistry:
                 raise ValueError("Границы периода — даты воскресений.")
         if active_from and active_until and active_from > active_until:
             raise ValueError("Начало периода позже окончания.")
-        if active_until is not None and active_until < today:
-            raise ValueError("Окончание периода уже прошло.")
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT service_id, enabled, reminder_days, reminder_time, task "
-                "FROM group_reminders WHERE id = ?",
+                f"SELECT {_GROUP_REMINDER_COLUMNS} "
+                f"FROM {_GROUP_REMINDER_SOURCE} WHERE g.id = ?",
                 (reminder_id,),
             ).fetchone()
             if row is None:
                 raise ValueError("Групповое напоминание больше не существует.")
             self._require_service_editor(connection, actor_id, row["service_id"])
+            # Неделя окончания идёт до дня задачи (вс +5 — пятница после).
+            if active_until is not None and active_until + timedelta(
+                days=reminder_day_offset(dict(row))
+            ) < today:
+                raise ValueError("Окончание периода уже прошло.")
             values = (
                 active_from.isoformat() if active_from else None,
                 active_until.isoformat() if active_until else None,

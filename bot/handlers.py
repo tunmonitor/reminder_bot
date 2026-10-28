@@ -3503,7 +3503,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if reminder is None or reminder["service_id"] != service_id:
             raise ValueError("Групповое напоминание больше не существует.")
         today = datetime.now(context.timezone).date()
-        first = today + timedelta(days=(6 - today.weekday()) % 7)
+        # Первое воскресенье, неделя которого ещё идёт: у задачи со своим
+        # днём (вс +5) — до дня задачи.
+        start = today - timedelta(days=reminder_day_offset(reminder))
+        first = start + timedelta(days=(6 - start.weekday()) % 7)
         if pick_until:
             start = max(first, active_from or first)
             choices = [start + timedelta(weeks=week) for week in range(12)]

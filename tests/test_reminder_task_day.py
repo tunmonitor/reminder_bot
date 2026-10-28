@@ -185,6 +185,25 @@ class TaskDayProcessingTest(unittest.TestCase):
             [monday],
         )
 
+    def test_period_may_end_with_current_task_week(self):
+        # Пятница после воскресенья (вс +5): во вторник 03.11 неделя
+        # 01.11 ещё идёт — окончание «по 01.11» допустимо.
+        self.registry.set_service_task_day(SUPER, "sound", "сборка", 5)
+        friday = self.reminder("сборка")
+        common = self.reminder(None)
+        tuesday = date(2026, 11, 3)
+        self.registry.set_group_reminder_period(
+            SUPER, friday, None, date(2026, 11, 1), today=tuesday,
+        )
+        self.assertEqual(
+            self.registry.get_group_reminder(friday)["active_until"],
+            "2026-11-01",
+        )
+        with self.assertRaisesRegex(ValueError, "уже прошло"):
+            self.registry.set_group_reminder_period(
+                SUPER, common, None, date(2026, 11, 1), today=tuesday,
+            )
+
     def test_common_reminder_skips_rehearsal_wednesday(self):
         reminder_id = self.reminder(None)
         bot, load, notify = self.process(
