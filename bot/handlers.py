@@ -6447,10 +6447,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
                 first = date(year, month, 1)
                 try:
-                    # Среда перед первым воскресеньем — в прошлом месяце.
+                    # Среда перед первым воскресеньем — в прошлом месяце,
+                    # «вс +1» последнего воскресенья — уже в следующем.
                     events = await loader(
                         force=True, since=first - timedelta(days=6),
-                        until=month_end(year, month),
+                        until=month_end(year, month) + timedelta(days=6),
                         with_replacements=False, excel_only=True,
                     )
                 except Exception:  # noqa: BLE001 — показать и не упасть

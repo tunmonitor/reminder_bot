@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 from contextlib import closing
 import logging
@@ -228,7 +229,9 @@ class SchedulePlanTest(unittest.TestCase):
         # Среда — в своё воскресенье; в воскресенье — разовый день.
         self.assertEqual(loaded["slots"]["2026-11-08"]["сборка"], ["Дмитрий"])
         self.assertEqual(loaded["slots"]["2026-11-15"]["сборка"], ["Незнакомец"])
-        self.assertEqual(loaded["days"], {"2026-11-15": {"Незнакомец": 0}})
+        self.assertEqual(loaded["days"], {
+            "2026-11-15": {schedule_plan.task_day_key("Незнакомец", "сборка"): 0}
+        })
         self.assertIn("Незнакомец", loaded["unbound"])
         plan = self.registry.import_excel_plan(
             1001, "sound", "2026-11", dates=loaded["dates"],
@@ -263,13 +266,55 @@ class SchedulePlanTest(unittest.TestCase):
         self.assertEqual(
             mixed["slots"]["2026-11-22"]["сборка"], ["Дмитрий", "Алексей"]
         )
-        self.assertEqual(mixed["days"], {"2026-11-22": {"Алексей": 0}})
+        self.assertEqual(mixed["days"], {
+            "2026-11-22": {schedule_plan.task_day_key("Алексей", "сборка"): 0}
+        })
         # Новый опрос пересчитывает рабочую копию, итоговым остаётся Excel,
         # пока не утвердят.
         draft = self.draft()
         self.assertEqual(draft["source"], "poll")
         self.assertEqual(draft["approved"], plan["approved"])
         self.assertTrue(draft["dirty"])
+        # Разовый день одной задачи не сдвигает другие задачи человека той
+        # же недели: сборка в воскресенье, звук (вс −4) — в среду.
+        self.registry.set_service_task_day(1001, "sound", "звук", -4)
+        both = schedule_plan.excel_plan(self.registry, "sound", 2026, 11, [
+            event(date(2026, 11, 22), ("сборка", "Алексей")),
+            event(date(2026, 11, 18), ("звук", "Алексей")),
+        ])
+        imported = self.registry.import_excel_plan(
+            1001, "sound", "2026-11", dates=both["dates"],
+            tasks=both["tasks"], slots=both["slots"], days=both["days"],
+        )
+        back = {
+            item.event_date: sorted((a.task, a.name) for a in item.assignments)
+            for item in schedule_plan.plan_events(imported, self.people())
+        }
+        self.assertEqual(back[date(2026, 11, 18)], [("звук", "Алексей")])
+        self.assertEqual(back[date(2026, 11, 22)], [("сборка", "Алексей")])
+        # Правка графика день задачи сохраняет; день на дату его заменяет.
+        key = schedule_plan.task_day_key("Алексей", "сборка")
+        edited = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", imported["slots"],
+        )
+        self.assertEqual(edited["days"]["2026-11-22"], {key: 0})
+        slots = imported["slots"]
+        slots["2026-11-22"]["сборка"] = []
+        edited = self.registry.set_schedule_slots(1001, "sound", "2026-11", slots)
+        self.assertNotIn("2026-11-22", edited["days"])
+        slots["2026-11-22"]["сборка"] = ["Алексей"]
+        self.registry.set_schedule_slots(1001, "sound", "2026-11", slots)
+        with closing(sqlite3.connect(self.registry.path)) as connection, \
+                connection:
+            connection.execute(
+                "UPDATE schedule_plans SET days_json = ? WHERE month = ?",
+                (json.dumps({"2026-11-22": {key: 0}}), "2026-11"),
+            )
+        edited = self.registry.set_schedule_day(
+            1001, "sound", "2026-11", "2026-11-22", "Алексей", -1,
+        )
+        self.assertEqual(edited["days"]["2026-11-22"], {"Алексей": -1})
+        self.registry.set_service_task_day(1001, "sound", "звук", None)
 
     def test_week_bundles_from_task_flag_and_member(self):
         # Алексей — звук и сборка; связка у служения: звук + сборка.

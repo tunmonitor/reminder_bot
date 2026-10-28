@@ -33,7 +33,9 @@ from .readiness import (
     summarize,
     task_lines,
 )
-from .services import ScheduleColumn, normalized_name
+from .services import (
+    ScheduleColumn, normalized_name, split_day_key, task_day_key,
+)
 from .ui import send_telegram_screen, user_link
 
 
@@ -315,10 +317,13 @@ def task_days(plan: dict) -> dict[str, int]:
 
 def slot_offset(plan: dict, person: dict | None, day: str,
                 task: str) -> int | None:
-    """День человека в задаче на дату: разовый в графике, иначе день
-    задачи, иначе личный."""
+    """День человека в задаче на дату: разовый для задачи, разовый в
+    графике, иначе день задачи, иначе личный."""
     key = (person or {}).get("key")
-    override = plan.get("days", {}).get(day, {}).get(key)
+    overrides = plan.get("days", {}).get(day, {})
+    override = overrides.get(task_day_key(str(key), task))
+    if override is None:
+        override = overrides.get(key)
     if override is not None:
         return override
     own = task_days(plan).get(task)
@@ -769,11 +774,13 @@ def publication_text(service: dict, plan: dict, people: list[dict],
                 for key in people
             }
             for key in sorted(set(before) | set(after)):
-                if before.get(key) == after.get(key) or key not in serving:
+                person, task = split_day_key(key)
+                if before.get(key) == after.get(key) or person not in serving:
                     continue
                 offset = after.get(key)
                 changes.append(
-                    f"• {_short(day)} {names.get(key, key)}: "
+                    f"• {_short(day)} {names.get(person, person)}"
+                    + (f" ({task})" if task else "") + ": "
                     + (
                         _weekday_date(
                             date.fromisoformat(day) + timedelta(days=offset)
@@ -876,10 +883,12 @@ def excel_plan(registry, service_id: str, year: int, month: int,
                     unbound.append(assignment.name)
             if assignment.task in own_days:
                 # Задача со своим днём не в свой день (в воскресенье) —
-                # разовый день человека.
+                # разовый день человека в этой задаче.
                 offset = (moment - block["date"]).days
                 if offset != own_days[assignment.task]:
-                    days.setdefault(day, {})[key] = offset
+                    days.setdefault(day, {})[
+                        task_day_key(key, assignment.task)
+                    ] = offset
     return {
         "dates": dates, "tasks": tasks, "slots": slots, "days": days,
         "unbound": unbound, "skipped": list(dict.fromkeys(skipped)),
