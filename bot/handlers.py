@@ -5572,6 +5572,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                                 "\n⚠️ Закрепить не удалось — дайте боту в "
                                 "чате право закреплять сообщения"
                             )
+                        if plan.get("unsent_notice"):
+                            notice += (
+                                "\n⚠️ Закреплённый график обновлён, но "
+                                "сообщение с изменениями в чат не ушло — "
+                                "перешлите его участникам:\n\n"
+                                + plan["unsent_notice"]
+                            )
                         try:
                             await send_excel_block(actor_id, service, plan)
                         except Exception:  # noqa: BLE001

@@ -40,7 +40,9 @@ from .readiness import (
 from .services import (
     ScheduleColumn, normalized_name, split_day_key, task_day_key,
 )
-from .ui import render_screen_chunks, send_telegram_screen, user_link
+from .ui import (
+    plain_text, render_screen_chunks, send_telegram_screen, user_link,
+)
 
 
 # Сколько ждать график прошлого месяца (секунды).
@@ -756,9 +758,11 @@ def published_baseline(plan: dict) -> dict:
 
 def change_lines(plan: dict, people: list[dict], old_slots: dict,
                  old_days: dict, settings: dict | None = None,
-                 show: Callable[[str], str] | None = None) -> list[str]:
+                 show: Callable[[str], str] | None = None,
+                 days_changed: bool | None = None) -> list[str]:
     """Изменения рабочей копии от old_slots/old_days: замены, разовые дни,
-    «Изменены дни служения»."""
+    «Изменены дни служения» (days_changed; None — после прошлого
+    утверждения)."""
     names = _names(people)
     changes = plan_changes(
         old_slots, plan["slots"], names, phrase(settings, "nobody"), show,
@@ -786,7 +790,7 @@ def change_lines(plan: dict, people: list[dict], old_slots: dict,
                     else phrase(settings, "usual_day")
                 )
             )
-    if plan.get("republish"):
+    if plan.get("republish") if days_changed is None else days_changed:
         changes.append(phrase(settings, "days_changed"))
     return changes
 
@@ -864,6 +868,9 @@ def publication_text(service: dict, plan: dict, people: list[dict],
         baseline = published_baseline(plan)
         changes = change_lines(
             plan, people, baseline["slots"], baseline["days"], settings,
+            days_changed=bool(
+                plan.get("republish") or baseline.get("days_changed")
+            ),
         )
         if changes:
             lines += ["", phrase(settings, "changes")] + changes
@@ -1203,7 +1210,8 @@ async def publish(
     Первая публикация закрепляется; обновление правит закреплённую и
     отвечает на неё новыми изменениями (правка не уведомляет). Не
     правится — новая публикация, закреплённая. ValueError — публиковать
-    некуда. В результате pinned=False — закрепить не удалось."""
+    некуда. В результате pinned=False — закрепить не удалось,
+    unsent_notice — текст ответа с изменениями, который не ушёл."""
     chat_id = service.get("group_chat_id")
     if not chat_id:
         raise ValueError("Чат служения не привязан — график не опубликован.")
@@ -1222,6 +1230,9 @@ async def publish(
         bot, chat_id, old_ids, text, text_limit,
     )
     pinned = True
+    # Ответ с изменениями не ушёл — его текст админу (переслать вручную):
+    # после утверждения изменений уже нет, повторить нечем.
+    unsent_notice = None
     sent: list[int] = []
     if edited:
         message_ids = old_ids
@@ -1243,6 +1254,7 @@ async def publish(
             except Exception:  # noqa: BLE001 — график уже обновлён
                 logger.warning("Изменения графика не отправлены ответом",
                                exc_info=True)
+                unsent_notice = plain_text(notice)
     else:
         async def send_chunk(chat, body, **kwargs):
             message = await send_to_service_group(
@@ -1274,13 +1286,18 @@ async def publish(
     except Exception:  # noqa: BLE001 — нет права закреплять
         pinned = False
         logger.warning("График не закреплён", exc_info=True)
-    # Изменения под графиком — от первой публикации месяца.
+    # Изменения под графиком — от первой публикации месяца; смена дней
+    # служения после неё помнится там же (republish сбросится).
     baseline = None
     if plan.get("baseline") is None:
         baseline = (
             {"slots": plan["slots"], "days": plan.get("days", {})}
             if plan["approved"] is None else published_baseline(plan)
         )
+    if plan["approved"] is not None and plan.get("republish"):
+        baseline = {
+            **(baseline or plan["baseline"]), "days_changed": True,
+        }
     for attempt in range(2):
         try:
             result = registry.approve_schedule_plan(
@@ -1315,7 +1332,7 @@ async def publish(
                     )
                 except Exception:  # noqa: BLE001
                     logger.info("Прежний график не откреплён", exc_info=True)
-    return {**result, "pinned": pinned}
+    return {**result, "pinned": pinned, "unsent_notice": unsent_notice}
 
 
 def excel_filled(events, service_id: str, year: int, month: int) -> bool:

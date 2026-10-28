@@ -377,6 +377,41 @@ class SchedulePlanTest(unittest.TestCase):
             [11],
         )
 
+    @unittest.mock.patch(
+        "bot.service_registry._current_month", return_value="2026-10"
+    )
+    def test_days_change_stays_in_pinned_and_unsent_reply_reported(self, _m):
+        plan = self.draft()
+        first = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+        ))
+        # Сменились дни служения — строка в закреплённом.
+        self.registry.set_readiness_settings(1001, "sound", day_from=-1, day_to=1)
+        changed = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertTrue(changed["republish"])
+        asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), changed, 1001, LOG, 4096,
+        ))
+        # Следующая правка людей — строка о днях не пропадает, хотя
+        # republish уже сброшен; ответ не ушёл — текст админу.
+        slots = self.registry.get_schedule_plan("sound", "2026-11")["slots"]
+        slots["2026-11-29"]["звук"] = ["Борис"]
+        changed = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", slots
+        )
+        self.assertFalse(changed["republish"])
+        self.bot.send_message.side_effect = RuntimeError("network")
+        third = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), changed, 1001, LOG, 4096,
+        ))
+        pinned_text = self.bot.edit_message_text.await_args.args[0]
+        self.assertIn("• Изменены дни служения", pinned_text)
+        self.assertIn("29.11 «звук»: никого → Борис", pinned_text)
+        self.assertIn("29.11 «звук»: никого → Борис", third["unsent_notice"])
+        self.assertNotIn("\x00", third["unsent_notice"])
+        self.assertNotIn("Изменены дни", third["unsent_notice"])
+        self.assertEqual(first["message_ids"], third["message_ids"])
+
     def test_change_lines_format(self):
         names = {"f": "Филипп", "d": "Денис", "a": "Анна"}
         self.assertEqual(
