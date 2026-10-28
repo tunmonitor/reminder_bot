@@ -216,6 +216,61 @@ class SchedulePlanTest(unittest.TestCase):
             recalculated["approved"]["2026-11-15"]["сборка"], ["Глеб"]
         )
 
+    def test_excel_plan_round_trip_with_task_day(self):
+        self.registry.set_service_task_day(1001, "sound", "сборка", -4)
+        events = [
+            event(date(2026, 11, 8), ("звук", "Алексей")),
+            event(date(2026, 11, 4), ("сборка", "Дмитрий")),
+            event(date(2026, 11, 15), ("сборка", "Незнакомец")),
+        ]
+        loaded = schedule_plan.excel_plan(self.registry, "sound", 2026, 11, events)
+        self.assertEqual(loaded["slots"]["2026-11-08"]["звук"], ["Алексей"])
+        # Среда — в своё воскресенье; в воскресенье — разовый день.
+        self.assertEqual(loaded["slots"]["2026-11-08"]["сборка"], ["Дмитрий"])
+        self.assertEqual(loaded["slots"]["2026-11-15"]["сборка"], ["Незнакомец"])
+        self.assertEqual(loaded["days"], {"2026-11-15": {"Незнакомец": 0}})
+        self.assertIn("Незнакомец", loaded["unbound"])
+        plan = self.registry.import_excel_plan(
+            1001, "sound", "2026-11", dates=loaded["dates"],
+            tasks=loaded["tasks"], slots=loaded["slots"], days=loaded["days"],
+        )
+        self.assertEqual(plan["source"], "excel")
+        self.assertFalse(plan["dirty"])
+        # Обратно — события для напоминаний: среда — своей датой.
+        back = {
+            item.event_date: sorted((a.task, a.name) for a in item.assignments)
+            for item in schedule_plan.plan_events(plan, self.people())
+        }
+        self.assertEqual(back[date(2026, 11, 4)], [("сборка", "Дмитрий")])
+        self.assertEqual(back[date(2026, 11, 8)], [("звук", "Алексей")])
+        self.assertEqual(back[date(2026, 11, 15)], [("сборка", "Незнакомец")])
+        # День задачи в настройках переносит и утверждённый график (он
+        # публикуется заново) — напоминания как в публикации.
+        self.registry.set_service_task_day(1001, "sound", "сборка", None)
+        plan = self.registry.get_schedule_plan("sound", "2026-11")
+        back = {
+            item.event_date: sorted((a.task, a.name) for a in item.assignments)
+            for item in schedule_plan.plan_events(plan, self.people())
+        }
+        self.assertNotIn(date(2026, 11, 4), back)
+        self.assertIn(("сборка", "Дмитрий"), back[date(2026, 11, 8)])
+        self.registry.set_service_task_day(1001, "sound", "сборка", -4)
+        # Разные дни у людей одной задачи — у каждого свой, как в файле.
+        mixed = schedule_plan.excel_plan(self.registry, "sound", 2026, 11, [
+            event(date(2026, 11, 18), ("сборка", "Дмитрий")),
+            event(date(2026, 11, 22), ("сборка", "Алексей")),
+        ])
+        self.assertEqual(
+            mixed["slots"]["2026-11-22"]["сборка"], ["Дмитрий", "Алексей"]
+        )
+        self.assertEqual(mixed["days"], {"2026-11-22": {"Алексей": 0}})
+        # Новый опрос пересчитывает рабочую копию, итоговым остаётся Excel,
+        # пока не утвердят.
+        draft = self.draft()
+        self.assertEqual(draft["source"], "poll")
+        self.assertEqual(draft["approved"], plan["approved"])
+        self.assertTrue(draft["dirty"])
+
     def test_week_bundles_from_task_flag_and_member(self):
         # Алексей — звук и сборка; связка у служения: звук + сборка.
         with self.assertRaises(ValueError):

@@ -860,5 +860,203 @@ class LoaderAppliesReplacementTest(Base):
         self.assertEqual(asyncio.run(run())["звук"]["names"], ["Алексей"])
 
 
+
+class BotPlanSourceTest(Base):
+    """Решение 15: утверждённый график бота главнее Excel."""
+
+    def approve(self, slots):
+        month = f"{EVENT:%Y-%m}"
+        tasks = [
+            {"name": task["name"], "needed": task["needed"], "max": task["max"],
+             "implicit": task["implicit"], "day": task.get("day")}
+            for task in self.registry.plan_tasks("sound")
+        ]
+        self.registry.save_schedule_draft(
+            "sound", month, run_id=None, dates=[EVENT.isoformat()],
+            tasks=tasks, slots=slots, last_served={},
+        )
+        self.registry.approve_schedule_plan(
+            SUPER, "sound", month, slots, chat_id=None, message_id=None,
+        )
+
+    def load(self, events):
+        from bot import app
+
+        async def run():
+            with tempfile.TemporaryDirectory() as shm, \
+                    patch.object(app, "download_public", new=AsyncMock()), \
+                    patch.object(
+                        app, "parse_service_events",
+                        return_value={"sound": events},
+                    ), \
+                    patch.object(app, "_sync_rosters_and_contacts"):
+                return await app._load_service_task_assignments(
+                    SimpleNamespace(yandex_public_url="https://example.invalid"),
+                    Path(shm), TZ, "sound", MagicMock(), only_date=EVENT,
+                    return_event_found=True, registry=self.registry,
+                )
+
+        return asyncio.run(run())
+
+    def test_reminders_follow_approved_bot_plan(self):
+        from bot import app
+        from bot.excel_parser import ServiceAssignment, ServiceEvent
+
+        excel = [
+            ServiceEvent("sound", EVENT, (ServiceAssignment("звук", "Алексей"),)),
+            ServiceEvent("books", EVENT, (ServiceAssignment("книги", "Ольга"),)),
+        ]
+        # Нет утверждённого графика — как в Excel.
+        result, found = self.load(excel[:1])
+        self.assertEqual(result["звук"]["names"], ["Алексей"])
+        self.assertTrue(found)
+        self.approve({EVENT.isoformat(): {"звук": ["Борис"], "сборка": []}})
+        result, found = self.load(excel[:1])
+        self.assertEqual(result["звук"]["names"], ["Борис"])
+        self.assertTrue(found)
+        # Замена — поверх графика бота.
+        self.registry.set_replacement(
+            "sound", EVENT.isoformat(), "звук", "Борис", "Алексей", OLD,
+            "alex_one", "admin", ADMIN,
+        )
+        result, _ = self.load(excel[:1])
+        self.assertEqual(result["звук"]["names"], ["Алексей"])
+        # Ближайшие недели: события Excel этого служения и месяца заменены,
+        # другие служения — как в файле.
+        shown = app._apply_bot_plans(
+            excel, self.registry, EVENT - timedelta(days=7),
+            EVENT + timedelta(days=7),
+        )
+        self.assertEqual(
+            sorted(
+                (event.service_id, [a.name for a in event.assignments])
+                for event in shown
+            ),
+            [("books", ["Ольга"]), ("sound", ["Борис"])],
+        )
+        # Не воскресенье утверждённого месяца, которого нет в графике бота
+        # (среда спевки к воскресенью следующего месяца), — из Excel.
+        wednesday = ServiceEvent(
+            "sound", EVENT + timedelta(days=24),
+            (ServiceAssignment("спевка", "Вера"),),
+        )
+        self.assertEqual(wednesday.event_date.month, EVENT.month)
+        self.assertNotEqual(wednesday.event_date.weekday(), 6)
+        shown = app._apply_bot_plans(
+            [wednesday], self.registry, EVENT, EVENT + timedelta(days=30),
+        )
+        self.assertIn(wednesday, shown)
+        # Пометки Excel остаются при графике бота.
+        noted = ServiceEvent("sound", EVENT, (
+            ServiceAssignment("звук", "Алексей"),
+            ServiceAssignment("2я часть членское", "", True),
+        ))
+        shown = app._apply_bot_plans(
+            [noted], self.registry, EVENT, EVENT,
+        )
+        self.assertEqual(
+            sorted((a.task, a.name) for a in shown[0].assignments),
+            [("2я часть членское", ""), ("звук", "Борис")],
+        )
+        result, _ = self.load([noted])
+        self.assertTrue(result["2я часть членское"]["is_informational"])
+
+    def test_previous_month_plan_covers_next_month_date(self):
+        from bot import app
+
+        # Воскресенье — последний день месяца, задача «вс +1».
+        sunday = next(
+            EVENT + timedelta(weeks=week) for week in range(60)
+            if (EVENT + timedelta(weeks=week, days=1)).day == 1
+        )
+        self.registry.set_service_task_day(SUPER, "sound", "звук", 1)
+        month = f"{sunday:%Y-%m}"
+        tasks = [
+            {"name": task["name"], "needed": task["needed"], "max": task["max"],
+             "implicit": task["implicit"], "day": task.get("day")}
+            for task in self.registry.plan_tasks("sound")
+        ]
+        self.registry.save_schedule_draft(
+            "sound", month, run_id=None, dates=[sunday.isoformat()],
+            tasks=tasks, slots={sunday.isoformat(): {"звук": ["Борис"]}},
+            last_served={},
+        )
+        self.registry.approve_schedule_plan(
+            SUPER, "sound", month, {sunday.isoformat(): {"звук": ["Борис"]}},
+            chat_id=None, message_id=None,
+        )
+        monday = sunday + timedelta(days=1)
+        planned, covered = app._bot_plan_events(self.registry, monday, monday)
+        self.assertIn(("sound", monday), covered)
+        self.assertEqual(
+            [
+                (event.event_date, [a.name for a in event.assignments])
+                for event in planned if event.event_date == monday
+            ],
+            [(monday, ["Борис"])],
+        )
+
+    def test_approved_tasks_ignore_draft_edits(self):
+        from bot import app
+        import sqlite3
+        from contextlib import closing
+
+        self.approve({EVENT.isoformat(): {"звук": ["Борис"]}})
+        month = f"{EVENT:%Y-%m}"
+
+        def moments():
+            planned, _ = app._bot_plan_events(
+                self.registry, EVENT, EVENT + timedelta(days=1),
+            )
+            return [
+                (event.event_date, [a.name for a in event.assignments])
+                for event in planned if event.assignments
+            ]
+
+        # Правка рабочей копии (переименование, свой день) — не в напоминаниях.
+        db = self.registry.path
+        with closing(sqlite3.connect(db)) as connection, connection:
+            connection.execute(
+                "UPDATE schedule_plans SET tasks_json = ? WHERE month = ?",
+                ('[{"name": "звук2", "day": 1}]', month),
+            )
+        self.assertEqual(moments(), [(EVENT, ["Борис"])])
+        # Утверждён до снимка — снимок заполняется при запуске из рабочей
+        # копии, дальше она на напоминания не влияет.
+        with closing(sqlite3.connect(db)) as connection, connection:
+            connection.execute(
+                "UPDATE schedule_plans SET approved_tasks_json = NULL, "
+                "tasks_json = ? WHERE month = ?",
+                ('[{"name": "звук", "day": null}]', month),
+            )
+        self.registry.initialize(SUPER, -100)
+        # Снимок из уже переименованной копии — назначения не теряются.
+        with closing(sqlite3.connect(db)) as connection, connection:
+            connection.execute(
+                "UPDATE schedule_plans SET approved_tasks_json = ? "
+                "WHERE month = ?",
+                ('[{"name": "звук2", "day": 1}]', month),
+            )
+        self.assertEqual(moments(), [(EVENT, ["Борис"])])
+        with closing(sqlite3.connect(db)) as connection, connection:
+            connection.execute(
+                "UPDATE schedule_plans SET approved_tasks_json = tasks_json "
+                "WHERE month = ?",
+                (month,),
+            )
+        with closing(sqlite3.connect(db)) as connection, connection:
+            connection.execute(
+                "UPDATE schedule_plans SET tasks_json = ? WHERE month = ?",
+                ('[{"name": "звук", "day": 1}]', month),
+            )
+        self.assertEqual(moments(), [(EVENT, ["Борис"])])
+        # День задачи в настройках — и в утверждённом графике (публикуется
+        # заново), напоминание — в новый день.
+        self.registry.set_service_task_day(SUPER, "sound", "звук", 1)
+        self.assertEqual(
+            moments(), [(EVENT + timedelta(days=1), ["Борис"])],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

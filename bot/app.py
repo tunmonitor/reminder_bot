@@ -45,6 +45,7 @@ if __package__:
         parse_schedule,
         SheetEmptyError,
         SheetNotFoundError,
+        ServiceEvent,
         parse_service_events,
         parse_service_rosters,
         resolve_assignments,
@@ -73,6 +74,7 @@ if __package__:
     from .secure_fs import open_private_directory
     from .month_summary import send_due_month_summaries
     from .readiness import run_readiness_tick
+    from .schedule_plan import plan_events
     from .scheduler import (
         add_service_reminder_jobs,
         build_scheduler,
@@ -108,6 +110,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         parse_schedule,
         SheetEmptyError,
         SheetNotFoundError,
+        ServiceEvent,
         parse_service_events,
         parse_service_rosters,
         resolve_assignments,
@@ -136,6 +139,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
     from bot.secure_fs import open_private_directory
     from bot.month_summary import send_due_month_summaries
     from bot.readiness import run_readiness_tick
+    from bot.schedule_plan import plan_events
     from bot.scheduler import (
         add_service_reminder_jobs,
         build_scheduler,
@@ -605,6 +609,44 @@ async def _load_service_task_assignments(
             }
             for task, task_info in sorted(assignments.items())
         }
+        if registry is not None and only_date is not None:
+            # Утверждённый график бота на эту дату главнее Excel
+            # (решение 15); Excel по-прежнему читается ради «Списков».
+            try:
+                planned, covered = _bot_plan_events(
+                    registry, only_date, only_date
+                )
+            except Exception:  # noqa: BLE001
+                debug_logger.exception("Не удалось прочитать график бота")
+                planned, covered = [], set()
+            if _covered(
+                SimpleNamespace(service_id=service_id, event_date=only_date),
+                covered,
+            ):
+                plan_tasks: dict[str, set[str]] = {}
+                event_found = False
+                for event in planned:
+                    if (
+                        event.service_id != service_id
+                        or event.event_date != only_date
+                    ):
+                        continue
+                    event_found = True
+                    for assignment in event.assignments:
+                        plan_tasks.setdefault(assignment.task, set()).add(
+                            assignment.name
+                        )
+                notes = {
+                    task: info for task, info in result.items()
+                    if info["is_informational"]
+                }
+                result = {
+                    task: {"names": sorted(names), "is_informational": False}
+                    for task, names in sorted(plan_tasks.items())
+                }
+                # Пометки Excel остаются: график бота заменяет только людей.
+                for task, info in notes.items():
+                    result.setdefault(task, info)
         if raw_out is not None:
             # Назначения из графика без замен: отчёт админам применяет
             # действующие замены сам при каждом обновлении.
@@ -744,6 +786,85 @@ async def _load_upcoming_service_events(
         return sorted(events, key=lambda event: (event.event_date, event.service_id))
     finally:
         xlsx_path.unlink(missing_ok=True)
+
+
+def _bot_plan_events(registry, first: date, last: date) -> tuple[list, set]:
+    """Утверждённые графики бота (решение 15) на месяцы окна: события и
+    (служение, месяц) / (служение, дата), которые они заменяют в Excel."""
+    if registry is None:
+        return [], set()
+    months = []
+    # Своя дата задачи (среда) — может быть до первого воскресенья месяца,
+    # а «вс +1» — уже в следующем: месяцы с запасом в обе стороны.
+    month = (first - timedelta(days=7)).replace(day=1)
+    while month <= last + timedelta(days=7):
+        months.append(f"{month:%Y-%m}")
+        month = (month + timedelta(days=32)).replace(day=1)
+    events, covered = [], set()
+    for service in registry.list_services():
+        people = None
+        for key in months:
+            plan = registry.get_schedule_plan(service["id"], key)
+            if plan is None or plan["approved"] is None:
+                continue
+            if people is None:
+                people = registry.readiness_people(service["id"])
+            covered.add((service["id"], key))
+            for event in plan_events(plan, people):
+                covered.add((service["id"], event.event_date))
+                events.append(event)
+    return events, covered
+
+
+def _covered(event, covered: set) -> bool:
+    """Событие Excel заменено графиком бота: воскресенье утверждённого
+    месяца или дата, которая есть в графике бота. Среда спевки 28.10
+    относится к графику ноября — утверждённый октябрь её не заменяет."""
+    return (event.service_id, event.event_date) in covered or (
+        event.event_date.weekday() == 6
+        and (event.service_id, f"{event.event_date:%Y-%m}") in covered
+    )
+
+
+def _apply_bot_plans(events: list, registry, first: date, last: date) -> list:
+    """События Excel, где на месяц есть утверждённый график бота, заменяются
+    его событиями: дальше график живёт в боте (решение 15)."""
+    try:
+        planned, covered = _bot_plan_events(registry, first, last)
+    except Exception:  # noqa: BLE001 — сбой базы не должен ломать Excel
+        return events
+    if not covered:
+        return events
+    kept, notes = [], {}
+    for event in events:
+        if not _covered(event, covered):
+            kept.append(event)
+            continue
+        # Пометки Excel («📌 2я часть членское») остаются: график бота
+        # заменяет только людей.
+        informational = [a for a in event.assignments if a.is_informational]
+        if informational:
+            notes.setdefault((event.service_id, event.event_date), []).extend(
+                informational
+            )
+    merged = []
+    for event in planned:
+        if not first <= event.event_date <= last:
+            continue
+        extra = notes.pop((event.service_id, event.event_date), [])
+        merged.append(
+            dataclass_replace(
+                event, assignments=tuple(event.assignments) + tuple(extra)
+            ) if extra else event
+        )
+    merged += [
+        ServiceEvent(service_id, day, tuple(extra))
+        for (service_id, day), extra in notes.items()
+    ]
+    return sorted(
+        kept + merged,
+        key=lambda event: (event.event_date, event.service_id),
+    )
 
 
 def _apply_event_replacements(events: list, registry) -> list:
@@ -1889,6 +2010,7 @@ async def _run_locked(args: CliArgs) -> None:
         async def load_upcoming_service_events(
             force: bool = False, until: date | None = None,
             since: date | None = None, with_replacements: bool = True,
+            excel_only: bool = False,
         ) -> list:
             # Один общий скачанный график на несколько минут для всех
             # пользователей: повторные нажатия не обращаются к Яндекс.Диску.
@@ -1906,6 +2028,14 @@ async def _run_locked(args: CliArgs) -> None:
                     event for event in events
                     if start <= event.event_date <= limit
                 ]
+                # excel_only — лист как есть («📥 Загрузить» в боте).
+                if excel_only:
+                    return selected
+                # Утверждённый график бота главнее Excel (решение 15) — при
+                # каждом чтении: кэш хранит Excel.
+                selected = _apply_bot_plans(
+                    selected, service_registry, start, limit,
+                )
                 # with_replacements=False — график как в файле (замены
                 # вызывающий применит сам, например к своему кэшу).
                 if not with_replacements:

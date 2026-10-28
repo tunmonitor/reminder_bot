@@ -1476,7 +1476,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ("⏰ Напоминания и шаблоны", "edit_notify"),
             ("👥 Ответственные", "service_contact"),
             ("🔁 Замена", "service_replace"),
-            ("🔄 Сверить график", "service_sync"),
+            ("📊 График Excel", "service_excel"),
         ]
         rows = [
             [
@@ -1556,8 +1556,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         "день, сколько раз в месяц; «🗓 По датам графика» — кто служит в "
         "ближайшие даты.\n"
         "🔁 Замена — поставить другого человека на дату.\n"
-        "🔄 Сверить график — перечитать Excel и показать, кто ещё не "
-        "привязан.\n"
+        "📊 График Excel — загрузить график месяца из Excel в бот (он "
+        "становится итоговым) и сверить, кто ещё не привязан.\n"
         "📅 График — опрос готовности и график месяца: составить, править, "
         "утвердить, тексты.\n"
         "📋 Задачи служения — задачи, сколько людей нужно, дни задач, "
@@ -1566,6 +1566,72 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         "супер-администратора — назначить и снять админа.\n"
         "⬅️ К списку служений — выбрать другое служение."
     )
+
+    def plan_version(plan: dict | None) -> tuple | None:
+        """Версия графика месяца: рабочая и утверждённая копии."""
+        if plan is None:
+            return None
+        return (plan["updated_at"], plan["approved_at"], plan["source"])
+
+    def excel_months() -> list[tuple[int, int]]:
+        """Месяцы экрана «📊 График Excel»: текущий и следующий."""
+        today = datetime.now(context.timezone).date()
+        following = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
+        return [(today.year, today.month), (following.year, following.month)]
+
+    def plan_source_line(plan: dict | None) -> str:
+        """Откуда напоминания месяца (решение 15)."""
+        if plan is None:
+            return "⚪ в боте графика нет — напоминания по Excel"
+        if plan["approved"] is None:
+            return "📝 в боте черновик — напоминания по Excel"
+        when = readiness.local_text(plan["approved_at"], context.timezone)
+        if plan["source"] == "excel":
+            return f"📥 загружен из Excel {when} — напоминания по графику бота"
+        return f"✅ по опросу, утверждён {when} — напоминания по графику бота"
+
+    async def show_excel_schedule(
+        message: Message, actor_id: int, service: dict,
+        notice: str | None = None,
+    ) -> None:
+        """«📊 График Excel» (решение 15): откуда график месяцев, загрузка
+        графика из Excel в бот, сверка «кто не привязан»."""
+        registry = service_registry()
+        service_id = service["id"]
+        lines = [f"📊 {service_label(service)} · график Excel", ""]
+        rows = []
+        for year, month in excel_months():
+            plan = registry.get_schedule_plan(service_id, f"{year:04d}-{month:02d}")
+            title = month_title(year, month)
+            lines.append(f"🗓 {title}: {plan_source_line(plan)}")
+            rows.append([InlineKeyboardButton(
+                text=f"📥 Загрузить: {title}"[:60],
+                callback_data=f"xls:load:{service_id}:{year:04d}{month:02d}",
+            )])
+        lines += [
+            "",
+            "ℹ️ График месяца готовится в Excel или опросом в боте. "
+            "«📥 Загрузить» — бот прочитает лист месяца и покажет график; "
+            "после «✅ Подтвердить» он станет итоговым графиком в боте: "
+            "по нему напоминания и замены, править — в «📅 График». Вернуть "
+            "график по опросу — «🔄 Пересчитать» там же и «✅ Утвердить».",
+        ]
+        if notice:
+            lines = [notice, ""] + lines
+        rows.append([InlineKeyboardButton(
+            text="🔄 Сверить: кто не привязан",
+            callback_data=f"service:service_sync:{service_id}",
+        )])
+        rows.append([InlineKeyboardButton(
+            text="⬅️ К карточке служения",
+            callback_data=f"service:service_settings:{service_id}",
+        )])
+        await _send_dialog(
+            message, "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
+            parse_mode=None,
+        )
 
     def keyboard_size(markup: InlineKeyboardMarkup) -> int:
         return sum(len(row) for row in markup.inline_keyboard)
@@ -4649,6 +4715,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         месяца, или без опроса — если опроса месяца нет (или он пропущен)."""
         if plan is None:
             return False
+        # Загружен из Excel — итоговый, пока его не заменят (решение 15).
+        if plan.get("source") == "excel":
+            return True
         if plan["run_id"] is None:
             return run is None or run["status"] == "skipped"
         return (
@@ -6337,6 +6406,188 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await show_readiness(message, service_id, notice)
         except Exception:  # noqa: BLE001
             debug.exception("Не удалось показать экран опроса готовности")
+
+    @admin_router.callback_query(F.data.startswith("xls:"))
+    async def on_excel_schedule(callback: CallbackQuery) -> None:
+        """«📊 График Excel»: «📥 Загрузить» месяц → предпросмотр →
+        «✅ Подтвердить» (график из Excel — итоговый в боте) / «❌ Отмена»."""
+        if (
+            not callback.from_user
+            or not callback.message
+            or callback.message.chat.type != ChatType.PRIVATE
+        ):
+            await _answer_callback(callback)
+            return
+        parts = callback.data.split(":")
+        if len(parts) != 4:
+            await _answer_callback(callback, "⚠️ Меню устарело.")
+            return
+        _, action, service_id, arg = parts
+        actor_id = callback.from_user.id
+        registry = service_registry()
+        service = service_by_id(registry, service_id) if registry else None
+        if service is None or not is_service_admin(actor_id, service_id):
+            await _answer_callback(callback, "❌ Недостаточно прав.")
+            return
+        message = callback.message
+        await _answer_callback(callback)
+        await clean_previous_menu(message, debug)
+        try:
+            if action == "load" and re.fullmatch(r"\d{6}", arg):
+                await clean_and_clear_pending_actor(actor_id)
+                year, month = int(arg[:4]), int(arg[4:])
+                loader = getattr(context, "load_upcoming_service_events", None)
+                if not 1 <= month <= 12 or loader is None:
+                    raise ValueError("Загрузка графика недоступна.")
+                await _send_dialog(
+                    message,
+                    f"⏳ {service_label(service)}: читаю лист "
+                    f"«{month_title(year, month)}»…",
+                    parse_mode=None,
+                )
+                first = date(year, month, 1)
+                try:
+                    # Среда перед первым воскресеньем — в прошлом месяце.
+                    events = await loader(
+                        force=True, since=first - timedelta(days=6),
+                        until=month_end(year, month),
+                        with_replacements=False, excel_only=True,
+                    )
+                except Exception:  # noqa: BLE001 — показать и не упасть
+                    debug.exception("Не удалось прочитать график Excel")
+                    await show_excel_schedule(
+                        message, actor_id, service,
+                        "⚠️ Не удалось прочитать лист месяца — проверьте "
+                        "файл и попробуйте снова.",
+                    )
+                    return
+                loaded = schedule_plan.excel_plan(
+                    registry, service_id, year, month, events
+                )
+                if not any(
+                    people for tasks in loaded["slots"].values()
+                    for people in tasks.values()
+                ):
+                    await show_excel_schedule(
+                        message, actor_id, service,
+                        f"⚠️ На листе «{month_title(year, month)}» для "
+                        "служения нет назначений.",
+                    )
+                    return
+                key = f"{year:04d}-{month:02d}"
+                token = secrets.token_urlsafe(6)
+                pending_inputs[actor_id] = {
+                    "operation": "excel_import", "service_id": service_id,
+                    "month": key, "token": token, "loaded": loaded,
+                }
+                people = registry.readiness_people(service_id)
+                preview = {
+                    "service_id": service_id, "month": key,
+                    "dates": loaded["dates"], "tasks": loaded["tasks"],
+                    "slots": loaded["slots"], "days": loaded["days"],
+                }
+                lines = [
+                    f"📥 {service_label(service)} · график из Excel · "
+                    f"{month_title(year, month)}",
+                    "",
+                    # Строки по воскресеньям — как в блоке «Для Excel».
+                    *schedule_plan.excel_text(
+                        registry, service, preview, people
+                    ).split("\n")[3:],
+                ]
+                if loaded["unbound"]:
+                    lines += ["", "⚪ Не привязаны к Telegram (напоминание "
+                              "не получат): " + ", ".join(loaded["unbound"])]
+                if loaded["skipped"]:
+                    lines += ["", "⚠️ Не воскресенье — пропущено (задайте "
+                              "задаче «📅 Дни задач»): "
+                              + ", ".join(loaded["skipped"])]
+                current = registry.get_schedule_plan(service_id, key)
+                # Версия графика месяца на момент предпросмотра: если его
+                # успели поправить или утвердить — подтвердить нельзя.
+                pending_inputs[actor_id]["version"] = plan_version(current)
+                if current is not None and current["source"] != "excel":
+                    lines += ["", (
+                        "⚠️ Утверждённый график по опросу будет заменён."
+                        if current["approved"] is not None else
+                        "⚠️ Черновик графика по опросу будет заменён."
+                    ) + " Вернуть — «🔄 Пересчитать» в «📅 График»."]
+                lines += ["", "«✅ Подтвердить» — этот график станет итоговым "
+                          "в боте: по нему напоминания и замены."]
+                rows = [[
+                    InlineKeyboardButton(
+                        text="✅ Подтвердить",
+                        callback_data=f"xls:ok:{service_id}:{token}",
+                    ),
+                    InlineKeyboardButton(
+                        text="❌ Отмена",
+                        callback_data=f"xls:no:{service_id}:{token}",
+                    ),
+                ]]
+                for chunk_index, chunk in enumerate(
+                    chunks := _telegram_text_chunks("\n".join(lines))
+                ):
+                    await _send_dialog(
+                        message, chunk, parse_mode=None,
+                        reply_markup=(
+                            InlineKeyboardMarkup(inline_keyboard=rows)
+                            if chunk_index == len(chunks) - 1 else None
+                        ),
+                    )
+                return
+            pending = pending_inputs.get(actor_id)
+            if (
+                action not in {"ok", "no"} or pending is None
+                or pending.get("operation") != "excel_import"
+                or pending.get("service_id") != service_id
+                or pending.get("token") != arg
+            ):
+                await show_excel_schedule(
+                    message, actor_id, service, "⚠️ Этот экран уже устарел."
+                )
+                return
+            pending_inputs.pop(actor_id, None)
+            if action == "no":
+                await show_excel_schedule(
+                    message, actor_id, service, "↩️ Загрузка отменена."
+                )
+                return
+            loaded = pending["loaded"]
+            async with readiness.service_lock(service_id):
+                if plan_version(registry.get_schedule_plan(
+                    service_id, pending["month"]
+                )) != pending.get("version"):
+                    raise ValueError(
+                        "График месяца изменился после предпросмотра — "
+                        "загрузите Excel заново."
+                    )
+                # Фактический день каждого — для интервалов следующего
+                # месяца (как снимок при публикации).
+                offsets = schedule_plan.served_offsets(
+                    {**loaded, "service_id": service_id},
+                    registry.readiness_people(service_id),
+                )
+                registry.import_excel_plan(
+                    actor_id, service_id, pending["month"],
+                    dates=loaded["dates"], tasks=loaded["tasks"],
+                    slots=loaded["slots"], days=loaded["days"],
+                    served_offsets=offsets,
+                )
+            year, month = map(int, pending["month"].split("-"))
+            await show_excel_schedule(
+                message, actor_id, service,
+                f"✅ График на {month_title(year, month)} из Excel — итоговый "
+                "в боте: по нему напоминания и замены.",
+            )
+        except (PermissionError, ValueError) as exc:
+            await _send_dialog(
+                message, _status_text(str(exc), "❌"), parse_mode=None
+            )
+        except sqlite3.Error:
+            debug.exception("Не удалось сохранить график из Excel")
+            await _send_dialog(
+                message, "❌ Ошибка базы данных.", parse_mode=None
+            )
 
     @admin_router.callback_query(F.data.startswith("svc_tasks:"))
     async def on_service_tasks(callback: CallbackQuery) -> None:
@@ -9007,6 +9258,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if operation not in {
             "service_settings",
             "service_setup",
+            "service_excel",
             "service_help",
             "edit_notify",
             "service_admin_add",
@@ -9051,6 +9303,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         service_id, callback.from_user.id
                     ),
                     parse_mode=None,
+                )
+            elif operation == "service_excel":
+                if not is_service_admin(callback.from_user.id, service_id):
+                    raise PermissionError(
+                        "Настройки доступны только администратору этого служения."
+                    )
+                await show_excel_schedule(
+                    callback.message, callback.from_user.id, service
                 )
             elif operation == "service_help":
                 await _send_dialog(
