@@ -531,7 +531,13 @@ class SchedulePlanTest(unittest.TestCase):
         changed = self.registry.set_schedule_slots(
             1001, "sound", "2026-11", slots
         )
-        self.bot.send_message.return_value = SimpleNamespace(message_id=41)
+        # Смена темы — график «с правками», даже без правок людей.
+        self.assertTrue(
+            self.registry.get_schedule_plan("sound", "2026-11")["dirty"]
+        )
+        self.bot.send_message.return_value = SimpleNamespace(
+            message_id=41, message_thread_id=77, is_topic_message=True,
+        )
         moved = asyncio.run(schedule_plan.publish(
             self.bot, self.registry, self.service(), changed, 1001, LOG, 4096,
         ))
@@ -543,6 +549,7 @@ class SchedulePlanTest(unittest.TestCase):
         self.assertEqual(
             (moved["message_ids"], moved["thread_id"]), ([41], 77)
         )
+        self.assertFalse(moved["dirty"])
         # Дальше — правка в новой теме.
         slots = moved["slots"]
         slots["2026-11-22"]["звук"] = ["Алексей"]
@@ -554,6 +561,77 @@ class SchedulePlanTest(unittest.TestCase):
         ))
         self.assertEqual(
             self.bot.edit_message_text.await_args.kwargs["message_id"], 41
+        )
+
+    def test_closed_topic_saves_actual_topic(self):
+        """Тема закрыта — график ушёл в общую: записана фактическая тема
+        (по ответу Telegram) и выбранная; дальше — правка, а не новая
+        публикация каждый раз; ответ — туда, где лежит график."""
+        self.registry.set_group_thread(1001, "sound", -1005555, 88)
+        # Ответ Telegram без темы — сообщение в общей теме.
+        self.bot.send_message.return_value = SimpleNamespace(message_id=51)
+        plan = self.draft()
+        published = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+        ))
+        self.assertEqual(
+            (published["thread_id"], published["target_thread_id"]), (None, 88)
+        )
+        self.assertFalse(published["moved"])
+        self.assertFalse(published["dirty"])
+        slots = published["slots"]
+        slots["2026-11-29"]["звук"] = ["Борис"]
+        changed = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", slots
+        )
+        self.bot.send_message.reset_mock()
+        asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), changed, 1001, LOG, 4096,
+        ))
+        self.assertEqual(
+            self.bot.edit_message_text.await_args.kwargs["message_id"], 51
+        )
+        reply = self.bot.send_message.await_args
+        self.assertNotIn("message_thread_id", reply.kwargs)
+        # Выбрали другую тему — график «не на месте», статус на экране.
+        self.registry.set_group_thread(1001, "sound", -1005555, 99)
+        moved = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertTrue(moved["moved"])
+        summary = schedule_plan.plan_summary(self.registry, moved, self.run)
+        self.assertIn(
+            "📍 Сменился чат или тема служения",
+            schedule_plan.plan_text("ЗВУК", moved, summary, TZ),
+        )
+
+    def test_deleted_topic_does_not_stay_moved(self):
+        """Тема удалена: отправка уходит в общую и сбрасывает тему
+        служения — график «на месте», дальше правка, не новая публикация."""
+        from aiogram.exceptions import TelegramBadRequest
+
+        self.registry.set_group_thread(1001, "sound", -1005555, 66)
+
+        async def send(chat_id, text, **kwargs):
+            if kwargs.get("message_thread_id"):
+                raise TelegramBadRequest(
+                    method=unittest.mock.MagicMock(),
+                    message="Bad Request: message thread not found",
+                )
+            return SimpleNamespace(message_id=61)
+
+        self.bot.send_message.side_effect = send
+        published = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), self.draft(), 1001, LOG,
+            4096,
+        ))
+        self.assertIsNone(self.service()["group_thread_id"])
+        self.assertEqual(
+            (published["thread_id"], published["target_thread_id"]),
+            (None, None),
+        )
+        self.assertFalse(published["moved"])
+        # Запись без выбранной темы (до этой правки) — по фактической.
+        self.assertEqual(
+            schedule_plan.plan_target_thread({"thread_id": 5}), 5
         )
 
     def test_change_lines_format(self):

@@ -183,6 +183,12 @@ def validate_notification_template(
         raise ValueError(f"{label}: некорректный синтаксис шаблона.") from exc
 
 
+def plan_target_thread(plan: dict) -> int | None:
+    """Выбранная тема публикации графика; записи без неё — фактическая."""
+    target = plan.get("target_thread_id")
+    return target if target is not None else plan.get("thread_id")
+
+
 class ServiceRegistry:
     def __init__(
         self, path: Path, on_change: Callable[[], None] | None = None
@@ -396,8 +402,11 @@ class ServiceRegistry:
                     -- ({"slots", "days"}) — изменения под графиком от него.
                     message_ids_json TEXT,
                     baseline_json TEXT,
-                    -- Тема чата публикации (/here): сменилась — новая.
+                    -- Тема чата публикации: где сообщение на самом деле
+                    -- (закрытая тема — в общей) и какую выбрали (/here):
+                    -- выбранная сменилась — новая публикация.
                     thread_id INTEGER,
+                    target_thread_id INTEGER,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (service_id, month)
                 );
@@ -921,6 +930,7 @@ class ServiceRegistry:
                 ("schedule_plans", "message_ids_json", "TEXT"),
                 ("schedule_plans", "baseline_json", "TEXT"),
                 ("schedule_plans", "thread_id", "INTEGER"),
+                ("schedule_plans", "target_thread_id", "INTEGER"),
                 ("service_members", "tasks_manual",
                  "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "poll_stopped", "INTEGER NOT NULL DEFAULT 0"),
@@ -5996,6 +6006,18 @@ class ServiceRegistry:
         )
         baseline = plan.pop("baseline_json", None)
         plan["baseline"] = json.loads(baseline) if baseline else None
+        # Чат или тема служения сменились (/here) — опубликованный график
+        # не там: его нужно опубликовать заново, даже без правок.
+        service_chat = plan.pop("service_chat", None)
+        service_thread = plan.pop("service_thread", None)
+        plan["moved"] = bool(
+            plan["approved"] is not None and plan["message_ids"]
+            and service_chat is not None and (
+                plan.get("chat_id") != service_chat
+                or (plan_target_thread(plan) or None)
+                != (service_thread or None)
+            )
+        )
         # Правки после утверждения ещё не опубликованы (порядок людей в
         # задаче не важен).
         def normal(slots):
@@ -6006,7 +6028,7 @@ class ServiceRegistry:
 
         # republish — после утверждения сменились дни служения (окно или
         # личный день): опубликованные даты устарели.
-        plan["dirty"] = bool(plan.get("republish")) or (
+        plan["dirty"] = bool(plan.get("republish")) or plan["moved"] or (
             normal(plan["approved"]) != normal(plan["slots"])
         ) or (
             plan["approved"] is not None
@@ -6019,7 +6041,10 @@ class ServiceRegistry:
         (`readiness_people`), approved — опубликованная копия."""
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT * FROM schedule_plans WHERE service_id = ? AND month = ?",
+                "SELECT p.*, s.group_chat_id AS service_chat, "
+                "s.group_thread_id AS service_thread "
+                "FROM schedule_plans p JOIN services s ON s.id = p.service_id "
+                "WHERE p.service_id = ? AND p.month = ?",
                 (service_id, month),
             ).fetchone()
         return self._schedule_plan(row)
@@ -6227,7 +6252,8 @@ class ServiceRegistry:
                 "approved_by = excluded.approved_by, "
                 "approved_at = excluded.approved_at, chat_id = NULL, "
                 "message_id = NULL, message_ids_json = NULL, "
-                "thread_id = NULL, baseline_json = NULL, republish = 0, "
+                "thread_id = NULL, target_thread_id = NULL, "
+                "baseline_json = NULL, republish = 0, "
                 "days_json = excluded.days_json, "
                 "approved_days_json = excluded.approved_days_json, "
                 "served_offsets_json = excluded.served_offsets_json, "
@@ -6294,6 +6320,7 @@ class ServiceRegistry:
         message_ids: list[int] | None = None,
         baseline: dict | None = None,
         thread_id: int | None = None,
+        target_thread_id: int | None = None,
     ) -> dict:
         """«✅ Утвердить»: опубликованная копия = slots. updated_at —
         версия опубликованного графика: если дни служения сменились, пока
@@ -6309,7 +6336,7 @@ class ServiceRegistry:
                 "UPDATE schedule_plans SET approved_json = ?, approved_by = ?, "
                 "approved_tasks_json = tasks_json, "
                 "approved_at = ?, chat_id = ?, message_id = ?, "
-                "message_ids_json = ?, thread_id = ?, "
+                "message_ids_json = ?, thread_id = ?, target_thread_id = ?, "
                 "baseline_json = COALESCE(?, baseline_json), "
                 "approved_days_json = ?, served_offsets_json = ?, "
                 "republish = CASE WHEN ? IS NULL OR updated_at = ? THEN 0 "
@@ -6319,7 +6346,7 @@ class ServiceRegistry:
                     json.dumps(slots, ensure_ascii=False), actor_id,
                     _utc_now(), chat_id, message_id,
                     json.dumps(message_ids) if message_ids else None,
-                    thread_id,
+                    thread_id, target_thread_id,
                     json.dumps(baseline, ensure_ascii=False)
                     if baseline is not None else None,
                     json.dumps(days or {}, ensure_ascii=False),

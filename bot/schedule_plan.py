@@ -37,6 +37,7 @@ from .readiness import (
     summarize,
     task_lines,
 )
+from .service_registry import plan_target_thread
 from .services import (
     ScheduleColumn, normalized_name, split_day_key, task_day_key,
 )
@@ -514,6 +515,13 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
     done, total = covered(plan)
     if plan["approved"] is None:
         status = "📝 Черновик — ещё не утверждён"
+    elif plan.get("moved") and not plan.get("republish") and (
+        plan["approved"] == plan["slots"]
+    ):
+        status = (
+            "📍 Сменился чат или тема служения — «✅ Утвердить изменения» "
+            "опубликует график там"
+        )
     elif plan["dirty"]:
         status = (
             "✏️ Есть правки после утверждения — «✅ Утвердить» опубликует "
@@ -1240,8 +1248,10 @@ async def publish(
     # Прежняя публикация правится, только если она в том же чате и той же
     # теме (/here могли сменить тему — тогда новая в выбранной).
     thread_id = service.get("group_thread_id") or None
+    # Сравнивается выбранная тема (закрытая остаётся выбранной, а
+    # сообщение лежит в общей — это то же место).
     same_place = plan.get("chat_id") == chat_id and (
-        plan.get("thread_id") or None
+        plan_target_thread(plan) or None
     ) == thread_id
     old_ids = list(plan.get("message_ids") or []) if same_place else []
     # Сменилась только тема — прежнюю публикацию в старой теме убрать.
@@ -1253,6 +1263,9 @@ async def publish(
         bot, chat_id, old_ids, text, text_limit,
     )
     pinned = True
+    # Тема, куда на самом деле ушла новая публикация (закрытая тема — в
+    # общую): по ответу Telegram, не по настройке служения.
+    sent_thread: list[int | None] = []
     # Ответ с изменениями не ушёл — его текст админу (переслать вручную):
     # после утверждения изменений уже нет, повторить нечем.
     unsent_notice = None
@@ -1267,7 +1280,9 @@ async def publish(
                         bot.send_message, chat, body, limit=text_limit,
                         **kwargs,
                     ),
-                    chat_id, notice, service, registry=registry,
+                    # Ответ — туда, где лежит закреплённый график.
+                    chat_id, notice,
+                    {**service, "group_thread_id": plan.get("thread_id")},
                     logger=logger,
                     reply_parameters=ReplyParameters(
                         message_id=old_ids[0],
@@ -1285,6 +1300,11 @@ async def publish(
                 registry=registry, logger=logger, **kwargs,
             )
             sent.append(message.message_id)
+            if not sent_thread:
+                sent_thread.append(
+                    getattr(message, "message_thread_id", None)
+                    if getattr(message, "is_topic_message", False) else None
+                )
             return message
 
         try:
@@ -1321,12 +1341,14 @@ async def publish(
         baseline = {
             **(baseline or plan["baseline"]), "days_changed": True,
         }
-    # Тема, где публикация на самом деле: удалённая тема при отправке
-    # сбрасывается, и сообщение уходит в общую.
     published_thread = (
+        sent_thread[0] if sent_thread else None
+    ) if not edited else plan.get("thread_id")
+    # Выбранная тема — после отправки: удалённую тему отправка сбросила.
+    target_thread = thread_id if edited else (
         (registry.get_service(service["id"]) or {}).get("group_thread_id")
         or None
-    ) if not edited else thread_id
+    )
     for attempt in range(2):
         try:
             result = registry.approve_schedule_plan(
@@ -1336,6 +1358,7 @@ async def publish(
                 message_ids=message_ids,
                 baseline=baseline,
                 thread_id=published_thread,
+                target_thread_id=target_thread,
                 updated_at=plan["updated_at"], days=plan.get("days", {}),
                 served_offsets=served_offsets(plan, people),
             )
