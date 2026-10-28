@@ -180,10 +180,10 @@ def _priority(data: PlanInput) -> dict[str, int]:
 
 def open_dates(data: PlanInput) -> list[date]:
     """Решение 16: даты, где ответившие (без не ответивших) не закрывают
-    минимум задач — каждый одно место, связка «в одну неделю» — свои
-    задачи вместе (приближённо: у человека со связкой и другой задачей
-    может засчитаться и то и другое); без интервалов и лимитов — «никто
-    не выбрал»."""
+    минимум задач — каждый одно место (в задаче — не больше одного),
+    связка «в одну неделю» — свои задачи вместе (приближённо: у человека
+    со связкой и другой задачей может засчитаться и то и другое); без
+    интервалов и лимитов — «никто не выбрал»."""
     required, _ = _seats(data)
     result = []
     for event_date in sorted(set(data.dates)):
@@ -191,12 +191,12 @@ def open_dates(data: PlanInput) -> list[date]:
         for person in sorted(data.free):
             if person in data.reluctant or event_date not in data.free[person]:
                 continue
-            bundle = data.bundles.get(person, frozenset())
-            # Связка — ещё места человека, только на её задачи.
-            for copy in range(max(1, len(bundle))):
-                tasks = data.tasks.get(person, frozenset())
-                if copy:
-                    tasks &= bundle
+            own = data.tasks.get(person, frozenset())
+            bundle = sorted(data.bundles.get(person, frozenset()) & own)
+            # Связка — ещё места человека, по одному на каждую её задачу:
+            # в одной задаче человек — одно место.
+            options = [own - set(bundle[1:])] + [{task} for task in bundle[1:]]
+            for copy, tasks in enumerate(options):
                 name = f"{person}{BUNDLE_SEPARATOR}{copy}"
                 people.append(name)
                 allowed[name] = {

@@ -570,6 +570,15 @@ class SchedulePlannerTest(unittest.TestCase):
             bundles={"Связка": both},
         )
         self.assertEqual(open_dates(data), list(SUNDAYS[1:3]))
+        # Связка не даёт одному человеку два места в одной задаче.
+        pair = frozenset({"a", "b"})
+        data = PlanInput(
+            dates=SUNDAYS[:1], needed={"a": 2, "b": 1},
+            free={"P": frozenset(SUNDAYS[:1]), "Q": frozenset(SUNDAYS[:1])},
+            tasks={"P": pair, "Q": frozenset({"b"})},
+            bundles={"P": pair},
+        )
+        self.assertEqual(open_dates(data), [SUNDAYS[0]])
 
 
 if __name__ == "__main__":
