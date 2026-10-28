@@ -97,6 +97,7 @@ from .service_registry import (
 )
 from .scheduler import (
     periods_overlap,
+    reminder_day_offset,
     reminder_occurrence,
     reminder_period_status,
 )
@@ -2169,6 +2170,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         weekday = schedule_plan.WEEKDAYS[(6 + offset) % 7]
         return f"{weekday} (вс {offset:+d})"
 
+    def reminder_anchor_text(reminder: dict) -> str:
+        """От какого дня считается срок напоминания (решение 17, 5а)."""
+        offset = reminder_day_offset(reminder)
+        if offset:
+            return f"дня задачи — {member_day_label(offset)}"
+        return "воскресенья"
+
     # Лимит служений в месяц (решение 12): готовые диапазоны и «Вручную» —
     # минимум, затем максимум кнопками.
     LIMIT_PRESETS = ((0, 2), (1, 2), (1, 3))
@@ -3239,7 +3247,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         text = (
             f"📝 Напоминание · {service_label(service)}\n\n"
             f"📌 Задача: {task_status}\n"
-            f"📅 Срок: за {reminder['reminder_days']} дн.\n"
+            f"📅 Срок: за {reminder['reminder_days']} дн. до "
+            f"{reminder_anchor_text(reminder)}\n"
             f"🗓 Период: {period_text(reminder, now.date())}\n"
             f"✉️ Отправка: {send_text}\n"
             f"📝 Текст: {body_status}\n"
@@ -3494,7 +3503,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if reminder is None or reminder["service_id"] != service_id:
             raise ValueError("Групповое напоминание больше не существует.")
         today = datetime.now(context.timezone).date()
-        first = today + timedelta(days=(6 - today.weekday()) % 7)
+        # Первое воскресенье, неделя которого ещё идёт: у задачи со своим
+        # днём (вс +5) — до дня задачи.
+        start = today - timedelta(days=reminder_day_offset(reminder))
+        first = start + timedelta(days=(6 - start.weekday()) % 7)
         if pick_until:
             start = max(first, active_from or first)
             choices = [start + timedelta(weeks=week) for week in range(12)]

@@ -16,7 +16,7 @@ from dataclasses import replace
 from typing import Callable
 
 from .presentation import is_replaced
-from .scheduler import periods_overlap
+from .scheduler import periods_overlap, reminder_day_offset
 from .secure_fs import open_private_directory
 from .services import (
     SERVICES,
@@ -130,6 +130,17 @@ DEFAULT_TASK_TEMPLATE = (
     "{task}: {task_responsibles}"
 )
 _UNSET = object()
+# Напоминание служения и свой день его задачи (task_day: спевка — вс −4;
+# NULL — отсчёт от воскресенья).
+_GROUP_REMINDER_COLUMNS = (
+    "g.id, g.service_id, g.body, g.reminder_days, g.reminder_time, "
+    "g.enabled, g.created_at, g.task, g.active_from, g.active_until, "
+    "t.day_offset AS task_day"
+)
+_GROUP_REMINDER_SOURCE = (
+    "group_reminders g LEFT JOIN service_tasks t "
+    "ON t.service_id = g.service_id AND t.name = g.task"
+)
 # Своих личных напоминаний человека в одном служении.
 USER_REMINDERS_PER_SERVICE = 10
 USER_REMINDER_BODY_LIMIT = 3000
@@ -2072,11 +2083,10 @@ class ServiceRegistry:
         with self._connection() as connection:
             self._require_service(connection, service_id)
             rows = connection.execute(
-                "SELECT id, service_id, body, reminder_days, reminder_time, "
-                "enabled, created_at, task, active_from, active_until "
-                "FROM group_reminders "
-                "WHERE service_id = ? "
-                "ORDER BY reminder_days, reminder_time, id",
+                f"SELECT {_GROUP_REMINDER_COLUMNS} "
+                f"FROM {_GROUP_REMINDER_SOURCE} "
+                "WHERE g.service_id = ? "
+                "ORDER BY g.reminder_days, g.reminder_time, g.id",
                 (service_id,),
             ).fetchall()
         return [
@@ -2109,9 +2119,8 @@ class ServiceRegistry:
         _validate_positive_id(reminder_id, "reminder_id")
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT id, service_id, body, reminder_days, reminder_time, "
-                "enabled, created_at, task, active_from, active_until "
-                "FROM group_reminders WHERE id = ?",
+                f"SELECT {_GROUP_REMINDER_COLUMNS} "
+                f"FROM {_GROUP_REMINDER_SOURCE} WHERE g.id = ?",
                 (reminder_id,),
             ).fetchone()
         return (
@@ -3095,17 +3104,20 @@ class ServiceRegistry:
                 raise ValueError("Границы периода — даты воскресений.")
         if active_from and active_until and active_from > active_until:
             raise ValueError("Начало периода позже окончания.")
-        if active_until is not None and active_until < today:
-            raise ValueError("Окончание периода уже прошло.")
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT service_id, enabled, reminder_days, reminder_time, task "
-                "FROM group_reminders WHERE id = ?",
+                f"SELECT {_GROUP_REMINDER_COLUMNS} "
+                f"FROM {_GROUP_REMINDER_SOURCE} WHERE g.id = ?",
                 (reminder_id,),
             ).fetchone()
             if row is None:
                 raise ValueError("Групповое напоминание больше не существует.")
             self._require_service_editor(connection, actor_id, row["service_id"])
+            # Неделя окончания идёт до дня задачи (вс +5 — пятница после).
+            if active_until is not None and active_until + timedelta(
+                days=reminder_day_offset(dict(row))
+            ) < today:
+                raise ValueError("Окончание периода уже прошло.")
             values = (
                 active_from.isoformat() if active_from else None,
                 active_until.isoformat() if active_until else None,
@@ -3135,15 +3147,19 @@ class ServiceRegistry:
             )
 
     def disable_expired_group_reminders(self, today: date) -> list[int]:
-        """Выключает напоминания, чей период закончился до today."""
+        """Выключает напоминания, чей период закончился до today. У задачи
+        со своим днём (вс +1) последняя неделя кончается днём задачи."""
         with self._connection() as connection:
             ids = [
                 row["id"]
                 for row in connection.execute(
-                    "SELECT id FROM group_reminders WHERE enabled = 1 "
-                    "AND active_until IS NOT NULL AND active_until < ?",
-                    (today.isoformat(),),
+                    f"SELECT {_GROUP_REMINDER_COLUMNS} "
+                    f"FROM {_GROUP_REMINDER_SOURCE} WHERE g.enabled = 1 "
+                    "AND g.active_until IS NOT NULL",
                 )
+                if date.fromisoformat(row["active_until"]) + timedelta(
+                    days=reminder_day_offset(dict(row))
+                ) < today
             ]
             connection.executemany(
                 "UPDATE group_reminders SET enabled = 0 WHERE id = ?",

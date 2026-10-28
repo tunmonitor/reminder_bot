@@ -26,6 +26,13 @@ from bot.backup import (
 from bot.excel_parser import _MONTH_SHEETS
 
 
+# Процессы бота проверяются через /proc — он есть только в Linux (бот
+# работает на Raspberry Pi); на macOS эти тесты пропускаются.
+NEEDS_PROC = unittest.skipUnless(
+    Path("/proc/self/stat").exists(), "нужен /proc (Linux)"
+)
+
+
 class BackupManagerTest(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -270,6 +277,7 @@ class BackupManagerTest(unittest.TestCase):
         self.assertFalse(stale_stage.exists())
         self.assertTrue(recent_stage.exists())
 
+    @NEEDS_PROC
     def test_restore_replaces_database_schedule_and_state(self):
         snapshot = asyncio.run(self.manager.create_snapshot("test"))
         with closing(sqlite3.connect(self.database)) as connection:
@@ -290,6 +298,7 @@ class BackupManagerTest(unittest.TestCase):
         self.assertEqual(json.loads(self.cache.read_text("utf-8"))["sunday_date"], "2030-01-06")
         self.assertTrue(self.xlsx.read_bytes().startswith(b"PK"))
 
+    @NEEDS_PROC
     def test_restore_refuses_leftover_rollback_journal(self):
         snapshot = asyncio.run(self.manager.create_snapshot("test"))
         journal = Path(f"{self.database}-journal")
@@ -307,6 +316,7 @@ class BackupManagerTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "уже выполняется"):
                 self.manager.restore_snapshot(snapshot)
 
+    @NEEDS_PROC
     def test_rejects_tampered_snapshot_before_restore(self):
         snapshot = asyncio.run(self.manager.create_snapshot("test"))
         with (snapshot / "database.sql").open("ab") as stream:
@@ -314,6 +324,7 @@ class BackupManagerTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "SHA-256"):
             self.manager.restore_snapshot(snapshot)
 
+    @NEEDS_PROC
     def test_rejects_snapshot_from_another_environment(self):
         snapshot = asyncio.run(self.manager.create_snapshot("test"))
         prod_manager = BackupManager(
@@ -460,6 +471,7 @@ class RestoreProcessGuardTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "небезопасен"):
                 assert_bot_stopped(root, shm)
 
+    @NEEDS_PROC
     def test_rejects_pid_file_for_live_process(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -79,6 +79,7 @@ if __package__:
         add_service_reminder_jobs,
         build_scheduler,
         in_reminder_period,
+        is_reminder_event_date,
         reminder_occurrence,
         next_sunday_date,
         refresh_user_reminder_jobs as refresh_user_reminder_schedule_jobs,
@@ -144,6 +145,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         add_service_reminder_jobs,
         build_scheduler,
         in_reminder_period,
+        is_reminder_event_date,
         reminder_occurrence,
         next_sunday_date,
         refresh_user_reminder_jobs as refresh_user_reminder_schedule_jobs,
@@ -1175,6 +1177,10 @@ async def _process_service_reminder(
     event_date = (run_date or datetime.now(tz).date()) + timedelta(
         days=reminder["reminder_days"]
     )
+    if not is_reminder_event_date(event_date, reminder):
+        # Задание срабатывает каждый день; событие — только в день, от
+        # которого считается напоминание (решение 17, 5а).
+        return
     if not in_reminder_period(event_date, reminder):
         interaction_logger.info(
             "Уведомление %s служения %s пропущено: %s вне периода",
