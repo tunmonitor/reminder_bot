@@ -6268,6 +6268,14 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIn(
                 "Ход опроса", progress.message.answer.await_args.args[0]
             )
+            # Пока опрос идёт — предварительный график, без утверждения.
+            draft_screen = await press(f"rdy:pprev:sound:{month_arg}")
+            draft_text = draft_screen.message.answer.await_args.args[0]
+            self.assertIn("⏳ Предварительный — опрос идёт", draft_text)
+            self.assertNotIn(
+                "Утвердить",
+                str(draft_screen.message.answer.await_args.kwargs["reply_markup"]),
+            )
             # Ответивший вне состава — «➕ В состав» с выбором задач.
             add_button = next(
                 button.callback_data

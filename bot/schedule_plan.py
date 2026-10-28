@@ -196,9 +196,12 @@ def plan_summary(registry, plan: dict, run: dict | None) -> Summary:
 
 async def build_draft(
     registry, run: dict, events_loader, logger: logging.Logger,
+    *, save: bool = True,
 ) -> dict:
     """Предложенный график по ответам опроса (run["id"] is None — без
-    опроса, все свободны); ручные правки сбрасываются."""
+    опроса, все свободны); ручные правки сбрасываются. save=False —
+    предварительный, пока опрос идёт: по текущим ответам, в базу не
+    пишется (утверждать его нельзя)."""
     year, month = month_of(run)
     people = registry.readiness_people(run["service_id"])
     served, note = await last_served(
@@ -220,6 +223,18 @@ async def build_draft(
         }
         for day in run["dates"]
     }
+    if not save:
+        return {
+            "service_id": run["service_id"], "month": month_key(year, month),
+            "run_id": run["id"], "source": "poll",
+            "dates": list(run["dates"]), "tasks": tasks, "slots": slots,
+            "last_served": served, "note": note, "edited": 0,
+            "approved": None, "approved_at": None, "approved_days": {},
+            "approved_tasks": None, "days": {}, "republish": 0,
+            "dirty": True, "message_ids": [], "baseline": None,
+            "chat_id": None, "message_id": None, "updated_at": None,
+            "served_offsets": {}, "served_snapshot": False,
+        }
     return registry.save_schedule_draft(
         run["service_id"], month_key(year, month),
         run_id=run["id"], dates=list(run["dates"]), tasks=tasks, slots=slots,
