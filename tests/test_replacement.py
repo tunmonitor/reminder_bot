@@ -614,18 +614,32 @@ class DirectChangeTest(HandlersTest):
         return callback.message
 
     def test_replace_screen_flow(self):
+        """Решение 17, 5в: неделя → задача (с датой и людьми) → кто
+        заменит; над кнопками — график месяца; внизу — к неделе и к
+        графику."""
         async def run():
             card = self._callback(SimpleNamespace(
                 callback_data="service:service_replace:sound"
             ))
             await self._handler("on_service_selected")(card)
-            dates = card.message
-            self.assertIn("Выберите дату", dates.answer.await_args.args[0])
-            people = await self._press(dates, f"{self.day:%d.%m}")
+            weeks = card.message
+            self.assertIn("Выберите неделю", weeks.answer.await_args.args[0])
+            week = await self._press(weeks, "нед.")
+            text = week.answer.await_args.args[0]
+            self.assertIn("📋 График на", text)
+            self.assertIn(f"сборка — {self.day:%d.%m} — Алексей", text)
+            self.assertIn(f"спевка — {self.day:%d.%m} — Вера, Глеб", text)
+            labels = [
+                item.text for row in
+                week.answer.await_args.kwargs["reply_markup"].inline_keyboard
+                for item in row
+            ]
+            self.assertEqual(labels[-2:], ["⬅️ К неделям", "📅 К графику"])
+            # В задаче двое — выбор, кого заменить.
+            people = await self._press(week, "спевка ·")
             self.assertIn("Кого нужно заменить", people.answer.await_args.args[0])
-            tasks = await self._press(people, "Алексей · 2 задачи")
-            self.assertIn("несколько задач", tasks.answer.await_args.args[0])
-            candidates = await self._press(tasks, "сборка")
+            back = await self._press(people, "К неделе")
+            candidates = await self._press(back, "сборка ·")
             labels = [
                 item.text for row in
                 candidates.answer.await_args.kwargs["reply_markup"].inline_keyboard
@@ -633,12 +647,50 @@ class DirectChangeTest(HandlersTest):
             ]
             self.assertIn("✅ Борис", labels)
             self.assertIn("👤 Выбрать пользователя Telegram", labels)
+            self.assertEqual(labels[-2:], ["⬅️ К неделе", "📅 К графику"])
+            self.assertIn("📋 График на", candidates.answer.await_args.args[0])
             confirm = await self._press(candidates, "Борис")
             self.assertIn("Алексей → Борис", confirm.answer.await_args.args[0])
             result = await self._press(confirm, "Назначить")
-            self.assertIn("✅ Замена назначена", result.answer.await_args.args[0])
+            # После замены — снова неделя, с отметкой.
+            text = result.answer.await_args.args[0]
+            self.assertIn("✅ Замена назначена", text)
+            self.assertIn("Неделя", text)
             row = self.registry.list_replacements("sound", self.day.isoformat())[0]
             self.assertEqual((row["task"], row["new_name"]), ("сборка", "Борис"))
+
+        asyncio.run(run())
+
+    def test_saturday_event_joins_its_week(self):
+        """Доп. событие в субботу — в одной неделе со своим воскресеньем."""
+        from bot.excel_parser import ServiceAssignment, ServiceEvent
+
+        today = datetime.now(TZ).date()
+        sunday = today + timedelta(days=(6 - today.weekday()) % 7 + 7)
+        self.events[:] = [
+            ServiceEvent("sound", sunday - timedelta(days=1), (
+                ServiceAssignment("сборка", "Алексей"),
+            )),
+            ServiceEvent("sound", sunday, (
+                ServiceAssignment("звук", "Алексей"),
+            )),
+        ]
+
+        async def run():
+            card = self._callback(SimpleNamespace(
+                callback_data="service:service_replace:sound"
+            ))
+            await self._handler("on_service_selected")(card)
+            labels = [
+                item.text for row in
+                card.message.answer.await_args.kwargs["reply_markup"].inline_keyboard
+                for item in row if "нед." in item.text
+            ]
+            monday = sunday - timedelta(days=6)
+            self.assertEqual(labels, [
+                f"🗓 {monday.isocalendar().week} нед. "
+                f"{monday:%d.%m}–{sunday:%d.%m}"
+            ])
 
         asyncio.run(run())
 
@@ -678,9 +730,8 @@ class DirectChangeTest(HandlersTest):
                 callback_data="service:service_replace:sound"
             ))
             await self._handler("on_service_selected")(card)
-            people = await self._press(card.message, f"{self.day:%d.%m}")
-            tasks = await self._press(people, "Алексей · 2 задачи")
-            candidates = await self._press(tasks, "сборка")
+            week = await self._press(card.message, "нед.")
+            candidates = await self._press(week, "сборка ·")
             confirm = await self._press(candidates, "Борис")
             # Пока экран открыт, замену назначили иначе.
             self.registry.set_replacement(
