@@ -912,6 +912,12 @@ class ServiceRegistry:
                             f"UPDATE readiness_runs SET {column} = 1 "
                             "WHERE status != 'open'"
                         )
+            # Утверждённые до снимка задач — снимок из рабочей копии, пока
+            # её не поправили: дальше напоминания не идут за черновиком.
+            connection.execute(
+                "UPDATE schedule_plans SET approved_tasks_json = tasks_json "
+                "WHERE approved_json IS NOT NULL AND approved_tasks_json IS NULL"
+            )
             self._sync_service_catalog(connection, assembly_group_chat_id)
             has_super_admin = connection.execute(
                 "SELECT 1 FROM super_admins LIMIT 1"
@@ -1753,26 +1759,38 @@ class ServiceRegistry:
                 (offset, service_id, task),
             )
             plans = connection.execute(
-                "SELECT month, tasks_json FROM schedule_plans "
-                "WHERE service_id = ? AND month >= ?",
+                "SELECT month, tasks_json, approved_tasks_json "
+                "FROM schedule_plans WHERE service_id = ? AND month >= ?",
                 (service_id, _current_month()),
             ).fetchall()
-            for plan in plans:
-                tasks = json.loads(plan["tasks_json"])
-                if not any(item["name"] == task for item in tasks):
-                    continue
-                for item in tasks:
+
+            def moved(raw):
+                # Задачи с новым днём; None — задачи нет (или нет снимка).
+                items = json.loads(raw) if raw else []
+                if not any(item["name"] == task for item in items):
+                    return None
+                for item in items:
                     if item["name"] == task:
                         item["day"] = offset
-                # Утверждённый график с этой задачей — опубликовать заново;
-                # графики без неё не меняются.
+                return json.dumps(items, ensure_ascii=False)
+
+            for plan in plans:
+                tasks = moved(plan["tasks_json"])
+                # Утверждённый график с этой задачей — опубликовать заново,
+                # день — и в утверждённых задачах (напоминания как в
+                # публикации), даже если в черновике её уже нет; графики
+                # без неё не меняются.
+                approved = moved(plan["approved_tasks_json"])
+                if tasks is None and approved is None:
+                    continue
                 connection.execute(
-                    "UPDATE schedule_plans SET tasks_json = ?, updated_at = ?, "
+                    "UPDATE schedule_plans "
+                    "SET tasks_json = COALESCE(?, tasks_json), updated_at = ?, "
+                    "approved_tasks_json = COALESCE(?, approved_tasks_json), "
                     "republish = CASE WHEN approved_json IS NOT NULL THEN 1 "
                     "ELSE republish END "
                     "WHERE service_id = ? AND month = ?",
-                    (json.dumps(tasks, ensure_ascii=False), _utc_now(),
-                     service_id, plan["month"]),
+                    (tasks, _utc_now(), approved, service_id, plan["month"]),
                 )
             self._audit(
                 connection, actor_id, "service_task_updated", service_id,

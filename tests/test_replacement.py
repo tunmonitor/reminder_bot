@@ -996,6 +996,53 @@ class BotPlanSourceTest(Base):
             [(monday, ["Борис"])],
         )
 
+    def test_approved_tasks_ignore_draft_edits(self):
+        from bot import app
+        import sqlite3
+        from contextlib import closing
+
+        self.approve({EVENT.isoformat(): {"звук": ["Борис"]}})
+        month = f"{EVENT:%Y-%m}"
+
+        def moments():
+            planned, _ = app._bot_plan_events(
+                self.registry, EVENT, EVENT + timedelta(days=1),
+            )
+            return [
+                (event.event_date, [a.name for a in event.assignments])
+                for event in planned if event.assignments
+            ]
+
+        # Правка рабочей копии (переименование, свой день) — не в напоминаниях.
+        db = self.registry.path
+        with closing(sqlite3.connect(db)) as connection, connection:
+            connection.execute(
+                "UPDATE schedule_plans SET tasks_json = ? WHERE month = ?",
+                ('[{"name": "звук2", "day": 1}]', month),
+            )
+        self.assertEqual(moments(), [(EVENT, ["Борис"])])
+        # Утверждён до снимка — снимок заполняется при запуске из рабочей
+        # копии, дальше она на напоминания не влияет.
+        with closing(sqlite3.connect(db)) as connection, connection:
+            connection.execute(
+                "UPDATE schedule_plans SET approved_tasks_json = NULL, "
+                "tasks_json = ? WHERE month = ?",
+                ('[{"name": "звук", "day": null}]', month),
+            )
+        self.registry.initialize(SUPER, -100)
+        with closing(sqlite3.connect(db)) as connection, connection:
+            connection.execute(
+                "UPDATE schedule_plans SET tasks_json = ? WHERE month = ?",
+                ('[{"name": "звук", "day": 1}]', month),
+            )
+        self.assertEqual(moments(), [(EVENT, ["Борис"])])
+        # День задачи в настройках — и в утверждённом графике (публикуется
+        # заново), напоминание — в новый день.
+        self.registry.set_service_task_day(SUPER, "sound", "звук", 1)
+        self.assertEqual(
+            moments(), [(EVENT + timedelta(days=1), ["Борис"])],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
