@@ -391,6 +391,11 @@ class ServiceRegistry:
                     -- Задачи (с днями) опубликованной копии: напоминания
                     -- по утверждённому, а не по правкам рабочей копии.
                     approved_tasks_json TEXT,
+                    -- Закреплённая публикация в чате: id всех её частей
+                    -- (правится при обновлении) и график первой публикации
+                    -- ({"slots", "days"}) — изменения под графиком от него.
+                    message_ids_json TEXT,
+                    baseline_json TEXT,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (service_id, month)
                 );
@@ -911,6 +916,8 @@ class ServiceRegistry:
                 ("schedule_plans", "approved_days_json", "TEXT"),
                 ("schedule_plans", "served_offsets_json", "TEXT"),
                 ("schedule_plans", "approved_tasks_json", "TEXT"),
+                ("schedule_plans", "message_ids_json", "TEXT"),
+                ("schedule_plans", "baseline_json", "TEXT"),
                 ("service_members", "tasks_manual",
                  "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "poll_stopped", "INTEGER NOT NULL DEFAULT 0"),
@@ -5978,6 +5985,14 @@ class ServiceRegistry:
         plan["approved_days"] = (
             json.loads(approved_days) if approved_days else {}
         )
+        message_ids = plan.pop("message_ids_json", None)
+        # Опубликован до шага 5б — известна только первая часть.
+        plan["message_ids"] = (
+            json.loads(message_ids) if message_ids
+            else [plan["message_id"]] if plan.get("message_id") else []
+        )
+        baseline = plan.pop("baseline_json", None)
+        plan["baseline"] = json.loads(baseline) if baseline else None
         # Правки после утверждения ещё не опубликованы (порядок людей в
         # задаче не важен).
         def normal(slots):
@@ -6208,7 +6223,8 @@ class ServiceRegistry:
                 "note = NULL, edited = 0, approved_json = excluded.approved_json, "
                 "approved_by = excluded.approved_by, "
                 "approved_at = excluded.approved_at, chat_id = NULL, "
-                "message_id = NULL, republish = 0, "
+                "message_id = NULL, message_ids_json = NULL, "
+                "baseline_json = NULL, republish = 0, "
                 "days_json = excluded.days_json, "
                 "approved_days_json = excluded.approved_days_json, "
                 "served_offsets_json = excluded.served_offsets_json, "
@@ -6239,17 +6255,25 @@ class ServiceRegistry:
         updated_at: str | None = None,
         days: dict | None = None,
         served_offsets: dict | None = None,
+        message_ids: list[int] | None = None,
+        baseline: dict | None = None,
     ) -> dict:
         """«✅ Утвердить»: опубликованная копия = slots. updated_at —
         версия опубликованного графика: если дни служения сменились, пока
-        шла публикация, отметка «опубликовать заново» остаётся."""
+        шла публикация, отметка «опубликовать заново» остаётся.
+        message_ids — части закреплённой публикации; baseline — график
+        первой публикации (None — оставить сохранённый)."""
         _validate_positive_id(actor_id, "actor_id")
+        if message_ids is None and message_id is not None:
+            message_ids = [message_id]
         with self._connection() as connection:
             self._require_service_editor(connection, actor_id, service_id)
             cursor = connection.execute(
                 "UPDATE schedule_plans SET approved_json = ?, approved_by = ?, "
                 "approved_tasks_json = tasks_json, "
                 "approved_at = ?, chat_id = ?, message_id = ?, "
+                "message_ids_json = ?, "
+                "baseline_json = COALESCE(?, baseline_json), "
                 "approved_days_json = ?, served_offsets_json = ?, "
                 "republish = CASE WHEN ? IS NULL OR updated_at = ? THEN 0 "
                 "ELSE republish END "
@@ -6257,6 +6281,9 @@ class ServiceRegistry:
                 (
                     json.dumps(slots, ensure_ascii=False), actor_id,
                     _utc_now(), chat_id, message_id,
+                    json.dumps(message_ids) if message_ids else None,
+                    json.dumps(baseline, ensure_ascii=False)
+                    if baseline is not None else None,
                     json.dumps(days or {}, ensure_ascii=False),
                     json.dumps(served_offsets or {}, ensure_ascii=False),
                     updated_at, updated_at, service_id, month,
