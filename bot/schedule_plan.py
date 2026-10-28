@@ -16,7 +16,7 @@ import logging
 from datetime import date, timedelta
 from io import BytesIO
 
-from .excel_parser import _schedule_sheet_name
+from .excel_parser import ServiceAssignment, ServiceEvent, _schedule_sheet_name
 from .group_send import send_to_service_group
 from .month_summary import month_end, month_key, month_title
 from .presentation import task_emoji
@@ -33,7 +33,9 @@ from .readiness import (
     summarize,
     task_lines,
 )
-from .services import ScheduleColumn, normalized_name
+from .services import (
+    ScheduleColumn, normalized_name, split_day_key, task_day_key,
+)
 from .ui import send_telegram_screen, user_link
 
 
@@ -315,10 +317,13 @@ def task_days(plan: dict) -> dict[str, int]:
 
 def slot_offset(plan: dict, person: dict | None, day: str,
                 task: str) -> int | None:
-    """День человека в задаче на дату: разовый в графике, иначе день
-    задачи, иначе личный."""
+    """День человека в задаче на дату: разовый для задачи, разовый в
+    графике, иначе день задачи, иначе личный."""
     key = (person or {}).get("key")
-    override = plan.get("days", {}).get(day, {}).get(key)
+    overrides = plan.get("days", {}).get(day, {})
+    override = overrides.get(task_day_key(str(key), task))
+    if override is None:
+        override = overrides.get(key)
     if override is not None:
         return override
     own = task_days(plan).get(task)
@@ -391,7 +396,8 @@ def week_events(events: list, own_days: dict[str, int]) -> list[dict]:
             # Дата без назначений — тоже в обзоре.
             blocks.setdefault(
                 event.event_date,
-                {"date": event.event_date, "assignments": [], "days": {}},
+                {"date": event.event_date, "assignments": [], "days": {},
+                 "moments": []},
             )
         for assignment in event.assignments:
             offset = own_days.get(assignment.task)
@@ -401,9 +407,12 @@ def week_events(events: list, own_days: dict[str, int]) -> list[dict]:
                 if candidate.weekday() == 6:
                     sunday = candidate
             block = blocks.setdefault(
-                sunday, {"date": sunday, "assignments": [], "days": {}}
+                sunday,
+                {"date": sunday, "assignments": [], "days": {}, "moments": []},
             )
             block["assignments"].append(assignment)
+            # Дата каждого назначения — как в файле.
+            block["moments"].append(event.event_date)
             if event.event_date != sunday:
                 block["days"][assignment.task] = event.event_date
     return [blocks[day] for day in sorted(blocks)]
@@ -481,7 +490,9 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
         status,
         "",
         (
-            "🧮 Без опроса: все из состава считаются свободными"
+            "📥 Загружен из Excel — напоминания и замены по нему"
+            if plan.get("source") == "excel"
+            else "🧮 Без опроса: все из состава считаются свободными"
             if plan["run_id"] is None
             else f"Ответили {len(summary.answered)} из {len(polled)}"
         ) + f" · закрыто мест {done} из {total}",
@@ -763,11 +774,13 @@ def publication_text(service: dict, plan: dict, people: list[dict],
                 for key in people
             }
             for key in sorted(set(before) | set(after)):
-                if before.get(key) == after.get(key) or key not in serving:
+                person, task = split_day_key(key)
+                if before.get(key) == after.get(key) or person not in serving:
                     continue
                 offset = after.get(key)
                 changes.append(
-                    f"• {_short(day)} {names.get(key, key)}: "
+                    f"• {_short(day)} {names.get(person, person)}"
+                    + (f" ({task})" if task else "") + ": "
                     + (
                         _weekday_date(
                             date.fromisoformat(day) + timedelta(days=offset)
@@ -804,11 +817,121 @@ def task_moments(plan: dict, by_key: dict, day: str,
     return [
         (
             sunday + timedelta(
-                days=slot_offset(plan, by_key.get(key), day, task) or 0
+                # Не из состава (имя из Excel) — разовый день по ключу.
+                days=slot_offset(
+                    plan, by_key.get(key) or {"key": key}, day, task
+                ) or 0
             ) if own else sunday,
             key,
         )
         for key in plan["slots"].get(day, {}).get(task, [])
+    ]
+
+
+def excel_plan(registry, service_id: str, year: int, month: int,
+               events: list) -> dict:
+    """График месяца из событий Excel (решение 15): воскресенья месяца,
+    задачи графика, люди — ключами состава (по имени; неизвестные и
+    неоднозначные — именем как в файле). Задача со своим днём (среда
+    перед воскресеньем) — в его воскресенье; другой день человека —
+    разовым днём. → dates, tasks, slots, days, unbound (не привязаны),
+    skipped (даты не воскресенья месяца: «ср 11.11 спевка» — у задачи нет
+    своего дня)."""
+    people = registry.readiness_people(service_id)
+    keys: dict[str, list[str]] = {}
+    for person in people:
+        keys.setdefault(normalized_name(person["name"]), []).append(person["key"])
+    by_key = {person["key"]: person for person in people}
+    tasks = plan_tasks(registry, service_id)
+    names = {task["name"] for task in tasks}
+    own_days = {
+        task["name"]: task["day"] for task in tasks if task.get("day") is not None
+    }
+    dates = free_run(service_id, year, month)["dates"]
+    slots = {day: {task["name"]: [] for task in tasks} for day in dates}
+    days: dict = {}
+    unbound: list[str] = []
+    skipped: list[str] = []
+    for block in week_events(
+        [event for event in events if event.service_id == service_id],
+        own_days,
+    ):
+        day = block["date"].isoformat()
+        if day not in slots:
+            if block["date"].weekday() != 6 and (
+                block["date"].year, block["date"].month
+            ) == (year, month):
+                skipped += [
+                    f"{_weekday_date(block['date'])} {item.task}"
+                    for item in block["assignments"]
+                    if not item.is_informational and item.name
+                ]
+            continue
+        for assignment, moment in zip(block["assignments"], block["moments"]):
+            if (
+                assignment.is_informational or not assignment.name
+                or assignment.task not in names
+            ):
+                continue
+            found = keys.get(normalized_name(assignment.name), [])
+            key = found[0] if len(found) == 1 else assignment.name
+            people_slot = slots[day][assignment.task]
+            if key not in people_slot:
+                people_slot.append(key)
+            if not (by_key.get(key) or {}).get("telegram_id"):
+                if assignment.name not in unbound:
+                    unbound.append(assignment.name)
+            if assignment.task in own_days:
+                # Задача со своим днём не в свой день (в воскресенье) —
+                # разовый день человека в этой задаче.
+                offset = (moment - block["date"]).days
+                if offset != own_days[assignment.task]:
+                    days.setdefault(day, {})[
+                        task_day_key(key, assignment.task)
+                    ] = offset
+    return {
+        "dates": dates, "tasks": tasks, "slots": slots, "days": days,
+        "unbound": unbound, "skipped": list(dict.fromkeys(skipped)),
+    }
+
+
+def plan_events(plan: dict, people: list[dict]) -> list[ServiceEvent]:
+    """Утверждённый график бота как события графика (решение 15): по ним
+    — напоминания и замены. Задача со своим днём — событием своей даты
+    (как в Excel), разовый день человека учитывается."""
+    if plan.get("approved") is None:
+        return []
+    # Задачи и дни — как утверждено (рабочая копия может быть уже
+    # переименована или с другим днём задачи). Задача утверждённых
+    # назначений не из снимка (снимок миграции из уже переименованной
+    # копии) — без своего дня, но не теряется.
+    tasks = list(plan.get("approved_tasks") or [])
+    known = {task["name"] for task in tasks}
+    tasks += [
+        {"name": name}
+        for name in dict.fromkeys(
+            task for day_tasks in plan["approved"].values()
+            for task in day_tasks
+        )
+        if name not in known
+    ]
+    published = {
+        **plan, "slots": plan["approved"], "tasks": tasks,
+        "days": plan.get("approved_days") or {},
+    }
+    names = _names(people)
+    by_key = {person["key"]: person for person in people}
+    events: dict[date, list[ServiceAssignment]] = {}
+    for day in sorted(plan["approved"]):
+        events.setdefault(date.fromisoformat(day), [])
+        for task in tasks:
+            for moment, key in task_moments(published, by_key, day, task["name"]):
+                events.setdefault(moment, []).append(
+                    ServiceAssignment(task["name"], names.get(key, key))
+                )
+    return [
+        ServiceEvent(plan["service_id"], moment, tuple(items))
+        for moment, items in sorted(events.items())
     ]
 
 
