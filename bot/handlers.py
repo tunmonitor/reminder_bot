@@ -5489,9 +5489,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "✅ Утвердить график "
                 f"{service_label(service)} на {month_title(year, month)}?",
                 "",
-                "График уйдёт в чат служения"
-                + (" с пометкой «обновлён» и списком изменений"
-                   if plan["approved"] is not None else "")
+                (
+                    "Закреплённый график в чате служения обновится, под ним "
+                    "— все изменения месяца; новые изменения уйдут ответом "
+                    "на него (с упоминаниями)"
+                    if plan["approved"] is not None
+                    else "График уйдёт в чат служения и закрепится"
+                )
                 + "; вам — блок для переноса в Excel.",
             ]
             problems = schedule_plan.gaps(plan)
@@ -5563,6 +5567,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         notice = "❌ Не удалось опубликовать график в чате"
                     else:
                         notice = "✅ График утверждён и опубликован в чате служения"
+                        if not plan.get("pinned", True):
+                            notice += (
+                                "\n⚠️ Закрепить не удалось — дайте боту в "
+                                "чате право закреплять сообщения"
+                            )
                         try:
                             await send_excel_block(actor_id, service, plan)
                         except Exception:  # noqa: BLE001

@@ -38,6 +38,10 @@ def fake_bot():
             message_id=12, poll=SimpleNamespace(id="poll-1"),
         )),
         stop_poll=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        pin_chat_message=AsyncMock(),
+        unpin_chat_message=AsyncMock(),
+        delete_message=AsyncMock(),
     )
 
 
@@ -198,7 +202,8 @@ class SchedulePlanTest(unittest.TestCase):
         self.assertIn("График Звук на ноябрь 2026 утверждён", text)
         self.assertIn('href="tg://user?id=501"', text)
 
-        # Правка после утверждения — публикация «обновлён» со списком.
+        # Правка после утверждения — закреплённый график правится,
+        # под ним список изменений.
         slots = approved["slots"]
         slots["2026-11-15"]["сборка"] = ["Глеб"]
         changed = self.registry.set_schedule_slots(1001, "sound", "2026-11", slots)
@@ -206,15 +211,187 @@ class SchedulePlanTest(unittest.TestCase):
         asyncio.run(schedule_plan.publish(
             self.bot, self.registry, self.service(), changed, 1001, LOG, 4096,
         ))
-        text = self.bot.send_message.await_args.args[1]
+        text = self.bot.edit_message_text.await_args.args[0]
         self.assertIn("обновлён", text)
-        self.assertIn("15.11 «сборка»: Дмитрий → Глеб", text)
+        self.assertIn("15.11 «сборка»: Дмитрий → ", text)
 
         # Пересчёт сбрасывает правки, утверждённая копия остаётся.
         recalculated = self.draft()
         self.assertEqual(recalculated["edited"], 0)
         self.assertEqual(
             recalculated["approved"]["2026-11-15"]["сборка"], ["Глеб"]
+        )
+
+    def test_publication_pinned_edited_and_answered(self):
+        """Решение 17, 5б: первая публикация закрепляется, обновление
+        правит её (под графиком — все изменения месяца) и отвечает на неё
+        только новыми изменениями; не правится — новая и закреплённая."""
+        from aiogram.exceptions import TelegramBadRequest
+
+        plan = self.draft()
+        plan["slots"]["2026-11-01"] = {"звук": ["Алексей"], "сборка": []}
+        plan["slots"]["2026-11-08"] = {"звук": ["Борис"], "сборка": []}
+        plan = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", plan["slots"]
+        )
+        first = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+        ))
+        self.assertTrue(first["pinned"])
+        self.bot.pin_chat_message.assert_awaited_once_with(
+            -1005555, 11, disable_notification=True,
+        )
+        self.assertEqual(first["message_ids"], [11])
+        self.assertEqual(
+            first["baseline"]["slots"]["2026-11-01"]["звук"], ["Алексей"]
+        )
+        text = self.bot.send_message.await_args.args[1]
+        # Каждый человек — на своей строке.
+        self.assertIn("🎚️ звук\n    • ", text)
+        self.assertIn("🧰 сборка: —", text)
+
+        # Первое обновление: 01.11 Борис вместо Алексея.
+        self.bot.send_message.reset_mock()
+        slots = first["slots"]
+        slots["2026-11-01"]["звук"] = ["Борис"]
+        changed = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", slots
+        )
+        second = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), changed, 1001, LOG, 4096,
+        ))
+        edit = self.bot.edit_message_text.await_args
+        self.assertEqual(
+            (edit.kwargs["chat_id"], edit.kwargs["message_id"]),
+            (-1005555, 11),
+        )
+        self.assertIn("Изменения:\n• 01.11 «звук»: Алексей → Борис",
+                      edit.args[0])
+        # Ответ на закреплённый — с упоминанием, правка не уведомляет.
+        reply = self.bot.send_message.await_args
+        self.assertEqual(reply.kwargs["reply_parameters"].message_id, 11)
+        self.assertIn("01.11 «звук»: ", reply.args[1])
+        self.assertIn('href="tg://user?id=502"', reply.args[1])
+        # Закрепляется и при правке (вдруг права дали позже).
+        self.assertEqual(self.bot.pin_chat_message.await_count, 2)
+        self.assertEqual(second["message_ids"], [11])
+
+        # Второе обновление: в закреплённом — оба изменения, в ответе —
+        # только новое.
+        self.bot.send_message.reset_mock()
+        slots = second["slots"]
+        slots["2026-11-08"]["звук"] = ["Алексей"]
+        changed = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", slots
+        )
+        third = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), changed, 1001, LOG, 4096,
+        ))
+        pinned_text = self.bot.edit_message_text.await_args.args[0]
+        self.assertIn("• 01.11 «звук»: Алексей → Борис", pinned_text)
+        self.assertIn("• 08.11 «звук»: Борис → Алексей", pinned_text)
+        reply_text = self.bot.send_message.await_args.args[1]
+        self.assertIn("08.11", reply_text)
+        self.assertNotIn("01.11", reply_text)
+
+        # Закреплённое удалено — новая публикация, закреплённая; прежняя
+        # откреплена; изменения — всё ещё от первой публикации.
+        self.bot.send_message.reset_mock()
+        self.bot.send_message.return_value = SimpleNamespace(message_id=21)
+        self.bot.edit_message_text.side_effect = TelegramBadRequest(
+            method=unittest.mock.MagicMock(),
+            message="Bad Request: message to edit not found",
+        )
+        slots = third["slots"]
+        slots["2026-11-22"]["звук"] = ["Борис"]
+        changed = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", slots
+        )
+        fourth = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), changed, 1001, LOG, 4096,
+        ))
+        self.assertEqual(fourth["message_ids"], [21])
+        self.bot.pin_chat_message.assert_awaited_with(
+            -1005555, 21, disable_notification=True,
+        )
+        # Прежняя публикация удалена; не удаляется — откреплена.
+        self.bot.delete_message.assert_awaited_with(-1005555, 11)
+        self.bot.unpin_chat_message.assert_not_awaited()
+        # Новое сообщение само уведомляет — ответа нет, оно одно.
+        self.assertEqual(self.bot.send_message.await_count, 1)
+        text = self.bot.send_message.await_args.args[1]
+        self.assertIn("• 01.11 «звук»: Алексей → Борис", text)
+        self.assertIn("• 22.11 «звук»: никого → Борис", text)
+
+        # Закрепить нельзя (нет права) — график всё равно утверждён.
+        self.bot.pin_chat_message.side_effect = RuntimeError("no rights")
+        # Публикации нет — следующая уходит новой.
+        with closing(sqlite3.connect(self.registry.path)) as connection:
+            connection.execute(
+                "UPDATE schedule_plans SET message_ids_json = NULL, "
+                "message_id = NULL WHERE month = '2026-11'"
+            )
+            connection.commit()
+        slots = fourth["slots"]
+        slots["2026-11-29"]["звук"] = ["Алексей"]
+        changed = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", slots
+        )
+        fifth = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), changed, 1001, LOG, 4096,
+        ))
+        self.assertFalse(fifth["pinned"])
+        self.assertFalse(fifth["dirty"])
+
+    def test_failed_save_keeps_previous_publication(self):
+        """Утверждение не сохранилось — прежняя публикация не удаляется:
+        в базе ещё её id."""
+        from aiogram.exceptions import TelegramBadRequest
+
+        plan = self.draft()
+        first = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+        ))
+        slots = first["slots"]
+        slots["2026-11-29"]["звук"] = ["Борис"]
+        changed = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", slots
+        )
+        self.bot.edit_message_text.side_effect = TelegramBadRequest(
+            method=unittest.mock.MagicMock(),
+            message="Bad Request: message to edit not found",
+        )
+        self.bot.send_message.return_value = SimpleNamespace(message_id=21)
+        with unittest.mock.patch.object(
+            self.registry, "approve_schedule_plan",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            with self.assertRaises(schedule_plan.PublishedNotSaved):
+                asyncio.run(schedule_plan.publish(
+                    self.bot, self.registry, self.service(), changed, 1001,
+                    LOG, 4096,
+                ))
+        self.bot.delete_message.assert_not_awaited()
+        self.assertEqual(
+            self.registry.get_schedule_plan("sound", "2026-11")["message_ids"],
+            [11],
+        )
+
+    def test_change_lines_format(self):
+        names = {"f": "Филипп", "d": "Денис", "a": "Анна"}
+        self.assertEqual(
+            schedule_plan.plan_changes(
+                {"2026-11-08": {"Уборка": ["d"]}},
+                {"2026-11-08": {"Уборка": ["f"]}}, names,
+            ),
+            ["• 08.11 Денис → Филипп"],
+        )
+        self.assertEqual(
+            schedule_plan.plan_changes(
+                {"2026-11-08": {"звук": ["d"], "сборка": ["a"]}},
+                {"2026-11-08": {"звук": ["d", "f"], "сборка": []}}, names,
+            ),
+            ["• 08.11 «звук»: никого → Филипп", "• 08.11 «сборка»: Анна → никого"],
         )
 
     def test_excel_plan_round_trip_with_task_day(self):
@@ -621,7 +798,7 @@ class SchedulePlanTest(unittest.TestCase):
         )
         self.assertIn(
             "📅 График Звук на ноябрь 2026 утверждён\n\n"
-            "🗓 01.11 (чт 29.10)\n  🎚️ звук: \x00", published,
+            "🗓 01.11 (чт 29.10)\n  🎚️ звук\n    • \x00", published,
         )
         self.assertIn("\n  🧰 сборка: —\n\n🗓 08.11", published)
         # Заголовок — свой шаблон из «📝 Тексты».
@@ -710,9 +887,10 @@ class SchedulePlanTest(unittest.TestCase):
             self.service(), plan, self.people()
         )
         self.assertIn(
-            "\n\n🗓 Неделя 26.10–01.11\n  ср 28.10\n    🧰 сборка: ", published
+            "\n\n🗓 Неделя 26.10–01.11\n  ср 28.10\n    🧰 сборка\n      • ",
+            published,
         )
-        self.assertIn("\n  вс 01.11\n    🎚️ звук: ", published)
+        self.assertIn("\n  вс 01.11\n    🎚️ звук\n      • ", published)
         self.assertIn("• Изменены дни служения", published)
         # Задача без людей во всех датах черновика — подсказка пересчитать.
         draft = {**plan, "approved": None, "slots": {

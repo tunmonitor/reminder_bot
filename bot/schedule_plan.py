@@ -13,8 +13,12 @@ import asyncio
 import hashlib
 import json
 import logging
+from collections.abc import Callable
 from datetime import date, timedelta
 from io import BytesIO
+
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import ReplyParameters
 
 from .excel_parser import ServiceAssignment, ServiceEvent, _schedule_sheet_name
 from .group_send import send_to_service_group
@@ -36,7 +40,7 @@ from .readiness import (
 from .services import (
     ScheduleColumn, normalized_name, split_day_key, task_day_key,
 )
-from .ui import send_telegram_screen, user_link
+from .ui import render_screen_chunks, send_telegram_screen, user_link
 
 
 # Сколько ждать график прошлого месяца (секунды).
@@ -674,8 +678,13 @@ def choice_notes(plan: dict, summary: Summary, key: str, day: str,
 
 
 def plan_changes(old: dict, new: dict, names: dict[str, str],
-                 nobody: str = "никого") -> list[str]:
-    """Отличия нового графика от опубликованного — для «обновлён».
+                 nobody: str = "никого",
+                 show: Callable[[str], str] | None = None) -> list[str]:
+    """Отличия нового графика от опубликованного — для «обновлён»: кто
+    кого заменил («• 08.11 Денис → Филипп»; при нескольких задачах — с
+    задачей), кто добавлен («никого → Анна») и кто убран («Анна → никого»).
+    Имена без склонения. show — как показать
+    человека (упоминание), по умолчанию имя.
     Единственная задача сменила название (служение без задач переименовано
     в каталоге) — одной строкой, люди сравниваются под новым названием.
     При нескольких задачах смена набора — это выключение и включение, не
@@ -683,8 +692,13 @@ def plan_changes(old: dict, new: dict, names: dict[str, str],
     lines = []
     old_tasks = {task for tasks in old.values() for task in tasks}
     new_tasks = {task for tasks in new.values() for task in tasks}
+    several = len(old_tasks | new_tasks) > 1
+    if show is None:
+        def show(key: str) -> str:
+            return names.get(key, key)
     if len(old_tasks) == len(new_tasks) == 1 and old_tasks != new_tasks:
         (was,), (now,) = old_tasks, new_tasks
+        several = False
         lines.append(f"• Задача «{was}» теперь называется «{now}»")
         old = {
             day: {(now if task == was else task): people
@@ -696,15 +710,22 @@ def plan_changes(old: dict, new: dict, names: dict[str, str],
         for task in tasks:
             before = old.get(day, {}).get(task, [])
             after = new.get(day, {}).get(task, [])
-            if sorted(before) == sorted(after):
-                continue
-
-            def shown(people: list[str]) -> str:
-                return ", ".join(names.get(p, p) for p in people) or nobody
-
-            lines.append(
-                f"• {_short(day)} «{task}»: {shown(before)} → {shown(after)}"
+            gone = [key for key in before if key not in after]
+            came = [key for key in after if key not in before]
+            where = (
+                f"• {_short(day)} «{task}»: " if several
+                else f"• {_short(day)} "
             )
+            lines += [
+                f"{where}{show(old_key)} → {show(new_key)}"
+                for new_key, old_key in zip(came, gone)
+            ]
+            lines += [
+                f"{where}{nobody} → {show(key)}" for key in came[len(gone):]
+            ]
+            lines += [
+                f"{where}{show(key)} → {nobody}" for key in gone[len(came):]
+            ]
     return lines
 
 
@@ -723,21 +744,76 @@ def publication_title(service: dict, month: str, update: bool,
     )
 
 
+def published_baseline(plan: dict) -> dict:
+    """График первой публикации месяца — от него изменения под закреплённым
+    графиком (решение 17, 5б). Опубликован до 5б — прошлая утверждённая
+    копия."""
+    return plan.get("baseline") or {
+        "slots": plan.get("approved") or {},
+        "days": plan.get("approved_days") or {},
+    }
+
+
+def change_lines(plan: dict, people: list[dict], old_slots: dict,
+                 old_days: dict, settings: dict | None = None,
+                 show: Callable[[str], str] | None = None) -> list[str]:
+    """Изменения рабочей копии от old_slots/old_days: замены, разовые дни,
+    «Изменены дни служения»."""
+    names = _names(people)
+    changes = plan_changes(
+        old_slots, plan["slots"], names, phrase(settings, "nobody"), show,
+    )
+    for day in plan["dates"]:
+        before = old_days.get(day, {})
+        after = plan.get("days", {}).get(day, {})
+        serving = {
+            key for keys in plan["slots"].get(day, {}).values()
+            for key in keys
+        }
+        for key in sorted(set(before) | set(after)):
+            person, task = split_day_key(key)
+            if before.get(key) == after.get(key) or person not in serving:
+                continue
+            offset = after.get(key)
+            changes.append(
+                f"• {_short(day)} "
+                + (show(person) if show else names.get(person, person))
+                + (f" ({task})" if task else "") + ": "
+                + (
+                    _weekday_date(
+                        date.fromisoformat(day) + timedelta(days=offset)
+                    ) if offset is not None
+                    else phrase(settings, "usual_day")
+                )
+            )
+    if plan.get("republish"):
+        changes.append(phrase(settings, "days_changed"))
+    return changes
+
+
+def _people_lines(head: str, keys: list[str], indent: str, empty: str,
+                  show: Callable[[str], str]) -> list[str]:
+    """Задача и под ней каждый человек на своей строке (решение 17, 5б)."""
+    if not keys:
+        return [f"{head}: {empty}"]
+    return [head] + [f"{indent}• {show(key)}" for key in keys]
+
+
 def publication_text(service: dict, plan: dict, people: list[dict],
                      window: tuple[int, int] = (0, 0),
                      settings: dict | None = None) -> str:
-    """Утверждённый график для чата служения (с упоминаниями): дата,
-    под ней задачи — каждая с новой строки."""
+    """Утверждённый график для чата служения (с упоминаниями): дата, под
+    ней задачи, под задачей — каждый человек на своей строке. При
+    обновлении под графиком — все изменения с первой публикации."""
     by_key = {person["key"]: person for person in people}
     update = plan["approved"] is not None
+    empty = phrase(settings, "empty")
 
-    def mention(key: str, day: str, shared_day: bool = False) -> str:
+    def link(key: str) -> str:
         person = by_key.get(key)
         if person is None:
             return key
-        return user_link(person["telegram_id"], person["name"]) + (
-            "" if shared_day else person_day(person, day, plan)
-        )
+        return user_link(person["telegram_id"], person["name"])
 
     lines = [
         publication_title(service, plan["month"], update, settings),
@@ -751,68 +827,75 @@ def publication_text(service: dict, plan: dict, people: list[dict],
             for label, offset, tasks in groups:
                 lines.append(f"  {label}")
                 for task in tasks:
-                    people_text = ", ".join(
-                        (
-                            user_link(by_key[key]["telegram_id"],
-                                      by_key[key]["name"])
-                            + week_person_day(
-                                plan, by_key[key], day, task["name"], offset
-                            )
-                        ) if key in by_key else key
-                        for key in plan["slots"].get(day, {}).get(
-                            task["name"], []
-                        )
-                    ) or phrase(settings, "empty")
-                    lines.append(
-                        f"    {task_emoji(task['name'])} {task['name']}: "
-                        f"{people_text}"
+                    name = task["name"]
+                    lines += _people_lines(
+                        f"    {task_emoji(name)} {name}",
+                        plan["slots"].get(day, {}).get(name, []),
+                        "      ", empty,
+                        lambda key, name=name, offset=offset: link(key) + (
+                            week_person_day(
+                                plan, by_key[key], day, name, offset
+                            ) if key in by_key else ""
+                        ),
                     )
             continue
         label, shared_day = date_header(plan, by_key, day, window)
         lines += ["", f"🗓 {label}"]
+
+        def mention(key: str) -> str:
+            person = by_key.get(key)
+            return link(key) + (
+                "" if shared_day or person is None
+                else person_day(person, day, plan)
+            )
+
         for task in plan["tasks"]:
-            people_keys = plan["slots"].get(day, {}).get(task["name"], [])
-            people_text = ", ".join(
-                mention(key, day, shared_day) for key in people_keys
-            ) or phrase(settings, "empty")
-            lines.append(
-                f"  {people_text}" if implicit_plan(plan)
-                else f"  {task_emoji(task['name'])} {task['name']}: "
-                f"{people_text}"
+            keys = plan["slots"].get(day, {}).get(task["name"], [])
+            if implicit_plan(plan):
+                lines += (
+                    [f"  • {mention(key)}" for key in keys] or [f"  {empty}"]
+                )
+                continue
+            lines += _people_lines(
+                f"  {task_emoji(task['name'])} {task['name']}", keys,
+                "    ", empty, mention,
             )
     if update:
-        changes = plan_changes(
-            plan["approved"], plan["slots"], _names(people),
-            phrase(settings, "nobody"),
+        baseline = published_baseline(plan)
+        changes = change_lines(
+            plan, people, baseline["slots"], baseline["days"], settings,
         )
-        names = _names(people)
-        for day in plan["dates"]:
-            before = plan.get("approved_days", {}).get(day, {})
-            after = plan.get("days", {}).get(day, {})
-            serving = {
-                key for people in plan["slots"].get(day, {}).values()
-                for key in people
-            }
-            for key in sorted(set(before) | set(after)):
-                person, task = split_day_key(key)
-                if before.get(key) == after.get(key) or person not in serving:
-                    continue
-                offset = after.get(key)
-                changes.append(
-                    f"• {_short(day)} {names.get(person, person)}"
-                    + (f" ({task})" if task else "") + ": "
-                    + (
-                        _weekday_date(
-                            date.fromisoformat(day) + timedelta(days=offset)
-                        ) if offset is not None
-                        else phrase(settings, "usual_day")
-                    )
-                )
-        if plan.get("republish"):
-            changes.append(phrase(settings, "days_changed"))
         if changes:
             lines += ["", phrase(settings, "changes")] + changes
     return "\n".join(lines)
+
+
+def update_notice(service: dict, plan: dict, people: list[dict],
+                  settings: dict | None = None) -> str | None:
+    """Короткий ответ на закреплённый график при обновлении: только новые
+    изменения (от прошлой утверждённой копии) с упоминаниями — правка
+    сообщения в Telegram не уведомляет. None — сообщать нечего."""
+    if plan["approved"] is None:
+        return None
+    by_key = {person["key"]: person for person in people}
+
+    def link(key: str) -> str:
+        person = by_key.get(key)
+        return (
+            user_link(person["telegram_id"], person["name"]) if person
+            else key
+        )
+
+    changes = change_lines(
+        plan, people, plan["approved"], plan.get("approved_days") or {},
+        settings, link,
+    )
+    if not changes:
+        return None
+    return "\n".join(
+        [publication_title(service, plan["month"], True, settings), ""]
+        + changes
+    )
 
 
 def _columns(registry, service_id: str) -> list[ScheduleColumn]:
@@ -1092,60 +1175,147 @@ def excel_file(registry, service: dict, plan: dict, people: list[dict]) -> bytes
     return buffer.getvalue()
 
 
+async def _edit_publication(bot, chat_id: int, message_ids: list[int],
+                            text: str, text_limit: int) -> bool:
+    """Правка закреплённой публикации (решение 17, 5б). False — не правится
+    (удалена, другое число частей): нужна новая."""
+    chunks = render_screen_chunks(text, limit=text_limit)
+    if not message_ids or len(chunks) != len(message_ids):
+        return False
+    for message_id, chunk in zip(message_ids, chunks):
+        try:
+            await bot.edit_message_text(
+                chunk, chat_id=chat_id, message_id=message_id,
+                parse_mode="HTML",
+            )
+        except TelegramBadRequest as exc:
+            if "not modified" in str(exc).lower():
+                continue
+            return False
+    return True
+
+
 async def publish(
     bot, registry, service: dict, plan: dict, actor_id: int,
     logger: logging.Logger, text_limit: int,
 ) -> dict:
     """«✅ Утвердить»: график в чат служения, затем отметка в базе.
-    ValueError — публиковать некуда."""
+    Первая публикация закрепляется; обновление правит закреплённую и
+    отвечает на неё новыми изменениями (правка не уведомляет). Не
+    правится — новая публикация, закреплённая. ValueError — публиковать
+    некуда. В результате pinned=False — закрепить не удалось."""
     chat_id = service.get("group_chat_id")
     if not chat_id:
         raise ValueError("Чат служения не привязан — график не опубликован.")
     if not service.get("enabled", True):
         raise ValueError("Служение выключено — график не опубликован.")
     people = registry.readiness_people(service["id"])
+    settings = registry.get_readiness_settings(service["id"])
+    text = publication_text(
+        service, plan, people, window_of(registry, service["id"]), settings,
+    )
+    old_ids = (
+        list(plan.get("message_ids") or [])
+        if plan.get("chat_id") == chat_id else []
+    )
+    edited = plan["approved"] is not None and await _edit_publication(
+        bot, chat_id, old_ids, text, text_limit,
+    )
+    pinned = True
     sent: list[int] = []
-
-    async def send_chunk(chat, text, **kwargs):
-        message = await send_to_service_group(
-            bot.send_message, chat, text, service,
-            registry=registry, logger=logger, **kwargs,
-        )
-        sent.append(message.message_id)
-        return message
-
-    try:
-        await send_telegram_screen(
-            send_chunk, chat_id,
-            publication_text(
-                service, plan, people, window_of(registry, service["id"]),
-                registry.get_readiness_settings(service["id"]),
-            ),
-            limit=text_limit,
-        )
-    except BaseException:
-        # Длинный график ушёл не целиком — убрать отправленные части, иначе
-        # повторное «Утвердить» продублировало бы их.
-        for message_id in sent:
+    if edited:
+        message_ids = old_ids
+        notice = update_notice(service, plan, people, settings)
+        if notice:
             try:
-                await bot.delete_message(chat_id, message_id)
-            except Exception:  # noqa: BLE001
-                logger.info("Часть графика не удалена", exc_info=True)
-        raise
+                await send_to_service_group(
+                    lambda chat, body, **kwargs: send_telegram_screen(
+                        bot.send_message, chat, body, limit=text_limit,
+                        **kwargs,
+                    ),
+                    chat_id, notice, service, registry=registry,
+                    logger=logger,
+                    reply_parameters=ReplyParameters(
+                        message_id=old_ids[0],
+                        allow_sending_without_reply=True,
+                    ),
+                )
+            except Exception:  # noqa: BLE001 — график уже обновлён
+                logger.warning("Изменения графика не отправлены ответом",
+                               exc_info=True)
+    else:
+        async def send_chunk(chat, body, **kwargs):
+            message = await send_to_service_group(
+                bot.send_message, chat, body, service,
+                registry=registry, logger=logger, **kwargs,
+            )
+            sent.append(message.message_id)
+            return message
+
+        try:
+            await send_telegram_screen(
+                send_chunk, chat_id, text, limit=text_limit,
+            )
+        except BaseException:
+            # Длинный график ушёл не целиком — убрать отправленные части,
+            # иначе повторное «Утвердить» продублировало бы их.
+            for message_id in sent:
+                try:
+                    await bot.delete_message(chat_id, message_id)
+                except Exception:  # noqa: BLE001
+                    logger.info("Часть графика не удалена", exc_info=True)
+            raise
+        message_ids = sent
+    # Закрепить и при правке: раньше могло не хватить прав.
+    try:
+        await bot.pin_chat_message(
+            chat_id, message_ids[0], disable_notification=True,
+        )
+    except Exception:  # noqa: BLE001 — нет права закреплять
+        pinned = False
+        logger.warning("График не закреплён", exc_info=True)
+    # Изменения под графиком — от первой публикации месяца.
+    baseline = None
+    if plan.get("baseline") is None:
+        baseline = (
+            {"slots": plan["slots"], "days": plan.get("days", {})}
+            if plan["approved"] is None else published_baseline(plan)
+        )
     for attempt in range(2):
         try:
-            return registry.approve_schedule_plan(
+            result = registry.approve_schedule_plan(
                 actor_id, service["id"], plan["month"], plan["slots"],
-                chat_id=chat_id, message_id=sent[0] if sent else None,
+                chat_id=chat_id,
+                message_id=message_ids[0] if message_ids else None,
+                message_ids=message_ids,
+                baseline=baseline,
                 updated_at=plan["updated_at"], days=plan.get("days", {}),
                 served_offsets=served_offsets(plan, people),
             )
+            break
         except Exception as exc:  # noqa: BLE001
             if attempt:
-                # Повторное «Утвердить» опубликовало бы график второй раз.
+                # Повторное «Утвердить» опубликовало бы график второй раз;
+                # прежняя публикация остаётся — в базе ещё её id.
                 raise PublishedNotSaved(str(exc)) from exc
             logger.warning("Утверждение графика не сохранено, повтор",
                            exc_info=True)
+    if not edited:
+        # Прежняя публикация не правится (или правка сорвалась на середине)
+        # — убрать её, чтобы в чате не осталось устаревших частей; не
+        # удаляется (старше 48 ч) — хотя бы снять с закрепа.
+        for message_id in old_ids:
+            try:
+                await bot.delete_message(chat_id, message_id)
+            except Exception:  # noqa: BLE001
+                logger.info("Прежний график не удалён", exc_info=True)
+                try:
+                    await bot.unpin_chat_message(
+                        chat_id, message_id=message_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.info("Прежний график не откреплён", exc_info=True)
+    return {**result, "pinned": pinned}
 
 
 def excel_filled(events, service_id: str, year: int, month: int) -> bool:
