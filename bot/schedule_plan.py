@@ -475,6 +475,21 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
     by_key = {person["key"]: person for person in summary.people}
     silent = {person["key"] for person in summary.not_answered}
     polled = [person for person in summary.people if person["tasks"]]
+    used_unpicked = False
+
+    def mark(person: str, day: str) -> str:
+        """* — не ответил; ° — ответил, но эту дату не отмечал (решение 16:
+        его даты заняли другие — вместо не ответившего; или вручную)."""
+        nonlocal used_unpicked
+        if person in silent:
+            return "*"
+        if plan["run_id"] is not None and person in summary.answered and (
+            day not in summary.answered[person]
+        ):
+            used_unpicked = True
+            return "°"
+        return ""
+
     done, total = covered(plan)
     if plan["approved"] is None:
         status = "📝 Черновик — ещё не утверждён"
@@ -513,7 +528,7 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
                             task["name"], task["needed"],
                             [
                                 names.get(person, person)
-                                + ("*" if person in silent else "")
+                                + mark(person, day)
                                 + week_person_day(
                                     plan, by_key.get(person), day,
                                     task["name"], offset,
@@ -531,7 +546,7 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
             lines += task_lines(
                 task["name"], task["needed"],
                 [
-                    names.get(person, person) + ("*" if person in silent else "")
+                    names.get(person, person) + mark(person, day)
                     + ("" if shared_day else person_day(
                         by_key.get(person), day, plan
                     ))
@@ -570,6 +585,11 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
     if used_silent:
         lines.append(
             "* не ответил(а) — поставлен(а) по общей логике, после ответивших"
+        )
+    if used_unpicked:
+        lines.append(
+            "° не отмечал(а) эту дату в опросе — отмеченные заняли другие "
+            "(поставлен(а) вместо не ответившего) или поставлен(а) вручную"
         )
     for answer in summary.outside:
         days = ", ".join(

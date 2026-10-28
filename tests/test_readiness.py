@@ -525,6 +525,67 @@ class ReadinessFlowTest(unittest.TestCase):
         ))
         bot.send_message.assert_not_awaited()
 
+    def test_free_days_reminder_once_after_two_thirds(self):
+        bot = fake_bot()
+        run = self.launch(bot)
+        bot.send_message.reset_mock()
+
+        def remind():
+            asyncio.run(readiness.send_free_days_reminder(
+                bot, self.registry, run, self.service(), LOG,
+            ))
+
+        self.registry.record_readiness_answer(
+            "poll-1", 501, "", "", ["2026-11-01"]
+        )
+        # Ответил 1 из 3 с Telegram — рано.
+        remind()
+        bot.send_message.assert_not_awaited()
+        self.registry.record_readiness_answer(
+            "poll-1", 502, "", "", ["2026-11-01", "2026-11-08"]
+        )
+        remind()
+        chat, text = bot.send_message.await_args.args[:2]
+        self.assertEqual(chat, -1005555)
+        # 01.11 закрыто (Алексей — сборка, Борис — звук), остальные — нет.
+        self.assertIn("08.11, 15.11, 22.11, 29.11", text)
+        self.assertNotIn("01.11", text)
+        # Глеб не ответил — просьба отметиться.
+        self.assertIn("отметьтесь", text)
+        remind()
+        self.assertEqual(bot.send_message.await_count, 1)
+
+    def test_free_days_reminder_without_silent_and_when_all_covered(self):
+        bot = fake_bot()
+        run = self.launch(bot)
+        bot.send_message.reset_mock()
+        self.registry.set_readiness_phrase(
+            1001, "sound", "free_days", "Свободно: {days}"
+        )
+        for telegram_id in (501, 502, 503):
+            self.registry.record_readiness_answer(
+                "poll-1", telegram_id, "", "", list(run["dates"])
+            )
+        # Все даты закрыты — напоминать не о чем.
+        asyncio.run(readiness.send_free_days_reminder(
+            bot, self.registry, run, self.service(), LOG,
+        ))
+        bot.send_message.assert_not_awaited()
+        self.registry.record_readiness_answer(
+            "poll-1", 501, "", "", ["2026-11-01"]
+        )
+        self.registry.record_readiness_answer(
+            "poll-1", 503, "", "", ["2026-11-01"]
+        )
+        asyncio.run(readiness.send_free_days_reminder(
+            bot, self.registry, run, self.service(), LOG,
+        ))
+        # Ответили все — без просьбы отметиться; своя фраза.
+        self.assertEqual(
+            bot.send_message.await_args.args[1],
+            "Свободно: 08.11, 15.11, 22.11, 29.11",
+        )
+
     def test_sent_chat_reminder_skips_summary(self):
         bot = fake_bot()
         run = self.launch(bot)

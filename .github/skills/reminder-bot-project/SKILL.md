@@ -421,6 +421,26 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
   may take it for one task; `_fill_bundle_gaps` fills the rest), and
   falls back to the plain plan if coverage drops. `Plan.load` and
   `served_dates` count dates, not slots.
+- PLAN decision 16 (planner): equal-cost ties go by `_priority` — fewer
+  picked dates, longer unserved (`last_served`), earlier answer
+  (`PlanInput.answer_order`, from `summary.answered` insertion order).
+  `_build_plan.assign` scales costs so lower digits are: bundle seat fit
+  (`seat_cost` on the person→seat edge of `_min_cost_matching`: a virtual
+  seat costs more for someone without that bundle), then priority. A
+  non-bundled person on a virtual seat takes the task that leaves the
+  other bundle seats fillable (`unfillable`, spare within max).
+  `build_plan` = `_bundled_plan` + `_place_losers`: a respondent with
+  picked dates but no service replaces a non-respondent on another date
+  (largest cost drop, not back-to-back with `last_served`, once; a
+  non-respondent's bundle moves only to someone with that bundle).
+  `plan_text` marks a respondent on an unpicked date «°» (poll plans only).
+- Free-days chat notice: `readiness.send_free_days_reminder` (called every
+  poll tick while open; notice kind `free-days-<run id>`, once) when
+  answered × 3 ≥ voters × 2 (voters = answered + silent with Telegram)
+  and `free_days` (→ `schedule_planner.open_dates`: per-date matching of
+  respondents only, bundles as extra seats) is non-empty. Text: phrases
+  `free_days` ({days}, poll option labels) + `free_days_vote` when silent
+  voters exist.
 - `service_tasks.day_offset` — task's own day (−6…+6 from the plan's Sunday,
   NULL = service days), `set_service_task_day` (also rewrites `tasks_json`
   of current/future plans and marks approved ones `republish`); UI
