@@ -38,7 +38,9 @@ def _period_bound(value) -> date | None:
 
 
 def in_reminder_period(event_date: date, reminder: dict) -> bool:
-    """Дата события в периоде напоминания «с — по» (этап 4.2)."""
+    """Дата события в периоде напоминания «с — по» (этап 4.2); у задачи со
+    своим днём — воскресенье её недели."""
+    event_date = event_date - timedelta(days=reminder_day_offset(reminder))
     active_from = _period_bound(reminder.get("active_from"))
     active_until = _period_bound(reminder.get("active_until"))
     return (active_from is None or event_date >= active_from) and (
@@ -60,16 +62,36 @@ def periods_overlap(first: dict, second: dict) -> bool:
 
 
 def reminder_period_status(reminder: dict, today: date) -> str | None:
-    """None — без периода; иначе active / pending / ended."""
+    """None — без периода; иначе active / pending / ended. У задачи со
+    своим днём границы — дни задачи первой и последней недели."""
     active_from = _period_bound(reminder.get("active_from"))
     active_until = _period_bound(reminder.get("active_until"))
     if active_from is None and active_until is None:
         return None
+    shift = timedelta(days=reminder_day_offset(reminder))
+    active_from = active_from + shift if active_from else None
+    active_until = active_until + shift if active_until else None
     if active_until is not None and active_until < today:
         return "ended"
     if active_from is not None and active_from > today:
         return "pending"
     return "active"
+
+
+def reminder_day_offset(reminder: dict) -> int:
+    """От какого дня недели считается срок: у напоминания задачи со своим
+    днём — от дня задачи (спевка — вс −4, среда), иначе от воскресенья."""
+    if not reminder.get("task"):
+        return 0
+    return reminder.get("task_day") or 0
+
+
+def is_reminder_event_date(event_date: date, reminder: dict) -> bool:
+    """Дата — день, от которого считается напоминание (решение 17, 5а):
+    общее — только воскресенье, напоминание задачи — день задачи. Иначе
+    «вс −0» пришло бы и в среду спевки."""
+    offset = reminder_day_offset(reminder)
+    return (event_date - timedelta(days=offset)).weekday() == 6
 
 
 def next_reminder_occurrence(
@@ -79,26 +101,31 @@ def next_reminder_occurrence(
     *,
     active_from: date | str | None = None,
     active_until: date | str | None = None,
+    day_offset: int = 0,
 ) -> tuple[date, date] | None:
-    """Ближайшее (воскресенье, дата отправки); None — период завершён."""
+    """Ближайшее (день события, дата отправки); None — период завершён.
+    День события — воскресенье, а у задачи со своим днём — воскресенье
+    плюс day_offset. Период «с — по» — по воскресеньям недели."""
     send_time = time.fromisoformat(reminder_time)
-    days_until_sunday = (6 - now.date().weekday()) % 7
-    event_date = now.date() + timedelta(days=days_until_sunday)
+    # Первое воскресенье, день события которого — сегодня или позже.
+    start = now.date() - timedelta(days=day_offset)
+    sunday = start + timedelta(days=(6 - start.weekday()) % 7)
     active_from = _period_bound(active_from)
     active_until = _period_bound(active_until)
-    if active_from is not None and event_date < active_from:
-        event_date = active_from
+    if active_from is not None and sunday < active_from:
+        sunday = active_from
 
     while True:
-        if active_until is not None and event_date > active_until:
+        if active_until is not None and sunday > active_until:
             return None
+        event_date = sunday + timedelta(days=day_offset)
         send_date = reminder_send_date(event_date, reminder_days)
         send_datetime = datetime.combine(
             send_date, send_time, tzinfo=now.tzinfo
         )
         if send_datetime >= now:
             return event_date, send_date
-        event_date += timedelta(days=7)
+        sunday += timedelta(days=7)
 
 
 def reminder_occurrence(now: datetime, reminder: dict) -> tuple[date, date] | None:
@@ -108,6 +135,7 @@ def reminder_occurrence(now: datetime, reminder: dict) -> tuple[date, date] | No
         reminder["reminder_time"],
         active_from=reminder.get("active_from"),
         active_until=reminder.get("active_until"),
+        day_offset=reminder_day_offset(reminder),
     )
 
 
