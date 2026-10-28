@@ -569,17 +569,37 @@ async def _load_service_task_assignments(
     os.fchmod(file_fd, 0o600)
     os.close(file_fd)
     xlsx_path = Path(file_name)
+    planned: list = []
+    covered: set = set()
+    if registry is not None and only_date is not None:
+        try:
+            planned, covered = _bot_plan_events(registry, only_date, only_date)
+        except Exception:  # noqa: BLE001
+            debug_logger.exception("Не удалось прочитать график бота")
+    bot_plan = _covered(
+        SimpleNamespace(service_id=service_id, event_date=only_date),
+        covered,
+    ) if only_date is not None else False
     try:
-        await download_public(
-            credentials.yandex_public_url,
-            xlsx_path,
-            debug_logger,
-            attempts=1,
-            interval=0,
-        )
-        events_by_service = parse_service_events(
-            xlsx_path, sunday_date, debug_logger, services
-        )
+        excel_read = True
+        try:
+            await download_public(
+                credentials.yandex_public_url,
+                xlsx_path,
+                debug_logger,
+                attempts=1,
+                interval=0,
+            )
+            events_by_service = parse_service_events(
+                xlsx_path, sunday_date, debug_logger, services
+            )
+        except Exception:
+            # Утверждённый график бота не зависит от Excel: без файла или
+            # листа месяца — назначения из бота, без пометок и «Списков».
+            if not bot_plan:
+                raise
+            debug_logger.exception("Excel не прочитан — график из бота")
+            events_by_service, excel_read = {}, False
         service_events = events_by_service.get(service_id, [])
         event_found = any(
             event.event_date == sunday_date for event in service_events
@@ -609,55 +629,45 @@ async def _load_service_task_assignments(
             }
             for task, task_info in sorted(assignments.items())
         }
-        if registry is not None and only_date is not None:
+        if bot_plan:
             # Утверждённый график бота на эту дату главнее Excel
             # (решение 15); Excel по-прежнему читается ради «Списков».
-            try:
-                planned, covered = _bot_plan_events(
-                    registry, only_date, only_date
-                )
-            except Exception:  # noqa: BLE001
-                debug_logger.exception("Не удалось прочитать график бота")
-                planned, covered = [], set()
-            if _covered(
-                SimpleNamespace(service_id=service_id, event_date=only_date),
-                covered,
-            ):
-                plan_tasks: dict[str, set[str]] = {}
-                event_found = False
-                for event in planned:
-                    if (
-                        event.service_id != service_id
-                        or event.event_date != only_date
-                    ):
-                        continue
-                    event_found = True
-                    for assignment in event.assignments:
-                        plan_tasks.setdefault(assignment.task, set()).add(
-                            assignment.name
-                        )
-                notes = {
-                    task: info for task, info in result.items()
-                    if info["is_informational"]
-                }
-                result = {
-                    task: {"names": sorted(names), "is_informational": False}
-                    for task, names in sorted(plan_tasks.items())
-                }
-                # Пометки Excel остаются: график бота заменяет только людей.
-                for task, info in notes.items():
-                    result.setdefault(task, info)
+            plan_tasks: dict[str, set[str]] = {}
+            event_found = False
+            for event in planned:
+                if (
+                    event.service_id != service_id
+                    or event.event_date != only_date
+                ):
+                    continue
+                event_found = True
+                for assignment in event.assignments:
+                    plan_tasks.setdefault(assignment.task, set()).add(
+                        assignment.name
+                    )
+            notes = {
+                task: info for task, info in result.items()
+                if info["is_informational"]
+            }
+            result = {
+                task: {"names": sorted(names), "is_informational": False}
+                for task, names in sorted(plan_tasks.items())
+            }
+            # Пометки Excel остаются: график бота заменяет только людей.
+            for task, info in notes.items():
+                result.setdefault(task, info)
         if raw_out is not None:
             # Назначения из графика без замен: отчёт админам применяет
             # действующие замены сам при каждом обновлении.
             raw_out.clear()
             raw_out.update(result)
         if registry is not None:
-            # Привязки и состав — по графику, без замен.
-            _sync_rosters_and_contacts(
-                registry, xlsx_path, service_id, result, services,
-                debug_logger, issues, own_roster_only,
-            )
+            if excel_read:
+                # Привязки и состав — по графику, без замен.
+                _sync_rosters_and_contacts(
+                    registry, xlsx_path, service_id, result, services,
+                    debug_logger, issues, own_roster_only,
+                )
             if only_date is not None:
                 # Замена на одну дату (этап 3.3) главнее графика. Без
                 # only_date здесь имена за весь месяц — замены не применяются.
@@ -810,6 +820,16 @@ def _bot_plan_events(registry, first: date, last: date) -> tuple[list, set]:
             if people is None:
                 people = registry.readiness_people(service["id"])
             covered.add((service["id"], key))
+            # Свой день задачи (среда спевки) утверждённого воскресенья
+            # заменяется и без назначений: убранный из графика человек не
+            # возвращается из Excel.
+            for day in plan["approved"]:
+                for task in plan.get("approved_tasks") or []:
+                    if task.get("day") is not None:
+                        covered.add((
+                            service["id"],
+                            date.fromisoformat(day) + timedelta(days=task["day"]),
+                        ))
             for event in plan_events(plan, people):
                 covered.add((service["id"], event.event_date))
                 events.append(event)
@@ -818,7 +838,8 @@ def _bot_plan_events(registry, first: date, last: date) -> tuple[list, set]:
 
 def _covered(event, covered: set) -> bool:
     """Событие Excel заменено графиком бота: воскресенье утверждённого
-    месяца или дата, которая есть в графике бота. Среда спевки 28.10
+    месяца, дата, которая есть в графике бота, или свой день задачи
+    утверждённого воскресенья. Среда спевки 28.10
     относится к графику ноября — утверждённый октябрь её не заменяет."""
     return (event.service_id, event.event_date) in covered or (
         event.event_date.weekday() == 6

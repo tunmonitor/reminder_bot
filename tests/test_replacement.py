@@ -996,6 +996,64 @@ class BotPlanSourceTest(Base):
             [(monday, ["Борис"])],
         )
 
+    def test_task_day_of_approved_sunday_replaced_even_when_empty(self):
+        from bot import app
+        from bot.excel_parser import ServiceAssignment, ServiceEvent
+
+        # Сборка — вс −4; в графике бота сборку на это воскресенье убрали,
+        # в Excel она осталась средой — человек не возвращается.
+        self.registry.set_service_task_day(SUPER, "sound", "сборка", -4)
+        self.approve({EVENT.isoformat(): {"звук": ["Борис"], "сборка": []}})
+        wednesday = ServiceEvent(
+            "sound", EVENT - timedelta(days=4),
+            (ServiceAssignment("сборка", "Вера"),),
+        )
+        shown = app._apply_bot_plans(
+            [wednesday], self.registry, wednesday.event_date, EVENT,
+        )
+        self.assertNotIn(
+            "Вера", [a.name for event in shown for a in event.assignments]
+        )
+
+    def test_bot_plan_reminders_without_excel(self):
+        from bot import app
+
+        def load_failing():
+            async def run():
+                with tempfile.TemporaryDirectory() as shm, \
+                        patch.object(
+                            app, "download_public",
+                            new=AsyncMock(side_effect=RuntimeError("нет")),
+                        ), \
+                        patch.object(app, "_sync_rosters_and_contacts") as sync:
+                    result = await app._load_service_task_assignments(
+                        SimpleNamespace(
+                            yandex_public_url="https://example.invalid"
+                        ),
+                        Path(shm), TZ, "sound", MagicMock(), only_date=EVENT,
+                        return_event_found=True, registry=self.registry,
+                    )
+                    sync.assert_not_called()
+                    return result
+
+            return asyncio.run(run())
+
+        # Без утверждённого графика бота сбой Excel — как раньше, ошибка.
+        with self.assertRaises(RuntimeError):
+            load_failing()
+        # С графиком бота Excel не нужен.
+        self.approve({EVENT.isoformat(): {"звук": ["Борис"]}})
+        result, found = load_failing()
+        self.assertEqual(result["звук"]["names"], ["Борис"])
+        self.assertTrue(found)
+        # Замена — и без Excel.
+        self.registry.set_replacement(
+            "sound", EVENT.isoformat(), "звук", "Борис", "Алексей", OLD,
+            "alex_one", "admin", ADMIN,
+        )
+        result, _ = load_failing()
+        self.assertEqual(result["звук"]["names"], ["Алексей"])
+
     def test_approved_tasks_ignore_draft_edits(self):
         from bot import app
         import sqlite3

@@ -15,6 +15,22 @@ CATALOG_PATH = Path(__file__).resolve().parent.parent / "reminder_bot_services.j
 _SERVICE_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_")
 
 
+# Разовый день одной задачи человека (из Excel: спевка в воскресенье) —
+# ключ «человек␟задача» в днях графика: другие задачи той же недели он не
+# сдвигает.
+TASK_DAY_SEPARATOR = "\x1f"
+
+
+def task_day_key(key: str, task: str) -> str:
+    return f"{key}{TASK_DAY_SEPARATOR}{task}"
+
+
+def split_day_key(key: str) -> tuple[str, str | None]:
+    """Ключ дня графика → (человек, задача или None)."""
+    person, _, task = key.partition(TASK_DAY_SEPARATOR)
+    return person, task or None
+
+
 def normalized_name(value: str) -> str:
     """Ключ сравнения названий: регистр, «ё», лишние пробелы и пробелы у скобок."""
     text = " ".join(str(value).casefold().replace("ё", "е").split())

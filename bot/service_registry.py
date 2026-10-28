@@ -23,6 +23,7 @@ from .services import (
     ServiceDefinition,
     ServiceTask,
     normalized_name,
+    split_day_key,
 )
 
 
@@ -4403,9 +4404,18 @@ class ServiceRegistry:
             for day, people_days in json.loads(
                 row["days_json"] or "{}"
             ).items():
+                def stays(key: str) -> bool:
+                    person, task = split_day_key(key)
+                    if not is_person(person):
+                        return True
+                    # Разовый день задачи — пока человек в этой задаче.
+                    if task is not None:
+                        return person in slots.get(day, {}).get(task, [])
+                    return person in serving.get(day, set())
+
                 kept_days = {
                     key: offset for key, offset in people_days.items()
-                    if not is_person(key) or key in serving.get(day, set())
+                    if stays(key)
                 }
                 changed |= kept_days != people_days
                 if kept_days:
@@ -6072,6 +6082,11 @@ class ServiceRegistry:
             if row is None:
                 raise ValueError("График не найден — откройте его заново.")
             days = json.loads(row["days_json"] or "{}")
+            # День на дату — для всех задач человека: разовые дни задач
+            # (из Excel) он заменяет.
+            for other in list(days.get(day, {})):
+                if split_day_key(other)[0] == key and other != key:
+                    days[day].pop(other)
             if offset is None:
                 days.get(day, {}).pop(key, None)
                 if not days.get(day):
@@ -6109,9 +6124,16 @@ class ServiceRegistry:
                     key for people in slots.get(day, {}).values()
                     for key in people
                 }
+
+                def stays(key: str) -> bool:
+                    person, task = split_day_key(key)
+                    if task is None:
+                        return person in serving
+                    return person in slots.get(day, {}).get(task, [])
+
                 kept = {
                     key: offset for key, offset in people_days.items()
-                    if key in serving
+                    if stays(key)
                 }
                 if kept:
                     days[day] = kept
