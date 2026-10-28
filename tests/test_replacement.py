@@ -694,6 +694,76 @@ class DirectChangeTest(HandlersTest):
 
         asyncio.run(run())
 
+    def test_many_candidates_are_paged(self):
+        """Ревью greptile к PR #90: много заменяющих — листание, нижние
+        кнопки на странице остаются (лимит Telegram — 100 кнопок)."""
+        from bot.excel_parser import RosterMember
+
+        self.registry.sync_service_rosters({"sound": [
+            RosterMember("Алексей", ("звук", "сборка")),
+            *(RosterMember(f"Сборщик {i:03d}", ("сборка",)) for i in range(120)),
+        ]})
+
+        async def run():
+            card = self._callback(SimpleNamespace(
+                callback_data="service:service_replace:sound"
+            ))
+            await self._handler("on_service_selected")(card)
+            week = await self._press(card.message, "нед.")
+            candidates = await self._press(week, "сборка ·")
+            rows = candidates.answer.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            labels = [item.text for row in rows for item in row]
+            self.assertLessEqual(len(labels), 100)
+            self.assertTrue(any("Далее" in label for label in labels))
+            self.assertIn("⬅️ К неделе", labels)
+            self.assertIn("📅 К графику", labels)
+            self.assertIn("👤 Выбрать пользователя Telegram", labels)
+            # Листание выше выхода с экрана.
+            nav = next(i for i, row in enumerate(rows)
+                       if any("Далее" in item.text for item in row))
+            back = next(i for i, row in enumerate(rows)
+                        if any(item.text == "⬅️ К неделе" for item in row))
+            self.assertLess(nav, back)
+
+        asyncio.run(run())
+
+    def test_month_view_keeps_past_tasks(self):
+        """График над кнопками — весь месяц, кнопки — только с сегодня."""
+        from bot.excel_parser import ServiceAssignment, ServiceEvent
+
+        today = datetime.now(TZ).date()
+        if today.day == 1 or today.weekday() == 0:
+            self.skipTest("вчера — другая неделя или другой месяц")
+        past = today - timedelta(days=1)
+        sunday = today + timedelta(days=(6 - today.weekday()) % 7)
+        # Вчера и воскресенье — одна неделя.
+        self.events[:] = [
+            ServiceEvent("sound", past, (ServiceAssignment("звук", "Прошлый"),)),
+            ServiceEvent("sound", sunday, (ServiceAssignment("звук", "Алексей"),)),
+        ]
+
+        async def run():
+            card = self._callback(SimpleNamespace(
+                callback_data="service:service_replace:sound"
+            ))
+            await self._handler("on_service_selected")(card)
+            labels = [
+                item.text for row in
+                card.message.answer.await_args.kwargs["reply_markup"].inline_keyboard
+                for item in row
+            ]
+            self.assertFalse(any(f"–{past:%d.%m}" in l for l in labels))
+            week = await self._press(card.message, "нед.")
+            self.assertIn("Прошлый", week.answer.await_args.args[0])
+            self.assertNotIn(
+                "Прошлый",
+                str(week.answer.await_args.kwargs["reply_markup"]),
+            )
+
+        asyncio.run(run())
+
     def test_replace_screen_closes_open_request(self):
         async def run():
             await self.context.on_assignment_declined(

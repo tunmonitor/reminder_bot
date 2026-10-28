@@ -755,7 +755,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 pinned_buttons = [
                     button
                     for button in buttons
-                    if button.text.startswith(("⬅️ К ", "↩️ К "))
+                    if button.text.startswith((
+                        "⬅️ К ", "↩️ К ", "📅 К графику",
+                        "👤 Выбрать пользователя Telegram",
+                    ))
                 ]
                 pageable_buttons = [
                     button for button in buttons
@@ -11496,7 +11499,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             f"📋 График на {month_title(sunday.year, sunday.month)} "
             f"({source}, с заменами):"
         ]
-        for block in pending["weeks"]:
+        for block in pending.get("month_weeks") or pending["weeks"]:
             if (block["date"].year, block["date"].month) != (
                 sunday.year, sunday.month
             ):
@@ -11526,12 +11529,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         ]
 
     async def send_replace_screen(message: Message, text: str,
-                                  rows: list) -> None:
+                                  rows: list, *, paged: bool = False) -> None:
+        """paged — длинный список (заменяющие): листание по страницам,
+        «⬅️ К …» и «📅 К графику» на каждой странице внизу."""
         await _send_dialog(
             message, text,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-            _dialog_keep_rows=True,
-            _dialog_keyboard_limit=sum(len(row) for row in rows),
+            _dialog_keep_rows=not paged,
+            _dialog_keyboard_limit=(
+                12 if paged else sum(len(row) for row in rows)
+            ),
             _dialog_text_limit=TELEGRAM_TEXT_LIMIT,
             parse_mode=None,
         )
@@ -11549,13 +11556,26 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await _send_dialog(message, "Замена сейчас недоступна.", parse_mode=None)
             return
         await clean_and_clear_pending_actor(actor_id)
+        today = datetime.now(context.timezone).date()
         try:
-            events = replace_events_window(
-                await loader(until=replace_window_end()), service_id
+            # С начала месяца — для графика над кнопками (прошедшие недели
+            # и задачи месяца тоже); кнопки замены — только с сегодня.
+            # Понедельник недели 1-го числа: первая неделя месяца целиком.
+            month_start = today.replace(day=1)
+            month_start -= timedelta(days=month_start.weekday())
+            loaded = await loader(
+                since=month_start, until=replace_window_end(),
             )
+            events = replace_events_window(loaded, service_id)
+            month_events = [
+                event for event in loaded
+                if event.service_id == service_id
+                and month_start <= event.event_date <= replace_window_end()
+            ]
         except (OSError, RuntimeError, ValueError, sqlite3.Error):
             debug.exception("Не удалось загрузить график для замены")
             events = None
+            month_events = []
         pending = {
             "operation": "service_replace",
             "service_id": service_id,
@@ -11563,6 +11583,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "step": "replace_date",
             "events": events or [],
             "weeks": replace_weeks(events or [], service_id),
+            "month_weeks": replace_weeks(month_events, service_id),
             "label": service_label(service),
         }
         pending_inputs[actor_id] = pending
@@ -11704,7 +11725,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "выберите пользователя Telegram."
             )
         )
-        await send_replace_screen(message, text, rows)
+        await send_replace_screen(message, text, rows, paged=len(rows) > 10)
 
     async def show_replace_confirm(message: Message, pending: dict) -> None:
         pending["step"] = "replace_confirm"
