@@ -517,6 +517,45 @@ class SchedulePlanTest(unittest.TestCase):
         self.assertNotEqual(schedule_plan.plan_events(november, self.people()), [])
         self.bot.unpin_chat_message.assert_not_awaited()
 
+    def test_topic_change_republishes_in_new_topic(self):
+        """Ревью greptile к PR #88: тему чата сменили (/here) — график не
+        правится в старой теме, а публикуется в новой; старый удаляется."""
+        plan = self.draft()
+        first = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+        ))
+        self.assertIsNone(first["thread_id"])
+        self.registry.set_group_thread(1001, "sound", -1005555, 77)
+        slots = first["slots"]
+        slots["2026-11-29"]["звук"] = ["Борис"]
+        changed = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", slots
+        )
+        self.bot.send_message.return_value = SimpleNamespace(message_id=41)
+        moved = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), changed, 1001, LOG, 4096,
+        ))
+        self.bot.edit_message_text.assert_not_awaited()
+        self.assertEqual(
+            self.bot.send_message.await_args.kwargs["message_thread_id"], 77
+        )
+        self.bot.delete_message.assert_awaited_with(-1005555, 11)
+        self.assertEqual(
+            (moved["message_ids"], moved["thread_id"]), ([41], 77)
+        )
+        # Дальше — правка в новой теме.
+        slots = moved["slots"]
+        slots["2026-11-22"]["звук"] = ["Алексей"]
+        changed = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", slots
+        )
+        asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), changed, 1001, LOG, 4096,
+        ))
+        self.assertEqual(
+            self.bot.edit_message_text.await_args.kwargs["message_id"], 41
+        )
+
     def test_change_lines_format(self):
         names = {"f": "Филипп", "d": "Денис", "a": "Анна"}
         self.assertEqual(

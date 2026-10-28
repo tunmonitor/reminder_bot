@@ -396,6 +396,8 @@ class ServiceRegistry:
                     -- ({"slots", "days"}) — изменения под графиком от него.
                     message_ids_json TEXT,
                     baseline_json TEXT,
+                    -- Тема чата публикации (/here): сменилась — новая.
+                    thread_id INTEGER,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (service_id, month)
                 );
@@ -918,6 +920,7 @@ class ServiceRegistry:
                 ("schedule_plans", "approved_tasks_json", "TEXT"),
                 ("schedule_plans", "message_ids_json", "TEXT"),
                 ("schedule_plans", "baseline_json", "TEXT"),
+                ("schedule_plans", "thread_id", "INTEGER"),
                 ("service_members", "tasks_manual",
                  "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "poll_stopped", "INTEGER NOT NULL DEFAULT 0"),
@@ -6224,7 +6227,7 @@ class ServiceRegistry:
                 "approved_by = excluded.approved_by, "
                 "approved_at = excluded.approved_at, chat_id = NULL, "
                 "message_id = NULL, message_ids_json = NULL, "
-                "baseline_json = NULL, republish = 0, "
+                "thread_id = NULL, baseline_json = NULL, republish = 0, "
                 "days_json = excluded.days_json, "
                 "approved_days_json = excluded.approved_days_json, "
                 "served_offsets_json = excluded.served_offsets_json, "
@@ -6290,6 +6293,7 @@ class ServiceRegistry:
         served_offsets: dict | None = None,
         message_ids: list[int] | None = None,
         baseline: dict | None = None,
+        thread_id: int | None = None,
     ) -> dict:
         """«✅ Утвердить»: опубликованная копия = slots. updated_at —
         версия опубликованного графика: если дни служения сменились, пока
@@ -6305,7 +6309,7 @@ class ServiceRegistry:
                 "UPDATE schedule_plans SET approved_json = ?, approved_by = ?, "
                 "approved_tasks_json = tasks_json, "
                 "approved_at = ?, chat_id = ?, message_id = ?, "
-                "message_ids_json = ?, "
+                "message_ids_json = ?, thread_id = ?, "
                 "baseline_json = COALESCE(?, baseline_json), "
                 "approved_days_json = ?, served_offsets_json = ?, "
                 "republish = CASE WHEN ? IS NULL OR updated_at = ? THEN 0 "
@@ -6315,6 +6319,7 @@ class ServiceRegistry:
                     json.dumps(slots, ensure_ascii=False), actor_id,
                     _utc_now(), chat_id, message_id,
                     json.dumps(message_ids) if message_ids else None,
+                    thread_id,
                     json.dumps(baseline, ensure_ascii=False)
                     if baseline is not None else None,
                     json.dumps(days or {}, ensure_ascii=False),

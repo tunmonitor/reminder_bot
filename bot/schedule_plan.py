@@ -1237,9 +1237,17 @@ async def publish(
     text = publication_text(
         service, plan, people, window_of(registry, service["id"]), settings,
     )
-    old_ids = (
+    # Прежняя публикация правится, только если она в том же чате и той же
+    # теме (/here могли сменить тему — тогда новая в выбранной).
+    thread_id = service.get("group_thread_id") or None
+    same_place = plan.get("chat_id") == chat_id and (
+        plan.get("thread_id") or None
+    ) == thread_id
+    old_ids = list(plan.get("message_ids") or []) if same_place else []
+    # Сменилась только тема — прежнюю публикацию в старой теме убрать.
+    stale_ids = (
         list(plan.get("message_ids") or [])
-        if plan.get("chat_id") == chat_id else []
+        if plan.get("chat_id") == chat_id and not same_place else []
     )
     edited = plan["approved"] is not None and await _edit_publication(
         bot, chat_id, old_ids, text, text_limit,
@@ -1313,6 +1321,12 @@ async def publish(
         baseline = {
             **(baseline or plan["baseline"]), "days_changed": True,
         }
+    # Тема, где публикация на самом деле: удалённая тема при отправке
+    # сбрасывается, и сообщение уходит в общую.
+    published_thread = (
+        (registry.get_service(service["id"]) or {}).get("group_thread_id")
+        or None
+    ) if not edited else thread_id
     for attempt in range(2):
         try:
             result = registry.approve_schedule_plan(
@@ -1321,6 +1335,7 @@ async def publish(
                 message_id=message_ids[0] if message_ids else None,
                 message_ids=message_ids,
                 baseline=baseline,
+                thread_id=published_thread,
                 updated_at=plan["updated_at"], days=plan.get("days", {}),
                 served_offsets=served_offsets(plan, people),
             )
@@ -1336,7 +1351,7 @@ async def publish(
         # Прежняя публикация не правится (или правка сорвалась на середине)
         # — убрать её, чтобы в чате не осталось устаревших частей; не
         # удаляется (старше 48 ч) — хотя бы снять с закрепа.
-        for message_id in old_ids:
+        for message_id in old_ids + stale_ids:
             try:
                 await bot.delete_message(chat_id, message_id)
             except Exception:  # noqa: BLE001
