@@ -893,17 +893,19 @@ def plan_events(plan: dict, people: list[dict]) -> list[ServiceEvent]:
     if plan.get("approved") is None:
         return []
     # Задачи и дни — как утверждено (рабочая копия может быть уже
-    # переименована или с другим днём задачи). Без снимка (его заполняет
-    # миграция) — задачи из утверждённых назначений, без своего дня.
-    tasks = plan.get("approved_tasks")
-    if tasks is None:
-        tasks = [
-            {"name": name}
-            for name in dict.fromkeys(
-                task for day_tasks in plan["approved"].values()
-                for task in day_tasks
-            )
-        ]
+    # переименована или с другим днём задачи). Задача утверждённых
+    # назначений не из снимка (снимок миграции из уже переименованной
+    # копии) — без своего дня, но не теряется.
+    tasks = list(plan.get("approved_tasks") or [])
+    known = {task["name"] for task in tasks}
+    tasks += [
+        {"name": name}
+        for name in dict.fromkeys(
+            task for day_tasks in plan["approved"].values()
+            for task in day_tasks
+        )
+        if name not in known
+    ]
     published = {
         **plan, "slots": plan["approved"], "tasks": tasks,
         "days": plan.get("approved_days") or {},

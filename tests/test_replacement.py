@@ -1030,6 +1030,20 @@ class BotPlanSourceTest(Base):
                 ('[{"name": "звук", "day": null}]', month),
             )
         self.registry.initialize(SUPER, -100)
+        # Снимок из уже переименованной копии — назначения не теряются.
+        with closing(sqlite3.connect(db)) as connection, connection:
+            connection.execute(
+                "UPDATE schedule_plans SET approved_tasks_json = ? "
+                "WHERE month = ?",
+                ('[{"name": "звук2", "day": 1}]', month),
+            )
+        self.assertEqual(moments(), [(EVENT, ["Борис"])])
+        with closing(sqlite3.connect(db)) as connection, connection:
+            connection.execute(
+                "UPDATE schedule_plans SET approved_tasks_json = tasks_json "
+                "WHERE month = ?",
+                (month,),
+            )
         with closing(sqlite3.connect(db)) as connection, connection:
             connection.execute(
                 "UPDATE schedule_plans SET tasks_json = ? WHERE month = ?",
