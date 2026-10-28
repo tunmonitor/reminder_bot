@@ -1177,11 +1177,23 @@ async def _process_service_reminder(
     event_date = (run_date or datetime.now(tz).date()) + timedelta(
         days=reminder["reminder_days"]
     )
-    if not is_reminder_event_date(event_date, reminder):
-        # Задание срабатывает каждый день; событие — только в день, от
-        # которого считается напоминание (решение 17, 5а).
+    # Задание срабатывает каждый день; событие — в день, от которого
+    # считается напоминание (решение 17, 5а): общее — воскресенье, задачи —
+    # её день. Задача в другой день (разовый день человека: спевка в
+    # воскресенье) — тоже, если в графике она на эту дату есть.
+    on_day = is_reminder_event_date(event_date, reminder)
+    if not on_day and not reminder.get("task"):
         return
-    if not in_reminder_period(event_date, reminder):
+    # Период — по воскресенью недели. Разовый день: понедельник — после
+    # своего воскресенья (окно «вс +1»), вт–сб — до него (спевка «вс −4»).
+    week_sunday = (
+        event_date - timedelta(days=1) if event_date.weekday() == 0
+        else event_date + timedelta(days=(6 - event_date.weekday()) % 7)
+    )
+    if not (
+        in_reminder_period(event_date, reminder) if on_day
+        else in_reminder_period(week_sunday, {**reminder, "task_day": None})
+    ):
         interaction_logger.info(
             "Уведомление %s служения %s пропущено: %s вне периода",
             reminder_id, service_id, event_date,
@@ -1209,6 +1221,10 @@ async def _process_service_reminder(
             service_id,
             event_date,
         )
+        if not on_day:
+            # Проверка разового дня идёт ежедневно — сбой только в лог,
+            # админ узнает о нём в день задачи.
+            return
         await _notify_admin(
             bot,
             credentials.admin_tg_id,
@@ -1216,6 +1232,11 @@ async def _process_service_reminder(
             f"на {event_date:%d.%m.%Y}: {type(exc).__name__}: {exc}",
             debug_logger,
         )
+        return
+    if not on_day and (
+        not event_found or not _reminder_task_names(reminder, assignments)
+    ):
+        # Не день задачи, и разового дня этой задачи на дату нет.
         return
     if not event_found:
         interaction_logger.info(
