@@ -34,6 +34,12 @@ RELUCTANT_WEIGHT: лучше не ответивший, чем служение 
 человек): у кого они связаны, тот ставится на них вместе — одно составное
 место, одно служение в неделю. Места связки, которые некем закрыть
 вместе, закрываются по отдельности.
+
+Конкуренция за дату (решение 16): при равной стоимости место получает
+тот, у кого меньше отмеченных дат, затем кто дольше не служил, затем кто
+раньше ответил. Ответивший, который остался без служения (его даты
+заняли другие), ставится на другую дату вместо не ответившего — с
+интервалом от прошлого служения.
 """
 from __future__ import annotations
 
@@ -87,6 +93,8 @@ class PlanInput:
     limits: Mapping[str, tuple[int, int | None]] = field(default_factory=dict)
     # Человек → задачи, которые он берёт в одну неделю (звук + спевка).
     bundles: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    # Человек → порядок ответа на опрос (0 — первый); нет записи — после.
+    answer_order: Mapping[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -158,6 +166,51 @@ def _rotation_penalty(data: PlanInput, person: str) -> int:
     return max(0, ROTATION_WEEKS - weeks)
 
 
+def _priority(data: PlanInput) -> dict[str, int]:
+    """Решение 16: кто получает дату при равной стоимости — меньше
+    отмеченных дат, дольше не служил, раньше ответил (0 — первый)."""
+    order = sorted(data.free, key=lambda person: (
+        len(data.free[person]),
+        data.last_served.get(person, date.min),
+        data.answer_order.get(person, len(data.answer_order)),
+        person,
+    ))
+    return {person: index for index, person in enumerate(order)}
+
+
+def open_dates(data: PlanInput) -> list[date]:
+    """Решение 16: даты, где ответившие (без не ответивших) не закрывают
+    минимум задач — каждый одно место (в задаче — не больше одного),
+    связка «в одну неделю» — свои задачи вместе (приближённо: у человека
+    со связкой и другой задачей может засчитаться и то и другое); без
+    интервалов и лимитов — «никто не выбрал»."""
+    required, _ = _seats(data)
+    result = []
+    for event_date in sorted(set(data.dates)):
+        people, allowed = [], {}
+        for person in sorted(data.free):
+            if person in data.reluctant or event_date not in data.free[person]:
+                continue
+            own = data.tasks.get(person, frozenset())
+            bundle = sorted(data.bundles.get(person, frozenset()) & own)
+            # Связка — ещё места человека, по одному на каждую её задачу:
+            # в одной задаче человек — одно место.
+            options = [own - set(bundle[1:])] + [{task} for task in bundle[1:]]
+            for copy, tasks in enumerate(options):
+                name = f"{person}{BUNDLE_SEPARATOR}{copy}"
+                people.append(name)
+                allowed[name] = {
+                    index for index, task in enumerate(required)
+                    if task in tasks
+                }
+        matching = _min_cost_matching(
+            people, required, allowed, dict.fromkeys(people, 0)
+        )
+        if len(matching) < len(required):
+            result.append(event_date)
+    return result
+
+
 def plan_cost(plan: Plan, data: PlanInput) -> int:
     served: dict[str, list[date]] = {}
     for (event_date, _), people in plan.slots.items():
@@ -180,6 +233,7 @@ def _min_cost_matching(
     seats: list[str],
     allowed: Mapping[str, set[int]],
     cost: Mapping[str, int],
+    seat_cost: Mapping[tuple[str, int], int] | None = None,
 ) -> dict[int, str]:
     """Место → человек: максимальное паросочетание минимальной стоимости.
 
@@ -188,6 +242,7 @@ def _min_cost_matching(
     сток, пропускная способность 1. Каждый путь увеличивает поток на 1
     с наименьшим приростом стоимости, поэтому итог — минимальная
     стоимость среди максимальных паросочетаний. Размеры крошечные.
+    seat_cost — доплата (человек, место) на ребре человек → место.
     """
     source, sink = 0, 1 + len(people) + len(seats)
     # Ребро: [куда, остаток, стоимость, индекс обратного ребра].
@@ -200,7 +255,10 @@ def _min_cost_matching(
     for index, person in enumerate(people, start=1):
         add(source, index, cost[person])
         for seat in sorted(allowed.get(person, ())):
-            add(index, 1 + len(people) + seat, 0)
+            add(
+                index, 1 + len(people) + seat,
+                (seat_cost or {}).get((person, seat), 0),
+            )
     for seat in range(len(seats)):
         add(1 + len(people) + seat, sink, 0)
 
@@ -257,6 +315,67 @@ BUNDLE_SEPARATOR = "\x1f"
 
 
 def build_plan(data: PlanInput) -> Plan:
+    """План месяца; ответившие без служения — вместо не ответивших."""
+    plan = _bundled_plan(data)
+    _place_losers(plan, data)
+    return plan
+
+
+def _place_losers(plan: Plan, data: PlanInput) -> None:
+    """Решение 16: ответивший, отметивший даты, но оставшийся без служения
+    (его даты заняли другие), — на другую дату вместо не ответившего:
+    туда, где это сильнее всего снижает стоимость плана (служение подряд у
+    не ответившего), не подряд со своим прошлым служением, один раз.
+    Связка «в одну неделю» не ответившего переходит целиком — к тому, у
+    кого она тоже связана. Очередь — как при конкуренции за дату."""
+    served: dict[str, set[date]] = {}
+    held: dict[tuple[str, date], list[str]] = {}
+    for (event_date, task), people in plan.slots.items():
+        for person in people:
+            served.setdefault(person, set()).add(event_date)
+            held.setdefault((person, event_date), []).append(task)
+    rank = _priority(data)
+    losers = sorted(
+        (
+            person for person in data.free
+            if person not in data.reluctant and data.free[person]
+            and data.tasks.get(person) and not served.get(person)
+            and _below_max(data, person, 0)
+        ),
+        key=rank.__getitem__,
+    )
+    for person in losers:
+        own = data.tasks[person]
+        best = None
+        for (other, event_date), tasks in sorted(held.items()):
+            if other not in data.reluctant or not set(tasks) <= own or (
+                len(tasks) > 1
+                and not set(tasks) <= data.bundles.get(person, frozenset())
+            ) or _gap_penalty(
+                data.last_served.get(person), event_date
+            ) >= BACK_TO_BACK_WEIGHT:
+                continue
+            dates = served[other]
+            delta = (
+                _person_cost(data, other, dates - {event_date})
+                - _person_cost(data, other, dates)
+                + _person_cost(data, person, {event_date})
+            )
+            if delta < 0 and (best is None or delta < best[0]):
+                best = (delta, other, event_date)
+        if best is None:
+            continue
+        _, other, event_date = best
+        for task in held.pop((other, event_date)):
+            people = plan.slots[(event_date, task)]
+            people[people.index(other)] = person
+            people.sort()
+            held.setdefault((person, event_date), []).append(task)
+        served[other].discard(event_date)
+        served[person] = {event_date}
+
+
+def _bundled_plan(data: PlanInput) -> Plan:
     """План месяца; связки задач «в одну неделю» — составными местами."""
     groups = sorted(
         {
@@ -311,19 +430,52 @@ def build_plan(data: PlanInput) -> Plan:
     for (event_date, task), people in inner.slots.items():
         if task not in virtual:
             plan.slots[(event_date, task)].extend(people)
+    on_inner: dict[date, set[str]] = {}
+    for (event_date, _), people in inner.slots.items():
+        on_inner.setdefault(event_date, set()).update(people)
+    inner_load = inner.load()
+    for (event_date, task), people in sorted(inner.slots.items()):
+        if task not in virtual:
             continue
         members = virtual[task]
+        # Свободные в дату, кого во внутреннем плане нет (в пределах
+        # максимума), — ими потом закрываются места связки по отдельности.
+        spare = [
+            person for person in data.free
+            if event_date in data.free[person]
+            and person not in on_inner.get(event_date, ())
+            and _below_max(data, person, inner_load.get(person, 0))
+        ]
+
+        def unfillable(member: str) -> int:
+            """Сколько мест задач связки в дату некем будет закрыть, если
+            человек возьмёт member."""
+            total = 0
+            for other in members:
+                left = (
+                    data.needed[other] - len(plan.slots[(event_date, other)])
+                    - (other == member)
+                )
+                able = sum(
+                    other in data.tasks.get(candidate, ())
+                    for candidate in spare
+                )
+                total += max(0, left - able)
+            return total
+
         for person in people:
             if data.bundles.get(person) == frozenset(members):
                 chosen = members
             else:
-                # Без связки — одна задача: где на эту дату меньше людей.
+                # Без связки — одна задача: чтобы остальные места связки
+                # было кем закрыть, затем где на эту дату меньше людей.
                 chosen = [min(
                     (
                         member for member in members
                         if member in data.tasks.get(person, ())
                     ),
                     key=lambda member: (
+                        unfillable(member),
                         len(plan.slots[(event_date, member)]),
                         members.index(member),
                     ),
@@ -355,6 +507,7 @@ def _fill_bundle_gaps(plan: Plan, data: PlanInput) -> None:
         for person in people:
             served.setdefault(person, set()).add(event_date)
             on_date.setdefault((person, event_date), set()).add(task)
+    queue = _priority(data)
     for event_date in sorted(set(data.dates)):
         for task, count in data.needed.items():
             people = plan.slots[(event_date, task)]
@@ -390,7 +543,7 @@ def _fill_bundle_gaps(plan: Plan, data: PlanInput) -> None:
                     bound = task in data.bundles.get(person, ())
                     return (
                         not extends(person), close, person in data.reluctant,
-                        bound, len(days), person,
+                        bound, len(days), queue[person],
                     )
 
                 chosen = min(candidates, key=rank)
@@ -405,6 +558,7 @@ def _fill_optional(plan: Plan, data: PlanInput) -> None:
     минимальной стоимости), только ответившие, без служения ни за неделю
     до, ни через неделю после, в пределах максимума; стоимость — прирост
     стоимости плана человека (недобравший минимум — дешевле)."""
+    rank = _priority(data)
     served: dict[str, set[date]] = {}
     for (event_date, _), people in plan.slots.items():
         for person in people:
@@ -441,10 +595,13 @@ def _fill_optional(plan: Plan, data: PlanInput) -> None:
             for person in people
         }
         # BELOW_MIN_WEIGHT — чтобы стоимость не была отрицательной.
+        # Равная стоимость — по очереди конкуренции (младший разряд).
+        scale = (len(rank) + 1) * (len(seats) + 1)
         cost = {
-            person: BELOW_MIN_WEIGHT + _person_cost(
+            person: (BELOW_MIN_WEIGHT + _person_cost(
                 data, person, served.get(person, set()) | {event_date}
-            ) - _person_cost(data, person, served.get(person, set()))
+            ) - _person_cost(data, person, served.get(person, set())))
+            * scale + rank[person]
             for person in people
         }
         for seat, person in sorted(
@@ -466,6 +623,7 @@ def _build_plan(data: PlanInput) -> Plan:
     )
     load: dict[str, int] = {}
     last: dict[str, date] = dict(data.last_served)
+    rank = _priority(data)
 
     def assign(
         event_date: date, people: list[str], seats: list[str],
@@ -478,7 +636,34 @@ def _build_plan(data: PlanInput) -> Plan:
             }
             for person in people
         }
-        matching = _min_cost_matching(people, seats, allowed, cost)
+        # Младшие разряды при равной стоимости: составное место связки —
+        # тому, кто берёт её задачи вместе (закрывает обе), затем очередь
+        # конкуренции. Разряды не перекрываются: сумма младших меньше
+        # единицы старшего.
+        ranks = (len(rank) + 1) * (len(seats) + 1)
+        scale = (len(seats) + 1) * ranks
+        cost = {
+            person: price * scale + rank[person]
+            for person, price in cost.items()
+        }
+        def misfit(person: str, index: int) -> bool:
+            # Составное место — не его связка; или он со связкой, а место
+            # обычное, хотя составное его связки на дату есть.
+            bundle = data.bundles.get(person, frozenset())
+            if BUNDLE_SEPARATOR in seats[index]:
+                return not set(seats[index].split(BUNDLE_SEPARATOR)) <= bundle
+            return any(
+                BUNDLE_SEPARATOR in seats[other]
+                and set(seats[other].split(BUNDLE_SEPARATOR)) <= bundle
+                for other in allowed[person]
+            )
+
+        seat_cost = {
+            (person, index): ranks
+            for person in people for index in allowed[person]
+            if misfit(person, index)
+        }
+        matching = _min_cost_matching(people, seats, allowed, cost, seat_cost)
         for seat, person in sorted(matching.items()):
             plan.slots[(event_date, seats[seat])].append(person)
             load[person] = load.get(person, 0) + 1

@@ -33,7 +33,7 @@ from .admin_report import fit_one_screen
 from .group_send import send_to_service_group
 from .month_summary import month_end, month_key, month_title, next_month
 from .presentation import task_emoji
-from .schedule_planner import Plan, PlanInput, build_plan
+from .schedule_planner import Plan, PlanInput, build_plan, open_dates
 from .service_registry import (  # noqa: F401 — шаблоны для экранов
     DEFAULT_READINESS_CHAT_REMINDER,
     DEFAULT_READINESS_CLOSED,
@@ -283,6 +283,11 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
             last_served=dict(last_served or {}),
             limits=limits,
             bundles=summary.bundles,
+            # Ответы — по времени ответа: кто раньше, тот первее при
+            # конкуренции за дату (решение 16).
+            answer_order={} if assume_free else {
+                key: index for index, key in enumerate(summary.answered)
+            },
         ))
     return summary
 
@@ -854,6 +859,86 @@ async def send_chat_reminder(
     registry.claim_readiness_notice(service["id"], run["month"], f"{kind}-sent")
 
 
+# Решение 16: напоминание о незанятых днях — когда ответили ⅔ тех, кто
+# может голосовать.
+FREE_DAYS_SHARE = (2, 3)
+
+
+def free_days(registry, run: dict, summary: Summary) -> list[str]:
+    """Даты опроса, где ответившие не закрывают минимум задач."""
+    catalog = registry.plan_tasks(run["service_id"])
+    tasks = {person["key"]: person["tasks"] for person in summary.people}
+    return [
+        moment.isoformat() for moment in open_dates(PlanInput(
+            dates=tuple(date.fromisoformat(day) for day in run["dates"]),
+            needed={task["name"]: task["needed"] for task in catalog},
+            free={
+                key: frozenset(date.fromisoformat(day) for day in days)
+                for key, days in summary.answered.items()
+            },
+            tasks={
+                key: frozenset(tasks.get(key, ())) for key in summary.answered
+            },
+            bundles=summary.bundles,
+        ))
+    ]
+
+
+def free_days_text(run: dict, settings: dict, days: list[str],
+                   ask_silent: bool) -> str:
+    window = (settings["day_from"], settings["day_to"])
+    text = render_template(
+        phrase(settings, "free_days"),
+        days=", ".join(option_label(day, window) for day in days),
+    )
+    if ask_silent:
+        text += " " + phrase(settings, "free_days_vote")
+    return text
+
+
+async def send_free_days_reminder(
+    bot, registry, run: dict, service: dict, logger: logging.Logger
+) -> None:
+    """Решение 16: ответили ⅔ — один раз в чат служения ответом на опрос,
+    какие дни никто не выбрал: пересмотреть выбор; не ответившим
+    (если есть) — отметиться. Временный сбой — повтор следующей проверкой."""
+    kind = f"free-days-{run['id']}"
+    if not run.get("chat_id") or registry.has_readiness_notice(
+        service["id"], run["month"], kind
+    ):
+        return
+    summary = summarize(registry, run, with_plan=False)
+    silent = [person for person in summary.not_answered if person["telegram_id"]]
+    voters = len(summary.answered) + len(silent)
+    share, of = FREE_DAYS_SHARE
+    if not voters or len(summary.answered) * of < voters * share:
+        return
+    days = free_days(registry, run, summary)
+    if not days or not registry.claim_readiness_notice(
+        service["id"], run["month"], kind
+    ):
+        return
+    text = free_days_text(
+        run, registry.get_readiness_settings(service["id"]), days, bool(silent),
+    )
+    try:
+        await send_to_service_group(
+            bot.send_message, run["chat_id"], text, service,
+            registry=registry, logger=logger, parse_mode=None,
+            reply_parameters=ReplyParameters(
+                message_id=run["message_id"], allow_sending_without_reply=True,
+            ) if run.get("message_id") else None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if unreachable(exc):
+            logger.info("Напоминание о незанятых днях не доставлено: %s", exc)
+            return
+        logger.warning(
+            "Напоминание о незанятых днях не отправлено", exc_info=True
+        )
+        registry.release_readiness_notice(service["id"], run["month"], kind)
+
+
 def reminder_line(run: dict, settings: dict, now: datetime, tz,
                   sent: bool = True) -> str:
     """Когда напоминание (для «📊 Ход опроса»); sent — хоть одно
@@ -1243,11 +1328,15 @@ async def _tick_run(
                 bot, registry, current, service, tz, admin_id, logger,
                 text_limit, events_loader,
             )
-        elif reminder_due(current, settings, now):
-            # Отметка — на человека после доставки: идемпотентно.
-            await send_reminders(bot, registry, current, service, tz, logger)
-            await send_chat_reminder(
-                bot, registry, current, service, tz, logger
+        else:
+            if reminder_due(current, settings, now):
+                # Отметка — на человека после доставки: идемпотентно.
+                await send_reminders(bot, registry, current, service, tz, logger)
+                await send_chat_reminder(
+                    bot, registry, current, service, tz, logger
+                )
+            await send_free_days_reminder(
+                bot, registry, current, service, logger
             )
 
 
