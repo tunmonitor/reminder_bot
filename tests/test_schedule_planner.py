@@ -2,7 +2,7 @@ import time
 import unittest
 from datetime import date, timedelta
 
-from bot.schedule_planner import PlanInput, build_plan, plan_cost
+from bot.schedule_planner import PlanInput, build_plan, open_dates, plan_cost
 
 SUNDAYS = tuple(date(2026, 11, 1) + timedelta(weeks=week) for week in range(5))
 
@@ -482,7 +482,94 @@ class SchedulePlannerTest(unittest.TestCase):
             limits={"Q": (1, None)},
             **dict(base, tasks=tasks, extra={"a": 1, "b": 0}),
         ))
-        self.assertIn("Q", plan.slots[(day, "a")])
+        self.assertIn("Q", plan.slots[(day, "a")] + plan.slots[(day, "b")])
+
+    def test_single_day_competition_and_loser_placed_instead_of_silent(self):
+        # Решение 16: Марк и Игорь отметили только 22.11, Елисей не ответил.
+        dates = SUNDAYS
+        both = frozenset({"звук", "спевка"})
+        data = PlanInput(
+            dates=dates,
+            needed={"звук": 1, "спевка": 1, "сборка": 1},
+            free={
+                "Матвей": frozenset(dates), "Егор": frozenset(dates),
+                "Игорь": frozenset({dates[3]}), "Марк": frozenset({dates[3]}),
+                "Елисей": frozenset(dates),
+                "Василий": frozenset({dates[0], dates[4]}),
+            },
+            tasks={
+                "Матвей": frozenset({"сборка"}), "Егор": frozenset({"сборка"}),
+                "Игорь": both, "Марк": both, "Елисей": both, "Василий": both,
+            },
+            reluctant=frozenset({"Елисей"}),
+            bundles={name: both for name in ("Игорь", "Марк", "Елисей", "Василий")},
+            # Игорь служил раньше Марка — дата его.
+            last_served={
+                "Игорь": date(2026, 10, 18), "Марк": date(2026, 10, 25),
+                "Елисей": date(2026, 10, 28),
+            },
+        )
+        plan = build_plan(data)
+        self.assertEqual(plan.slots[(dates[3], "звук")], ["Игорь"])
+        # Марк — вместо не ответившего, Елисей — без служения подряд.
+        self.assertEqual(plan.load()["Марк"], 1)
+        self.assertEqual(plan.load()["Елисей"], 1)
+        mark = next(day for (day, _), people in plan.slots.items()
+                    if "Марк" in people)
+        self.assertEqual(
+            plan.slots[(mark, "звук")] + plan.slots[(mark, "спевка")],
+            ["Марк", "Марк"],
+        )
+        # Раньше ответивший выигрывает при прочих равных.
+        tie = build_plan(PlanInput(
+            dates=(dates[0],), needed={"звук": 1},
+            free={"А": frozenset({dates[0]}), "Б": frozenset({dates[0]})},
+            tasks={"А": frozenset({"звук"}), "Б": frozenset({"звук"})},
+            answer_order={"Б": 0, "А": 1},
+        ))
+        self.assertEqual(tie.slots[(dates[0], "звук")], ["Б"])
+        # Меньше отмеченных дат — главнее порядка ответа.
+        tie = build_plan(PlanInput(
+            dates=dates[:2], needed={"звук": 1},
+            free={"А": frozenset({dates[0]}), "Б": frozenset(dates[:2])},
+            tasks={"А": frozenset({"звук"}), "Б": frozenset({"звук"})},
+            answer_order={"Б": 0, "А": 1},
+        ))
+        self.assertEqual(tie.slots[(dates[0], "звук")], ["А"])
+
+    def test_loser_not_placed_back_to_back_or_when_cant(self):
+        dates = SUNDAYS[:2]
+        data = PlanInput(
+            dates=dates, needed={"звук": 1},
+            free={
+                "А": frozenset({dates[0]}), "Б": frozenset({dates[0]}),
+                "Тихий": frozenset(dates), "Не смогу": frozenset(),
+            },
+            tasks={name: frozenset({"звук"})
+                   for name in ("А", "Б", "Тихий", "Не смогу")},
+            reluctant=frozenset({"Тихий"}),
+            # Б служил за неделю до 08.11 — туда не ставится.
+            last_served={"А": date(2026, 10, 4), "Б": date(2026, 11, 1)},
+            answer_order={"А": 0, "Б": 1},
+        )
+        plan = build_plan(data)
+        self.assertEqual(plan.slots[(dates[0], "звук")], ["А"])
+        self.assertEqual(plan.slots[(dates[1], "звук")], ["Тихий"])
+
+    def test_open_dates_ignore_silent_and_count_bundles(self):
+        both = frozenset({"звук", "спевка"})
+        data = PlanInput(
+            dates=SUNDAYS[:3], needed={"звук": 1, "спевка": 1},
+            free={
+                "Связка": frozenset({SUNDAYS[0]}),
+                "Звук": frozenset({SUNDAYS[1]}),
+                "Тихий": frozenset(SUNDAYS),
+            },
+            tasks={"Связка": both, "Звук": frozenset({"звук"}), "Тихий": both},
+            reluctant=frozenset({"Тихий"}),
+            bundles={"Связка": both},
+        )
+        self.assertEqual(open_dates(data), list(SUNDAYS[1:3]))
 
 
 if __name__ == "__main__":

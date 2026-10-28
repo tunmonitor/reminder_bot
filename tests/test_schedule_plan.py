@@ -834,6 +834,12 @@ class SchedulePlanTest(unittest.TestCase):
         self.assertIn("ℹ️ служит 15.11", notes)
         plan["slots"]["2026-11-15"] = {"звук": [], "сборка": []}
         self.assertIn("⚠️ 15.11 «звук»: никого", schedule_plan.gaps(plan))
+        # Ответивший на неотмеченной дате (решение 16) — «°» и сноска.
+        plan["slots"][day] = {"звук": ["Борис"], "сборка": []}
+        text = schedule_plan.plan_text("ЗВУК", plan, summary, TZ)
+        self.assertIn("🗓 01.11\n   🎚️ звук\n      • Борис\n", text)
+        self.assertIn("• Борис°", text)
+        self.assertIn("° не отмечал(а) эту дату в опросе", text)
 
     def test_excel_block_and_file(self):
         plan = self.draft()
