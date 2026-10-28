@@ -412,6 +412,111 @@ class SchedulePlanTest(unittest.TestCase):
         self.assertNotIn("Изменены дни", third["unsent_notice"])
         self.assertEqual(first["message_ids"], third["message_ids"])
 
+    def test_new_poll_cancels_approval_and_preview_is_not_saved(self):
+        """Решение 28.10: запуск опроса отменяет утверждённый график —
+        прежний откреплён; пока опрос идёт — предварительный график по
+        текущим ответам без записи в базу; новое утверждение — новая
+        публикация, прежняя удаляется."""
+        plan = self.draft()
+        approved = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+        ))
+        self.assertIsNotNone(approved["approved"])
+        # «Запустить заново»: прежний опрос откладывается, новый — в чат.
+        self.registry.move_readiness_run(self.run["id"], f"2026-11#{self.run['id']}")
+        self.bot.send_poll.return_value = SimpleNamespace(
+            message_id=13, poll=SimpleNamespace(id="poll-2"),
+        )
+        run = asyncio.run(readiness.launch_run(
+            self.bot, self.registry, self.service(), 2026, 11,
+            datetime(2026, 10, 30, 20, 0, tzinfo=TZ), TZ, LOG, 4096,
+        ))
+        cancelled = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertIsNone(cancelled["approved"])
+        self.assertIsNone(cancelled["baseline"])
+        self.assertEqual(cancelled["message_ids"], [11])
+        self.bot.unpin_chat_message.assert_awaited_once_with(
+            -1005555, message_id=11,
+        )
+        # Напоминания больше не по отменённому графику.
+        self.assertEqual(schedule_plan.plan_events(cancelled, self.people()), [])
+        # Предварительный: по текущим ответам (их нет — все не ответили),
+        # в базе ничего не меняется.
+        before = self.registry.get_schedule_plan("sound", "2026-11")
+        preview = asyncio.run(schedule_plan.build_draft(
+            self.registry, run, None, LOG, save=False,
+        ))
+        self.assertEqual(preview["run_id"], run["id"])
+        self.assertIsNone(preview["approved"])
+        self.assertEqual(
+            self.registry.get_schedule_plan("sound", "2026-11"), before
+        )
+        summary = schedule_plan.plan_summary(self.registry, preview, run)
+        self.assertIn(
+            "📝 Черновик", schedule_plan.plan_text("ЗВУК", preview, summary, TZ)
+        )
+        # Опрос завершён — новый черновик, утверждение — новая публикация
+        # и удаление прежней.
+        self.registry.close_readiness_run(run["id"])
+        run = self.registry.get_readiness_run_by_id(run["id"])
+        fresh = asyncio.run(
+            schedule_plan.ensure_plan(self.registry, run, None, LOG)
+        )
+        self.assertEqual(fresh["run_id"], run["id"])
+        self.bot.send_message.reset_mock()
+        self.bot.send_message.return_value = SimpleNamespace(message_id=31)
+        published = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), fresh, 1001, LOG, 4096,
+        ))
+        self.assertEqual(published["message_ids"], [31])
+        self.assertIn("утверждён", self.bot.send_message.await_args.args[1])
+        self.bot.edit_message_text.assert_not_awaited()
+        self.bot.delete_message.assert_awaited_with(-1005555, 11)
+
+    def test_new_poll_cancels_excel_plan(self):
+        """Загруженный из Excel график после запуска опроса — не итоговый:
+        утвердить его, пока опрос идёт, нельзя."""
+        events = [event(date(2026, 11, 8), ("звук", "Алексей"))]
+        loaded = schedule_plan.excel_plan(self.registry, "sound", 2026, 11, events)
+        self.registry.import_excel_plan(
+            1001, "sound", "2026-11", dates=loaded["dates"],
+            tasks=loaded["tasks"], slots=loaded["slots"], days=loaded["days"],
+        )
+        self.assertEqual(
+            self.registry.get_schedule_plan("sound", "2026-11")["source"], "excel"
+        )
+        self.registry.move_readiness_run(self.run["id"], f"2026-11#{self.run['id']}")
+        self.bot.send_poll.return_value = SimpleNamespace(
+            message_id=13, poll=SimpleNamespace(id="poll-3"),
+        )
+        asyncio.run(readiness.launch_run(
+            self.bot, self.registry, self.service(), 2026, 11,
+            datetime(2026, 10, 30, 20, 0, tzinfo=TZ), TZ, LOG, 4096,
+        ))
+        plan = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertIsNone(plan["approved"])
+        self.assertEqual(plan["source"], "poll")
+        self.assertIsNone(plan["run_id"])
+
+    def test_next_month_poll_keeps_current_month_approved(self):
+        """Опрос следующего месяца не отменяет утверждённый график текущего:
+        по нему идут напоминания, пока его месяц не закончился."""
+        plan = self.draft()
+        asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+        ))
+        self.bot.send_poll.return_value = SimpleNamespace(
+            message_id=14, poll=SimpleNamespace(id="poll-dec"),
+        )
+        asyncio.run(readiness.launch_run(
+            self.bot, self.registry, self.service(), 2026, 12,
+            datetime(2026, 11, 26, 20, 0, tzinfo=TZ), TZ, LOG, 4096,
+        ))
+        november = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertIsNotNone(november["approved"])
+        self.assertNotEqual(schedule_plan.plan_events(november, self.people()), [])
+        self.bot.unpin_chat_message.assert_not_awaited()
+
     def test_change_lines_format(self):
         names = {"f": "Филипп", "d": "Денис", "a": "Анна"}
         self.assertEqual(

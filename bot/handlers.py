@@ -4342,6 +4342,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 readiness_button("⏹ Завершить", "finish", service_id, month_arg),
             ])
             rows.append([
+                readiness_button("📋 Предварительный график", "pprev",
+                                 service_id, month_arg),
+            ])
+            rows.append([
                 readiness_button("🔄 Перезапустить", "restart", service_id,
                                  month_arg),
             ])
@@ -4697,6 +4701,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     PLAN_ACTIONS = {
         "plan", "precalc", "precalcok", "pedit", "pdate", "ptask", "padd",
         "prem", "pclear", "pok", "pokok", "pfree", "pnew", "pday", "pdset",
+        "pprev",
     }
 
     def plan_month(arg: str | None, now: datetime) -> str | None:
@@ -5257,6 +5262,48 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             else:
                 await show_plan(callback.message, service, run, plan, notice)
             return
+        if action == "pprev":
+            # Пока опрос идёт — каким получится график по текущим ответам
+            # (общая логика); не сохраняется, утвердить — после завершения.
+            await _answer_callback(callback, "⏳ Составляю…")
+            run = registry.get_readiness_run(service_id, key)
+            if run is None or run["status"] != "open":
+                await show_readiness(
+                    callback.message, service_id,
+                    "⚠️ Опрос уже не идёт — откройте «📋 График»",
+                )
+                return
+            plan = await schedule_plan.build_draft(
+                registry, run, loader, debug, save=False,
+            )
+            summary = await asyncio.to_thread(
+                schedule_plan.plan_summary, registry, plan, run
+            )
+            text = schedule_plan.plan_text(
+                service_label(service), plan, summary, context.timezone,
+                schedule_plan.window_of(registry, service_id),
+            ).replace(
+                "📝 Черновик — ещё не утверждён",
+                "⏳ Предварительный — опрос идёт; окончательный составится "
+                "после завершения, тогда его можно поправить и утвердить",
+                1,
+            )
+            await _send_dialog(
+                callback.message, text,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [readiness_button(
+                        "🔄 Обновить", "pprev", service_id,
+                        key.replace("-", ""),
+                    )],
+                    [readiness_button(
+                        "⬅️ К разделу «График»", "open", service_id,
+                    )],
+                ]),
+                _dialog_keep_rows=True,
+                _dialog_text_limit=TELEGRAM_TEXT_LIMIT,
+                parse_mode=None,
+            )
+            return
         run, plan = await load_plan(service_id, key)
         if not plan_current(run, plan):
             await show_readiness(
@@ -5790,6 +5837,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     "заново?\n\nОтветы завершённого опроса будут удалены, "
                     "в чат уйдёт новый опрос."
                 )
+                approved = registry.get_schedule_plan(service_id, key)
+                if approved is not None and approved["approved"] is not None:
+                    question += (
+                        " Утверждённый график месяца отменится: прежний "
+                        "открепится, новый опубликуется после завершения "
+                        "опроса и утверждения."
+                    )
                 await _send_dialog(
                     callback.message,
                     question + " Отвечать придётся заново.",

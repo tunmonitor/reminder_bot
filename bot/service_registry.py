@@ -6243,6 +6243,39 @@ class ServiceRegistry:
             )
         return self.get_schedule_plan(service_id, month)
 
+    def cancel_schedule_approval(
+        self, service_id: str, month: str,
+    ) -> dict | None:
+        """Новый опрос месяца отменяет утверждённый график (решение
+        28.10): прежний в чате уже не актуален, даже если совпадёт.
+        Публикация (чат, id частей) остаётся — новая её заменит. → прежние
+        {chat_id, message_ids}; None — утверждённого не было."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT chat_id, message_id, message_ids_json "
+                "FROM schedule_plans WHERE service_id = ? AND month = ? "
+                "AND approved_json IS NOT NULL",
+                (service_id, month),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                "UPDATE schedule_plans SET approved_json = NULL, "
+                "approved_by = NULL, approved_at = NULL, "
+                "approved_days_json = NULL, approved_tasks_json = NULL, "
+                "served_offsets_json = NULL, baseline_json = NULL, "
+                # Загруженный из Excel перестаёт быть итоговым: дальше
+                # график — по новому опросу.
+                "source = 'poll', "
+                "republish = 0 WHERE service_id = ? AND month = ?",
+                (service_id, month),
+            )
+        ids = (
+            json.loads(row["message_ids_json"]) if row["message_ids_json"]
+            else [row["message_id"]] if row["message_id"] else []
+        )
+        return {"chat_id": row["chat_id"], "message_ids": ids}
+
     def approve_schedule_plan(
         self,
         actor_id: int,
