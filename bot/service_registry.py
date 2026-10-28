@@ -4404,10 +4404,18 @@ class ServiceRegistry:
             for day, people_days in json.loads(
                 row["days_json"] or "{}"
             ).items():
+                def stays(key: str) -> bool:
+                    person, task = split_day_key(key)
+                    if not is_person(person):
+                        return True
+                    # Разовый день задачи — пока человек в этой задаче.
+                    if task is not None:
+                        return person in slots.get(day, {}).get(task, [])
+                    return person in serving.get(day, set())
+
                 kept_days = {
                     key: offset for key, offset in people_days.items()
-                    if not is_person(split_day_key(key)[0])
-                    or split_day_key(key)[0] in serving.get(day, set())
+                    if stays(key)
                 }
                 changed |= kept_days != people_days
                 if kept_days:

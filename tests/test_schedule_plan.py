@@ -314,6 +314,19 @@ class SchedulePlanTest(unittest.TestCase):
             1001, "sound", "2026-11", "2026-11-22", "Алексей", -1,
         )
         self.assertEqual(edited["days"]["2026-11-22"], {"Алексей": -1})
+        # Снят со сборки, но остался в звуке — день сборки уходит.
+        slots["2026-11-22"]["звук"] = ["Алексей"]
+        self.registry.set_schedule_slots(1001, "sound", "2026-11", slots)
+        with closing(sqlite3.connect(self.registry.path)) as connection, \
+                connection:
+            connection.execute(
+                "UPDATE schedule_plans SET days_json = ? WHERE month = ?",
+                (json.dumps({"2026-11-22": {key: 0}}), "2026-11"),
+            )
+        self.registry.set_service_member_tasks(1001, "sound", "Алексей", ["звук"])
+        plan = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertEqual(plan["slots"]["2026-11-22"]["звук"], ["Алексей"])
+        self.assertNotIn("2026-11-22", plan["days"])
         self.registry.set_service_task_day(1001, "sound", "звук", None)
 
     def test_week_bundles_from_task_flag_and_member(self):
