@@ -553,7 +553,12 @@ Raspberry Pi specifics:
   pass-1 costs). After pass 1 `repair_gaps` augments the plan as a max
   flow (source → person [max] → (person, date) [1] → seat [needed] →
   sink), so required gaps caused by caps are closed whenever possible;
-  kept people stay in place. UI: `rdy:lim` (section) and `mbr:lim|lset` (card);
+  kept people stay in place. `build_plan` then runs `_spread_soft_limits`
+  (direct replacement by someone under the max, otherwise
+  `_rearrange_over_limit`: a BFS chain where a person at the max takes
+  the seat and gives up another, until someone under the max; applied only
+  if total excess drops and nobody gets two tasks on one service day).
+  UI: `rdy:lim` (section) and `mbr:lim|lset` (card);
   values `n`, `a_b`, `a_x`, `m` (pick min), `m<a>` (pick max), `s` (as
   service).
 - Removing a member (in the lists or not) records
@@ -683,6 +688,24 @@ Raspberry Pi specifics:
   blank → default); «📝 Тексты» (`show_readiness_texts`, kind "q").
   Poll options by day window (`readiness.option_label`), intro footnote
   `own_days_note` (readiness_people `in_roster`, @username for same names).
+- Reverse mode («↔️ Наоборот», `readiness_settings.reverse_poll`, snapshotted
+  in `readiness_runs.reverse_poll`): marked options mean «cannot»;
+  `question_text(..., reverse_poll)` and `intro_text(..., reverse_poll)` use
+  `DEFAULT_READINESS_QUESTION_REVERSE` / `DEFAULT_READINESS_INTRO_REVERSE`
+  when no custom template is set; a custom question gets a «НЕ сможешь»
+  suffix (kept inside the 300 limit), a custom intro an explanatory
+  paragraph. Pass `settings["reverse_poll"]` everywhere these are rendered
+  (`launch_run` and the `rdy:tplprev` previews `intro`/`q`). The personal
+  `DEFAULT_READINESS_REMINDER` is deliberately mode-neutral («не ответил(а)
+  на опрос по служению на {month}»); keep new default texts neutral or add
+  a reverse variant.
+- Linked-task fallback (`schedule_planner._can_serve`): a bundled person who
+  only marked the later task may serve the earlier one unless
+  `_alternate_covers` says another respondent really covers the seat. It
+  compares the max matchings of the date's required seats without and with
+  the fallback, so an alternate needed for another seat the same day does
+  not block it. Do not reintroduce a plain «any other candidate exists»
+  check.
 - Approved plan snapshot `served_offsets_json` (`schedule_plan.served_offsets`,
   passed to `approve_schedule_plan`); `last_served` uses it (legacy plans:
   approved_days, else personal day). Planner: gap under a week counts as

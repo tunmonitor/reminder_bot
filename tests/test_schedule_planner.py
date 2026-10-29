@@ -565,6 +565,34 @@ class SchedulePlannerTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 5)
         self.assertEqual(plan.covered(), 150)
 
+    def test_dense_schedule_with_linked_fallbacks_is_fast(self):
+        # Связки и ответы только по части дней: проверка запасной связки
+        # в _can_serve не должна пересчитываться на каждый вызов.
+        people = [f"Человек {index}" for index in range(30)]
+        slot_dates = {}
+        for day in SUNDAYS:
+            for person in people:
+                slot_dates[(day, "звук", person)] = day
+                slot_dates[(day, "спевка", person)] = day - timedelta(days=3)
+        data = PlanInput(
+            dates=SUNDAYS,
+            needed={"звук": 15, "спевка": 15},
+            free={person: frozenset(SUNDAYS) for person in people},
+            tasks={person: frozenset({"звук", "спевка"}) for person in people},
+            availability={
+                person: frozenset(SUNDAYS) | (
+                    frozenset(day - timedelta(days=3) for day in SUNDAYS)
+                    if index % 3 == 0 else frozenset()
+                )
+                for index, person in enumerate(people)
+            },
+            bundles={person: frozenset({"звук", "спевка"}) for person in people},
+            slot_dates=slot_dates,
+        )
+        started = time.monotonic()
+        plan = build_plan(data)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(plan.covered(), 150)
 
     def test_rotation_when_more_people_than_seats(self):
         # 4 воскресенья, нужен один: кто служил в прошлом месяце позже,

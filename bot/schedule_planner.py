@@ -104,6 +104,11 @@ class PlanInput:
     answer_order: Mapping[str, int] = field(default_factory=dict)
     # Фактический день задачи в неделе графика, с учётом личного дня.
     slot_dates: Mapping[tuple[date, str, str], date] = field(default_factory=dict)
+    # Результаты дорогих проверок (вход неизменяем, значения стабильны);
+    # replace() даёт новому входу пустой кэш.
+    _cache: dict = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
 
 @dataclass
@@ -277,7 +282,19 @@ def _alternate_covers(data: PlanInput, person: str, event_date: date,
     Мало того, что такой человек есть: он может быть нужен на другом
     месте того же дня, где больше некому. Поэтому сравниваются максимальные
     паросочетания обязательных мест даты без запасного варианта и с ним —
-    связка допускается, только если она увеличивает покрытие."""
+    связка допускается, только если она увеличивает покрытие. Результат
+    кэшируется во входе: `_can_serve` вызывается очень часто."""
+    key = ("alternate", event_date, task, person)
+    cached = data._cache.get(key)
+    if cached is None:
+        cached = data._cache[key] = _alternate_covers_uncached(
+            data, person, event_date, task
+        )
+    return cached
+
+
+def _alternate_covers_uncached(data: PlanInput, person: str,
+                               event_date: date, task: str) -> bool:
     if not any(
         candidate != person
         and candidate in data.availability
@@ -313,7 +330,13 @@ def _alternate_covers(data: PlanInput, person: str, event_date: date,
             tokens, seats, allowed, dict.fromkeys(tokens, 0)
         ))
 
-    return matched(True) <= matched(False)
+    # Без запасного варианта покрытие не зависит от человека — одно на дату.
+    base_key = ("direct-matching", event_date)
+    base = data._cache.get(base_key)
+    if base is None:
+        base = data._cache[base_key] = matched(False)
+    # Все места уже закрыты — связка покрытие не увеличит.
+    return base >= len(seats) or matched(True) <= base
 
 
 def _can_serve(data: PlanInput, person: str, event_date: date, task: str) -> bool:
