@@ -68,7 +68,7 @@ READINESS_INTRO_FIELDS = frozenset({"service_name", "month", "deadline", "people
 READINESS_REMINDER_FIELDS = frozenset({"service_name", "month", "deadline"})
 DEFAULT_READINESS_INTRO = (
     "🗳 График {service_name} на {month}\n"
-    "Отметь воскресенья, когда можешь служить. Ответ можно менять "
+    "Отметь даты, когда можешь служить. Ответ можно менять "
     "до {deadline}.\n"
     "Постараемся составить график, удобный для всех. Спасибо за твое "
     "служение в церкви! ❤️\n"
@@ -90,7 +90,7 @@ DEFAULT_READINESS_REMINDER = (
 # Общее напоминание в чат служения (ответом на опрос), без имён.
 DEFAULT_READINESS_CHAT_REMINDER = (
     "🔔 {service_name}: опрос о графике на {month} открыт до {deadline}.\n"
-    "Кто ещё не отметил воскресенья — проголосуй, пожалуйста, в опросе "
+    "Кто ещё не отметил даты — проголосуй, пожалуйста, в опросе "
     "выше 🙏"
 )
 # Заголовки графика в чате служения: при первой публикации и при
@@ -331,6 +331,8 @@ class ServiceRegistry:
                     -- Окно дней служения от воскресенья (Уборка: −1…+1).
                     day_from INTEGER NOT NULL DEFAULT 0,
                     day_to INTEGER NOT NULL DEFAULT 0,
+                    reverse_poll INTEGER NOT NULL DEFAULT 0
+                        CHECK (reverse_poll IN (0, 1)),
                     updated_at TEXT NOT NULL
                 );
 
@@ -349,6 +351,9 @@ class ServiceRegistry:
                     status TEXT NOT NULL
                         CHECK (status IN ('open', 'closed', 'skipped')),
                     dates_json TEXT NOT NULL DEFAULT '[]',
+                    options_json TEXT NOT NULL DEFAULT '[]',
+                    reverse_poll INTEGER NOT NULL DEFAULT 0
+                        CHECK (reverse_poll IN (0, 1)),
                     poll_id TEXT UNIQUE,
                     chat_id INTEGER,
                     message_id INTEGER,
@@ -397,6 +402,9 @@ class ServiceRegistry:
                     -- Задачи (с днями) опубликованной копии: напоминания
                     -- по утверждённому, а не по правкам рабочей копии.
                     approved_tasks_json TEXT,
+                    -- Фактический сдвиг каждого назначения на момент публикации:
+                    -- дата → задача → человек → сдвиг от воскресенья.
+                    approved_slot_days_json TEXT,
                     -- Закреплённая публикация в чате: id всех её частей
                     -- (правится при обновлении) и график первой публикации
                     -- ({"slots", "days"}) — изменения под графиком от него.
@@ -917,6 +925,8 @@ class ServiceRegistry:
                 ("readiness_settings", "people_max", "INTEGER"),
                 ("readiness_settings", "day_from", "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_settings", "day_to", "INTEGER NOT NULL DEFAULT 0"),
+                ("readiness_settings", "reverse_poll",
+                 "INTEGER NOT NULL DEFAULT 0"),
                 ("service_members", "day_offset", "INTEGER"),
                 ("service_members", "month_min", "INTEGER"),
                 ("service_members", "month_max", "INTEGER"),
@@ -927,6 +937,7 @@ class ServiceRegistry:
                 ("schedule_plans", "approved_days_json", "TEXT"),
                 ("schedule_plans", "served_offsets_json", "TEXT"),
                 ("schedule_plans", "approved_tasks_json", "TEXT"),
+                ("schedule_plans", "approved_slot_days_json", "TEXT"),
                 ("schedule_plans", "message_ids_json", "TEXT"),
                 ("schedule_plans", "baseline_json", "TEXT"),
                 ("schedule_plans", "thread_id", "INTEGER"),
@@ -936,6 +947,9 @@ class ServiceRegistry:
                 ("readiness_runs", "poll_stopped", "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "result_sent", "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "closed_announced",
+                 "INTEGER NOT NULL DEFAULT 0"),
+                ("readiness_runs", "options_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("readiness_runs", "reverse_poll",
                  "INTEGER NOT NULL DEFAULT 0"),
             ):
                 columns = {
@@ -5507,6 +5521,7 @@ class ServiceRegistry:
         "people_max": None,
         "day_from": 0,
         "day_to": 0,
+        "reverse_poll": False,
     }
 
     def get_readiness_settings(self, service_id: str) -> dict:
@@ -5517,7 +5532,7 @@ class ServiceRegistry:
                 "closed_template, chat_reminder_template, question_template, "
                 "plan_title_template, plan_update_template, phrases_json, "
                 "month_min, month_max, "
-                "people_needed, people_max, day_from, day_to "
+                "people_needed, people_max, day_from, day_to, reverse_poll "
                 "FROM readiness_settings WHERE service_id = ?",
                 (service_id,),
             ).fetchone()
@@ -5525,7 +5540,10 @@ class ServiceRegistry:
             return {
                 **self.READINESS_DEFAULTS, "phrases": {}, "enabled_at": None,
             }
-        settings = {**dict(row), "enabled": bool(row["enabled"])}
+        settings = {
+            **dict(row), "enabled": bool(row["enabled"]),
+            "reverse_poll": bool(row["reverse_poll"]),
+        }
         settings["phrases"] = json.loads(settings.pop("phrases_json") or "{}")
         return settings
 
@@ -5552,6 +5570,8 @@ class ServiceRegistry:
         new = {**current, **changes}
         if not isinstance(new["enabled"], bool):
             raise ValueError("enabled должен быть логическим значением")
+        if not isinstance(new["reverse_poll"], bool):
+            raise ValueError("reverse_poll должен быть логическим значением")
         for key in ("start_time", "deadline_time"):
             if not isinstance(new[key], str) or not re.fullmatch(
                 r"(?:[01]\d|2[0-3]):[0-5]\d", new[key]
@@ -5642,8 +5662,9 @@ class ServiceRegistry:
                 "closed_template, chat_reminder_template, question_template, "
                 "plan_title_template, plan_update_template, phrases_json, "
                 "month_min, month_max, "
-                "people_needed, people_max, day_from, day_to, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "people_needed, people_max, day_from, day_to, reverse_poll, "
+                "updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id) DO UPDATE SET "
                 "enabled = excluded.enabled, start_time = excluded.start_time, "
                 "duration_days = excluded.duration_days, "
@@ -5663,6 +5684,7 @@ class ServiceRegistry:
                 "people_needed = excluded.people_needed, "
                 "people_max = excluded.people_max, "
                 "day_from = excluded.day_from, day_to = excluded.day_to, "
+                "reverse_poll = excluded.reverse_poll, "
                 "updated_at = excluded.updated_at",
                 (
                     service_id, int(new["enabled"]), new["start_time"],
@@ -5675,7 +5697,8 @@ class ServiceRegistry:
                     json.dumps(new["phrases"], ensure_ascii=False),
                     new["month_min"], new["month_max"],
                     new["people_needed"], new["people_max"],
-                    new["day_from"], new["day_to"], now,
+                    new["day_from"], new["day_to"],
+                    int(new["reverse_poll"]), now,
                 ),
             )
             if (new["day_from"], new["day_to"]) != (
@@ -5857,7 +5880,12 @@ class ServiceRegistry:
     def _readiness_run(row) -> dict | None:
         if row is None:
             return None
-        return {**dict(row), "dates": json.loads(row["dates_json"])}
+        result = {
+            **dict(row), "dates": json.loads(row["dates_json"]),
+            "options": json.loads(row["options_json"] or "[]"),
+            "reverse_poll": bool(row["reverse_poll"]),
+        }
+        return result
 
     def create_readiness_run(
         self,
@@ -5866,6 +5894,8 @@ class ServiceRegistry:
         *,
         status: str,
         dates: list[str] = (),
+        options: list[dict] = (),
+        reverse_poll: bool = False,
         poll_id: str | None = None,
         chat_id: int | None = None,
         message_id: int | None = None,
@@ -5880,11 +5910,14 @@ class ServiceRegistry:
             try:
                 cursor = connection.execute(
                     "INSERT INTO readiness_runs (service_id, month, status, "
-                    "dates_json, poll_id, chat_id, message_id, "
+                    "dates_json, options_json, reverse_poll, "
+                    "poll_id, chat_id, message_id, "
                     "intro_message_id, deadline, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         service_id, month, status, json.dumps(list(dates)),
+                        json.dumps(list(options), ensure_ascii=False),
+                        int(reverse_poll),
                         poll_id, chat_id, message_id, intro_message_id,
                         deadline, _utc_now(),
                     ),
@@ -5997,6 +6030,10 @@ class ServiceRegistry:
         approved_days = plan.pop("approved_days_json")
         plan["approved_days"] = (
             json.loads(approved_days) if approved_days else {}
+        )
+        approved_slot_days = plan.pop("approved_slot_days_json", None)
+        plan["approved_slot_days"] = (
+            json.loads(approved_slot_days) if approved_slot_days else {}
         )
         message_ids = plan.pop("message_ids_json", None)
         # Опубликован до шага 5б — известна только первая часть.
@@ -6220,6 +6257,7 @@ class ServiceRegistry:
         self, actor_id: int, service_id: str, month: str, *,
         dates: list[str], tasks: list[dict], slots: dict, days: dict,
         served_offsets: dict | None = None,
+        approved_slot_days: dict | None = None,
     ) -> dict:
         """«📊 График Excel» → «✅ Подтвердить» (решение 15): график месяца
         из Excel как есть — итоговый график в боте (утверждён, без
@@ -6241,9 +6279,9 @@ class ServiceRegistry:
                 "last_served_json, note, edited, approved_json, approved_by, "
                 "approved_at, chat_id, message_id, republish, days_json, "
                 "approved_days_json, served_offsets_json, approved_tasks_json, "
-                "updated_at) "
+                "approved_slot_days_json, updated_at) "
                 "VALUES (?, ?, NULL, 'excel', ?, ?, ?, '{}', NULL, 0, ?, ?, ?, "
-                "NULL, NULL, 0, ?, ?, ?, ?, ?) "
+                "NULL, NULL, 0, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id, month) DO UPDATE SET run_id = NULL, "
                 "source = 'excel', dates_json = excluded.dates_json, "
                 "tasks_json = excluded.tasks_json, "
@@ -6258,12 +6296,15 @@ class ServiceRegistry:
                 "approved_days_json = excluded.approved_days_json, "
                 "served_offsets_json = excluded.served_offsets_json, "
                 "approved_tasks_json = excluded.approved_tasks_json, "
+                "approved_slot_days_json = excluded.approved_slot_days_json, "
                 "updated_at = excluded.updated_at",
                 (
                     service_id, month, values[0], values[1], values[2],
                     values[2], actor_id, now, values[3], values[3],
                     json.dumps(served_offsets or {}, ensure_ascii=False),
-                    values[1], now,
+                    values[1],
+                    json.dumps(approved_slot_days or {}, ensure_ascii=False),
+                    now,
                 ),
             )
             self._audit(
@@ -6292,7 +6333,8 @@ class ServiceRegistry:
                 "UPDATE schedule_plans SET approved_json = NULL, "
                 "approved_by = NULL, approved_at = NULL, "
                 "approved_days_json = NULL, approved_tasks_json = NULL, "
-                "served_offsets_json = NULL, baseline_json = NULL, "
+                "served_offsets_json = NULL, approved_slot_days_json = NULL, "
+                "baseline_json = NULL, "
                 # Загруженный из Excel перестаёт быть итоговым: дальше
                 # график — по новому опросу.
                 "source = 'poll', "
@@ -6317,6 +6359,7 @@ class ServiceRegistry:
         updated_at: str | None = None,
         days: dict | None = None,
         served_offsets: dict | None = None,
+        approved_slot_days: dict | None = None,
         message_ids: list[int] | None = None,
         baseline: dict | None = None,
         thread_id: int | None = None,
@@ -6339,6 +6382,7 @@ class ServiceRegistry:
                 "message_ids_json = ?, thread_id = ?, target_thread_id = ?, "
                 "baseline_json = COALESCE(?, baseline_json), "
                 "approved_days_json = ?, served_offsets_json = ?, "
+                "approved_slot_days_json = ?, "
                 "republish = CASE WHEN ? IS NULL OR updated_at = ? THEN 0 "
                 "ELSE republish END "
                 "WHERE service_id = ? AND month = ?",
@@ -6351,6 +6395,7 @@ class ServiceRegistry:
                     if baseline is not None else None,
                     json.dumps(days or {}, ensure_ascii=False),
                     json.dumps(served_offsets or {}, ensure_ascii=False),
+                    json.dumps(approved_slot_days or {}, ensure_ascii=False),
                     updated_at, updated_at, service_id, month,
                 ),
             )
