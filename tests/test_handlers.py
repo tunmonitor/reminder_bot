@@ -6107,11 +6107,32 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             await handler(callback)
             return callback
 
+        def buttons(callback):
+            return [
+                button
+                for row in callback.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+            ]
+
         async def run():
             screen = await press("rdy:open:sound")
             text = screen.message.answer.await_args.args[0]
             self.assertIn("🗳 Опрос готовности", text)
             self.assertIn("🔴 выключен", text)
+            self.assertIn(
+                "rdy:rev:sound",
+                [button.callback_data for button in buttons(screen)],
+            )
+            await press("rdy:rev:sound")
+            self.assertTrue(
+                self.registry.get_readiness_settings("sound")["reverse_poll"]
+            )
+            await press("rdy:rev:sound")
+            self.assertFalse(
+                self.registry.get_readiness_settings("sound")["reverse_poll"]
+            )
             denied = await press("rdy:open:sound", actor_id=24680)
             self.assertIn("Недостаточно прав", denied.answer.await_args.args[0])
 
@@ -6720,7 +6741,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             # «Нужно 1» — Борис ставится вместо Алексея.
             added = await press(borys.callback_data)
             self.assertIn("Поставлен(а): Борис вместо Алексей", text_of(added))
-            self.assertIn("не отмечал(а)", text_of(added))
+            self.assertIn("не отметил(а)", text_of(added))
             plan = self.registry.get_schedule_plan("sound", key)
             self.assertEqual(plan["slots"][dates[0]]["звук"], ["Борис"])
             self.assertEqual(plan["edited"], 1)

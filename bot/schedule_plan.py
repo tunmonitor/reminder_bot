@@ -31,6 +31,7 @@ from .readiness import (
     month_sundays,
     local_text,
     month_of,
+    option_key,
     outside_name,
     phrase,
     render_template,
@@ -354,6 +355,16 @@ def slot_offset(plan: dict, person: dict | None, day: str,
     return (person or {}).get("day_offset")
 
 
+def _selected_slot(summary: Summary, key: str, day: str, task: str,
+                   service_day: date) -> bool:
+    available = summary.available.get(key, ())
+    return (
+        option_key(service_day.isoformat(), task) in available
+        or service_day.isoformat() in available
+        or day in available
+    )
+
+
 def served_offsets(plan: dict, people: list[dict]) -> dict:
     """Фактический сдвиг дня служения каждого поставленного (разовый, день
     задачи или свой день) — снимок при публикации. У человека в нескольких
@@ -369,6 +380,21 @@ def served_offsets(plan: dict, people: list[dict]) -> dict:
     for (day, key), offset in latest.items():
         if offset:
             result.setdefault(day, {})[key] = offset
+    return result
+
+
+def served_days(plan: dict, people: list[dict]) -> dict[str, set[date]]:
+    """Фактические дни задач, с учётом дня задачи и личных переносов."""
+    by_key = {person["key"]: person for person in people}
+    result: dict[str, set[date]] = {}
+    for day, tasks in plan["slots"].items():
+        sunday = date.fromisoformat(day)
+        for task, keys in tasks.items():
+            for key in keys:
+                offset = slot_offset(plan, by_key.get(key), day, task) or 0
+                result.setdefault(key, set()).add(
+                    sunday + timedelta(days=offset)
+                )
     return result
 
 
@@ -499,15 +525,17 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
     polled = [person for person in summary.people if person["tasks"]]
     used_unpicked = False
 
-    def mark(person: str, day: str) -> str:
+    def mark(person: str, day: str, task: str) -> str:
         """* — не ответил; ° — ответил, но эту дату не отмечал (решение 16:
         его даты заняли другие — вместо не ответившего; или вручную)."""
         nonlocal used_unpicked
         if person in silent:
             return "*"
-        if plan["run_id"] is not None and person in summary.answered and (
-            day not in summary.answered[person]
-        ):
+        service_day = date.fromisoformat(day) + timedelta(
+            days=slot_offset(plan, by_key.get(person), day, task) or 0
+        )
+        selected = _selected_slot(summary, person, day, task, service_day)
+        if plan["run_id"] is not None and person in summary.answered and not selected:
             used_unpicked = True
             return "°"
         return ""
@@ -557,7 +585,7 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
                             task["name"], task["needed"],
                             [
                                 names.get(person, person)
-                                + mark(person, day)
+                                + mark(person, day, task["name"])
                                 + week_person_day(
                                     plan, by_key.get(person), day,
                                     task["name"], offset,
@@ -575,7 +603,7 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
             lines += task_lines(
                 task["name"], task["needed"],
                 [
-                    names.get(person, person) + mark(person, day)
+                    names.get(person, person) + mark(person, day, task["name"])
                     + ("" if shared_day else person_day(
                         by_key.get(person), day, plan
                     ))
@@ -583,14 +611,14 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
                 ],
                 bare=implicit_plan(plan),
             )
-    # Нагрузка — только админам: сколько воскресений у каждого, по убыванию.
-    load = served_dates(plan["slots"])
+    # Нагрузка — фактические дни служения, а не недели графика.
+    load = served_days(plan, polled)
     ordered = sorted(
-        polled, key=lambda person: (-len(load.get(person["key"], [])),
+        polled, key=lambda person: (-len(load.get(person["key"], set())),
                                     person["name"]),
     )
-    lines += ["", "👥 Нагрузка (воскресений в месяце):"] + [
-        f"   {len(load.get(person['key'], []))} — {person['name']}"
+    lines += ["", "👥 Нагрузка (дней служения в месяце):"] + [
+        f"   {len(load.get(person['key'], set()))} — {person['name']}"
         + ("" if person["telegram_id"] else " (без Telegram)")
         for person in ordered
     ]
@@ -666,10 +694,16 @@ def candidates(
             continue
         if key in silent:
             (quiet if task in person["tasks"] else rest).append(key)
-        elif day in summary.answered.get(key, ()) and task in person["tasks"]:
-            free.append(key)
         else:
-            rest.append(key)
+            service_day = date.fromisoformat(day) + timedelta(
+                days=slot_offset(plan, person, day, task) or 0
+            )
+            if task in person["tasks"] and _selected_slot(
+                summary, key, day, task, service_day
+            ):
+                free.append(key)
+            else:
+                rest.append(key)
     return free, quiet, rest
 
 
@@ -681,24 +715,27 @@ def choice_notes(plan: dict, summary: Summary, key: str, day: str,
     )
     notes = []
     silent = {item["key"] for item in summary.not_answered}
+    event_date = date.fromisoformat(day)
+    service_day = event_date + timedelta(
+        days=slot_offset(plan, person, day, task) or 0
+    )
     if key in silent:
         notes.append("⚪ не отвечал(а) на опрос")
-    elif day not in summary.answered.get(key, ()):
-        notes.append(f"⚠️ не отмечал(а) {_short(day)}")
+    elif not _selected_slot(summary, key, day, task, service_day):
+        notes.append(f"⚠️ не отметил(а) {service_day:%d.%m}")
     if person is not None and task not in person["tasks"]:
         notes.append(f"⚠️ не приписан(а) к «{task}»")
-    event_date = date.fromisoformat(day)
     near = [
-        other for other in served_dates(plan["slots"]).get(key, [])
-        if other != day
-        and abs((date.fromisoformat(other) - event_date).days) <= 7
+        other for other in sorted(served_days(plan, summary.people).get(key, ()))
+        if other != service_day
+        and abs((other - service_day).days) <= 7
     ]
     previous = plan["last_served"].get(key)
-    if previous and (event_date - date.fromisoformat(previous)).days <= 7:
-        near.append(previous)
+    if previous and (service_day - date.fromisoformat(previous)).days <= 7:
+        near.append(date.fromisoformat(previous))
     for other in sorted(near):
-        verb = "служил(а)" if other < day else "служит"
-        notes.append(f"ℹ️ {verb} {_short(other)}")
+        verb = "служил(а)" if other < service_day else "служит"
+        notes.append(f"ℹ️ {verb} {other:%d.%m}")
     return notes
 
 
@@ -1407,4 +1444,3 @@ def excel_filled(events, service_id: str, year: int, month: int) -> bool:
         )
         for event in events
     )
-

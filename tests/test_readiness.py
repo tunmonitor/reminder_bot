@@ -174,6 +174,15 @@ class ReadinessDatesTest(unittest.TestCase):
         self.assertEqual(
             readiness.answer_dates([1, 0, 2], dates), ["2026-11-01", "2026-11-08"]
         )
+        options = [{"date": day} for day in dates]
+        self.assertEqual(
+            readiness.answer_dates([1], options, reverse_poll=True),
+            ["2026-11-08"],
+        )
+        self.assertEqual(
+            readiness.answer_dates([2], options, reverse_poll=True),
+            [readiness.UNAVAILABLE_ALL],
+        )
 
 
 class ReadinessFlowTest(unittest.TestCase):
@@ -225,6 +234,17 @@ class ReadinessFlowTest(unittest.TestCase):
             1001, "sound", duration_days=2, remind_days=3
         )
         self.assertEqual(settings["remind_days"], 1)
+        settings = self.registry.set_readiness_settings(
+            1001, "sound", reverse_poll=True
+        )
+        self.assertTrue(settings["reverse_poll"])
+        self.assertTrue(
+            self.registry.get_readiness_settings("sound")["reverse_poll"]
+        )
+        with self.assertRaises(ValueError):
+            self.registry.set_readiness_settings(
+                1001, "sound", reverse_poll=1
+            )
 
     def launch(self, bot):
         return asyncio.run(readiness.launch_run(
@@ -235,15 +255,76 @@ class ReadinessFlowTest(unittest.TestCase):
     def test_launch_uses_day_window_and_own_day_note(self):
         self.registry.set_readiness_settings(1001, "sound", day_from=-1, day_to=1)
         self.registry.set_service_member_day(1001, "sound", "Алексей", -3)
+        self.registry.set_service_member_day(1001, "sound", "Борис", -3)
+        self.registry.set_service_member_day(1001, "sound", "Дмитрий", -3)
+        self.registry.set_service_member_day(1001, "sound", "Глеб", -3)
         bot = fake_bot()
         self.launch(bot)
         options = bot.send_poll.await_args.kwargs["options"]
-        self.assertEqual(options[0], "сб 31.10–пн 02.11")
+        self.assertEqual(options[0], "29.10 — звук")
         intro = bot.send_message.await_args.args[1]
         self.assertIn("📅 Свой день: Алексей — по четвергам", intro)
 
+    def test_launch_snapshots_date_options_and_reverse_mode(self):
+        self.registry.set_service_task_day(1001, "sound", "сборка", -3)
+        self.registry.set_readiness_settings(
+            1001, "sound", reverse_poll=True
+        )
+        bot = fake_bot()
+        run = self.launch(bot)
+        options = run["options"]
+        self.assertEqual(len(options), 10)
+        self.assertEqual(options[0]["label"], "29.10 — сборка")
+        self.assertEqual(options[1]["label"], "01.11 — звук")
+        self.assertTrue(run["reverse_poll"])
+        self.assertIn(
+            "отметь даты, когда не сможешь",
+            bot.send_message.await_args.args[1].lower(),
+        )
+        # После запуска настройка не меняет интерпретацию уже собранного опроса.
+        self.registry.set_readiness_settings(
+            1001, "sound", reverse_poll=False
+        )
+        marked = options[0]["date"]
+        dates = readiness.answer_dates([0], options, reverse_poll=True)
+        self.registry.record_readiness_answer(
+            run["poll_id"], 501, "alex", "Алексей", dates
+        )
+        summary = readiness.summarize(
+            self.registry, self.registry.get_readiness_run("sound", "2026-11"),
+            with_plan=False,
+        )
+        marked_option = readiness.option_key(marked, options[0]["task"])
+        self.assertEqual(summary.answered["Алексей"], [marked_option])
+        self.assertNotIn(marked_option, summary.available["Алексей"])
+        self.assertIn(
+            readiness.option_key(options[1]["date"], options[1]["task"]),
+            summary.available["Алексей"],
+        )
+        self.assertTrue(summary.reverse_poll)
+
+    def test_poll_options_refuse_more_than_telegram_limit(self):
+        tasks = [
+            {"name": name, "needed": 1, "max": 1, "position": name,
+             "implicit": False, "day": offset}
+            for name, offset in (("сб", -1), ("вс", 0), ("пн", 1))
+        ]
+        people = [
+            {**self.registry.readiness_people("sound")[0],
+             "tasks": [task["name"]]}
+            for task in tasks
+        ]
+        with (
+            patch.object(self.registry, "plan_tasks", return_value=tasks),
+            patch.object(self.registry, "readiness_people", return_value=people),
+        ):
+            with self.assertRaisesRegex(ValueError, "не более 12 вариантов"):
+                readiness.poll_options(self.registry, "sound", 2026, 11)
+
     def test_launch_uses_own_phrases(self):
         self.registry.set_service_member_day(1001, "sound", "Алексей", -3)
+        for name in ("Борис", "Дмитрий", "Глеб"):
+            self.registry.set_service_member_day(1001, "sound", name, -3)
         self.registry.set_readiness_phrase(1001, "sound", "cant", "🙈 Пропускаю месяц")
         self.registry.set_readiness_phrase(1001, "sound", "own_days", "🗓 Особые дни:")
         bot = fake_bot()
@@ -312,7 +393,10 @@ class ReadinessFlowTest(unittest.TestCase):
         self.assertEqual(summary.plan.slots[(date(2026, 11, 1), "сборка")], ["Глеб"])
         text = readiness.progress_text("ЗВУК", run, summary, TZ)
         self.assertIn("Ответили 3 из 4 · вне состава: 1", text)
-        self.assertIn("Свободны:  01 — 2 · 08 — 1 · 15 — 0", text)
+        self.assertIn("01.11 — звук — 2", text)
+        self.assertIn("01.11 — сборка — 2", text)
+        self.assertIn("08.11 — звук — 1", text)
+        self.assertIn("08.11 — сборка — 1", text)
         self.assertIn("⚪ Вне состава: Сергей (15)", text)
         self.assertIn("Дмитрий (без Telegram)", text)
         # Отзыв голоса.
@@ -362,7 +446,7 @@ class ReadinessFlowTest(unittest.TestCase):
             call for call in bot.send_message.await_args_list
             if call.args[0] == -1005555
         )
-        self.assertIn("Кто ещё не отметил воскресенья", chat.args[1])
+        self.assertIn("Кто ещё не отметил даты", chat.args[1])
         self.assertNotIn("Борис", chat.args[1])
         self.assertEqual(chat.kwargs["reply_parameters"].message_id, 12)
         bot.send_message.reset_mock()
@@ -548,7 +632,10 @@ class ReadinessFlowTest(unittest.TestCase):
         chat, text = bot.send_message.await_args.args[:2]
         self.assertEqual(chat, -1005555)
         # 01.11 закрыто (Алексей — сборка, Борис — звук), остальные — нет.
-        self.assertIn("08.11, 15.11, 22.11, 29.11", text)
+        self.assertIn("08.11 — звук", text)
+        self.assertIn("08.11 — сборка", text)
+        self.assertIn("29.11 — звук", text)
+        self.assertIn("29.11 — сборка", text)
         self.assertNotIn("01.11", text)
         # Глеб не ответил — просьба отметиться.
         self.assertIn("отметьтесь", text)
@@ -583,7 +670,9 @@ class ReadinessFlowTest(unittest.TestCase):
         # Ответили все — без просьбы отметиться; своя фраза.
         self.assertEqual(
             bot.send_message.await_args.args[1],
-            "Свободно: 08.11, 15.11, 22.11, 29.11",
+            "Свободно: 08.11 — звук, 08.11 — сборка, 15.11 — звук, "
+            "15.11 — сборка, 22.11 — звук, 22.11 — сборка, "
+            "29.11 — звук, 29.11 — сборка",
         )
 
     def test_sent_chat_reminder_skips_summary(self):
@@ -772,7 +861,10 @@ class ReadinessFlowTest(unittest.TestCase):
         with patch.object(readiness, "_EARLY_LIMIT", 1):
             run = self.launch(bot)
         answers = self.registry.list_readiness_answers(run["id"])
-        self.assertEqual(answers[0]["dates"], run["dates"][:2])
+        self.assertEqual(
+            answers[0]["dates"],
+            readiness.answer_dates([0, 1], run["options"]),
+        )
 
     def test_lost_poll_response_keeps_month_and_asks_to_check(self):
         from aiogram.exceptions import TelegramNetworkError

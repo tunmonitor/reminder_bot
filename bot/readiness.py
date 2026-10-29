@@ -160,12 +160,52 @@ def local_text(moment: datetime | str, tz) -> str:
     return moment.astimezone(tz).strftime("%d.%m %H:%M")
 
 
-def answer_dates(option_ids, dates: list[str]) -> list[str] | None:
-    """Варианты опроса → свободные даты; None — голос отозван; [] —
-    только «Не смогу». Даты вместе с «Не смогу» — засчитываются даты."""
+UNAVAILABLE_ALL = "__no_available_dates__"
+OPTION_SEPARATOR = "\x1f"
+
+
+def option_key(day: str, task: str | None = None) -> str:
+    return day if task is None else f"{day}{OPTION_SEPARATOR}{task}"
+
+
+def option_parts(key: str) -> tuple[str, str | None]:
+    day, separator, task = key.partition(OPTION_SEPARATOR)
+    return day, task if separator else None
+
+
+def option_weeks(
+    options: list[dict],
+) -> tuple[dict[str, set[date]], dict[str, set[date]]]:
+    """Map option keys and calendar dates to their weeks in the schedule."""
+    by_option: dict[str, set[date]] = {}
+    by_date: dict[str, set[date]] = {}
+    for option in options:
+        day = option["date"]
+        task = option.get("task") or (
+            option["tasks"][0] if len(option.get("tasks", ())) == 1 else None
+        )
+        weeks = {date.fromisoformat(value) for value in option.get("weeks", ())}
+        by_option[option_key(day, task)] = weeks
+        by_date.setdefault(day, set()).update(weeks)
+    return by_option, by_date
+
+
+def answer_dates(option_ids, options, *, reverse_poll: bool = False
+                 ) -> list[str] | None:
+    """Варианты опроса → отмеченные даты; None — голос отозван."""
     chosen = list(option_ids or ())
     if not chosen:
         return None
+    dates = [
+        option_key(
+            option["date"],
+            option.get("task")
+            or (option["tasks"][0] if len(option.get("tasks", ())) == 1 else None),
+        ) if isinstance(option, dict) else option
+        for option in options
+    ]
+    if reverse_poll and len(dates) in chosen:
+        return [UNAVAILABLE_ALL]
     return sorted(dates[index] for index in chosen if index < len(dates))
 
 
@@ -176,6 +216,8 @@ class Summary:
     people: list[dict]
     # Ключ человека (`key` из readiness_people) → свободные даты.
     answered: dict[str, list[str]] = field(default_factory=dict)
+    # Реальная доступность после интерпретации режима опроса.
+    available: dict[str, list[str]] = field(default_factory=dict)
     outside: list[dict] = field(default_factory=list)
     not_answered: list[dict] = field(default_factory=list)
     plan: Plan | None = None
@@ -184,6 +226,8 @@ class Summary:
     implicit: bool = False
     # Ключ → задачи, которые человек берёт в одну неделю (звук + спевка).
     bundles: dict = field(default_factory=dict)
+    reverse_poll: bool = False
+    date_options: bool = False
 
 
 def week_bundles(registry, service_id: str,
@@ -207,6 +251,50 @@ def week_bundles(registry, service_id: str,
     return bundles
 
 
+def slot_availability(available: dict[str, list[str]],
+                      people: dict[str, dict], weeks: tuple[date, ...],
+                      slot_dates: dict[tuple[date, str, str], date],
+                      options: list[dict]) -> dict[str, frozenset]:
+    """Translate poll answers into confirmed task service dates."""
+    week_set = set(weeks)
+    options_by_date: dict[str, set[tuple[date, str]]] = {}
+    for option in options:
+        day = option["date"]
+        tasks = [option["task"]] if option.get("task") else option.get("tasks", ())
+        for week in option.get("weeks", ()):
+            for task in tasks:
+                options_by_date.setdefault(day, set()).add(
+                    (date.fromisoformat(week), task)
+                )
+
+    result = {}
+    for key, values in available.items():
+        allowed: set[date | tuple[date, str]] = set()
+        for value in values:
+            day, task = option_parts(value)
+            actual_date = date.fromisoformat(day)
+            if task is not None:
+                allowed.add((actual_date, task))
+            elif actual_date in week_set:
+                for task_name in people[key]["tasks"]:
+                    allowed.add((
+                        slot_dates.get((actual_date, task_name, key), actual_date),
+                        task_name,
+                    ))
+            else:
+                matches = options_by_date.get(day, ())
+                for week, task_name in matches:
+                    if task_name in people[key]["tasks"]:
+                        allowed.add((
+                            slot_dates.get((week, task_name, key), actual_date),
+                            task_name,
+                        ))
+                if not matches:
+                    allowed.add(actual_date)
+        result[key] = frozenset(allowed)
+    return result
+
+
 def summarize(registry, run: dict, *, with_plan: bool = True,
               last_served: dict[str, date] | None = None,
               assume_free: bool = False) -> Summary:
@@ -220,9 +308,18 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
     }
     summary = Summary(people=people)
     summary.bundles = week_bundles(registry, run["service_id"], people)
+    summary.reverse_poll = bool(run.get("reverse_poll"))
+    options = run.get("options") or []
+    summary.date_options = bool(options)
+    option_week_map, date_week_map = option_weeks(options)
+    option_dates = run_option_dates(run)
+    options_by_date: dict[str, set[str]] = {}
+    for key in option_dates:
+        day, _ = option_parts(key)
+        options_by_date.setdefault(day, set()).add(key)
     if assume_free:
         summary.answered = {
-            person["key"]: list(run["dates"])
+            person["key"]: list(option_dates)
             for person in people if person["tasks"]
         }
     for answer in (
@@ -237,30 +334,74 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
             summary.outside.append(answer)
             continue
         summary.answered[person["key"]] = answer["dates"]
+    all_dates = set(option_dates)
+    for key, marked in summary.answered.items():
+        if summary.reverse_poll:
+            unavailable = set(marked)
+            for value in marked:
+                day, task = option_parts(value)
+                if task is None:
+                    unavailable.update(options_by_date.get(day, ()))
+            available = (
+                [] if UNAVAILABLE_ALL in marked
+                else sorted(all_dates - unavailable)
+            )
+        else:
+            available = [day for day in marked if day != UNAVAILABLE_ALL]
+        summary.available[key] = available
     summary.not_answered = [
         person for person in people
         if person["tasks"] and person["key"] not in summary.answered
     ]
     summary.free_count = {
-        day: sum(day in dates for dates in summary.answered.values())
-        for day in run["dates"]
+        day: sum(
+            day in dates or option_parts(day)[0] in dates
+            for dates in summary.available.values()
+        )
+        for day in option_dates
     }
     if with_plan:
         tasks = {person["key"]: person["tasks"] for person in people}
         # У служения без задач — одна задача с его названием.
         catalog = registry.plan_tasks(run["service_id"])
         summary.implicit = any(task["implicit"] for task in catalog)
-        all_dates = frozenset(date.fromisoformat(day) for day in run["dates"])
-        free = {
-            name: frozenset(date.fromisoformat(day) for day in dates)
-            for name, dates in summary.answered.items()
-        }
+        week_dates = frozenset(date.fromisoformat(day) for day in run["dates"])
+        free = {}
+        for name, dates in summary.available.items():
+            if options:
+                free[name] = frozenset(
+                    week for day in dates
+                    for week in (
+                        option_week_map.get(day)
+                        or date_week_map.get(option_parts(day)[0], ())
+                    )
+                )
+            else:
+                free[name] = frozenset(date.fromisoformat(day) for day in dates)
         # Не ответившие (и люди без Telegram) — по общей логике: свободны
         # во все даты, но ставятся после ответивших.
         silent = {person["key"] for person in summary.not_answered}
-        free.update({name: all_dates for name in silent})
+        free.update({name: week_dates for name in silent})
         # Лимит служений в месяц: личный главнее лимита служения.
         settings = registry.get_readiness_settings(run["service_id"])
+        by_person = {person["key"]: person for person in people}
+        slot_dates = {}
+        for sunday in week_dates:
+            for task in catalog:
+                for person in people:
+                    if task["name"] not in person["tasks"]:
+                        continue
+                    offset = task["day"]
+                    if offset is None:
+                        offset = person["day_offset"]
+                    if offset is None:
+                        offset = settings["day_from"]
+                    slot_dates[(sunday, task["name"], person["key"])] = (
+                        sunday + timedelta(days=offset)
+                    )
+        availability = slot_availability(
+            summary.available, by_person, tuple(week_dates), slot_dates, options,
+        ) if options else {}
         common = (
             (settings["month_min"], settings["month_max"])
             if settings["month_min"] or settings["month_max"] is not None
@@ -272,13 +413,15 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
             if person.get("month_limit") or common
         }
         summary.plan = build_plan(PlanInput(
-            dates=tuple(sorted(all_dates)),
+            dates=tuple(sorted(week_dates)),
             needed={task["name"]: task["needed"] for task in catalog},
             extra={
                 task["name"]: task["max"] - task["needed"] for task in catalog
             },
             free=free,
             tasks={name: frozenset(tasks[name]) for name in free},
+            availability=availability,
+            slot_dates=slot_dates,
             reluctant=frozenset(silent),
             last_served=dict(last_served or {}),
             limits=limits,
@@ -323,15 +466,23 @@ def progress_text(service_label: str, run: dict, summary: Summary, tz,
         + (f" · вне состава: {len(summary.outside)}" if summary.outside else ""),
         "",
         "Свободны:  " + " · ".join(
-            f"{_short(day)} — {summary.free_count.get(day, 0)}"
-            for day in run["dates"]
+            f"{run_option_label(run, day)} — "
+            f"{summary.free_count.get(day, 0)}"
+            for day in run_option_dates(run)
         ),
     ]
     names = {person["key"]: person["name"] for person in summary.people}
     if summary.answered:
         lines += ["", "✅ Ответили: " + "; ".join(
             f"{names.get(key, key)} ("
-            + (", ".join(_short(day) for day in dates) or "не сможет")
+            + (
+                "недоступен: " if summary.reverse_poll and dates
+                and UNAVAILABLE_ALL not in dates else ""
+            )
+            + (", ".join(
+                run_option_label(run, day)
+                for day in dates if day != UNAVAILABLE_ALL
+            ) or "не сможет")
             + ")"
             for key, dates in summary.answered.items()
         )]
@@ -440,6 +591,73 @@ def option_label(day: str, window: tuple[int, int] = (0, 0)) -> str:
     )
 
 
+def poll_options(registry, service_id: str, year: int, month: int) -> list[dict]:
+    """Доступность по каждой фактической дате и задаче отдельно."""
+    settings = registry.get_readiness_settings(service_id)
+    tasks = registry.plan_tasks(service_id)
+    people = registry.readiness_people(service_id)
+    by_day_task: dict[tuple[date, str], dict] = {}
+    for sunday in month_sundays(year, month):
+        for task in tasks:
+            eligible = [
+                person for person in people if task["name"] in person["tasks"]
+            ]
+            if not eligible:
+                continue
+            offsets = {
+                task["day"] if task["day"] is not None
+                else person["day_offset"] if person["day_offset"] is not None
+                else settings["day_from"]
+                for person in eligible
+            }
+            for offset in offsets:
+                actual_day = sunday + timedelta(days=offset)
+                item = by_day_task.setdefault((actual_day, task["name"]), {
+                    "date": actual_day.isoformat(), "task": task["name"],
+                    "weeks": [], "tasks": [task["name"]],
+                })
+                if sunday.isoformat() not in item["weeks"]:
+                    item["weeks"].append(sunday.isoformat())
+    result = []
+    for (actual_day, _), item in sorted(by_day_task.items()):
+        label = f"{actual_day:%d.%m} — {', '.join(item['tasks'])}"
+        if len(label) > 100:
+            raise ValueError(
+                f"Слишком длинное название задач для варианта опроса "
+                f"{actual_day:%d.%m}."
+            )
+        result.append({**item, "label": label})
+    if len(result) + 1 > 12:
+        raise ValueError(
+            "Опрос не запущен: Telegram допускает не более 12 вариантов, "
+            "а для выбранных дат задач их получилось больше."
+        )
+    return result
+
+
+def run_option_dates(run: dict) -> list[str]:
+    """Ключи вариантов; старые опросы хранят только даты недель."""
+    options = run.get("options") or []
+    return [
+        option_key(
+            item["date"], item.get("task")
+            or (item["tasks"][0] if len(item.get("tasks", ())) == 1 else None),
+        )
+        for item in options
+    ] if options else list(run["dates"])
+
+
+def run_option_label(run: dict, day: str) -> str:
+    for option in run.get("options") or ():
+        key = option_key(
+            option["date"], option.get("task")
+            or (option["tasks"][0] if len(option.get("tasks", ())) == 1 else None),
+        )
+        if key == day:
+            return option.get("label") or option["date"]
+    return option_label(option_parts(day)[0])
+
+
 def own_days_note(people: list[dict], title: str | None = None) -> str:
     """Сноска к опросу: у кого свой день служения."""
     def label(person: dict) -> str:
@@ -464,7 +682,8 @@ def own_days_note(people: list[dict], title: str | None = None) -> str:
 
 def intro_text(service: dict, people: list[dict], year: int, month: int,
                deadline: datetime, tz, template: str | None = None,
-               own_days_label: str | None = None) -> str:
+               own_days_label: str | None = None,
+               reverse_poll: bool = False) -> str:
     mentions = [
         user_link(person["telegram_id"], person["name"])
         if person["telegram_id"] else person["name"]
@@ -479,6 +698,11 @@ def intro_text(service: dict, people: list[dict], year: int, month: int,
     )
     # У кого свой день — сноской после текста (шаблон не нужно менять).
     note = own_days_note(people, own_days_label)
+    if reverse_poll:
+        text += (
+            "\n\n↔️ Режим «Наоборот»: отметь даты, когда не сможешь "
+            "служить. Остальные даты доступны после твоего ответа."
+        )
     return f"{text}\n\n{note}" if note else text
 
 
@@ -545,14 +769,15 @@ async def launch_run(
     dates = [day.isoformat() for day in month_sundays(year, month)]
     people = registry.readiness_people(service["id"])
     settings = registry.get_readiness_settings(service["id"])
-    # Варианты опроса — по окну дней служения («сб 31.10–пн 02.11»).
-    window = (settings["day_from"], settings["day_to"])
+    options = poll_options(registry, service["id"], year, month)
     # Запись — до отправки: месяц занят (перезапуск, прерванный между
     # отправкой и записью, не вернёт старый опрос поверх нового).
     run = registry.create_readiness_run(
         service["id"], key,
         status="open",
         dates=dates,
+        options=options,
+        reverse_poll=settings["reverse_poll"],
         deadline=deadline.astimezone(timezone.utc).isoformat(),
     )
     # Вступление может уйти несколькими сообщениями (длинный шаблон,
@@ -578,6 +803,7 @@ async def launch_run(
             intro_text(
                 service, people, year, month, deadline, tz,
                 settings.get("intro_template"), phrase(settings, "own_days"),
+                settings["reverse_poll"],
             ),
             limit=text_limit,
         )
@@ -589,7 +815,7 @@ async def launch_run(
             ),
             service, registry=registry, logger=logger,
             options=[
-                *(option_label(day, window) for day in dates),
+                *(option["label"] for option in options),
                 phrase(settings, "cant"),
             ],
             is_anonymous=False,
@@ -749,7 +975,10 @@ async def replay_early_answers(registry, poll_id: str,
         try:
             registry.record_readiness_answer(
                 poll_id, telegram_id, username, full_name,
-                answer_dates(option_ids, run["dates"]),
+                answer_dates(
+                    option_ids, run.get("options") or run["dates"],
+                    reverse_poll=run.get("reverse_poll", False),
+                ),
             )
         except Exception:  # noqa: BLE001
             logger.exception("Не удалось учесть ранний ответ в опросе")
@@ -879,31 +1108,70 @@ FREE_DAYS_SHARE = (2, 3)
 
 
 def free_days(registry, run: dict, summary: Summary) -> list[str]:
-    """Даты опроса, где ответившие не закрывают минимум задач."""
+    """Даты недель, где ответившие не закрывают минимум задач."""
     catalog = registry.plan_tasks(run["service_id"])
-    tasks = {person["key"]: person["tasks"] for person in summary.people}
+    settings = registry.get_readiness_settings(run["service_id"])
+    people = {person["key"]: person for person in summary.people}
+    weeks = tuple(date.fromisoformat(day) for day in run["dates"])
+    options = run.get("options") or []
+    option_week_map, date_week_map = option_weeks(options)
+    free = {
+        key: frozenset(
+            week for day in days
+            for week in (
+                option_week_map.get(day)
+                or date_week_map.get(option_parts(day)[0], ())
+            )
+        ) if options else frozenset(date.fromisoformat(day) for day in days)
+        for key, days in summary.available.items()
+    }
+    slot_dates = {}
+    for sunday in weeks:
+        for task in catalog:
+            for key, person in people.items():
+                if task["name"] not in person["tasks"]:
+                    continue
+                offset = task["day"]
+                if offset is None:
+                    offset = person["day_offset"]
+                if offset is None:
+                    offset = settings["day_from"]
+                slot_dates[(sunday, task["name"], key)] = (
+                    sunday + timedelta(days=offset)
+                )
+    availability = slot_availability(
+        summary.available, people, weeks, slot_dates, options,
+    ) if options else {}
+    open_weeks = set(open_dates(PlanInput(
+        dates=weeks,
+        needed={task["name"]: task["needed"] for task in catalog},
+        free=free,
+        tasks={
+            key: frozenset(person["tasks"])
+            for key, person in people.items() if key in free
+        },
+        availability=availability,
+        bundles=summary.bundles,
+        slot_dates=slot_dates,
+    )))
     return [
-        moment.isoformat() for moment in open_dates(PlanInput(
-            dates=tuple(date.fromisoformat(day) for day in run["dates"]),
-            needed={task["name"]: task["needed"] for task in catalog},
-            free={
-                key: frozenset(date.fromisoformat(day) for day in days)
-                for key, days in summary.answered.items()
-            },
-            tasks={
-                key: frozenset(tasks.get(key, ())) for key in summary.answered
-            },
-            bundles=summary.bundles,
-        ))
+        option_key(
+            option["date"], option.get("task")
+            or (option["tasks"][0] if len(option.get("tasks", ())) == 1 else None)
+        ) for option in options
+        if open_weeks.intersection(
+            date.fromisoformat(day) for day in option.get("weeks", ())
+        )
+    ] if options else [
+        day for day in run["dates"] if date.fromisoformat(day) in open_weeks
     ]
 
 
 def free_days_text(run: dict, settings: dict, days: list[str],
                    ask_silent: bool) -> str:
-    window = (settings["day_from"], settings["day_to"])
     text = render_template(
         phrase(settings, "free_days"),
-        days=", ".join(option_label(day, window) for day in days),
+        days=", ".join(run_option_label(run, day) for day in days),
     )
     if ask_silent:
         text += " " + phrase(settings, "free_days_vote")
