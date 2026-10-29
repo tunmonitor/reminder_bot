@@ -402,6 +402,9 @@ class ServiceRegistry:
                     -- Задачи (с днями) опубликованной копии: напоминания
                     -- по утверждённому, а не по правкам рабочей копии.
                     approved_tasks_json TEXT,
+                    -- Фактический сдвиг каждого назначения на момент публикации:
+                    -- дата → задача → человек → сдвиг от воскресенья.
+                    approved_slot_days_json TEXT,
                     -- Закреплённая публикация в чате: id всех её частей
                     -- (правится при обновлении) и график первой публикации
                     -- ({"slots", "days"}) — изменения под графиком от него.
@@ -934,6 +937,7 @@ class ServiceRegistry:
                 ("schedule_plans", "approved_days_json", "TEXT"),
                 ("schedule_plans", "served_offsets_json", "TEXT"),
                 ("schedule_plans", "approved_tasks_json", "TEXT"),
+                ("schedule_plans", "approved_slot_days_json", "TEXT"),
                 ("schedule_plans", "message_ids_json", "TEXT"),
                 ("schedule_plans", "baseline_json", "TEXT"),
                 ("schedule_plans", "thread_id", "INTEGER"),
@@ -6027,6 +6031,10 @@ class ServiceRegistry:
         plan["approved_days"] = (
             json.loads(approved_days) if approved_days else {}
         )
+        approved_slot_days = plan.pop("approved_slot_days_json", None)
+        plan["approved_slot_days"] = (
+            json.loads(approved_slot_days) if approved_slot_days else {}
+        )
         message_ids = plan.pop("message_ids_json", None)
         # Опубликован до шага 5б — известна только первая часть.
         plan["message_ids"] = (
@@ -6321,7 +6329,8 @@ class ServiceRegistry:
                 "UPDATE schedule_plans SET approved_json = NULL, "
                 "approved_by = NULL, approved_at = NULL, "
                 "approved_days_json = NULL, approved_tasks_json = NULL, "
-                "served_offsets_json = NULL, baseline_json = NULL, "
+                "served_offsets_json = NULL, approved_slot_days_json = NULL, "
+                "baseline_json = NULL, "
                 # Загруженный из Excel перестаёт быть итоговым: дальше
                 # график — по новому опросу.
                 "source = 'poll', "
@@ -6346,6 +6355,7 @@ class ServiceRegistry:
         updated_at: str | None = None,
         days: dict | None = None,
         served_offsets: dict | None = None,
+        approved_slot_days: dict | None = None,
         message_ids: list[int] | None = None,
         baseline: dict | None = None,
         thread_id: int | None = None,
@@ -6368,6 +6378,7 @@ class ServiceRegistry:
                 "message_ids_json = ?, thread_id = ?, target_thread_id = ?, "
                 "baseline_json = COALESCE(?, baseline_json), "
                 "approved_days_json = ?, served_offsets_json = ?, "
+                "approved_slot_days_json = ?, "
                 "republish = CASE WHEN ? IS NULL OR updated_at = ? THEN 0 "
                 "ELSE republish END "
                 "WHERE service_id = ? AND month = ?",
@@ -6380,6 +6391,7 @@ class ServiceRegistry:
                     if baseline is not None else None,
                     json.dumps(days or {}, ensure_ascii=False),
                     json.dumps(served_offsets or {}, ensure_ascii=False),
+                    json.dumps(approved_slot_days or {}, ensure_ascii=False),
                     updated_at, updated_at, service_id, month,
                 ),
             )

@@ -1180,6 +1180,38 @@ class SchedulePlanTest(unittest.TestCase):
             ),
         )
 
+    def test_approved_reminder_keeps_published_personal_day(self):
+        self.registry.set_readiness_settings(
+            1001, "sound", day_from=0, day_to=0
+        )
+        self.registry.set_service_member_day(
+            1001, "sound", "Алексей", None
+        )
+        plan = self.draft()
+        plan["slots"]["2026-11-01"] = {
+            "звук": ["Алексей"], "сборка": [],
+        }
+        people = self.people()
+        self.registry.approve_schedule_plan(
+            1001, "sound", "2026-11", plan["slots"],
+            chat_id=None, message_id=None,
+            days=plan["days"],
+            served_offsets=schedule_plan.served_offsets(plan, people),
+            approved_slot_days=schedule_plan.approved_slot_days(plan, people),
+        )
+
+        self.registry.set_service_member_day(
+            1001, "sound", "Алексей", -3
+        )
+        approved = self.registry.get_schedule_plan("sound", "2026-11")
+        events = schedule_plan.plan_events(approved, people)
+        assignments = [
+            (event.event_date, assignment.name)
+            for event in events for assignment in event.assignments
+        ]
+        self.assertIn((date(2026, 11, 1), "Алексей"), assignments)
+        self.assertNotIn((date(2026, 10, 29), "Алексей"), assignments)
+
     def test_task_day_shows_plan_by_weeks(self):
         plan = self.draft()
         plan["slots"]["2026-11-01"] = {"звук": ["Алексей"], "сборка": ["Борис"]}

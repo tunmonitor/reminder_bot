@@ -397,6 +397,21 @@ def served_offsets(plan: dict, people: list[dict]) -> dict:
     return result
 
 
+def approved_slot_days(plan: dict, people: list[dict]) -> dict:
+    """Resolved assignment offsets, frozen with the published schedule."""
+    by_key = {person["key"]: person for person in people}
+    return {
+        day: {
+            task: {
+                key: slot_offset(plan, by_key.get(key), day, task) or 0
+                for key in keys
+            }
+            for task, keys in tasks.items()
+        }
+        for day, tasks in plan["slots"].items()
+    }
+
+
 def served_days(plan: dict, people: list[dict]) -> dict[str, set[date]]:
     """Фактические дни задач, с учётом дня задачи и личных переносов."""
     by_key = {person["key"]: person for person in people}
@@ -1004,11 +1019,16 @@ def task_moments(plan: dict, by_key: dict, day: str,
     со своим или сохранённым днём — фактический день задачи, иначе
     воскресенье графика."""
     sunday = date.fromisoformat(day)
+    approved_offset = (
+        plan.get("approved_slot_days", {})
+        .get(day, {}).get(task, {})
+    )
     return [
         (
             sunday + timedelta(
                 # Не из состава (имя из Excel) — разовый день по ключу.
-                days=slot_offset(
+                days=approved_offset[key] if key in approved_offset else
+                slot_offset(
                     plan, by_key.get(key) or {"key": key}, day, task
                 ) or 0
             ),
@@ -1108,6 +1128,7 @@ def plan_events(plan: dict, people: list[dict]) -> list[ServiceEvent]:
     published = {
         **plan, "slots": plan["approved"], "tasks": tasks,
         "days": plan.get("approved_days") or {},
+        "approved_slot_days": plan.get("approved_slot_days") or {},
     }
     names = _names(people)
     by_key = {person["key"]: person for person in people}
@@ -1425,6 +1446,7 @@ async def publish(
                 target_thread_id=target_thread,
                 updated_at=plan["updated_at"], days=plan.get("days", {}),
                 served_offsets=served_offsets(plan, people),
+                approved_slot_days=approved_slot_days(plan, people),
             )
             break
         except Exception as exc:  # noqa: BLE001
