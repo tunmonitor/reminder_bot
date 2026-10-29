@@ -282,7 +282,7 @@ class ReadinessFlowTest(unittest.TestCase):
         self.assertEqual(options[1]["label"], "01.11 — звук")
         self.assertTrue(run["reverse_poll"])
         self.assertIn(
-            "отметь даты, когда не сможешь",
+            "отмечай только даты, когда не сможешь",
             bot.send_message.await_args.args[1].lower(),
         )
         # После запуска настройка не меняет интерпретацию уже собранного опроса.
@@ -398,6 +398,59 @@ class ReadinessFlowTest(unittest.TestCase):
         bot = fake_bot()
         self.launch(bot)
         self.assertEqual(bot.send_poll.await_args.args[1], "Звук: когда в ноябре?")
+
+    def test_reverse_mode_texts_ask_for_unavailable_dates(self):
+        service = {"name": "Звук"}
+        deadline = datetime(2026, 10, 20, 12, tzinfo=TZ)
+        people = [{"name": "Анна", "telegram_id": None, "tasks": ["звук"]}]
+
+        def intro(template=None, reverse=False):
+            return readiness.intro_text(
+                service, people, 2026, 11, deadline, TZ, template,
+                reverse_poll=reverse,
+            )
+
+        self.assertEqual(
+            readiness.question_text(service, 2026, 11),
+            "Когда можешь служить в ноябре?",
+        )
+        self.assertEqual(
+            readiness.question_text(service, 2026, 11, None, True),
+            "Когда НЕ можешь служить в ноябре?",
+        )
+        custom = readiness.question_text(
+            service, 2026, 11, "{service_name}: когда в {month_in}?", True
+        )
+        self.assertTrue(custom.startswith("Звук: когда в ноябре?"))
+        self.assertIn("НЕ сможешь", custom)
+        long_custom = readiness.question_text(service, 2026, 11, "я" * 400, True)
+        self.assertEqual(len(long_custom), 300)
+        self.assertIn("НЕ сможешь", long_custom)
+
+        self.assertIn("Отметь даты, когда можешь служить", intro())
+        self.assertNotIn("Режим «Наоборот»", intro())
+        reverse = intro(reverse=True)
+        self.assertIn("Отметь даты, когда НЕ можешь служить", reverse)
+        self.assertNotIn("Отметь даты, когда можешь служить", reverse)
+        self.assertIn("Режим «Наоборот»", reverse)
+        custom_intro = intro("Когда можешь служить в {month}?", reverse=True)
+        self.assertTrue(custom_intro.startswith("Когда можешь служить"))
+        self.assertIn("НЕ сможешь", custom_intro)
+
+    def test_launch_in_reverse_mode_asks_for_unavailable_dates(self):
+        self.registry.set_readiness_settings(
+            1001, "sound", reverse_poll=True
+        )
+        bot = fake_bot()
+        self.launch(bot)
+        self.assertEqual(
+            bot.send_poll.await_args.args[1],
+            "Когда НЕ можешь служить в ноябре?",
+        )
+        self.assertIn(
+            "Отметь даты, когда НЕ можешь служить",
+            bot.send_message.await_args.args[1],
+        )
         self.assertIsNone(bot.send_poll.await_args.kwargs["question_parse_mode"])
         with self.assertRaises(ValueError):
             self.registry.set_readiness_settings(
@@ -1014,6 +1067,10 @@ class ReadinessFlowTest(unittest.TestCase):
             ),
             "Напоминаю: ноябрь 2026, до 22.10 20:00",
         )
+        # Встроенный текст не привязан к смыслу выбора (в т. ч. «Наоборот»).
+        default = readiness.reminder_text(self.service(), run, TZ)
+        self.assertIn("не ответил(а) на опрос по служению на ноябрь 2026", default)
+        self.assertNotIn("можешь служить", default)
         self.registry.set_readiness_settings(
             1001, "sound", closed_template="Всё, {month} — спасибо!"
         )

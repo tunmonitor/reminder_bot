@@ -8,14 +8,94 @@ user-invocable: true
 
 Use this skill for project-wide work in `tunmonitor/reminder_bot`, including
 code changes, reviews, tests, operational diagnosis, and documentation.
-Project requirements and examples are also recorded in `README.md`, `tz2.txt`,
-and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
+Project requirements and examples are also recorded in `README.md`, `TZ2.txt`,
+and `UI_SKETCHES.md` (v1, current); check the relevant section when behavior
+is ambiguous. Plans: `PLAN.md` (customer decisions, stage status),
+`EXECUTION_PLAN.md` (technical tasks), `BACKLOG.md`, `UI_SKETCHES_V2.md`
+(menu redesign proposal, not approved until the user says so).
+
+This file is the single source for Claude Code and Codex/Copilot:
+`.github/skills/` is the real directory; `.claude/skills` and
+`.agents/skills` are symlinks to it. Edit only `.github/skills/...`.
+Reply to the user in Russian; identifiers, paths and commands stay as is.
+
+## Environments: Mac (dev) vs Raspberry Pi (test, prod)
+
+Detect where you are first: `uname -s` → `Darwin` = Mac dev checkout,
+`Linux` + `/home/pi` = Raspberry Pi. Below, `$PY` is the interpreter of the
+current environment.
+
+| | Mac (development) | Raspberry Pi (test / prod) |
+|---|---|---|
+| Checkout | `/Users/alex/projects/app/reminder_bot/dev`, branch `dev` | `/mnt/external_data/reminder_bot/test`, prod in its own directory |
+| `$PY` | `/Users/alex/projects/.venv/bin/python` (shared venv; never create a new one; install with `$PY -m pip install -r requirements.txt`) | `/home/pi/.venv/bin/python` |
+| Temp files, test `TMPDIR`, scratch worktrees | `/Users/alex/projects/.tmp/reminder_bot` (not `/tmp`, not the project folder) | `/dev/shm/app/reminder_bot/src/.tmp` (RAM, not the SD card) |
+| Diagnostic workbooks/logs | `/Users/alex/projects/.tmp/reminder_bot/debug/` (dir 700, files 600) | `/dev/shm/reminder_bot/debug/` (dir 700, files 600) |
+| Role | write code, run tests, open PRs | run the bot (test/prod); code arrives only through GitHub |
+| Bot process | never run with the test/prod `BOT_TOKEN` (two pollers on one token conflict); a local run needs a separate dev bot token | `manage.sh` / cron watchdog; do not stop, restart or deploy without an explicit request |
+| Tests | `TMPDIR=… $PY -m unittest discover -s tests -q > <tmp>/full.log 2>&1` in the background; some tests are skipped on macOS (POSIX-only) | run in the background too: a heavy foreground run can be killed (exit 137) |
+
+Mac specifics:
+
+- No Telegram sends in tests, dry-runs or previews. No `ssh`/`scp` to the Pi
+  to copy code or change the live environments (read-only look is fine when
+  the user asks).
+- Never print tokens, `*.env` files, full participant records or private
+  messages.
+- Delete only temp files you created yourself.
+
+Raspberry Pi specifics:
+
+- Test and prod have separate directories, configs, databases and tokens.
+- `.github/workflows/deploy.yml` runs on the self-hosted runner
+  `[self-hosted, tunmonitor]`: a push to a PR with head `dev` and base `test`
+  deploys to **test**; a push to `main` deploys to **prod**. A PR from any
+  other head into `test` does not deploy.
+- Never edit files on the Pi by hand; fix in `dev` and ship through a PR.
+
+## Git flow and the local `dev` branch
+
+- Work and commit **only on `dev`**; `test` and `main` change only through PRs.
+  Never force-push, never push to `test`/`main` directly.
+- `dev` also receives PRs from other agents (`copilot/*` → `dev`, e.g. #91,
+  #92). Before starting work run `git fetch` and `git status -sb`; if `dev` is
+  behind `origin/dev`, merge it (`git merge origin/dev`) **before** editing, so
+  docs such as `EXECUTION_PLAN.md` are not overwritten.
+- Flow: `dev` → PR to `test` (deploys to test) → comment `/review` after the
+  PR is opened and after every push → wait for greptile
+  (`/Users/alex/projects/bin/greptile_watch.sh <PR> <ISO time before push>` in
+  the background; one updating comment «Confidence Score: N/5» plus line
+  comments) → fix findings, repeat until 5/5 with no new findings → merge to
+  `test` → give the user a checklist of buttons/screens to verify in the test
+  bot. The `test` → `main` PR is merged **only by the user**.
+- Before every commit or push: review the diff by a separate model (Agent,
+  `model: "sonnet"`), correctness bugs only, each with `file:line` and a failure
+  scenario; verify findings against the code, fix the real ones, tell the user
+  what was found and fixed.
+- Commit only when the user asks. Do not open new PRs or start new PLAN steps
+  while the user has paused them (check project memory).
+
+## UI principles (every screen you add or change)
+
+- **Friendly to the user.** Users are service admins and church members, not
+  engineers: plain words («за день до воскресенья», not «offset»/«дн.»), each
+  screen says what it is and what to do next, errors give the reason and the
+  next action, empty states invite action, dangerous actions are confirmed,
+  manual input shows an example and has quick buttons, never ask for IDs.
+- **Clear menu hierarchy.** One meaning — one place; sections named by the
+  user's task; frequent actions ≤ 3 taps from `/start`; the path is visible
+  («ЗВУК › 📅 График › Замены»); «back» is named and behaves the same
+  everywhere; same-meaning buttons have the same label; ≤ 6 buttons per screen
+  without paging, 2–3 per row; dangerous actions in a separate bottom row.
+- Check `UI_SKETCHES.md` (and `UI_SKETCHES_V2.md` once approved) and update
+  the sketches and `docs/ADMIN_GUIDE.md` / `docs/VOLUNTEER_GUIDE.md` in the
+  same PR.
 
 ## Safety and working-tree rules
 
-- Run project Python commands with `/home/pi/.venv/bin/python`.
-- Put temporary files (test `TMPDIR`, scratch worktrees) under
-  `/dev/shm/app/reminder_bot/src/.tmp`, not `/tmp` or the SD card.
+- Run project Python commands with `$PY` (see the environment table).
+- Put temporary files (test `TMPDIR`, scratch worktrees) in the temp folder of
+  the current environment (table above).
 - Start by checking `git status --short`. Preserve existing user changes; never
   revert unrelated edits or commit/push unless asked.
 - Never print `BOT_TOKEN`, credential files, full participant records, or
@@ -25,8 +105,9 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - Do not send Telegram messages during tests, dry-runs, or previews. Do not
   invoke live delivery paths to validate rendering.
 - Do not delete original workbooks or broad directories. Keep diagnostic
-  workbooks/logs under `/dev/shm/reminder_bot/debug/` with directory mode 700
-  and file mode 600; these artifacts are not automatically removed.
+  workbooks/logs in the debug folder of the current environment (table above)
+  with directory mode 700 and file mode 600; these artifacts are not
+  automatically removed.
 - Do not stop, restart, deploy, restore, or mutate a live environment unless
   explicitly requested. For restore operations, the bot must be stopped and
   the snapshot environment must match the target.
@@ -61,7 +142,7 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 ## Development procedure
 
 1. Read the relevant implementation and tests, then check `README.md`,
-   `tz2.txt`, or `UI_SKETCHES.md` for project-specific behavior.
+   `TZ2.txt`, or `UI_SKETCHES.md` for project-specific behavior.
 2. Trace the full affected path (entry point, callback/message handler,
    registry, scheduler/notifier, and UI as applicable). Reuse shared helpers
    instead of adding parallel logic.
@@ -76,14 +157,16 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
    checks:
 
    ```bash
-   /home/pi/.venv/bin/python -m unittest tests.test_<area> -v
-   /home/pi/.venv/bin/python -m unittest discover -s tests -q
-   /home/pi/.venv/bin/python -m compileall -q bot tests
+   # $PY and <tmp> — from the environment table; TMPDIR keeps temp files there
+   TMPDIR=<tmp> $PY -m unittest tests.test_<area> -v
+   TMPDIR=<tmp> $PY -m unittest discover -s tests -q > <tmp>/full.log 2>&1   # background
+   $PY -m compileall -q bot tests
    git diff --check
    ```
 
    Choose existing test modules relevant to the change; do not literally run
-   the `<area>` placeholder. Documentation-only changes need no tests unless
+   the `<area>` placeholder. The full run writes to a file in the temp folder
+   and goes to the background. Documentation-only changes need no tests unless
    documentation tests exist.
 
 ## Domain rules and invariants
@@ -154,7 +237,7 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 - For safe diagnosis, use the dry-run rather than sender paths:
 
   ```bash
-  /home/pi/.venv/bin/python -m bot.debug_schedule --date YYYY-MM-DD
+  $PY -m bot.debug_schedule --date YYYY-MM-DD
   ```
 
   Omit `--date` to use the next target Sunday. Preserve downloaded files when
@@ -802,6 +885,9 @@ and `UI_SKETCHES.md`; check the relevant section when behavior is ambiguous.
 ## Relevant project documentation
 
 - `README.md` — setup, commands, operations, and development workflow.
-- `tz2.txt` — detailed behavioral, UI, data, backup, and Web App
+- `TZ1.txt`, `TZ2.txt` — detailed behavioral, UI, data, backup, and Web App
   requirements.
-- `UI_SKETCHES.md` — representative Telegram screen layouts.
+- `UI_SKETCHES.md` — representative Telegram screen layouts (v1, current);
+  `UI_SKETCHES_V2.md` — menu redesign proposal (pending approval).
+- `PLAN.md`, `EXECUTION_PLAN.md`, `BACKLOG.md` — customer decisions, status,
+  technical tasks.

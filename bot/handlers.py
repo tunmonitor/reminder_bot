@@ -6420,11 +6420,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         service, registry.readiness_people(service_id),
                         year, month, deadline, tz, settings["intro_template"],
                         readiness.phrase(settings, "own_days"),
+                        settings["reverse_poll"],
                     )
                     where = "в чате служения перед опросом"
                 elif arg == "q":
                     body = readiness.question_text(
-                        service, year, month, settings["question_template"]
+                        service, year, month, settings["question_template"],
+                        settings["reverse_poll"],
                     )
                     where = "вопрос над вариантами опроса"
                 elif arg in {"rem", "chat"}:

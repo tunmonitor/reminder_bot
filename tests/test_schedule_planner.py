@@ -355,6 +355,36 @@ class SchedulePlannerTest(unittest.TestCase):
         self.assertEqual(plan.slots[(day, "звук")], ["Связка"])
         self.assertEqual(plan.slots[(day, "спевка")], [])
 
+    def test_linked_fallback_is_kept_when_the_exact_candidate_is_needed_elsewhere(self):
+        # Б свободен в среду на спевку и сборку, но сборку кроме него некому
+        # вести: спевку закрывает А по связке со звуком.
+        day = SUNDAYS[0]
+        wednesday = day - timedelta(days=3)
+        plan = build_plan(PlanInput(
+            dates=(day,),
+            needed={"звук": 1, "спевка": 1, "сборка": 1},
+            free={"А": frozenset({day}), "Б": frozenset({day})},
+            tasks={
+                "А": frozenset({"звук", "спевка"}),
+                "Б": frozenset({"спевка", "сборка"}),
+            },
+            availability={
+                "А": frozenset({day}),
+                "Б": frozenset({wednesday}),
+            },
+            bundles={"А": frozenset({"звук", "спевка"})},
+            slot_dates={
+                (day, "звук", "А"): day,
+                (day, "спевка", "А"): wednesday,
+                (day, "спевка", "Б"): wednesday,
+                (day, "сборка", "Б"): wednesday,
+            },
+        ))
+        self.assertEqual(plan.gaps(), [])
+        self.assertEqual(plan.slots[(day, "звук")], ["А"])
+        self.assertEqual(plan.slots[(day, "спевка")], ["А"])
+        self.assertEqual(plan.slots[(day, "сборка")], ["Б"])
+
     def test_optional_matching_respects_month_max_across_task_days(self):
         day = SUNDAYS[0]
         rehearsal = day - timedelta(days=3)
@@ -419,6 +449,43 @@ class SchedulePlannerTest(unittest.TestCase):
         self.assertEqual(plan.gaps(), [])
         self.assertEqual(plan.slots[(SUNDAYS[0], "звук")], ["Вера"])
         self.assertEqual(plan.slots[(SUNDAYS[2], "звук")], ["Анна"])
+
+    def test_month_max_rearranges_chain_of_assignments(self):
+        # Лимит 1 у всех: А свободна 01 и 15, Б — 01 и 08, В — только 08.
+        # Прямой замены нет (Б уже на пределе), но цепочка Б→01, В→08,
+        # А→15 укладывается во все лимиты.
+        dates = SUNDAYS[:3]
+        names = ("А", "Б", "В")
+        plan = build_plan(plan_input(
+            {
+                "А": {dates[0], dates[2]},
+                "Б": {dates[0], dates[1]},
+                "В": {dates[1]},
+            },
+            {name: {"звук"} for name in names},
+            needed={"звук": 1}, dates=dates,
+            limits={name: (0, 1) for name in names},
+            last_served={"В": date(2026, 10, 25)},
+        ))
+        self.assertEqual(plan.gaps(), [])
+        self.assertEqual(
+            [plan.slots[(day, "звук")] for day in dates],
+            [["Б"], ["В"], ["А"]],
+        )
+        self.assertEqual(plan.load(), {"А": 1, "Б": 1, "В": 1})
+
+    def test_month_max_chain_is_not_applied_without_a_free_end(self):
+        # Все трое на пределе и других нет: превышение остаётся, покрытие
+        # не теряется.
+        dates = SUNDAYS[:3]
+        plan = build_plan(plan_input(
+            {"А": {dates[0], dates[2]}, "Б": {dates[0], dates[1]}},
+            {name: {"звук"} for name in ("А", "Б")},
+            needed={"звук": 1}, dates=dates,
+            limits={"А": (0, 1), "Б": (0, 1)},
+        ))
+        self.assertEqual(plan.gaps(), [])
+        self.assertEqual(sum(plan.load().values()), 3)
 
     def test_month_min_preferred(self):
         # Трое на 3 даты: без лимита — по одному; у Глеба минимум 2 —

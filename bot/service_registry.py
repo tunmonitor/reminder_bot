@@ -74,18 +74,28 @@ DEFAULT_READINESS_INTRO = (
     "служение в церкви! ❤️\n"
     "👥 {people}"
 )
+# Встроенное вступление режима «Наоборот»: отмечают даты, когда НЕ могут.
+DEFAULT_READINESS_INTRO_REVERSE = (
+    "🗳 График {service_name} на {month}\n"
+    "Отметь даты, когда НЕ можешь служить. Ответ можно менять "
+    "до {deadline}.\n"
+    "Постараемся составить график, удобный для всех. Спасибо за твое "
+    "служение в церкви! ❤️\n"
+    "👥 {people}"
+)
 READINESS_CLOSED_FIELDS = frozenset({"service_name", "month"})
 # Вопрос Telegram-опроса над вариантами (до 300 символов).
 READINESS_QUESTION_FIELDS = frozenset({"service_name", "month", "month_in"})
 DEFAULT_READINESS_QUESTION = "Когда можешь служить в {month_in}?"
+DEFAULT_READINESS_QUESTION_REVERSE = "Когда НЕ можешь служить в {month_in}?"
 DEFAULT_READINESS_CLOSED = (
     "🗳 Опрос «График {service_name} на {month}» завершён. Спасибо всем, "
     "кто ответил! ❤️ График появится вскоре."
 )
 DEFAULT_READINESS_REMINDER = (
     "🗳 {service_name} · график на {month}\n"
-    "Ты ещё не отметил(а), когда можешь служить. Опрос в чате служения "
-    "открыт до {deadline}."
+    "Ты ещё не ответил(а) на опрос по служению на {month}. Опрос в чате "
+    "служения открыт до {deadline}."
 )
 # Общее напоминание в чат служения (ответом на опрос), без имён.
 DEFAULT_READINESS_CHAT_REMINDER = (

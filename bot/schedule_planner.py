@@ -251,6 +251,71 @@ def _available_on(data: PlanInput, person: str,
     )
 
 
+def _serves_directly(data: PlanInput, person: str, event_date: date,
+                     task: str) -> bool:
+    """Человек отметил именно этот день задачи (без запасной связки)."""
+    if (
+        event_date not in data.free.get(person, ())
+        or task not in data.tasks.get(person, ())
+    ):
+        return False
+    service_date = data.slot_dates.get((event_date, task, person), event_date)
+    unavailable = data.unavailable.get(person, ())
+    if service_date in unavailable or (service_date, task) in unavailable:
+        return False
+    return (
+        data.availability.get(person) is None
+        or _available_on(data, person, service_date, task)
+    )
+
+
+def _alternate_covers(data: PlanInput, person: str, event_date: date,
+                      task: str) -> bool:
+    """Закроет ли место другой ответивший, так что запасная связка
+    `person` не нужна.
+
+    Мало того, что такой человек есть: он может быть нужен на другом
+    месте того же дня, где больше некому. Поэтому сравниваются максимальные
+    паросочетания обязательных мест даты без запасного варианта и с ним —
+    связка допускается, только если она увеличивает покрытие."""
+    if not any(
+        candidate != person
+        and candidate in data.availability
+        and _serves_directly(data, candidate, event_date, task)
+        for candidate in data.free
+    ):
+        return False
+    seats, _ = _seats(data)
+    if task not in seats:
+        return True
+
+    def matched(with_fallback: bool) -> int:
+        tokens: list[str] = []
+        allowed: dict[str, set[int]] = {}
+        for member in sorted(data.free):
+            if member not in data.availability:
+                continue
+            by_day: dict[date, set[int]] = {}
+            for index, seat in enumerate(seats):
+                if _serves_directly(data, member, event_date, seat) or (
+                    with_fallback and member == person
+                    and seat == task
+                    and event_date in data.free.get(member, ())
+                ):
+                    by_day.setdefault(data.slot_dates.get(
+                        (event_date, seat, member), event_date
+                    ), set()).add(index)
+            for service_day, indexes in sorted(by_day.items()):
+                token = f"{member}{BUNDLE_SEPARATOR}{service_day.isoformat()}"
+                tokens.append(token)
+                allowed[token] = indexes
+        return len(_min_cost_matching(
+            tokens, seats, allowed, dict.fromkeys(tokens, 0)
+        ))
+
+    return matched(True) <= matched(False)
+
+
 def _can_serve(data: PlanInput, person: str, event_date: date, task: str) -> bool:
     if (
         event_date not in data.free.get(person, ())
@@ -280,20 +345,10 @@ def _can_serve(data: PlanInput, person: str, event_date: date, task: str) -> boo
         )
         for linked_task in bundle
     )
-    alternate = any(
-        candidate != person
-        and candidate in data.availability
-        and event_date in data.free.get(candidate, ())
-        and task in data.tasks.get(candidate, ())
-        and _available_on(
-            data,
-            candidate,
-            data.slot_dates.get((event_date, task, candidate), event_date),
-            task,
-        )
-        for candidate in data.free
+    return (
+        task in bundle and has_linked_date
+        and not _alternate_covers(data, person, event_date, task)
     )
-    return task in bundle and has_linked_date and not alternate
 
 
 def _min_cost_matching(
@@ -459,11 +514,95 @@ def _spread_soft_limits(plan: Plan, data: PlanInput) -> None:
             if move:
                 break
         if not move:
+            # Прямой замены нет — перестановка цепочкой по всему месяцу.
+            if _rearrange_over_limit(plan, data, loads):
+                continue
             return
         key, person, candidate = move
         assigned = plan.slots[key]
         assigned[assigned.index(person)] = candidate
         assigned.sort()
+
+
+def _rearrange_over_limit(plan: Plan, data: PlanInput,
+                          loads: Mapping[str, int]) -> bool:
+    """Снимает превышение месячного максимума цепочкой замен.
+
+    Прямая замена не работает, когда все, кто может взять место, уже на
+    пределе. Тогда такой человек берёт это место, а своё отдаёт следующему,
+    и так до того, у кого лимит ещё не исчерпан: каждый в цепочке остаётся с
+    прежней нагрузкой, превышение у первого уходит. Цепочки ищутся в ширину
+    (кратчайшие первыми, порядок детерминирован); применяется первая, после
+    которой превышение в сумме меньше, покрытие то же, а у каждого
+    затронутого человека — не больше одной задачи в день."""
+    def excess(slots: dict[tuple[date, str], list[str]]) -> int:
+        current = replace(plan, slots=slots).load()
+        return sum(
+            max(0, current.get(person, 0) - high)
+            for person in data.free
+            if (high := _limit(data, person)[1]) is not None
+        )
+
+    def one_task_per_day(slots, people) -> bool:
+        for person in people:
+            days = [
+                plan.slot_dates.get((event_date, task, person), event_date)
+                for (event_date, task), assigned in slots.items()
+                if person in assigned
+            ]
+            if len(days) != len(set(days)):
+                return False
+        return True
+
+    before = excess(plan.slots)
+    for start_key, start_person in [
+        (key, person)
+        for key, assigned in sorted(plan.slots.items())
+        for person in assigned
+        if (high := _limit(data, person)[1]) is not None
+        and loads.get(person, 0) > high
+    ]:
+        # Шаг цепочки: (место, кто уходит, кто приходит).
+        queue = [([], start_key, start_person, {start_person})]
+        seen = {start_key}
+        for steps, key, leaver, used in queue:
+            event_date, task = key
+            for candidate in sorted(data.free):
+                if (
+                    candidate in used
+                    or candidate in plan.slots[key]
+                    or (leaver not in data.reluctant
+                        and candidate in data.reluctant)
+                    or not _can_serve(data, candidate, event_date, task)
+                ):
+                    continue
+                chain = [*steps, (key, leaver, candidate)]
+                high = _limit(data, candidate)[1]
+                if high is None or loads.get(candidate, 0) < high:
+                    slots = {
+                        slot: list(assigned)
+                        for slot, assigned in plan.slots.items()
+                    }
+                    for slot, out, came in chain:
+                        slots[slot][slots[slot].index(out)] = came
+                    if excess(slots) < before and one_task_per_day(
+                        slots, {came for _, _, came in chain}
+                    ):
+                        for slot, assigned in slots.items():
+                            plan.slots[slot] = sorted(assigned)
+                        return True
+                    continue
+                # Кандидат на пределе: берёт это место, отдаёт своё другое.
+                for other in sorted(plan.slots):
+                    if (
+                        other not in seen
+                        and candidate in plan.slots[other]
+                    ):
+                        seen.add(other)
+                        queue.append(
+                            (chain, other, candidate, used | {candidate})
+                        )
+    return False
 
 
 def _prefer_bundles(plan: Plan, data: PlanInput) -> None:

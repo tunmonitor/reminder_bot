@@ -41,7 +41,9 @@ from .service_registry import (  # noqa: F401 — шаблоны для экра
     DEFAULT_PLAN_UPDATE_TITLE,
     READINESS_PHRASES,
     DEFAULT_READINESS_QUESTION,
+    DEFAULT_READINESS_QUESTION_REVERSE,
     DEFAULT_READINESS_INTRO,
+    DEFAULT_READINESS_INTRO_REVERSE,
     DEFAULT_READINESS_REMINDER,
 )
 from .ui import send_telegram_screen, user_link
@@ -727,7 +729,10 @@ def intro_text(service: dict, people: list[dict], year: int, month: int,
         for person in people if person["tasks"]
     ]
     text = render_template(
-        template or DEFAULT_READINESS_INTRO,
+        template or (
+            DEFAULT_READINESS_INTRO_REVERSE if reverse_poll
+            else DEFAULT_READINESS_INTRO
+        ),
         service_name=service["name"],
         month=month_title(year, month),
         deadline=local_text(deadline, tz),
@@ -736,15 +741,19 @@ def intro_text(service: dict, people: list[dict], year: int, month: int,
     # У кого свой день — сноской после текста (шаблон не нужно менять).
     note = own_days_note(people, own_days_label)
     if reverse_poll:
+        # Свой шаблон мог остаться про «можешь служить» — пояснение
+        # однозначно говорит, что отмечать в этом опросе.
         text += (
-            "\n\n↔️ Режим «Наоборот»: отметь даты, когда не сможешь "
-            "служить. Остальные даты доступны после твоего ответа."
+            "\n\n↔️ Режим «Наоборот»: отмечай только даты, когда НЕ сможешь "
+            "служить. Остальные даты считаются доступными после твоего "
+            "ответа."
         )
     return f"{text}\n\n{note}" if note else text
 
 
 def question_text(service: dict, year: int, month: int,
-                  template: str | None = None) -> str:
+                  template: str | None = None,
+                  reverse_poll: bool = False) -> str:
     """Вопрос Telegram-опроса над вариантами (не длиннее 300 символов —
     предел Telegram)."""
     values = dict(
@@ -752,10 +761,18 @@ def question_text(service: dict, year: int, month: int,
         month=month_title(year, month),
         month_in=MONTHS_IN[month - 1],
     )
-    text = render_template(template or DEFAULT_READINESS_QUESTION, **values)
+    default = (
+        DEFAULT_READINESS_QUESTION_REVERSE if reverse_poll
+        else DEFAULT_READINESS_QUESTION
+    )
+    text = render_template(template or default, **values)
     if not text.strip():
         # Пустой вопрос Telegram не примет — опрос не запустился бы.
-        text = render_template(DEFAULT_READINESS_QUESTION, **values)
+        text = render_template(default, **values)
+    if reverse_poll and template:
+        # Свой вопрос мог остаться про «можешь» — уточнение не обрезается.
+        suffix = " ↔️ Отметь даты, когда НЕ сможешь."
+        return text[:300 - len(suffix)] + suffix
     return text[:300]
 
 
@@ -851,7 +868,8 @@ async def launch_run(
         poll_message = await send_to_service_group(
             bot.send_poll, chat_id,
             question_text(
-                service, year, month, settings.get("question_template")
+                service, year, month, settings.get("question_template"),
+                settings["reverse_poll"],
             ),
             service, registry=registry, logger=logger,
             options=[
