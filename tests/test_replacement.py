@@ -651,6 +651,14 @@ class DirectChangeTest(HandlersTest):
             self.assertIn("📋 График на", candidates.answer.await_args.args[0])
             confirm = await self._press(candidates, "Борис")
             self.assertIn("Алексей → Борис", confirm.answer.await_args.args[0])
+            self.assertIn("📋 График на", confirm.answer.await_args.args[0])
+            confirm_rows = confirm.answer.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            self.assertEqual(
+                [button.text for button in confirm_rows[-1]],
+                ["⬅️ К неделе", "📅 К графику"],
+            )
             result = await self._press(confirm, "Назначить")
             # После замены — снова неделя, с отметкой.
             text = result.answer.await_args.args[0]
@@ -726,6 +734,47 @@ class DirectChangeTest(HandlersTest):
             back = next(i for i, row in enumerate(rows)
                         if any(item.text == "⬅️ К неделе" for item in row))
             self.assertLess(nav, back)
+            first_page_candidates = {
+                item.text for row in rows for item in row
+                if "Сборщик" in item.text
+            }
+            next_button = next(
+                item for row in rows for item in row
+                if item.callback_data.startswith("ui_page:")
+                and "Далее" in item.text
+            )
+            callback = self._callback(next_button)
+            await self._handler("on_dialog_page")(callback)
+            next_rows = callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            next_page_candidates = {
+                item.text for row in next_rows for item in row
+                if "Сборщик" in item.text
+            }
+            self.assertEqual(len(next_page_candidates), 6)
+            self.assertTrue(first_page_candidates.isdisjoint(next_page_candidates))
+            self.assertTrue(any("Далее" in item.text
+                                for row in next_rows for item in row))
+
+        asyncio.run(run())
+
+    def test_telegram_picker_shows_graph_and_navigation(self):
+        async def run():
+            card = self._callback(SimpleNamespace(
+                callback_data="service:service_replace:sound"
+            ))
+            await self._handler("on_service_selected")(card)
+            week = await self._press(card.message, "нед.")
+            candidates = await self._press(week, "сборка ·")
+            picker = await self._press(candidates, "Выбрать пользователя Telegram")
+
+            self.assertIn("📋 График на", picker.answer.await_args.args[0])
+            keyboard = picker.answer.await_args.kwargs["reply_markup"].keyboard
+            self.assertEqual(
+                [button.text for button in keyboard[-1]],
+                ["⬅️ К неделе", "📅 К графику"],
+            )
 
         asyncio.run(run())
 
