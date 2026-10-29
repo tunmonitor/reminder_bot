@@ -1212,6 +1212,47 @@ class SchedulePlanTest(unittest.TestCase):
         self.assertIn((date(2026, 11, 1), "Алексей"), assignments)
         self.assertNotIn((date(2026, 10, 29), "Алексей"), assignments)
 
+    def test_excel_import_replaces_approved_reminder_date_snapshot(self):
+        self.registry.set_service_task_day(
+            1001, "sound", "сборка", -4
+        )
+        people = self.people()
+        old = self.draft()
+        old["slots"]["2026-11-08"] = {
+            "звук": [], "сборка": ["Дмитрий"],
+        }
+        self.registry.approve_schedule_plan(
+            1001, "sound", "2026-11", old["slots"],
+            chat_id=None, message_id=None,
+            days=old["days"],
+            served_offsets=schedule_plan.served_offsets(old, people),
+            approved_slot_days=schedule_plan.approved_slot_days(old, people),
+        )
+        imported = schedule_plan.excel_plan(
+            self.registry, "sound", 2026, 11,
+            [event(date(2026, 11, 8), ("сборка", "Дмитрий"))],
+        )
+        self.assertEqual(imported["days"]["2026-11-08"], {
+            schedule_plan.task_day_key("Дмитрий", "сборка"): 0
+        })
+        self.registry.import_excel_plan(
+            1001, "sound", "2026-11",
+            dates=imported["dates"], tasks=imported["tasks"],
+            slots=imported["slots"], days=imported["days"],
+            served_offsets=schedule_plan.served_offsets(imported, people),
+            approved_slot_days=schedule_plan.approved_slot_days(
+                imported, people
+            ),
+        )
+        plan = self.registry.get_schedule_plan("sound", "2026-11")
+        assignments = [
+            (item.event_date, assignment.name)
+            for item in schedule_plan.plan_events(plan, people)
+            for assignment in item.assignments
+            if assignment.task == "сборка"
+        ]
+        self.assertEqual(assignments, [(date(2026, 11, 8), "Дмитрий")])
+
     def test_task_day_shows_plan_by_weeks(self):
         plan = self.draft()
         plan["slots"]["2026-11-01"] = {"звук": ["Алексей"], "сборка": ["Борис"]}

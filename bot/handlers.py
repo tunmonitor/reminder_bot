@@ -6690,15 +6690,21 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     )
                 # Фактический день каждого — для интервалов следующего
                 # месяца (как снимок при публикации).
+                people = registry.readiness_people(service_id)
                 offsets = schedule_plan.served_offsets(
                     {**loaded, "service_id": service_id},
-                    registry.readiness_people(service_id),
+                    people,
+                )
+                approved_days = schedule_plan.approved_slot_days(
+                    {**loaded, "service_id": service_id},
+                    people,
                 )
                 registry.import_excel_plan(
                     actor_id, service_id, pending["month"],
                     dates=loaded["dates"], tasks=loaded["tasks"],
                     slots=loaded["slots"], days=loaded["days"],
                     served_offsets=offsets,
+                    approved_slot_days=approved_days,
                 )
             year, month = map(int, pending["month"].split("-"))
             await show_excel_schedule(

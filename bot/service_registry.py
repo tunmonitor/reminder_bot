@@ -6257,6 +6257,7 @@ class ServiceRegistry:
         self, actor_id: int, service_id: str, month: str, *,
         dates: list[str], tasks: list[dict], slots: dict, days: dict,
         served_offsets: dict | None = None,
+        approved_slot_days: dict | None = None,
     ) -> dict:
         """«📊 График Excel» → «✅ Подтвердить» (решение 15): график месяца
         из Excel как есть — итоговый график в боте (утверждён, без
@@ -6278,9 +6279,9 @@ class ServiceRegistry:
                 "last_served_json, note, edited, approved_json, approved_by, "
                 "approved_at, chat_id, message_id, republish, days_json, "
                 "approved_days_json, served_offsets_json, approved_tasks_json, "
-                "updated_at) "
+                "approved_slot_days_json, updated_at) "
                 "VALUES (?, ?, NULL, 'excel', ?, ?, ?, '{}', NULL, 0, ?, ?, ?, "
-                "NULL, NULL, 0, ?, ?, ?, ?, ?) "
+                "NULL, NULL, 0, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id, month) DO UPDATE SET run_id = NULL, "
                 "source = 'excel', dates_json = excluded.dates_json, "
                 "tasks_json = excluded.tasks_json, "
@@ -6295,12 +6296,15 @@ class ServiceRegistry:
                 "approved_days_json = excluded.approved_days_json, "
                 "served_offsets_json = excluded.served_offsets_json, "
                 "approved_tasks_json = excluded.approved_tasks_json, "
+                "approved_slot_days_json = excluded.approved_slot_days_json, "
                 "updated_at = excluded.updated_at",
                 (
                     service_id, month, values[0], values[1], values[2],
                     values[2], actor_id, now, values[3], values[3],
                     json.dumps(served_offsets or {}, ensure_ascii=False),
-                    values[1], now,
+                    values[1],
+                    json.dumps(approved_slot_days or {}, ensure_ascii=False),
+                    now,
                 ),
             )
             self._audit(
