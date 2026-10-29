@@ -1001,10 +1001,9 @@ def _columns(registry, service_id: str) -> list[ScheduleColumn]:
 def task_moments(plan: dict, by_key: dict, day: str,
                  task: str) -> list[tuple[date, str]]:
     """Люди задачи на дату и фактический день каждого для Excel: у задачи
-    со своим днём — день задачи или разовый день человека, иначе
+    со своим или сохранённым днём — фактический день задачи, иначе
     воскресенье графика."""
     sunday = date.fromisoformat(day)
-    own = task in task_days(plan)
     return [
         (
             sunday + timedelta(
@@ -1012,7 +1011,7 @@ def task_moments(plan: dict, by_key: dict, day: str,
                 days=slot_offset(
                     plan, by_key.get(key) or {"key": key}, day, task
                 ) or 0
-            ) if own else sunday,
+            ),
             key,
         )
         for key in plan["slots"].get(day, {}).get(task, [])

@@ -1096,6 +1096,7 @@ class SchedulePlanTest(unittest.TestCase):
             "\n    🧰 сборка: —\n\n🗓 Неделя 02.11–08.11\n"
             "  сб 07.11", published
         )
+
         # Заголовок — свой шаблон из «📝 Тексты».
         self.registry.set_readiness_settings(
             1001, "sound",
@@ -1143,6 +1144,41 @@ class SchedulePlanTest(unittest.TestCase):
         self.assertFalse(self.registry.get_schedule_plan("sound", "2026-11")["dirty"])
         self.registry.set_service_member_day(1001, "sound", "Борис", 0)
         self.assertTrue(self.registry.get_schedule_plan("sound", "2026-11")["dirty"])
+
+    def test_saved_fallback_day_matches_reminder_and_excel_dates(self):
+        self.registry.set_readiness_settings(
+            1001, "sound", day_from=-1, day_to=1
+        )
+        plan = self.draft()
+        plan["slots"]["2026-11-01"] = {
+            "звук": ["Алексей"], "сборка": [],
+        }
+        moment, key = schedule_plan.task_moments(
+            plan, {}, "2026-11-01", "звук"
+        )[0]
+        self.assertEqual((moment, key), (date(2026, 10, 31), "Алексей"))
+
+        approved = {
+            **plan,
+            "approved": plan["slots"],
+            "approved_tasks": plan["tasks"],
+            "approved_days": {},
+        }
+        events = schedule_plan.plan_events(approved, self.people())
+        self.assertEqual(
+            [
+                (event.event_date, assignment.name)
+                for event in events for assignment in event.assignments
+                if event.event_date == date(2026, 10, 31)
+            ],
+            [(date(2026, 10, 31), "Алексей")],
+        )
+        self.assertIn(
+            "⚠️ сб 31.10 звук — Алексей: это лист «ОКТЯБРЬ26»",
+            schedule_plan.excel_text(
+                self.registry, self.service(), plan, self.people()
+            ),
+        )
 
     def test_task_day_shows_plan_by_weeks(self):
         plan = self.draft()

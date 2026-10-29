@@ -840,7 +840,7 @@ def _build_plan(data: PlanInput) -> Plan:
             ))
             and (
                 required_pass
-                or _gap_penalty(last.get(person), event_date)
+                or _gap_penalty(data.last_served.get(person), event_date)
                 < BACK_TO_BACK_WEIGHT
             )
         )

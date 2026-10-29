@@ -212,6 +212,17 @@ class SchedulePlannerTest(unittest.TestCase):
             plan.slots[(dates[0], "звук")], plan.slots[(dates[1], "звук")]
         )
 
+    def test_extra_seat_can_use_person_serving_later_in_month(self):
+        first, later = SUNDAYS[0], SUNDAYS[3]
+        plan = build_plan(plan_input(
+            {"А": {first}, "Б": {first, later}},
+            {"А": {"звук"}, "Б": {"звук"}},
+            needed={"звук": 1}, extra={"звук": 1},
+            dates=(first, later),
+        ))
+        self.assertEqual(len(plan.slots[(first, "звук")]), 2)
+        self.assertEqual(plan.slots[(later, "звук")], ["Б"])
+
     def test_month_max_is_soft_when_coverage_needs_it(self):
         # Желательный максимум распределяет места, но не блокирует
         # обязательные назначения, когда других кандидатов нет.
