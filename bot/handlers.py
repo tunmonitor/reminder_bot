@@ -368,7 +368,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     ] = {}
     pending_contact_navigation: dict[str, tuple[int, str, str]] = {}
     pending_notify_task_choices: dict[str, tuple[int, str, str | None]] = {}
-    pending_dialog_pages: dict[str, tuple[int, str, InlineKeyboardMarkup, int]] = {}
+    pending_dialog_pages: dict[
+        str, tuple[int, str, InlineKeyboardMarkup, int, int, bool, int]
+    ] = {}
     # Клавиатура навигации: shown, helpers (подсказки), back и screen
     # (кнопка «⬅️ …» и ID последнего экрана).
     nav_state: dict[int, dict[str, Any]] = {}
@@ -784,7 +786,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         token = secrets.token_urlsafe(8)
                         if actor_id is not None:
                             pending_dialog_pages[token] = (
-                                actor_id, text, markup, next_page
+                                actor_id, text, markup, next_page,
+                                keyboard_limit, keep_rows, text_limit,
                             )
                         navigation.append(
                             InlineKeyboardButton(
@@ -940,13 +943,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if page_state is None or page_state[0] != callback.from_user.id:
             await _answer_callback(callback, "Выбор устарел")
             return
-        _, text, markup, page = page_state
+        _, text, markup, page, keyboard_limit, keep_rows, text_limit = page_state
         await clean_previous_menu(callback.message, debug)
         await _send_dialog(
             callback.message,
             text,
             reply_markup=markup,
             _dialog_page=page,
+            _dialog_keyboard_limit=keyboard_limit,
+            _dialog_keep_rows=keep_rows,
+            _dialog_text_limit=text_limit,
             clean_previous=False,
         )
         await _answer_callback(callback)
@@ -11734,17 +11740,19 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             replace_button("✅ Назначить", pending, "confirm"),
             replace_button("⬅️ Назад", pending, "candidates"),
         ]]
-        await _send_dialog(
+        rows.append(replace_bottom(pending))
+        await send_replace_screen(
             message,
-            f"🔁 Подтвердите замену\n"
+            f"🔁 Замены · {pending['label']}\n\n"
+            f"{replace_month_text(pending)}\n\n"
+            f"Подтвердите замену\n"
             f"🗓 {pending['event'].event_date:%d.%m.%Y} · "
             f"«{pending['task']}»\n"
             f"{pending['old_name']} → "
             f"{person_label(substitute['name'], substitute.get('username'))}\n"
             "ℹ️ Замена действует только на эту дату и главнее графика. Чат "
             "служения, админы и заменяющий получат сообщение.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-            parse_mode=None,
+            rows,
         )
 
     async def ask_replace_telegram_user(message: Message, actor_id: int, pending: dict) -> None:
@@ -11768,15 +11776,21 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     ),
                 )],
                 [KeyboardButton(text=CONTACT_BACK_TEXT)],
+                [
+                    KeyboardButton(text="⬅️ К неделе"),
+                    KeyboardButton(text="📅 К графику"),
+                ],
             ],
             resize_keyboard=True,
             one_time_keyboard=True,
         )
         await _send_dialog(
             message,
+            f"🔁 Замены · {pending['label']}\n\n"
+            f"{replace_month_text(pending)}\n\n"
             f"Нажмите кнопку и выберите, кто заменит {pending['old_name']} "
             f"(«{pending['task']}»). «{CONTACT_BACK_TEXT}» — вернуться к "
-            "списку.",
+            "списку заменяющих.",
             reply_markup=keyboard,
             parse_mode=None,
         )
@@ -12671,16 +12685,23 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if pending is None:
             return
         if pending.get("operation") == "service_replace":
-            if (
-                message.text == CONTACT_BACK_TEXT
-                and pending.get("step") == "await_user"
-            ):
-                await message.answer(
-                    "Выбор отменён.", reply_markup=ReplyKeyboardRemove()
-                )
-                await show_replace_candidates(
-                    message, message.from_user.id, pending
-                )
+            if pending.get("step") == "await_user":
+                if message.text == "⬅️ К неделе":
+                    await message.answer(
+                        "Выбор отменён.", reply_markup=ReplyKeyboardRemove()
+                    )
+                    await show_replace_week(message, pending)
+                elif message.text == "📅 К графику":
+                    service_id = pending["service_id"]
+                    await clean_and_clear_pending_actor(message.from_user.id)
+                    await show_readiness(message, service_id)
+                elif message.text == CONTACT_BACK_TEXT:
+                    await message.answer(
+                        "Выбор отменён.", reply_markup=ReplyKeyboardRemove()
+                    )
+                    await show_replace_candidates(
+                        message, message.from_user.id, pending
+                    )
             return
         if pending.get("operation") == "readiness_plan":
             if pending.get("step") == "plan_user":
