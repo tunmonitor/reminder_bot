@@ -97,6 +97,7 @@ from .service_registry import (
 )
 from .scheduler import (
     periods_overlap,
+    reminder_day_offset,
     reminder_occurrence,
     reminder_period_status,
 )
@@ -367,7 +368,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     ] = {}
     pending_contact_navigation: dict[str, tuple[int, str, str]] = {}
     pending_notify_task_choices: dict[str, tuple[int, str, str | None]] = {}
-    pending_dialog_pages: dict[str, tuple[int, str, InlineKeyboardMarkup, int]] = {}
+    pending_dialog_pages: dict[
+        str, tuple[int, str, InlineKeyboardMarkup, int, int, bool, int]
+    ] = {}
     # Клавиатура навигации: shown, helpers (подсказки), back и screen
     # (кнопка «⬅️ …» и ID последнего экрана).
     nav_state: dict[int, dict[str, Any]] = {}
@@ -754,7 +757,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 pinned_buttons = [
                     button
                     for button in buttons
-                    if button.text.startswith(("⬅️ К ", "↩️ К "))
+                    if button.text.startswith((
+                        "⬅️ К ", "↩️ К ", "📅 К графику",
+                        "👤 Выбрать пользователя Telegram",
+                    ))
                 ]
                 pageable_buttons = [
                     button for button in buttons
@@ -780,7 +786,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         token = secrets.token_urlsafe(8)
                         if actor_id is not None:
                             pending_dialog_pages[token] = (
-                                actor_id, text, markup, next_page
+                                actor_id, text, markup, next_page,
+                                keyboard_limit, keep_rows, text_limit,
                             )
                         navigation.append(
                             InlineKeyboardButton(
@@ -804,9 +811,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         None,
                     ),
                 )
-                rows = layout_buttons([*page_buttons, *pinned_buttons])
+                # Листание — над «⬅️ К …» (решение 17, 5в): выход с экрана
+                # всегда последний.
+                rows = layout_buttons(page_buttons)
                 if navigation:
                     rows.append(navigation)
+                rows += layout_buttons(pinned_buttons) if pinned_buttons else []
                 validate_inline_keyboard(rows, max_buttons=keyboard_limit)
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
                 text = f"{text}\n📊 Страница {_dialog_page + 1}/{page_count}"
@@ -933,13 +943,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if page_state is None or page_state[0] != callback.from_user.id:
             await _answer_callback(callback, "Выбор устарел")
             return
-        _, text, markup, page = page_state
+        _, text, markup, page, keyboard_limit, keep_rows, text_limit = page_state
         await clean_previous_menu(callback.message, debug)
         await _send_dialog(
             callback.message,
             text,
             reply_markup=markup,
             _dialog_page=page,
+            _dialog_keyboard_limit=keyboard_limit,
+            _dialog_keep_rows=keep_rows,
+            _dialog_text_limit=text_limit,
             clean_previous=False,
         )
         await _answer_callback(callback)
@@ -1475,7 +1488,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         items = [
             ("⏰ Напоминания и шаблоны", "edit_notify"),
             ("👥 Ответственные", "service_contact"),
-            ("🔁 Замена", "service_replace"),
             ("📊 График Excel", "service_excel"),
         ]
         rows = [
@@ -1555,11 +1567,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         "👥 Ответственные — список людей служения: Telegram, задачи, свой "
         "день, сколько раз в месяц; «🗓 По датам графика» — кто служит в "
         "ближайшие даты.\n"
-        "🔁 Замена — поставить другого человека на дату.\n"
         "📊 График Excel — загрузить график месяца из Excel в бот (он "
         "становится итоговым) и сверить, кто ещё не привязан.\n"
         "📅 График — опрос готовности и график месяца: составить, править, "
-        "утвердить, тексты.\n"
+        "утвердить, замены, тексты.\n"
         "📋 Задачи служения — задачи, сколько людей нужно, дни задач, "
         "задачи «в одну неделю».\n"
         "⚙️ Настройки — групповой чат и проверка доставки; у "
@@ -2168,6 +2179,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     def member_day_label(offset: int) -> str:
         weekday = schedule_plan.WEEKDAYS[(6 + offset) % 7]
         return f"{weekday} (вс {offset:+d})"
+
+    def reminder_anchor_text(reminder: dict) -> str:
+        """От какого дня считается срок напоминания (решение 17, 5а)."""
+        offset = reminder_day_offset(reminder)
+        if offset:
+            return f"дня задачи — {member_day_label(offset)}"
+        return "воскресенья"
 
     # Лимит служений в месяц (решение 12): готовые диапазоны и «Вручную» —
     # минимум, затем максимум кнопками.
@@ -3239,7 +3257,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         text = (
             f"📝 Напоминание · {service_label(service)}\n\n"
             f"📌 Задача: {task_status}\n"
-            f"📅 Срок: за {reminder['reminder_days']} дн.\n"
+            f"📅 Срок: за {reminder['reminder_days']} дн. до "
+            f"{reminder_anchor_text(reminder)}\n"
             f"🗓 Период: {period_text(reminder, now.date())}\n"
             f"✉️ Отправка: {send_text}\n"
             f"📝 Текст: {body_status}\n"
@@ -3494,7 +3513,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if reminder is None or reminder["service_id"] != service_id:
             raise ValueError("Групповое напоминание больше не существует.")
         today = datetime.now(context.timezone).date()
-        first = today + timedelta(days=(6 - today.weekday()) % 7)
+        # Первое воскресенье, неделя которого ещё идёт: у задачи со своим
+        # днём (вс +5) — до дня задачи.
+        start = today - timedelta(days=reminder_day_offset(reminder))
+        first = start + timedelta(days=(6 - start.weekday()) % 7)
         if pick_until:
             start = max(first, active_from or first)
             choices = [start + timedelta(weeks=week) for week in range(12)]
@@ -4330,6 +4352,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 readiness_button("⏹ Завершить", "finish", service_id, month_arg),
             ])
             rows.append([
+                readiness_button("📋 Предварительный график", "pprev",
+                                 service_id, month_arg),
+            ])
+            rows.append([
                 readiness_button("🔄 Перезапустить", "restart", service_id,
                                  month_arg),
             ])
@@ -4371,7 +4397,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             readiness_button("📅 Свой день", "own", service_id),
             readiness_button("🔢 В месяц", "lim", service_id),
         ])
-        rows.append([readiness_button("📝 Тексты", "texts", service_id)])
+        rows.append([
+            readiness_button("🔁 Замены", "repl", service_id),
+            readiness_button("📝 Тексты", "texts", service_id),
+        ])
         current_key = f"{now.year:04d}-{now.month:02d}"
         current_plan = registry.get_schedule_plan(service_id, current_key)
         if current_plan is not None:
@@ -4685,6 +4714,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     PLAN_ACTIONS = {
         "plan", "precalc", "precalcok", "pedit", "pdate", "ptask", "padd",
         "prem", "pclear", "pok", "pokok", "pfree", "pnew", "pday", "pdset",
+        "pprev",
     }
 
     def plan_month(arg: str | None, now: datetime) -> str | None:
@@ -5245,6 +5275,48 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             else:
                 await show_plan(callback.message, service, run, plan, notice)
             return
+        if action == "pprev":
+            # Пока опрос идёт — каким получится график по текущим ответам
+            # (общая логика); не сохраняется, утвердить — после завершения.
+            await _answer_callback(callback, "⏳ Составляю…")
+            run = registry.get_readiness_run(service_id, key)
+            if run is None or run["status"] != "open":
+                await show_readiness(
+                    callback.message, service_id,
+                    "⚠️ Опрос уже не идёт — откройте «📋 График»",
+                )
+                return
+            plan = await schedule_plan.build_draft(
+                registry, run, loader, debug, save=False,
+            )
+            summary = await asyncio.to_thread(
+                schedule_plan.plan_summary, registry, plan, run
+            )
+            text = schedule_plan.plan_text(
+                service_label(service), plan, summary, context.timezone,
+                schedule_plan.window_of(registry, service_id),
+            ).replace(
+                "📝 Черновик — ещё не утверждён",
+                "⏳ Предварительный — опрос идёт; окончательный составится "
+                "после завершения, тогда его можно поправить и утвердить",
+                1,
+            )
+            await _send_dialog(
+                callback.message, text,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [readiness_button(
+                        "🔄 Обновить", "pprev", service_id,
+                        key.replace("-", ""),
+                    )],
+                    [readiness_button(
+                        "⬅️ К разделу «График»", "open", service_id,
+                    )],
+                ]),
+                _dialog_keep_rows=True,
+                _dialog_text_limit=TELEGRAM_TEXT_LIMIT,
+                parse_mode=None,
+            )
+            return
         run, plan = await load_plan(service_id, key)
         if not plan_current(run, plan):
             await show_readiness(
@@ -5477,9 +5549,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "✅ Утвердить график "
                 f"{service_label(service)} на {month_title(year, month)}?",
                 "",
-                "График уйдёт в чат служения"
-                + (" с пометкой «обновлён» и списком изменений"
-                   if plan["approved"] is not None else "")
+                (
+                    "Закреплённый график в чате служения обновится, под ним "
+                    "— все изменения месяца; новые изменения уйдут ответом "
+                    "на него (с упоминаниями)"
+                    if plan["approved"] is not None
+                    else "График уйдёт в чат служения и закрепится"
+                )
                 + "; вам — блок для переноса в Excel.",
             ]
             problems = schedule_plan.gaps(plan)
@@ -5551,6 +5627,19 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         notice = "❌ Не удалось опубликовать график в чате"
                     else:
                         notice = "✅ График утверждён и опубликован в чате служения"
+                        if not plan.get("pinned", True):
+                            notice += (
+                                "\n⚠️ Закрепить не удалось — сделайте бота "
+                                "администратором чата с правом «Закреплять "
+                                "сообщения»"
+                            )
+                        if plan.get("unsent_notice"):
+                            notice += (
+                                "\n⚠️ Закреплённый график обновлён, но "
+                                "сообщение с изменениями в чат не ушло — "
+                                "перешлите его участникам:\n\n"
+                                + plan["unsent_notice"]
+                            )
                         try:
                             await send_excel_block(actor_id, service, plan)
                         except Exception:  # noqa: BLE001
@@ -5762,6 +5851,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     "заново?\n\nОтветы завершённого опроса будут удалены, "
                     "в чат уйдёт новый опрос."
                 )
+                approved = registry.get_schedule_plan(service_id, key)
+                if approved is not None and approved["approved"] is not None:
+                    question += (
+                        " Утверждённый график месяца отменится: прежний "
+                        "открепится, новый опубликуется после завершения "
+                        "опроса и утверждения."
+                    )
                 await _send_dialog(
                     callback.message,
                     question + " Отвечать придётся заново.",
@@ -5978,6 +6074,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 return
             elif action == "own":
                 await show_own_days(callback.message, actor_id, service_id)
+                await _answer_callback(callback)
+                return
+            elif action == "repl":
+                # Замены (решение 17, 5в) — в разделе «📅 График».
+                await open_replace_dates(callback.message, actor_id, service_id)
                 await _answer_callback(callback)
                 return
             elif action in {"ownp", "owns"}:
@@ -11309,7 +11410,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "username": named.get("username") or person.get("username") or "",
         }
 
-    # --- Экран «🔁 Замена» в карточке служения (этап 3.4) ---
+    # --- Экран «📅 График» → «🔁 Замены» (этап 3.4) ---
 
     def replace_button(text: str, pending: dict, action: str, arg="") -> InlineKeyboardButton:
         return InlineKeyboardButton(
@@ -11337,9 +11438,123 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
         ]
 
+    def replace_weeks(events: list, service_id: str) -> list[dict]:
+        """События окна замен по неделям (воскресенье — правая граница;
+        задача со своим днём — в неделе своего воскресенья), только недели
+        с назначениями."""
+        registry = service_registry()
+        own = {
+            task["name"]: task["day"]
+            for task in registry.plan_tasks(service_id)
+            if task.get("day") is not None
+        }
+        # Событие не в воскресенье (доп. суббота) — в неделю своего
+        # воскресенья, вместе с ним.
+        weeks: dict = {}
+        for block in schedule_plan.week_events(events, own):
+            day = block["date"]
+            sunday = day + timedelta(days=(6 - day.weekday()) % 7)
+            week = weeks.setdefault(sunday, {
+                "date": sunday, "assignments": [], "days": {}, "moments": [],
+            })
+            week["assignments"] += block["assignments"]
+            week["moments"] += block["moments"]
+        return [
+            weeks[sunday] for sunday in sorted(weeks)
+            if week_items(weeks[sunday])
+        ]
+
+    def week_title(block: dict) -> str:
+        """«44 нед. 26.10–01.11» — номер недели по ISO (как в календарях
+        телефонов)."""
+        monday = block["date"] - timedelta(days=6)
+        end = max([block["date"], *block["moments"]])
+        return (
+            f"{monday.isocalendar().week} нед. {monday:%d.%m}–{end:%d.%m}"
+        )
+
+    def week_items(block: dict) -> list[tuple]:
+        """Задачи недели по порядку дней: (день, задача, люди)."""
+        items: dict[tuple, list[str]] = {}
+        for item, moment in zip(block["assignments"], block["moments"]):
+            if item.is_informational or not item.name:
+                continue
+            names = items.setdefault((moment, item.task), [])
+            if item.name not in names:
+                names.append(item.name)
+        return [
+            (day, task, names)
+            for (day, task), names in sorted(
+                items.items(), key=lambda entry: entry[0][0]
+            )
+        ]
+
+    def replace_month_text(pending: dict) -> str:
+        """Текущий график месяца выбранной недели (решение 17, 5в): все
+        задачи и назначения с заменами, выбранная неделя — ▶️."""
+        registry = service_registry()
+        sunday = pending["week"]["date"]
+        plan = registry.get_schedule_plan(
+            pending["service_id"], f"{sunday:%Y-%m}"
+        )
+        source = (
+            "утверждённый" if plan is not None and plan["approved"] is not None
+            else "из Excel"
+        )
+        lines = [
+            f"📋 График на {month_title(sunday.year, sunday.month)} "
+            f"({source}, с заменами):"
+        ]
+        for block in pending.get("month_weeks") or pending["weeks"]:
+            if (block["date"].year, block["date"].month) != (
+                sunday.year, sunday.month
+            ):
+                continue
+            mark = "▶️" if block["date"] == sunday else "🗓"
+            lines.append(f"{mark} {week_title(block)}")
+            by_day: dict = {}
+            for day, task, names in week_items(block):
+                by_day.setdefault(day, []).append(
+                    f"{task_emoji(task)} {task}: {', '.join(names)}"
+                )
+            lines += [
+                f"   {_WEEKDAYS[day.weekday()]} {day:%d.%m} — "
+                + "; ".join(parts)
+                for day, parts in by_day.items()
+            ]
+        return "\n".join(lines)
+
+    def replace_bottom(pending: dict, back: str = "week") -> list:
+        """Нижний ряд экранов замены: к неделе (к неделям) и к графику."""
+        return [
+            replace_button(
+                "⬅️ К неделе" if back == "week" else "⬅️ К неделям",
+                pending, "weekback" if back == "week" else "dates",
+            ),
+            replace_button("📅 К графику", pending, "graph"),
+        ]
+
+    async def send_replace_screen(message: Message, text: str,
+                                  rows: list, *, paged: bool = False) -> None:
+        """paged — длинный список (заменяющие): листание по страницам,
+        «⬅️ К …» и «📅 К графику» на каждой странице внизу."""
+        await _send_dialog(
+            message, text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keep_rows=not paged,
+            _dialog_keyboard_limit=(
+                12 if paged else sum(len(row) for row in rows)
+            ),
+            _dialog_text_limit=TELEGRAM_TEXT_LIMIT,
+            parse_mode=None,
+        )
+
     async def open_replace_dates(
-        message: Message, actor_id: int, service_id: str, notice: str = ""
+        message: Message, actor_id: int, service_id: str, notice: str = "",
+        week: date | None = None,
     ) -> None:
+        """«📅 График» → «🔁 Замены»: недели текущего и следующего месяца
+        (решение 17, 5в). week — сразу открыть неделю (после замены)."""
         registry = service_registry()
         service = service_by_id(registry, service_id) if registry else None
         loader = getattr(context, "load_upcoming_service_events", None)
@@ -11347,97 +11562,115 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await _send_dialog(message, "Замена сейчас недоступна.", parse_mode=None)
             return
         await clean_and_clear_pending_actor(actor_id)
+        today = datetime.now(context.timezone).date()
         try:
-            events = replace_events_window(
-                await loader(until=replace_window_end()), service_id
+            # С начала месяца — для графика над кнопками (прошедшие недели
+            # и задачи месяца тоже); кнопки замены — только с сегодня.
+            # Понедельник недели 1-го числа: первая неделя месяца целиком.
+            month_start = today.replace(day=1)
+            month_start -= timedelta(days=month_start.weekday())
+            loaded = await loader(
+                since=month_start, until=replace_window_end(),
             )
+            events = replace_events_window(loaded, service_id)
+            month_events = [
+                event for event in loaded
+                if event.service_id == service_id
+                and month_start <= event.event_date <= replace_window_end()
+            ]
         except (OSError, RuntimeError, ValueError, sqlite3.Error):
             debug.exception("Не удалось загрузить график для замены")
             events = None
+            month_events = []
         pending = {
             "operation": "service_replace",
             "service_id": service_id,
             "session_id": secrets.token_urlsafe(9),
             "step": "replace_date",
             "events": events or [],
+            "weeks": replace_weeks(events or [], service_id),
+            "month_weeks": replace_weeks(month_events, service_id),
+            "label": service_label(service),
         }
         pending_inputs[actor_id] = pending
-        back = [replace_button("⬅️ К карточке служения", pending, "card")]
-        title = f"🔁 Замена · {service_label(service)}"
+        chosen = next(
+            (block for block in pending["weeks"] if block["date"] == week),
+            None,
+        )
+        if chosen is not None:
+            pending["week"] = chosen
+            await show_replace_week(message, pending, notice)
+            return
+        title = f"🔁 Замены · {pending['label']}"
         if events is None:
             text = f"{title}\n⚠️ Не удалось загрузить график. Попробуйте позже."
-        elif not events:
+        elif not pending["weeks"]:
             text = (
-                f"{title}\n⚪ В этом и следующем месяце событий с "
-                "ответственными в графике нет."
+                f"{title}\n⚪ В этом и следующем месяце назначений в графике "
+                "нет."
             )
         else:
             text = (
                 f"{title}\n{notice + chr(10) if notice else ''}"
-                "ℹ️ Выберите дату — замена действует только на неё."
+                "ℹ️ Выберите неделю, затем задачу — замена действует только "
+                "на её дату."
             )
         rows = [
-            [replace_button(
-                f"🗓 {event.event_date:%d.%m}, "
-                f"{_WEEKDAYS[event.event_date.weekday()]}",
-                pending, "date", index,
-            )]
-            for index, event in enumerate(events or [])
+            [replace_button(f"🗓 {week_title(block)}", pending, "week", index)]
+            for index, block in enumerate(pending["weeks"])
         ]
-        await _send_dialog(
-            message, text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[*rows, back]),
-            parse_mode=None,
-        )
+        rows.append([replace_button("📅 К графику", pending, "graph")])
+        await send_replace_screen(message, text, rows)
 
-    def replace_people(event) -> dict[str, list[str]]:
-        """{имя: [задачи]} на дату (без информационных задач)."""
-        people: dict[str, list[str]] = {}
-        for item in event.assignments:
-            if item.name and not item.is_informational:
-                tasks = people.setdefault(item.name, [])
-                if item.task not in tasks:
-                    tasks.append(item.task)
-        return people
+    async def show_replace_week(message: Message, pending: dict,
+                                notice: str = "") -> None:
+        """Неделя: все её задачи с датами и людьми, выбор задачи."""
+        items = week_items(pending["week"])
+        pending["items"] = items
+        pending["step"] = "replace_week"
+        for key in ("event", "task", "old_name", "task_people", "substitute"):
+            pending.pop(key, None)
+        lines = [
+            f"🔁 Замены · {pending['label']}",
+            *([notice] if notice else []),
+            "",
+            replace_month_text(pending),
+            "",
+            f"Неделя {week_title(pending['week'])}:",
+            *(
+                f"   {task_emoji(task)} {task} — {day:%d.%m} — "
+                + ", ".join(names)
+                for day, task, names in items
+            ),
+            "",
+            "ℹ️ Выберите задачу.",
+        ]
+        rows = [
+            [replace_button(
+                f"{task_emoji(task)} {task} · {_WEEKDAYS[day.weekday()]} "
+                f"{day:%d.%m}"[:60],
+                pending, "item", index,
+            )]
+            for index, (day, task, _names) in enumerate(items)
+        ]
+        rows.append(replace_bottom(pending, back="weeks"))
+        await send_replace_screen(message, "\n".join(lines), rows)
 
-    async def show_replace_people(message: Message, pending: dict) -> None:
-        event = pending["event"]
-        people = replace_people(event)
-        pending["people"] = list(people)
+    async def show_replace_task_people(message: Message, pending: dict) -> None:
+        """В задаче несколько человек — кого заменить."""
         pending["step"] = "replace_person"
         rows = [
-            [replace_button(
-                f"👤 {name} · " + (
-                    tasks[0] if len(tasks) == 1 else f"{len(tasks)} задачи"
-                ),
-                pending, "person", index,
-            )]
-            for index, (name, tasks) in enumerate(people.items())
+            [replace_button(f"👤 {name}", pending, "person", index)]
+            for index, name in enumerate(pending["task_people"])
         ]
-        rows.append([replace_button("⬅️ К датам", pending, "dates")])
-        await _send_dialog(
+        rows.append(replace_bottom(pending))
+        await send_replace_screen(
             message,
-            f"🔁 Замена · {event.event_date:%d.%m.%Y}\n"
+            f"🔁 Замены · {pending['label']}\n\n"
+            f"{replace_month_text(pending)}\n\n"
+            f"«{pending['task']}» · {pending['event'].event_date:%d.%m.%Y}\n"
             "ℹ️ Кого нужно заменить?",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-            parse_mode=None,
-        )
-
-    async def show_replace_tasks(message: Message, pending: dict) -> None:
-        tasks = replace_people(pending["event"])[pending["old_name"]]
-        pending["tasks"] = tasks
-        pending["step"] = "replace_task"
-        rows = [
-            [replace_button(f"{task_emoji(task)} {task}", pending, "task", index)]
-            for index, task in enumerate(tasks)
-        ]
-        rows.append([replace_button("⬅️ К людям", pending, "people")])
-        await _send_dialog(
-            message,
-            f"🔁 Замена · {pending['event'].event_date:%d.%m.%Y}\n"
-            f"ℹ️ У {pending['old_name']} несколько задач. В какой нужна замена?",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-            parse_mode=None,
+            rows,
         )
 
     def replace_candidates(registry, pending: dict) -> list[dict]:
@@ -11481,14 +11714,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             for index, item in enumerate(candidates)
         ]
         rows.append([replace_button("👤 Выбрать пользователя Telegram", pending, "tg")])
-        back_label = (
-            "⬅️ К задачам"
-            if len(replace_people(pending["event"]).get(pending["old_name"], [])) > 1
-            else "⬅️ К людям"
-        )
-        rows.append([replace_button(back_label, pending, "back_person")])
+        if len(pending.get("task_people", [])) > 1:
+            rows.append([replace_button("⬅️ К людям", pending, "people")])
+        rows.append(replace_bottom(pending))
         text = (
-            f"🔁 Замена · «{pending['task']}» · "
+            f"🔁 Замены · {pending['label']}\n\n"
+            f"{replace_month_text(pending)}\n\n"
+            f"«{pending['task']}» · "
             f"{pending['event'].event_date:%d.%m.%Y}\n"
             f"Вместо: {pending['old_name']}\n"
             + (
@@ -11499,11 +11731,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "выберите пользователя Telegram."
             )
         )
-        await _send_dialog(
-            message, text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-            parse_mode=None,
-        )
+        await send_replace_screen(message, text, rows, paged=len(rows) > 10)
 
     async def show_replace_confirm(message: Message, pending: dict) -> None:
         pending["step"] = "replace_confirm"
@@ -11512,17 +11740,19 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             replace_button("✅ Назначить", pending, "confirm"),
             replace_button("⬅️ Назад", pending, "candidates"),
         ]]
-        await _send_dialog(
+        rows.append(replace_bottom(pending))
+        await send_replace_screen(
             message,
-            f"🔁 Подтвердите замену\n"
+            f"🔁 Замены · {pending['label']}\n\n"
+            f"{replace_month_text(pending)}\n\n"
+            f"Подтвердите замену\n"
             f"🗓 {pending['event'].event_date:%d.%m.%Y} · "
             f"«{pending['task']}»\n"
             f"{pending['old_name']} → "
             f"{person_label(substitute['name'], substitute.get('username'))}\n"
             "ℹ️ Замена действует только на эту дату и главнее графика. Чат "
             "служения, админы и заменяющий получат сообщение.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-            parse_mode=None,
+            rows,
         )
 
     async def ask_replace_telegram_user(message: Message, actor_id: int, pending: dict) -> None:
@@ -11546,15 +11776,21 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     ),
                 )],
                 [KeyboardButton(text=CONTACT_BACK_TEXT)],
+                [
+                    KeyboardButton(text="⬅️ К неделе"),
+                    KeyboardButton(text="📅 К графику"),
+                ],
             ],
             resize_keyboard=True,
             one_time_keyboard=True,
         )
         await _send_dialog(
             message,
+            f"🔁 Замены · {pending['label']}\n\n"
+            f"{replace_month_text(pending)}\n\n"
             f"Нажмите кнопку и выберите, кто заменит {pending['old_name']} "
             f"(«{pending['task']}»). «{CONTACT_BACK_TEXT}» — вернуться к "
-            "списку.",
+            "списку заменяющих.",
             reply_markup=keyboard,
             parse_mode=None,
         )
@@ -11570,7 +11806,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("old_name") != share[4]
         ):
             await _send_dialog(
-                message, "Выбор устарел. Откройте «🔁 Замена» заново.",
+                message, "Выбор устарел. Откройте «🔁 Замены» заново.",
                 parse_mode=None, reply_markup=ReplyKeyboardRemove(),
             )
             return
@@ -11623,7 +11859,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or pending.get("operation") != "service_replace"
             or pending.get("session_id") != parts[1]
         ):
-            await _answer_callback(callback, "⚠️ Экран устарел. Откройте «🔁 Замена» заново.")
+            await _answer_callback(callback, "⚠️ Экран устарел. Откройте «🔁 Замены» заново.")
             return
         _, _, action, arg = parts
         service_id = pending["service_id"]
@@ -11639,47 +11875,50 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 return None
 
         message = callback.message
-        if action == "card":
-            service = service_by_id(registry, service_id)
+        if action in {"graph", "card"}:
+            # «📅 К графику» — раздел «📅 График» (замены теперь там).
             await clean_and_clear_pending_actor(actor_id)
-            if service is not None:
-                await send_service_card(message, actor_id, service)
+            await show_readiness(message, service_id)
         elif action == "dates":
             await open_replace_dates(message, actor_id, service_id)
-        elif action == "date":
-            event = pick(pending["events"], arg)
-            if event is None:
-                await _answer_callback(callback, "⚠️ Дата устарела.")
+        elif action == "week":
+            block = pick(pending.get("weeks", []), arg)
+            if block is None:
+                await _answer_callback(callback, "⚠️ Неделя устарела.")
                 return
-            pending["event"] = event
-            await show_replace_people(message, pending)
-        elif action in {"person", "people"} and "event" in pending:
-            if action == "people":
-                await show_replace_people(message, pending)
-            else:
-                name = pick(pending.get("people", []), arg)
-                if name is None:
-                    await _answer_callback(callback, "⚠️ Выбор устарел.")
-                    return
-                pending["old_name"] = name
-                tasks = replace_people(pending["event"])[name]
-                if len(tasks) == 1:
-                    pending["task"] = tasks[0]
-                    await show_replace_candidates(message, actor_id, pending)
-                else:
-                    await show_replace_tasks(message, pending)
-        elif action == "task" and "old_name" in pending:
-            task = pick(pending.get("tasks", []), arg)
-            if task is None:
+            pending["week"] = block
+            await show_replace_week(message, pending)
+        elif action == "weekback" and "week" in pending:
+            await show_replace_week(message, pending)
+        elif action == "item" and "week" in pending:
+            item = pick(pending.get("items", []), arg)
+            event = item and next(
+                (
+                    event for event in pending["events"]
+                    if event.event_date == item[0]
+                ),
+                None,
+            )
+            if event is None:
                 await _answer_callback(callback, "⚠️ Выбор устарел.")
                 return
-            pending["task"] = task
-            await show_replace_candidates(message, actor_id, pending)
-        elif action == "back_person" and "event" in pending:
-            if len(replace_people(pending["event"]).get(pending.get("old_name"), [])) > 1:
-                await show_replace_tasks(message, pending)
+            pending["event"] = event
+            pending["task"] = item[1]
+            pending["task_people"] = list(item[2])
+            if len(item[2]) == 1:
+                pending["old_name"] = item[2][0]
+                await show_replace_candidates(message, actor_id, pending)
             else:
-                await show_replace_people(message, pending)
+                await show_replace_task_people(message, pending)
+        elif action == "people" and "task" in pending:
+            await show_replace_task_people(message, pending)
+        elif action == "person" and "task" in pending:
+            name = pick(pending.get("task_people", []), arg)
+            if name is None:
+                await _answer_callback(callback, "⚠️ Выбор устарел.")
+                return
+            pending["old_name"] = name
+            await show_replace_candidates(message, actor_id, pending)
         elif action == "candidates" and "task" in pending:
             await show_replace_candidates(message, actor_id, pending)
         elif action == "pick" and "task" in pending:
@@ -11712,7 +11951,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 f"{pending['old_name']}."
                 if done else "ℹ️ Эту замену уже назначили."
             )
-            await open_replace_dates(message, actor_id, service_id, notice)
+            await open_replace_dates(
+                message, actor_id, service_id, notice,
+                week=pending["week"]["date"] if "week" in pending else None,
+            )
         else:
             await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
             return
@@ -11832,7 +12074,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     list(dict.fromkeys(item.name for item in matched)),
                 )
                 # Без даты — ближайшая дата с одним ответственным; если
-                # таких нет, первая (с подсказкой выбрать в «🔁 Замена»).
+                # таких нет, первая (с подсказкой выбрать в «🔁 Замены»).
                 first_any.setdefault(event.service_id, target)
                 if len(target[3]) == 1 and event.service_id not in nearest:
                     nearest[event.service_id] = target
@@ -11867,15 +12109,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await reply(
                 f"ℹ️ Задача «{task_text}» есть в нескольких местах: {choices}. "
                 "Ответьте командой на нужный опрос, укажите дату или "
-                "откройте «🔁 Замена» в карточке служения."
+                "откройте «📅 График» → «🔁 Замены»."
             )
             return
         service_id, target_date, task, names = allowed[0]
         if len(names) != 1:
             await reply(
                 f"ℹ️ В задаче «{task}» {target_date:%d.%m} несколько человек: "
-                f"{', '.join(names)}. Выберите, кого заменить, в «🔁 Замена» "
-                "в карточке служения."
+                f"{', '.join(names)}. Выберите, кого заменить, в «📅 График» "
+                "→ «🔁 Замены»."
             )
             return
         substitute = substitute_by_username(registry, service_id, task, username)
@@ -11883,7 +12125,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await reply(
                 f"❌ @{username} не найден в составе служения. Сначала "
                 "привяжите человека к Telegram (/service_contact) или "
-                "выберите его в «🔁 Замена»."
+                "выберите его в «📅 График» → «🔁 Замены»."
             )
             return
         if substitute["name"] == names[0]:
@@ -12443,16 +12685,23 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if pending is None:
             return
         if pending.get("operation") == "service_replace":
-            if (
-                message.text == CONTACT_BACK_TEXT
-                and pending.get("step") == "await_user"
-            ):
-                await message.answer(
-                    "Выбор отменён.", reply_markup=ReplyKeyboardRemove()
-                )
-                await show_replace_candidates(
-                    message, message.from_user.id, pending
-                )
+            if pending.get("step") == "await_user":
+                if message.text == "⬅️ К неделе":
+                    await message.answer(
+                        "Выбор отменён.", reply_markup=ReplyKeyboardRemove()
+                    )
+                    await show_replace_week(message, pending)
+                elif message.text == "📅 К графику":
+                    service_id = pending["service_id"]
+                    await clean_and_clear_pending_actor(message.from_user.id)
+                    await show_readiness(message, service_id)
+                elif message.text == CONTACT_BACK_TEXT:
+                    await message.answer(
+                        "Выбор отменён.", reply_markup=ReplyKeyboardRemove()
+                    )
+                    await show_replace_candidates(
+                        message, message.from_user.id, pending
+                    )
             return
         if pending.get("operation") == "readiness_plan":
             if pending.get("step") == "plan_user":

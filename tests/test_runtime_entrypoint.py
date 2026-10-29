@@ -21,6 +21,13 @@ def group_sends(bot):
     ]
 
 
+# Процессы бота проверяются через /proc — он есть только в Linux (бот
+# работает на Raspberry Pi); на macOS эти тесты пропускаются.
+NEEDS_PROC = unittest.skipUnless(
+    Path("/proc/self/stat").exists(), "нужен /proc (Linux)"
+)
+
+
 class ReminderBotEntrypointTest(unittest.TestCase):
     def test_webapp_menu_button_uses_configured_https_url(self):
         from bot.app import _configure_webapp_menu
@@ -1566,6 +1573,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 )
                 self.assertIsNone(sent_assignments["Ведущий"]["tg_id"])
 
+    @NEEDS_PROC
     def test_existing_pid_file_stops_startup_with_clear_error(self):
         from bot import app
 
@@ -1655,6 +1663,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 ("999999999", False),
             )
 
+    @NEEDS_PROC
     def test_existing_pid_file_status_detects_live_process(self):
         from bot.app import _current_process_starttime, _existing_pid_process_status
 
@@ -1671,6 +1680,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 (str(os.getpid()), True),
             )
 
+    @NEEDS_PROC
     def test_shutdown_runs_once_after_polling_stops(self):
         from bot import app
 
@@ -1804,6 +1814,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
         self.assertEqual([call.args[0] for call in schedule.call_args_list], ["a", "b"])
         logger.exception.assert_called_once()
 
+    @NEEDS_PROC
     def test_command_menu_sync_does_not_block_startup(self):
         """Без DNS обновление меню висит, но PID-файл и опрос уже работают."""
         from bot import app
@@ -1890,6 +1901,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
 
         asyncio.run(run_bot())
 
+    @NEEDS_PROC
     def test_write_pid_creates_private_file(self):
         from bot.app import _current_process_starttime, _write_pid
 

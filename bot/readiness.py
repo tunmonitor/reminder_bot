@@ -642,6 +642,20 @@ async def launch_run(
         _LAUNCHING[0] -= 1
     # Опрос записан — ранние голоса учитываются; сбой здесь опрос не отменяет.
     await replay_early_answers(registry, poll_message.poll.id, logger)
+    # Новый опрос отменяет утверждённый график месяца: прежний снимается
+    # с закрепа (новый при утверждении заменит его).
+    try:
+        previous = registry.cancel_schedule_approval(service["id"], key)
+    except Exception:  # noqa: BLE001 — опрос уже в чате
+        logger.exception("Утверждённый график не отменён")
+        previous = None
+    if previous and previous["chat_id"] and previous["message_ids"]:
+        try:
+            await bot.unpin_chat_message(
+                previous["chat_id"], message_id=previous["message_ids"][0],
+            )
+        except Exception:  # noqa: BLE001
+            logger.info("Прежний график не откреплён", exc_info=True)
     return attached
 
 

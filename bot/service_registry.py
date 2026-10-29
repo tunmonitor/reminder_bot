@@ -16,7 +16,7 @@ from dataclasses import replace
 from typing import Callable
 
 from .presentation import is_replaced
-from .scheduler import periods_overlap
+from .scheduler import periods_overlap, reminder_day_offset
 from .secure_fs import open_private_directory
 from .services import (
     SERVICES,
@@ -130,6 +130,17 @@ DEFAULT_TASK_TEMPLATE = (
     "{task}: {task_responsibles}"
 )
 _UNSET = object()
+# Напоминание служения и свой день его задачи (task_day: спевка — вс −4;
+# NULL — отсчёт от воскресенья).
+_GROUP_REMINDER_COLUMNS = (
+    "g.id, g.service_id, g.body, g.reminder_days, g.reminder_time, "
+    "g.enabled, g.created_at, g.task, g.active_from, g.active_until, "
+    "t.day_offset AS task_day"
+)
+_GROUP_REMINDER_SOURCE = (
+    "group_reminders g LEFT JOIN service_tasks t "
+    "ON t.service_id = g.service_id AND t.name = g.task"
+)
 # Своих личных напоминаний человека в одном служении.
 USER_REMINDERS_PER_SERVICE = 10
 USER_REMINDER_BODY_LIMIT = 3000
@@ -170,6 +181,12 @@ def validate_notification_template(
         if str(exc).startswith(f"{label}:"):
             raise
         raise ValueError(f"{label}: некорректный синтаксис шаблона.") from exc
+
+
+def plan_target_thread(plan: dict) -> int | None:
+    """Выбранная тема публикации графика; записи без неё — фактическая."""
+    target = plan.get("target_thread_id")
+    return target if target is not None else plan.get("thread_id")
 
 
 class ServiceRegistry:
@@ -380,6 +397,16 @@ class ServiceRegistry:
                     -- Задачи (с днями) опубликованной копии: напоминания
                     -- по утверждённому, а не по правкам рабочей копии.
                     approved_tasks_json TEXT,
+                    -- Закреплённая публикация в чате: id всех её частей
+                    -- (правится при обновлении) и график первой публикации
+                    -- ({"slots", "days"}) — изменения под графиком от него.
+                    message_ids_json TEXT,
+                    baseline_json TEXT,
+                    -- Тема чата публикации: где сообщение на самом деле
+                    -- (закрытая тема — в общей) и какую выбрали (/here):
+                    -- выбранная сменилась — новая публикация.
+                    thread_id INTEGER,
+                    target_thread_id INTEGER,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (service_id, month)
                 );
@@ -900,6 +927,10 @@ class ServiceRegistry:
                 ("schedule_plans", "approved_days_json", "TEXT"),
                 ("schedule_plans", "served_offsets_json", "TEXT"),
                 ("schedule_plans", "approved_tasks_json", "TEXT"),
+                ("schedule_plans", "message_ids_json", "TEXT"),
+                ("schedule_plans", "baseline_json", "TEXT"),
+                ("schedule_plans", "thread_id", "INTEGER"),
+                ("schedule_plans", "target_thread_id", "INTEGER"),
                 ("service_members", "tasks_manual",
                  "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "poll_stopped", "INTEGER NOT NULL DEFAULT 0"),
@@ -2072,11 +2103,10 @@ class ServiceRegistry:
         with self._connection() as connection:
             self._require_service(connection, service_id)
             rows = connection.execute(
-                "SELECT id, service_id, body, reminder_days, reminder_time, "
-                "enabled, created_at, task, active_from, active_until "
-                "FROM group_reminders "
-                "WHERE service_id = ? "
-                "ORDER BY reminder_days, reminder_time, id",
+                f"SELECT {_GROUP_REMINDER_COLUMNS} "
+                f"FROM {_GROUP_REMINDER_SOURCE} "
+                "WHERE g.service_id = ? "
+                "ORDER BY g.reminder_days, g.reminder_time, g.id",
                 (service_id,),
             ).fetchall()
         return [
@@ -2109,9 +2139,8 @@ class ServiceRegistry:
         _validate_positive_id(reminder_id, "reminder_id")
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT id, service_id, body, reminder_days, reminder_time, "
-                "enabled, created_at, task, active_from, active_until "
-                "FROM group_reminders WHERE id = ?",
+                f"SELECT {_GROUP_REMINDER_COLUMNS} "
+                f"FROM {_GROUP_REMINDER_SOURCE} WHERE g.id = ?",
                 (reminder_id,),
             ).fetchone()
         return (
@@ -3095,17 +3124,20 @@ class ServiceRegistry:
                 raise ValueError("Границы периода — даты воскресений.")
         if active_from and active_until and active_from > active_until:
             raise ValueError("Начало периода позже окончания.")
-        if active_until is not None and active_until < today:
-            raise ValueError("Окончание периода уже прошло.")
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT service_id, enabled, reminder_days, reminder_time, task "
-                "FROM group_reminders WHERE id = ?",
+                f"SELECT {_GROUP_REMINDER_COLUMNS} "
+                f"FROM {_GROUP_REMINDER_SOURCE} WHERE g.id = ?",
                 (reminder_id,),
             ).fetchone()
             if row is None:
                 raise ValueError("Групповое напоминание больше не существует.")
             self._require_service_editor(connection, actor_id, row["service_id"])
+            # Неделя окончания идёт до дня задачи (вс +5 — пятница после).
+            if active_until is not None and active_until + timedelta(
+                days=reminder_day_offset(dict(row))
+            ) < today:
+                raise ValueError("Окончание периода уже прошло.")
             values = (
                 active_from.isoformat() if active_from else None,
                 active_until.isoformat() if active_until else None,
@@ -3135,15 +3167,19 @@ class ServiceRegistry:
             )
 
     def disable_expired_group_reminders(self, today: date) -> list[int]:
-        """Выключает напоминания, чей период закончился до today."""
+        """Выключает напоминания, чей период закончился до today. У задачи
+        со своим днём (вс +1) последняя неделя кончается днём задачи."""
         with self._connection() as connection:
             ids = [
                 row["id"]
                 for row in connection.execute(
-                    "SELECT id FROM group_reminders WHERE enabled = 1 "
-                    "AND active_until IS NOT NULL AND active_until < ?",
-                    (today.isoformat(),),
+                    f"SELECT {_GROUP_REMINDER_COLUMNS} "
+                    f"FROM {_GROUP_REMINDER_SOURCE} WHERE g.enabled = 1 "
+                    "AND g.active_until IS NOT NULL",
                 )
+                if date.fromisoformat(row["active_until"]) + timedelta(
+                    days=reminder_day_offset(dict(row))
+                ) < today
             ]
             connection.executemany(
                 "UPDATE group_reminders SET enabled = 0 WHERE id = ?",
@@ -5962,6 +5998,26 @@ class ServiceRegistry:
         plan["approved_days"] = (
             json.loads(approved_days) if approved_days else {}
         )
+        message_ids = plan.pop("message_ids_json", None)
+        # Опубликован до шага 5б — известна только первая часть.
+        plan["message_ids"] = (
+            json.loads(message_ids) if message_ids
+            else [plan["message_id"]] if plan.get("message_id") else []
+        )
+        baseline = plan.pop("baseline_json", None)
+        plan["baseline"] = json.loads(baseline) if baseline else None
+        # Чат или тема служения сменились (/here) — опубликованный график
+        # не там: его нужно опубликовать заново, даже без правок.
+        service_chat = plan.pop("service_chat", None)
+        service_thread = plan.pop("service_thread", None)
+        plan["moved"] = bool(
+            plan["approved"] is not None and plan["message_ids"]
+            and service_chat is not None and (
+                plan.get("chat_id") != service_chat
+                or (plan_target_thread(plan) or None)
+                != (service_thread or None)
+            )
+        )
         # Правки после утверждения ещё не опубликованы (порядок людей в
         # задаче не важен).
         def normal(slots):
@@ -5972,7 +6028,7 @@ class ServiceRegistry:
 
         # republish — после утверждения сменились дни служения (окно или
         # личный день): опубликованные даты устарели.
-        plan["dirty"] = bool(plan.get("republish")) or (
+        plan["dirty"] = bool(plan.get("republish")) or plan["moved"] or (
             normal(plan["approved"]) != normal(plan["slots"])
         ) or (
             plan["approved"] is not None
@@ -5985,7 +6041,10 @@ class ServiceRegistry:
         (`readiness_people`), approved — опубликованная копия."""
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT * FROM schedule_plans WHERE service_id = ? AND month = ?",
+                "SELECT p.*, s.group_chat_id AS service_chat, "
+                "s.group_thread_id AS service_thread "
+                "FROM schedule_plans p JOIN services s ON s.id = p.service_id "
+                "WHERE p.service_id = ? AND p.month = ?",
                 (service_id, month),
             ).fetchone()
         return self._schedule_plan(row)
@@ -6192,7 +6251,9 @@ class ServiceRegistry:
                 "note = NULL, edited = 0, approved_json = excluded.approved_json, "
                 "approved_by = excluded.approved_by, "
                 "approved_at = excluded.approved_at, chat_id = NULL, "
-                "message_id = NULL, republish = 0, "
+                "message_id = NULL, message_ids_json = NULL, "
+                "thread_id = NULL, target_thread_id = NULL, "
+                "baseline_json = NULL, republish = 0, "
                 "days_json = excluded.days_json, "
                 "approved_days_json = excluded.approved_days_json, "
                 "served_offsets_json = excluded.served_offsets_json, "
@@ -6211,6 +6272,39 @@ class ServiceRegistry:
             )
         return self.get_schedule_plan(service_id, month)
 
+    def cancel_schedule_approval(
+        self, service_id: str, month: str,
+    ) -> dict | None:
+        """Новый опрос месяца отменяет утверждённый график (решение
+        28.10): прежний в чате уже не актуален, даже если совпадёт.
+        Публикация (чат, id частей) остаётся — новая её заменит. → прежние
+        {chat_id, message_ids}; None — утверждённого не было."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT chat_id, message_id, message_ids_json "
+                "FROM schedule_plans WHERE service_id = ? AND month = ? "
+                "AND approved_json IS NOT NULL",
+                (service_id, month),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                "UPDATE schedule_plans SET approved_json = NULL, "
+                "approved_by = NULL, approved_at = NULL, "
+                "approved_days_json = NULL, approved_tasks_json = NULL, "
+                "served_offsets_json = NULL, baseline_json = NULL, "
+                # Загруженный из Excel перестаёт быть итоговым: дальше
+                # график — по новому опросу.
+                "source = 'poll', "
+                "republish = 0 WHERE service_id = ? AND month = ?",
+                (service_id, month),
+            )
+        ids = (
+            json.loads(row["message_ids_json"]) if row["message_ids_json"]
+            else [row["message_id"]] if row["message_id"] else []
+        )
+        return {"chat_id": row["chat_id"], "message_ids": ids}
+
     def approve_schedule_plan(
         self,
         actor_id: int,
@@ -6223,17 +6317,27 @@ class ServiceRegistry:
         updated_at: str | None = None,
         days: dict | None = None,
         served_offsets: dict | None = None,
+        message_ids: list[int] | None = None,
+        baseline: dict | None = None,
+        thread_id: int | None = None,
+        target_thread_id: int | None = None,
     ) -> dict:
         """«✅ Утвердить»: опубликованная копия = slots. updated_at —
         версия опубликованного графика: если дни служения сменились, пока
-        шла публикация, отметка «опубликовать заново» остаётся."""
+        шла публикация, отметка «опубликовать заново» остаётся.
+        message_ids — части закреплённой публикации; baseline — график
+        первой публикации (None — оставить сохранённый)."""
         _validate_positive_id(actor_id, "actor_id")
+        if message_ids is None and message_id is not None:
+            message_ids = [message_id]
         with self._connection() as connection:
             self._require_service_editor(connection, actor_id, service_id)
             cursor = connection.execute(
                 "UPDATE schedule_plans SET approved_json = ?, approved_by = ?, "
                 "approved_tasks_json = tasks_json, "
                 "approved_at = ?, chat_id = ?, message_id = ?, "
+                "message_ids_json = ?, thread_id = ?, target_thread_id = ?, "
+                "baseline_json = COALESCE(?, baseline_json), "
                 "approved_days_json = ?, served_offsets_json = ?, "
                 "republish = CASE WHEN ? IS NULL OR updated_at = ? THEN 0 "
                 "ELSE republish END "
@@ -6241,6 +6345,10 @@ class ServiceRegistry:
                 (
                     json.dumps(slots, ensure_ascii=False), actor_id,
                     _utc_now(), chat_id, message_id,
+                    json.dumps(message_ids) if message_ids else None,
+                    thread_id, target_thread_id,
+                    json.dumps(baseline, ensure_ascii=False)
+                    if baseline is not None else None,
                     json.dumps(days or {}, ensure_ascii=False),
                     json.dumps(served_offsets or {}, ensure_ascii=False),
                     updated_at, updated_at, service_id, month,

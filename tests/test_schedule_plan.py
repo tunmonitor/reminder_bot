@@ -38,6 +38,10 @@ def fake_bot():
             message_id=12, poll=SimpleNamespace(id="poll-1"),
         )),
         stop_poll=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        pin_chat_message=AsyncMock(),
+        unpin_chat_message=AsyncMock(),
+        delete_message=AsyncMock(),
     )
 
 
@@ -198,7 +202,8 @@ class SchedulePlanTest(unittest.TestCase):
         self.assertIn("График Звук на ноябрь 2026 утверждён", text)
         self.assertIn('href="tg://user?id=501"', text)
 
-        # Правка после утверждения — публикация «обновлён» со списком.
+        # Правка после утверждения — закреплённый график правится,
+        # под ним список изменений.
         slots = approved["slots"]
         slots["2026-11-15"]["сборка"] = ["Глеб"]
         changed = self.registry.set_schedule_slots(1001, "sound", "2026-11", slots)
@@ -206,15 +211,466 @@ class SchedulePlanTest(unittest.TestCase):
         asyncio.run(schedule_plan.publish(
             self.bot, self.registry, self.service(), changed, 1001, LOG, 4096,
         ))
-        text = self.bot.send_message.await_args.args[1]
+        text = self.bot.edit_message_text.await_args.args[0]
         self.assertIn("обновлён", text)
-        self.assertIn("15.11 «сборка»: Дмитрий → Глеб", text)
+        self.assertIn("15.11 «сборка»: Дмитрий → ", text)
 
         # Пересчёт сбрасывает правки, утверждённая копия остаётся.
         recalculated = self.draft()
         self.assertEqual(recalculated["edited"], 0)
         self.assertEqual(
             recalculated["approved"]["2026-11-15"]["сборка"], ["Глеб"]
+        )
+
+    def test_publication_pinned_edited_and_answered(self):
+        """Решение 17, 5б: первая публикация закрепляется, обновление
+        правит её (под графиком — все изменения месяца) и отвечает на неё
+        только новыми изменениями; не правится — новая и закреплённая."""
+        from aiogram.exceptions import TelegramBadRequest
+
+        plan = self.draft()
+        plan["slots"]["2026-11-01"] = {"звук": ["Алексей"], "сборка": []}
+        plan["slots"]["2026-11-08"] = {"звук": ["Борис"], "сборка": []}
+        plan = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", plan["slots"]
+        )
+        first = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+        ))
+        self.assertTrue(first["pinned"])
+        self.bot.pin_chat_message.assert_awaited_once_with(
+            -1005555, 11, disable_notification=True,
+        )
+        self.assertEqual(first["message_ids"], [11])
+        self.assertEqual(
+            first["baseline"]["slots"]["2026-11-01"]["звук"], ["Алексей"]
+        )
+        text = self.bot.send_message.await_args.args[1]
+        # Каждый человек — на своей строке.
+        self.assertIn("🎚️ звук\n    • ", text)
+        self.assertIn("🧰 сборка: —", text)
+
+        # Первое обновление: 01.11 Борис вместо Алексея.
+        self.bot.send_message.reset_mock()
+        slots = first["slots"]
+        slots["2026-11-01"]["звук"] = ["Борис"]
+        changed = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", slots
+        )
+        second = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), changed, 1001, LOG, 4096,
+        ))
+        edit = self.bot.edit_message_text.await_args
+        self.assertEqual(
+            (edit.kwargs["chat_id"], edit.kwargs["message_id"]),
+            (-1005555, 11),
+        )
+        self.assertIn("Изменения:\n• 01.11 «звук»: Алексей → Борис",
+                      edit.args[0])
+        # Ответ на закреплённый — с упоминанием, правка не уведомляет.
+        reply = self.bot.send_message.await_args
+        self.assertEqual(reply.kwargs["reply_parameters"].message_id, 11)
+        self.assertIn("01.11 «звук»: ", reply.args[1])
+        self.assertIn('href="tg://user?id=502"', reply.args[1])
+        # Закрепляется и при правке (вдруг права дали позже).
+        self.assertEqual(self.bot.pin_chat_message.await_count, 2)
+        self.assertEqual(second["message_ids"], [11])
+
+        # Второе обновление: в закреплённом — оба изменения, в ответе —
+        # только новое.
+        self.bot.send_message.reset_mock()
+        slots = second["slots"]
+        slots["2026-11-08"]["звук"] = ["Алексей"]
+        changed = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", slots
+        )
+        third = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), changed, 1001, LOG, 4096,
+        ))
+        pinned_text = self.bot.edit_message_text.await_args.args[0]
+        self.assertIn("• 01.11 «звук»: Алексей → Борис", pinned_text)
+        self.assertIn("• 08.11 «звук»: Борис → Алексей", pinned_text)
+        reply_text = self.bot.send_message.await_args.args[1]
+        self.assertIn("08.11", reply_text)
+        self.assertNotIn("01.11", reply_text)
+
+        # Закреплённое удалено — новая публикация, закреплённая; прежняя
+        # откреплена; изменения — всё ещё от первой публикации.
+        self.bot.send_message.reset_mock()
+        self.bot.send_message.return_value = SimpleNamespace(message_id=21)
+        self.bot.edit_message_text.side_effect = TelegramBadRequest(
+            method=unittest.mock.MagicMock(),
+            message="Bad Request: message to edit not found",
+        )
+        slots = third["slots"]
+        slots["2026-11-22"]["звук"] = ["Борис"]
+        changed = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", slots
+        )
+        fourth = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), changed, 1001, LOG, 4096,
+        ))
+        self.assertEqual(fourth["message_ids"], [21])
+        self.bot.pin_chat_message.assert_awaited_with(
+            -1005555, 21, disable_notification=True,
+        )
+        # Прежняя публикация удалена; не удаляется — откреплена.
+        self.bot.delete_message.assert_awaited_with(-1005555, 11)
+        self.bot.unpin_chat_message.assert_not_awaited()
+        # Новое сообщение само уведомляет — ответа нет, оно одно.
+        self.assertEqual(self.bot.send_message.await_count, 1)
+        text = self.bot.send_message.await_args.args[1]
+        self.assertIn("• 01.11 «звук»: Алексей → Борис", text)
+        self.assertIn("• 22.11 «звук»: никого → Борис", text)
+
+        # Закрепить нельзя (нет права) — график всё равно утверждён.
+        self.bot.pin_chat_message.side_effect = RuntimeError("no rights")
+        # Публикации нет — следующая уходит новой.
+        with closing(sqlite3.connect(self.registry.path)) as connection:
+            connection.execute(
+                "UPDATE schedule_plans SET message_ids_json = NULL, "
+                "message_id = NULL WHERE month = '2026-11'"
+            )
+            connection.commit()
+        slots = fourth["slots"]
+        slots["2026-11-29"]["звук"] = ["Алексей"]
+        changed = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", slots
+        )
+        fifth = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), changed, 1001, LOG, 4096,
+        ))
+        self.assertFalse(fifth["pinned"])
+        self.assertFalse(fifth["dirty"])
+
+    def test_failed_save_keeps_previous_publication(self):
+        """Утверждение не сохранилось — прежняя публикация не удаляется:
+        в базе ещё её id."""
+        from aiogram.exceptions import TelegramBadRequest
+
+        plan = self.draft()
+        first = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+        ))
+        slots = first["slots"]
+        slots["2026-11-29"]["звук"] = ["Борис"]
+        changed = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", slots
+        )
+        self.bot.edit_message_text.side_effect = TelegramBadRequest(
+            method=unittest.mock.MagicMock(),
+            message="Bad Request: message to edit not found",
+        )
+        self.bot.send_message.return_value = SimpleNamespace(message_id=21)
+        with unittest.mock.patch.object(
+            self.registry, "approve_schedule_plan",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            with self.assertRaises(schedule_plan.PublishedNotSaved):
+                asyncio.run(schedule_plan.publish(
+                    self.bot, self.registry, self.service(), changed, 1001,
+                    LOG, 4096,
+                ))
+        self.bot.delete_message.assert_not_awaited()
+        self.assertEqual(
+            self.registry.get_schedule_plan("sound", "2026-11")["message_ids"],
+            [11],
+        )
+
+    @unittest.mock.patch(
+        "bot.service_registry._current_month", return_value="2026-10"
+    )
+    def test_days_change_stays_in_pinned_and_unsent_reply_reported(self, _m):
+        plan = self.draft()
+        first = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+        ))
+        # Сменились дни служения — строка в закреплённом.
+        self.registry.set_readiness_settings(1001, "sound", day_from=-1, day_to=1)
+        changed = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertTrue(changed["republish"])
+        asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), changed, 1001, LOG, 4096,
+        ))
+        # Следующая правка людей — строка о днях не пропадает, хотя
+        # republish уже сброшен; ответ не ушёл — текст админу.
+        slots = self.registry.get_schedule_plan("sound", "2026-11")["slots"]
+        slots["2026-11-29"]["звук"] = ["Борис"]
+        changed = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", slots
+        )
+        self.assertFalse(changed["republish"])
+        self.bot.send_message.side_effect = RuntimeError("network")
+        third = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), changed, 1001, LOG, 4096,
+        ))
+        pinned_text = self.bot.edit_message_text.await_args.args[0]
+        self.assertIn("• Изменены дни служения", pinned_text)
+        self.assertIn("29.11 «звук»: никого → Борис", pinned_text)
+        self.assertIn("29.11 «звук»: никого → Борис", third["unsent_notice"])
+        self.assertNotIn("\x00", third["unsent_notice"])
+        self.assertNotIn("Изменены дни", third["unsent_notice"])
+        self.assertEqual(first["message_ids"], third["message_ids"])
+
+    def test_new_poll_cancels_approval_and_preview_is_not_saved(self):
+        """Решение 28.10: запуск опроса отменяет утверждённый график —
+        прежний откреплён; пока опрос идёт — предварительный график по
+        текущим ответам без записи в базу; новое утверждение — новая
+        публикация, прежняя удаляется."""
+        plan = self.draft()
+        approved = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+        ))
+        self.assertIsNotNone(approved["approved"])
+        # «Запустить заново»: прежний опрос откладывается, новый — в чат.
+        self.registry.move_readiness_run(self.run["id"], f"2026-11#{self.run['id']}")
+        self.bot.send_poll.return_value = SimpleNamespace(
+            message_id=13, poll=SimpleNamespace(id="poll-2"),
+        )
+        run = asyncio.run(readiness.launch_run(
+            self.bot, self.registry, self.service(), 2026, 11,
+            datetime(2026, 10, 30, 20, 0, tzinfo=TZ), TZ, LOG, 4096,
+        ))
+        cancelled = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertIsNone(cancelled["approved"])
+        self.assertIsNone(cancelled["baseline"])
+        self.assertEqual(cancelled["message_ids"], [11])
+        self.bot.unpin_chat_message.assert_awaited_once_with(
+            -1005555, message_id=11,
+        )
+        # Напоминания больше не по отменённому графику.
+        self.assertEqual(schedule_plan.plan_events(cancelled, self.people()), [])
+        # Предварительный: по текущим ответам (их нет — все не ответили),
+        # в базе ничего не меняется.
+        before = self.registry.get_schedule_plan("sound", "2026-11")
+        preview = asyncio.run(schedule_plan.build_draft(
+            self.registry, run, None, LOG, save=False,
+        ))
+        self.assertEqual(preview["run_id"], run["id"])
+        self.assertIsNone(preview["approved"])
+        self.assertEqual(
+            self.registry.get_schedule_plan("sound", "2026-11"), before
+        )
+        summary = schedule_plan.plan_summary(self.registry, preview, run)
+        self.assertIn(
+            "📝 Черновик", schedule_plan.plan_text("ЗВУК", preview, summary, TZ)
+        )
+        # Опрос завершён — новый черновик, утверждение — новая публикация
+        # и удаление прежней.
+        self.registry.close_readiness_run(run["id"])
+        run = self.registry.get_readiness_run_by_id(run["id"])
+        fresh = asyncio.run(
+            schedule_plan.ensure_plan(self.registry, run, None, LOG)
+        )
+        self.assertEqual(fresh["run_id"], run["id"])
+        self.bot.send_message.reset_mock()
+        self.bot.send_message.return_value = SimpleNamespace(message_id=31)
+        published = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), fresh, 1001, LOG, 4096,
+        ))
+        self.assertEqual(published["message_ids"], [31])
+        self.assertIn("утверждён", self.bot.send_message.await_args.args[1])
+        self.bot.edit_message_text.assert_not_awaited()
+        self.bot.delete_message.assert_awaited_with(-1005555, 11)
+
+    def test_new_poll_cancels_excel_plan(self):
+        """Загруженный из Excel график после запуска опроса — не итоговый:
+        утвердить его, пока опрос идёт, нельзя."""
+        events = [event(date(2026, 11, 8), ("звук", "Алексей"))]
+        loaded = schedule_plan.excel_plan(self.registry, "sound", 2026, 11, events)
+        self.registry.import_excel_plan(
+            1001, "sound", "2026-11", dates=loaded["dates"],
+            tasks=loaded["tasks"], slots=loaded["slots"], days=loaded["days"],
+        )
+        self.assertEqual(
+            self.registry.get_schedule_plan("sound", "2026-11")["source"], "excel"
+        )
+        self.registry.move_readiness_run(self.run["id"], f"2026-11#{self.run['id']}")
+        self.bot.send_poll.return_value = SimpleNamespace(
+            message_id=13, poll=SimpleNamespace(id="poll-3"),
+        )
+        asyncio.run(readiness.launch_run(
+            self.bot, self.registry, self.service(), 2026, 11,
+            datetime(2026, 10, 30, 20, 0, tzinfo=TZ), TZ, LOG, 4096,
+        ))
+        plan = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertIsNone(plan["approved"])
+        self.assertEqual(plan["source"], "poll")
+        self.assertIsNone(plan["run_id"])
+
+    def test_next_month_poll_keeps_current_month_approved(self):
+        """Опрос следующего месяца не отменяет утверждённый график текущего:
+        по нему идут напоминания, пока его месяц не закончился."""
+        plan = self.draft()
+        asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+        ))
+        self.bot.send_poll.return_value = SimpleNamespace(
+            message_id=14, poll=SimpleNamespace(id="poll-dec"),
+        )
+        asyncio.run(readiness.launch_run(
+            self.bot, self.registry, self.service(), 2026, 12,
+            datetime(2026, 11, 26, 20, 0, tzinfo=TZ), TZ, LOG, 4096,
+        ))
+        november = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertIsNotNone(november["approved"])
+        self.assertNotEqual(schedule_plan.plan_events(november, self.people()), [])
+        self.bot.unpin_chat_message.assert_not_awaited()
+
+    def test_topic_change_republishes_in_new_topic(self):
+        """Ревью greptile к PR #88: тему чата сменили (/here) — график не
+        правится в старой теме, а публикуется в новой; старый удаляется."""
+        plan = self.draft()
+        first = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+        ))
+        self.assertIsNone(first["thread_id"])
+        self.registry.set_group_thread(1001, "sound", -1005555, 77)
+        slots = first["slots"]
+        slots["2026-11-29"]["звук"] = ["Борис"]
+        changed = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", slots
+        )
+        # Смена темы — график «с правками», даже без правок людей.
+        self.assertTrue(
+            self.registry.get_schedule_plan("sound", "2026-11")["dirty"]
+        )
+        self.bot.send_message.return_value = SimpleNamespace(
+            message_id=41, message_thread_id=77, is_topic_message=True,
+        )
+        moved = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), changed, 1001, LOG, 4096,
+        ))
+        self.bot.edit_message_text.assert_not_awaited()
+        self.assertEqual(
+            self.bot.send_message.await_args.kwargs["message_thread_id"], 77
+        )
+        self.bot.delete_message.assert_awaited_with(-1005555, 11)
+        self.assertEqual(
+            (moved["message_ids"], moved["thread_id"]), ([41], 77)
+        )
+        self.assertFalse(moved["dirty"])
+        # Дальше — правка в новой теме.
+        slots = moved["slots"]
+        slots["2026-11-22"]["звук"] = ["Алексей"]
+        changed = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", slots
+        )
+        asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), changed, 1001, LOG, 4096,
+        ))
+        self.assertEqual(
+            self.bot.edit_message_text.await_args.kwargs["message_id"], 41
+        )
+
+    def test_closed_topic_saves_actual_topic(self):
+        """Тема закрыта — график ушёл в общую: записана фактическая тема
+        (по ответу Telegram) и выбранная; дальше — правка, а не новая
+        публикация каждый раз; ответ — туда, где лежит график."""
+        self.registry.set_group_thread(1001, "sound", -1005555, 88)
+        # Ответ Telegram без темы — сообщение в общей теме.
+        self.bot.send_message.return_value = SimpleNamespace(message_id=51)
+        plan = self.draft()
+        published = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+        ))
+        self.assertEqual(
+            (published["thread_id"], published["target_thread_id"]), (None, 88)
+        )
+        self.assertFalse(published["moved"])
+        self.assertFalse(published["dirty"])
+        slots = published["slots"]
+        slots["2026-11-29"]["звук"] = ["Борис"]
+        changed = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", slots
+        )
+        self.bot.send_message.reset_mock()
+        asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), changed, 1001, LOG, 4096,
+        ))
+        self.assertEqual(
+            self.bot.edit_message_text.await_args.kwargs["message_id"], 51
+        )
+        reply = self.bot.send_message.await_args
+        self.assertNotIn("message_thread_id", reply.kwargs)
+        # Выбрали другую тему — график «не на месте», статус на экране.
+        self.registry.set_group_thread(1001, "sound", -1005555, 99)
+        moved = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertTrue(moved["moved"])
+        summary = schedule_plan.plan_summary(self.registry, moved, self.run)
+        self.assertIn(
+            "📍 Сменился чат или тема служения",
+            schedule_plan.plan_text("ЗВУК", moved, summary, TZ),
+        )
+
+    def test_deleted_topic_does_not_stay_moved(self):
+        """Тема удалена: отправка уходит в общую и сбрасывает тему
+        служения — график «на месте», дальше правка, не новая публикация."""
+        from aiogram.exceptions import TelegramBadRequest
+
+        self.registry.set_group_thread(1001, "sound", -1005555, 66)
+
+        async def send(chat_id, text, **kwargs):
+            if kwargs.get("message_thread_id"):
+                raise TelegramBadRequest(
+                    method=unittest.mock.MagicMock(),
+                    message="Bad Request: message thread not found",
+                )
+            return SimpleNamespace(message_id=61)
+
+        self.bot.send_message.side_effect = send
+        published = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), self.draft(), 1001, LOG,
+            4096,
+        ))
+        self.assertIsNone(self.service()["group_thread_id"])
+        self.assertEqual(
+            (published["thread_id"], published["target_thread_id"]),
+            (None, None),
+        )
+        self.assertFalse(published["moved"])
+        # Запись без выбранной темы (до этой правки) — по фактической.
+        self.assertEqual(
+            schedule_plan.plan_target_thread({"thread_id": 5}), 5
+        )
+
+    def test_topic_changed_during_publication(self):
+        """/here во время публикации: записана тема отправки, график
+        «не на месте» — следующее утверждение опубликует его в новой."""
+        self.registry.set_group_thread(1001, "sound", -1005555, 70)
+        service = self.service()
+
+        async def send(chat_id, text, **kwargs):
+            # Пока сообщение уходит, админ выбрал другую тему.
+            self.registry.set_group_thread(1001, "sound", -1005555, 71)
+            return SimpleNamespace(
+                message_id=81, message_thread_id=70, is_topic_message=True,
+            )
+
+        self.bot.send_message.side_effect = send
+        published = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, service, self.draft(), 1001, LOG, 4096,
+        ))
+        self.assertEqual(
+            (published["thread_id"], published["target_thread_id"]), (70, 70)
+        )
+        self.assertTrue(published["moved"])
+
+    def test_change_lines_format(self):
+        names = {"f": "Филипп", "d": "Денис", "a": "Анна"}
+        self.assertEqual(
+            schedule_plan.plan_changes(
+                {"2026-11-08": {"Уборка": ["d"]}},
+                {"2026-11-08": {"Уборка": ["f"]}}, names,
+            ),
+            ["• 08.11 Денис → Филипп"],
+        )
+        self.assertEqual(
+            schedule_plan.plan_changes(
+                {"2026-11-08": {"звук": ["d"], "сборка": ["a"]}},
+                {"2026-11-08": {"звук": ["d", "f"], "сборка": []}}, names,
+            ),
+            ["• 08.11 «звук»: никого → Филипп", "• 08.11 «сборка»: Анна → никого"],
         )
 
     def test_excel_plan_round_trip_with_task_day(self):
@@ -621,7 +1077,7 @@ class SchedulePlanTest(unittest.TestCase):
         )
         self.assertIn(
             "📅 График Звук на ноябрь 2026 утверждён\n\n"
-            "🗓 01.11 (чт 29.10)\n  🎚️ звук: \x00", published,
+            "🗓 01.11 (чт 29.10)\n  🎚️ звук\n    • \x00", published,
         )
         self.assertIn("\n  🧰 сборка: —\n\n🗓 08.11", published)
         # Заголовок — свой шаблон из «📝 Тексты».
@@ -710,9 +1166,10 @@ class SchedulePlanTest(unittest.TestCase):
             self.service(), plan, self.people()
         )
         self.assertIn(
-            "\n\n🗓 Неделя 26.10–01.11\n  ср 28.10\n    🧰 сборка: ", published
+            "\n\n🗓 Неделя 26.10–01.11\n  ср 28.10\n    🧰 сборка\n      • ",
+            published,
         )
-        self.assertIn("\n  вс 01.11\n    🎚️ звук: ", published)
+        self.assertIn("\n  вс 01.11\n    🎚️ звук\n      • ", published)
         self.assertIn("• Изменены дни служения", published)
         # Задача без людей во всех датах черновика — подсказка пересчитать.
         draft = {**plan, "approved": None, "slots": {
