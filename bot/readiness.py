@@ -33,7 +33,7 @@ from .admin_report import fit_one_screen
 from .group_send import send_to_service_group
 from .month_summary import month_end, month_key, month_title, next_month
 from .presentation import task_emoji
-from .schedule_planner import Plan, PlanInput, build_plan, open_dates
+from .schedule_planner import Plan, PlanInput, build_plan
 from .service_registry import (  # noqa: F401 — шаблоны для экранов
     DEFAULT_READINESS_CHAT_REMINDER,
     DEFAULT_READINESS_CLOSED,
@@ -161,6 +161,7 @@ def local_text(moment: datetime | str, tz) -> str:
 
 
 UNAVAILABLE_ALL = "__no_available_dates__"
+AVAILABLE_ALL = "__all_dates_available__"
 OPTION_SEPARATOR = "\x1f"
 
 
@@ -204,8 +205,11 @@ def answer_dates(option_ids, options, *, reverse_poll: bool = False
         ) if isinstance(option, dict) else option
         for option in options
     ]
-    if reverse_poll and len(dates) in chosen:
-        return [UNAVAILABLE_ALL]
+    if reverse_poll:
+        if len(dates) + 1 in chosen:
+            return [UNAVAILABLE_ALL]
+        if len(dates) in chosen:
+            return [AVAILABLE_ALL]
     return sorted(dates[index] for index in chosen if index < len(dates))
 
 
@@ -218,6 +222,8 @@ class Summary:
     answered: dict[str, list[str]] = field(default_factory=dict)
     # Реальная доступность после интерпретации режима опроса.
     available: dict[str, list[str]] = field(default_factory=dict)
+    # Явные исключения; связка задач не может переопределять их.
+    unavailable: dict[str, frozenset] = field(default_factory=dict)
     outside: list[dict] = field(default_factory=list)
     not_answered: list[dict] = field(default_factory=list)
     plan: Plan | None = None
@@ -295,6 +301,26 @@ def slot_availability(available: dict[str, list[str]],
     return result
 
 
+def _excluded_slot_availability(
+    summary: Summary,
+    people: dict[str, dict],
+    weeks: tuple[date, ...],
+    slot_dates: dict[tuple[date, str, str], date],
+    options: list[dict],
+) -> dict[str, frozenset]:
+    if not summary.reverse_poll or not options:
+        return {}
+    excluded = {
+        key: [
+            value for value in marked
+            if value not in (AVAILABLE_ALL, UNAVAILABLE_ALL)
+        ]
+        for key, marked in summary.answered.items()
+    }
+    excluded = {key: values for key, values in excluded.items() if values}
+    return slot_availability(excluded, people, weeks, slot_dates, options)
+
+
 def summarize(registry, run: dict, *, with_plan: bool = True,
               last_served: dict[str, date] | None = None,
               assume_free: bool = False) -> Summary:
@@ -344,10 +370,14 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
                     unavailable.update(options_by_date.get(day, ()))
             available = (
                 [] if UNAVAILABLE_ALL in marked
+                else sorted(all_dates) if AVAILABLE_ALL in marked
                 else sorted(all_dates - unavailable)
             )
         else:
-            available = [day for day in marked if day != UNAVAILABLE_ALL]
+            available = [
+                day for day in marked
+                if day not in (UNAVAILABLE_ALL, AVAILABLE_ALL)
+            ]
         summary.available[key] = available
     summary.not_answered = [
         person for person in people
@@ -402,6 +432,9 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
         availability = slot_availability(
             summary.available, by_person, tuple(week_dates), slot_dates, options,
         ) if options else {}
+        summary.unavailable = _excluded_slot_availability(
+            summary, by_person, tuple(week_dates), slot_dates, options,
+        )
         common = (
             (settings["month_min"], settings["month_max"])
             if settings["month_min"] or settings["month_max"] is not None
@@ -421,6 +454,7 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
             free=free,
             tasks={name: frozenset(tasks[name]) for name in free},
             availability=availability,
+            unavailable=summary.unavailable,
             slot_dates=slot_dates,
             reluctant=frozenset(silent),
             last_served=dict(last_served or {}),
@@ -476,13 +510,15 @@ def progress_text(service_label: str, run: dict, summary: Summary, tz,
         lines += ["", "✅ Ответили: " + "; ".join(
             f"{names.get(key, key)} ("
             + (
-                "недоступен: " if summary.reverse_poll and dates
-                and UNAVAILABLE_ALL not in dates else ""
+                "в любые даты" if AVAILABLE_ALL in dates else
+                "не сможет" if UNAVAILABLE_ALL in dates else
+                ("недоступен: " if summary.reverse_poll and dates else "")
+                + (", ".join(
+                    run_option_label(run, day)
+                    for day in dates
+                    if day not in (UNAVAILABLE_ALL, AVAILABLE_ALL)
+                ) or "не сможет")
             )
-            + (", ".join(
-                run_option_label(run, day)
-                for day in dates if day != UNAVAILABLE_ALL
-            ) or "не сможет")
             + ")"
             for key, dates in summary.answered.items()
         )]
@@ -591,7 +627,8 @@ def option_label(day: str, window: tuple[int, int] = (0, 0)) -> str:
     )
 
 
-def poll_options(registry, service_id: str, year: int, month: int) -> list[dict]:
+def poll_options(registry, service_id: str, year: int, month: int,
+                 *, reverse_poll: bool = False) -> list[dict]:
     """Доступность по каждой фактической дате и задаче отдельно."""
     settings = registry.get_readiness_settings(service_id)
     tasks = registry.plan_tasks(service_id)
@@ -627,7 +664,7 @@ def poll_options(registry, service_id: str, year: int, month: int) -> list[dict]
                 f"{actual_day:%d.%m}."
             )
         result.append({**item, "label": label})
-    if len(result) + 1 > 12:
+    if len(result) + 1 + int(reverse_poll) > 12:
         raise ValueError(
             "Опрос не запущен: Telegram допускает не более 12 вариантов, "
             "а для выбранных дат задач их получилось больше."
@@ -769,7 +806,10 @@ async def launch_run(
     dates = [day.isoformat() for day in month_sundays(year, month)]
     people = registry.readiness_people(service["id"])
     settings = registry.get_readiness_settings(service["id"])
-    options = poll_options(registry, service["id"], year, month)
+    options = poll_options(
+        registry, service["id"], year, month,
+        reverse_poll=settings["reverse_poll"],
+    )
     # Запись — до отправки: месяц занят (перезапуск, прерванный между
     # отправкой и записью, не вернёт старый опрос поверх нового).
     run = registry.create_readiness_run(
@@ -816,6 +856,7 @@ async def launch_run(
             service, registry=registry, logger=logger,
             options=[
                 *(option["label"] for option in options),
+                *(["✅ Смогу в любые даты"] if settings["reverse_poll"] else []),
                 phrase(settings, "cant"),
             ],
             is_anonymous=False,
@@ -1142,7 +1183,10 @@ def free_days(registry, run: dict, summary: Summary) -> list[str]:
     availability = slot_availability(
         summary.available, people, weeks, slot_dates, options,
     ) if options else {}
-    open_weeks = set(open_dates(PlanInput(
+    unavailable = _excluded_slot_availability(
+        summary, people, weeks, slot_dates, options,
+    )
+    plan = build_plan(PlanInput(
         dates=weeks,
         needed={task["name"]: task["needed"] for task in catalog},
         free=free,
@@ -1151,20 +1195,32 @@ def free_days(registry, run: dict, summary: Summary) -> list[str]:
             for key, person in people.items() if key in free
         },
         availability=availability,
+        unavailable=unavailable,
         bundles=summary.bundles,
         slot_dates=slot_dates,
-    )))
-    return [
-        option_key(
-            option["date"], option.get("task")
-            or (option["tasks"][0] if len(option.get("tasks", ())) == 1 else None)
-        ) for option in options
-        if open_weeks.intersection(
-            date.fromisoformat(day) for day in option.get("weeks", ())
-        )
-    ] if options else [
-        day for day in run["dates"] if date.fromisoformat(day) in open_weeks
-    ]
+    ))
+    open_slots = {(day, task) for day, task, _ in plan.gaps()}
+    if not options:
+        return [
+            day for day in run["dates"]
+            if any(
+                event_day == date.fromisoformat(day)
+                for event_day, _ in open_slots
+            )
+        ]
+    result = []
+    for option in options:
+        tasks = [option["task"]] if option.get("task") else option.get("tasks", ())
+        if any(
+            (date.fromisoformat(week), task) in open_slots
+            for week in option.get("weeks", ())
+            for task in tasks
+        ):
+            result.append(option_key(
+                option["date"], option.get("task")
+                or (tasks[0] if len(tasks) == 1 else None)
+            ))
+    return result
 
 
 def free_days_text(run: dict, settings: dict, days: list[str],

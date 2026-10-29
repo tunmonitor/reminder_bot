@@ -85,6 +85,10 @@ class PlanInput:
     availability: Mapping[
         str, frozenset[date | tuple[date, str]]
     ] = field(default_factory=dict)
+    # Явные исключения; связка не может назначить человека на них.
+    unavailable: Mapping[
+        str, frozenset[date | tuple[date, str]]
+    ] = field(default_factory=dict)
     # Человек → последнее служение до месяца (из прошлого месяца).
     last_served: Mapping[str, date] = field(default_factory=dict)
     # Задача → сколько ещё людей сверх минимума можно поставить.
@@ -234,41 +238,58 @@ def plan_cost(plan: Plan, data: PlanInput) -> int:
     )
 
 
+def _available_on(data: PlanInput, person: str,
+                  service_date: date, task: str) -> bool:
+    unavailable = data.unavailable.get(person, ())
+    if service_date in unavailable or (service_date, task) in unavailable:
+        return False
+    available = data.availability.get(person)
+    return (
+        available is None
+        or service_date in available
+        or (service_date, task) in available
+    )
+
+
 def _can_serve(data: PlanInput, person: str, event_date: date, task: str) -> bool:
     if (
         event_date not in data.free.get(person, ())
         or task not in data.tasks.get(person, ())
     ):
         return False
+    service_date = data.slot_dates.get((event_date, task, person), event_date)
+    unavailable = data.unavailable.get(person, ())
+    if service_date in unavailable or (service_date, task) in unavailable:
+        return False
     available = data.availability.get(person)
     if available is None:
         return True
-    service_date = data.slot_dates.get((event_date, task, person), event_date)
-    if service_date in available or (service_date, task) in available:
+    if _available_on(data, person, service_date, task):
         return True
     bundle = data.bundles.get(person, frozenset())
     has_linked_date = any(
         linked_task != task
-        and (
-            data.slot_dates.get((event_date, linked_task, person), event_date)
-            in available
-            or (
-                data.slot_dates.get((event_date, linked_task, person), event_date),
-                linked_task,
-            ) in available
+        and data.slot_dates.get(
+            (event_date, linked_task, person), event_date
+        ) > service_date
+        and _available_on(
+            data,
+            person,
+            data.slot_dates.get((event_date, linked_task, person), event_date),
+            linked_task,
         )
         for linked_task in bundle
     )
     alternate = any(
         candidate != person
+        and candidate in data.availability
+        and event_date in data.free.get(candidate, ())
         and task in data.tasks.get(candidate, ())
-        and (
-            data.slot_dates.get((event_date, task, candidate), event_date)
-            in data.availability.get(candidate, ())
-            or (
-                data.slot_dates.get((event_date, task, candidate), event_date),
-                task,
-            ) in data.availability.get(candidate, ())
+        and _available_on(
+            data,
+            candidate,
+            data.slot_dates.get((event_date, task, candidate), event_date),
+            task,
         )
         for candidate in data.free
     )
@@ -281,33 +302,52 @@ def _min_cost_matching(
     allowed: Mapping[str, set[int]],
     cost: Mapping[str, int],
     seat_cost: Mapping[tuple[str, int], int] | None = None,
+    person_groups: Mapping[str, str] | None = None,
+    group_capacity: Mapping[str, int] | None = None,
 ) -> dict[int, str]:
     """Место → человек: максимальное паросочетание минимальной стоимости.
 
     Поток минимальной стоимости последовательными кратчайшими путями
-    (Беллман — Форд): исток → человек (стоимость человека) → место →
-    сток, пропускная способность 1. Каждый путь увеличивает поток на 1
+    (Беллман — Форд): исток → группа → человек (стоимость человека) →
+    место → сток. Каждый путь увеличивает поток на 1
     с наименьшим приростом стоимости, поэтому итог — минимальная
     стоимость среди максимальных паросочетаний. Размеры крошечные.
     seat_cost — доплата (человек, место) на ребре человек → место.
     """
-    source, sink = 0, 1 + len(people) + len(seats)
+    groups = {
+        person: (person_groups or {}).get(person, person)
+        for person in people
+    }
+    group_names = sorted(set(groups.values()))
+    group_nodes = {
+        group: index + 1 for index, group in enumerate(group_names)
+    }
+    person_start = 1 + len(group_names)
+    person_nodes = {
+        person: person_start + index for index, person in enumerate(people)
+    }
+    seat_start = person_start + len(people)
+    source, sink = 0, seat_start + len(seats)
     # Ребро: [куда, остаток, стоимость, индекс обратного ребра].
     graph: list[list[list[int]]] = [[] for _ in range(sink + 1)]
 
-    def add(start: int, end: int, price: int) -> None:
-        graph[start].append([end, 1, price, len(graph[end])])
+    def add(start: int, end: int, price: int, capacity: int = 1) -> None:
+        graph[start].append([end, capacity, price, len(graph[end])])
         graph[end].append([start, 0, -price, len(graph[start]) - 1])
 
-    for index, person in enumerate(people, start=1):
-        add(source, index, cost[person])
+    for group in group_names:
+        capacity = (group_capacity or {}).get(group, len(people))
+        add(source, group_nodes[group], 0, max(0, capacity))
+    for person in people:
+        index = person_nodes[person]
+        add(group_nodes[groups[person]], index, cost[person])
         for seat in sorted(allowed.get(person, ())):
             add(
-                index, 1 + len(people) + seat,
+                index, seat_start + seat,
                 (seat_cost or {}).get((person, seat), 0),
             )
     for seat in range(len(seats)):
-        add(1 + len(people) + seat, sink, 0)
+        add(seat_start + seat, sink, 0)
 
     infinity = 1 << 60
     while True:
@@ -337,9 +377,9 @@ def _min_cost_matching(
             node = previous
 
     result: dict[int, str] = {}
-    for index, person in enumerate(people, start=1):
-        for end, left, _, _ in graph[index]:
-            seat = end - 1 - len(people)
+    for person in people:
+        for end, left, _, _ in graph[person_nodes[person]]:
+            seat = end - seat_start
             if 0 <= seat < len(seats) and left == 0:
                 result[seat] = person
     return result
@@ -442,6 +482,18 @@ def _prefer_bundles(plan: Plan, data: PlanInput) -> None:
                 service_day = data.slot_dates.get(
                     (event_date, task, person), event_date
                 )
+                current_days = {
+                    plan.slot_dates.get((week, current_task, person), week)
+                    for (week, current_task), names in plan.slots.items()
+                    if person in names
+                }
+                high = _limit(data, person)[1]
+                if (
+                    service_day not in current_days
+                    and high is not None
+                    and len(current_days) >= high
+                ):
+                    continue
                 if any(
                     other_task not in bundle
                     and service_day == data.slot_dates.get(
@@ -737,9 +789,19 @@ def _fill_optional(plan: Plan, data: PlanInput) -> None:
             * scale + rank[person]
             for person in people
         }
-        for seat, person in sorted(
-            _min_cost_matching(people, seats, allowed, cost).items()
-        ):
+        loads = plan.load()
+        capacities = {
+            person: (
+                len(people) if (high := _limit(data, person)[1]) is None
+                else max(0, high - loads.get(person, 0))
+            )
+            for person in people
+        }
+        for seat, person in sorted(_min_cost_matching(
+            people, seats, allowed, cost,
+            person_groups={person: person for person in people},
+            group_capacity=capacities,
+        ).items()):
             plan.slots[(event_date, seats[seat])].append(person)
             served.setdefault(person, set()).add(event_date)
 
@@ -776,6 +838,11 @@ def _build_plan(data: PlanInput) -> Plan:
                 abs((week - event_date).days) <= 7
                 for week in served_weeks.get(person, set())
             ))
+            and (
+                required_pass
+                or _gap_penalty(last.get(person), event_date)
+                < BACK_TO_BACK_WEIGHT
+            )
         )
         possible_days = sorted({
             data.slot_dates.get((event_date, task, person), event_date)
@@ -833,7 +900,21 @@ def _build_plan(data: PlanInput) -> Plan:
             if person in data.reluctant:
                 price += RELUCTANT_WEIGHT
             costs[token] = price * scale + rank[person]
-        matching = _min_cost_matching(tokens, seats, allowed, costs)
+        group_capacity = {}
+        for token in tokens:
+            person = token_person[token]
+            high = _limit(data, person)[1]
+            group_capacity[person] = (
+                len(tokens) if high is None
+                else max(0, high - load.get(person, 0))
+            )
+        matching = _min_cost_matching(
+            tokens, seats, allowed, costs,
+            person_groups={token: token_person[token] for token in tokens},
+            group_capacity=group_capacity,
+        ) if not required_pass else _min_cost_matching(
+            tokens, seats, allowed, costs
+        )
         for seat, token in sorted(matching.items()):
             person = token_person[token]
             task = seats[seat]

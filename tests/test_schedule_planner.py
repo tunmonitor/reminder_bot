@@ -307,6 +307,73 @@ class SchedulePlannerTest(unittest.TestCase):
         self.assertEqual(plan.slots[(day, "спевка")], ["Связка"])
         self.assertEqual(plan.load()["Связка"], 2)
 
+    def test_linked_fallback_only_goes_from_later_to_earlier_task(self):
+        day = SUNDAYS[0]
+        rehearsal = day - timedelta(days=3)
+        plan = build_plan(PlanInput(
+            dates=(day,),
+            needed={"звук": 1, "спевка": 1},
+            free={"Связка": frozenset({day})},
+            tasks={"Связка": frozenset({"звук", "спевка"})},
+            availability={"Связка": frozenset({(rehearsal, "спевка")})},
+            bundles={"Связка": frozenset({"звук", "спевка"})},
+            slot_dates={
+                (day, "звук", "Связка"): day,
+                (day, "спевка", "Связка"): rehearsal,
+            },
+        ))
+        self.assertEqual(plan.slots[(day, "звук")], [])
+        self.assertEqual(plan.slots[(day, "спевка")], ["Связка"])
+
+    def test_linked_fallback_does_not_override_explicit_exclusion(self):
+        day = SUNDAYS[0]
+        rehearsal = day - timedelta(days=3)
+        plan = build_plan(PlanInput(
+            dates=(day,),
+            needed={"звук": 1, "спевка": 1},
+            free={"Связка": frozenset({day})},
+            tasks={"Связка": frozenset({"звук", "спевка"})},
+            availability={"Связка": frozenset({(day, "звук")})},
+            unavailable={"Связка": frozenset({(rehearsal, "спевка")})},
+            bundles={"Связка": frozenset({"звук", "спевка"})},
+            slot_dates={
+                (day, "звук", "Связка"): day,
+                (day, "спевка", "Связка"): rehearsal,
+            },
+        ))
+        self.assertEqual(plan.slots[(day, "звук")], ["Связка"])
+        self.assertEqual(plan.slots[(day, "спевка")], [])
+
+    def test_optional_matching_respects_month_max_across_task_days(self):
+        day = SUNDAYS[0]
+        rehearsal = day - timedelta(days=3)
+        plan = build_plan(PlanInput(
+            dates=(day,),
+            needed={"звук": 0, "спевка": 0},
+            extra={"звук": 1, "спевка": 1},
+            free={"А": frozenset({day})},
+            tasks={"А": frozenset({"звук", "спевка"})},
+            limits={"А": (0, 1)},
+            slot_dates={
+                (day, "звук", "А"): day,
+                (day, "спевка", "А"): rehearsal,
+            },
+        ))
+        self.assertEqual(plan.load(), {"А": 1})
+        self.assertEqual(plan.covered(), 1)
+
+    def test_optional_assignment_respects_last_month_consecutive_week(self):
+        day = SUNDAYS[0]
+        plan = build_plan(PlanInput(
+            dates=(day,),
+            needed={"звук": 0},
+            extra={"звук": 1},
+            free={"А": frozenset({day})},
+            tasks={"А": frozenset({"звук"})},
+            last_served={"А": day - timedelta(weeks=1)},
+        ))
+        self.assertEqual(plan.slots[(day, "звук")], [])
+
     def test_soft_month_limit_counts_separate_days(self):
         day = SUNDAYS[0]
         rehearsal = day - timedelta(days=3)

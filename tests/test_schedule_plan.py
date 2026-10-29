@@ -1062,24 +1062,40 @@ class SchedulePlanTest(unittest.TestCase):
             self.registry.set_readiness_settings(1001, "sound", day_from=1)
         self.registry.set_service_member_day(1001, "sound", "Алексей", -3)
         plan = self.draft()
+        self.assertEqual(
+            schedule_plan.slot_offset(
+                plan, {"key": "Борис"}, "2026-11-01", "звук"
+            ),
+            -1,
+        )
         plan["slots"]["2026-11-01"] = {"звук": ["Алексей"], "сборка": []}
         summary = readiness.summarize(self.registry, self.run, with_plan=False)
         text = schedule_plan.plan_text(
             "ЗВУК", plan, summary, TZ, schedule_plan.window_of(self.registry, "sound")
         )
         # У единственного на дату свой день — общий период не показывается.
-        self.assertIn("🗓 01.11 (чт 29.10)\n   🎚️ звук\n      • Алексей\n", text)
+        self.assertIn(
+            "🗓 Неделя 26.10–01.11\n   сб 31.10\n     🎚️ звук",
+            text,
+        )
         self.assertIn("      • Алексей (чт 05.11)", text)
         # Рядом служит Глеб без своего дня — период для него показывается.
-        self.assertIn("🗓 08.11 (сб 07.11 – пн 09.11)", text)
+        self.assertIn(
+            "🗓 Неделя 02.11–08.11\n   сб 07.11", text
+        )
         published = schedule_plan.publication_text(
             self.service(), plan, self.people(), (-1, 1)
         )
         self.assertIn(
             "📅 График Звук на ноябрь 2026 утверждён\n\n"
-            "🗓 01.11 (чт 29.10)\n  🎚️ звук\n    • \x00", published,
+            "🗓 Неделя 26.10–01.11\n  сб 31.10\n    🎚️ звук\n"
+            "      • \x00", published,
         )
-        self.assertIn("\n  🧰 сборка: —\n\n🗓 08.11", published)
+        self.assertIn(" (чт 29.10)", published)
+        self.assertIn(
+            "\n    🧰 сборка: —\n\n🗓 Неделя 02.11–08.11\n"
+            "  сб 07.11", published
+        )
         # Заголовок — свой шаблон из «📝 Тексты».
         self.registry.set_readiness_settings(
             1001, "sound",
@@ -1091,7 +1107,8 @@ class SchedulePlanTest(unittest.TestCase):
             self.registry.get_readiness_settings("sound"),
         )
         self.assertTrue(custom.startswith(
-            "График Звук на ноябрь 2026 подготовлен\n\n🗓 01.11"
+            "График Звук на ноябрь 2026 подготовлен\n\n"
+            "🗓 Неделя 26.10–01.11"
         ))
         self.assertIn("🧰 сборка: пока никого", custom)
         for bad in ("{deadline}", "{status}"):

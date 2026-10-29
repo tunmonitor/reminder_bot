@@ -216,6 +216,11 @@ async def build_draft(
         assume_free=run["id"] is None,
     )
     tasks = plan_tasks(registry, run["service_id"])
+    default_day = registry.get_readiness_settings(
+        run["service_id"]
+    )["day_from"]
+    if default_day:
+        tasks = [{**task, "default_day": default_day} for task in tasks]
     slots = {
         day: {
             task["name"]: list(
@@ -352,7 +357,16 @@ def slot_offset(plan: dict, person: dict | None, day: str,
     own = task_days(plan).get(task)
     if own is not None:
         return own
-    return (person or {}).get("day_offset")
+    personal = (person or {}).get("day_offset")
+    if personal is not None:
+        return personal
+    return next(
+        (
+            item.get("default_day") for item in plan["tasks"]
+            if item["name"] == task
+        ),
+        None,
+    )
 
 
 def _selected_slot(summary: Summary, key: str, day: str, task: str,
@@ -409,7 +423,10 @@ def week_groups(plan: dict, day: str, window: tuple[int, int]
     groups: dict[int | None, list[dict]] = {}
     base = None if window != (0, 0) else 0
     for task in plan["tasks"]:
-        groups.setdefault(own.get(task["name"], base), []).append(task)
+        groups.setdefault(
+            own.get(task["name"], task.get("default_day", base)),
+            [],
+        ).append(task)
     offsets = [offset for offset in groups if offset is not None]
     last = max([0, window[1] if None in groups else 0, *offsets])
     title = (
@@ -570,7 +587,9 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
         ) + f" · закрыто мест {done} из {total}",
     ]
     used_silent = False
-    weekly = bool(task_days(plan))
+    weekly = bool(task_days(plan)) or any(
+        task.get("default_day") is not None for task in plan["tasks"]
+    )
     for day in plan["dates"]:
         if weekly:
             title, groups = week_groups(plan, day, window)
@@ -882,7 +901,9 @@ def publication_text(service: dict, plan: dict, people: list[dict],
     lines = [
         publication_title(service, plan["month"], update, settings),
     ]
-    weekly = bool(task_days(plan))
+    weekly = bool(task_days(plan)) or any(
+        task.get("default_day") is not None for task in plan["tasks"]
+    )
     for day in plan["dates"]:
         if weekly:
             # У задач свои дни (спевка — ср): неделя, под ней дни и задачи.
