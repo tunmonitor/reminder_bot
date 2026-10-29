@@ -5884,7 +5884,6 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 [
                     "service:edit_notify:sound",
                     "service:service_contact:sound",
-                    "service:service_replace:sound",
                     "service:service_excel:sound",
                     "rdy:open:sound",
                     "svc_tasks:open:sound",
@@ -6267,6 +6266,12 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             progress = await press(f"rdy:progress:sound:{month_arg}")
             self.assertIn(
                 "Ход опроса", progress.message.answer.await_args.args[0]
+            )
+            # Замены — в разделе «📅 График» (решение 17, 5в).
+            section = await press("rdy:open:sound")
+            self.assertIn(
+                "rdy:repl:sound",
+                str(section.message.answer.await_args.kwargs["reply_markup"]),
             )
             # Пока опрос идёт — предварительный график, без утверждения.
             draft_screen = await press(f"rdy:pprev:sound:{month_arg}")
@@ -6820,7 +6825,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertEqual(
                 self.callback_data_list(callback.message),
                 ["service:edit_notify:sound", "service:service_contact:sound",
-                 "service:service_replace:sound", "service:service_excel:sound",
+                 "service:service_excel:sound",
                  "rdy:open:sound", "svc_tasks:open:sound",
                  "service:service_setup:sound", "service:service_help:sound",
                  "service:back_to_services:list"],

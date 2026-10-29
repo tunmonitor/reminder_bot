@@ -1344,11 +1344,18 @@ async def publish(
     published_thread = (
         sent_thread[0] if sent_thread else None
     ) if not edited else plan.get("thread_id")
-    # Выбранная тема — после отправки: удалённую тему отправка сбросила.
-    target_thread = thread_id if edited else (
+    # Выбранная тема — та, в которую шла отправка (а не выбранная после:
+    # /here во время публикации — график тогда «не на месте»). Удалённую
+    # тему отправка сбросила — сообщение в общей, цель — общая.
+    current_thread = (
         (registry.get_service(service["id"]) or {}).get("group_thread_id")
         or None
     )
+    target_thread = thread_id
+    if not edited and thread_id is not None and current_thread is None and (
+        published_thread is None
+    ):
+        target_thread = None
     for attempt in range(2):
         try:
             result = registry.approve_schedule_plan(

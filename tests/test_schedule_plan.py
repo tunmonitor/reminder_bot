@@ -634,6 +634,28 @@ class SchedulePlanTest(unittest.TestCase):
             schedule_plan.plan_target_thread({"thread_id": 5}), 5
         )
 
+    def test_topic_changed_during_publication(self):
+        """/here во время публикации: записана тема отправки, график
+        «не на месте» — следующее утверждение опубликует его в новой."""
+        self.registry.set_group_thread(1001, "sound", -1005555, 70)
+        service = self.service()
+
+        async def send(chat_id, text, **kwargs):
+            # Пока сообщение уходит, админ выбрал другую тему.
+            self.registry.set_group_thread(1001, "sound", -1005555, 71)
+            return SimpleNamespace(
+                message_id=81, message_thread_id=70, is_topic_message=True,
+            )
+
+        self.bot.send_message.side_effect = send
+        published = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, service, self.draft(), 1001, LOG, 4096,
+        ))
+        self.assertEqual(
+            (published["thread_id"], published["target_thread_id"]), (70, 70)
+        )
+        self.assertTrue(published["moved"])
+
     def test_change_lines_format(self):
         names = {"f": "Филипп", "d": "Денис", "a": "Анна"}
         self.assertEqual(
