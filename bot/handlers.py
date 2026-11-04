@@ -2621,8 +2621,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     f"🔢 Служений в месяц · {name}\n\n" + (
                         title or
                         "Сколько раз в месяц человека можно ставить в "
-                        "график. Максимум — даже если он отметил все даты; "
-                        "минимум — бот старается дать не меньше. Личный "
+                        "график. Максимум — желательный, при необходимости "
+                        "может быть превышен; минимум — бот старается дать "
+                        "не меньше. Личный "
                         "лимит главнее лимита служения."
                     ),
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -4392,11 +4393,23 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             "🔢 Служений в месяц: "
             + month_limit_label(service_month_limit(registry, service_id))
         )
+        lines.append(
+            "🗳 Наоборот: " + (
+                "включён — отмеченные даты недоступны"
+                if settings["reverse_poll"]
+                else "выключен — отмеченные даты доступны"
+            )
+        )
         rows.append([
             readiness_button("📆 Дни служения", "days", service_id),
             readiness_button("📅 Свой день", "own", service_id),
             readiness_button("🔢 В месяц", "lim", service_id),
         ])
+        rows.append([readiness_button(
+            "↔️ Выключить «Наоборот»" if settings["reverse_poll"]
+            else "↔️ Включить «Наоборот»",
+            "rev", service_id,
+        )])
         rows.append([
             readiness_button("🔁 Замены", "repl", service_id),
             readiness_button("📝 Тексты", "texts", service_id),
@@ -5822,6 +5835,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     "🔕 Автозапуск выключен" if settings["enabled"]
                     else "🟢 Автозапуск включён"
                 )
+            elif action == "rev":
+                enabled = not settings["reverse_poll"]
+                registry.set_readiness_settings(
+                    actor_id, service_id, reverse_poll=enabled
+                )
+                notice = (
+                    "↔️ Режим «Наоборот» включён — отмеченные даты "
+                    "недоступны"
+                    if enabled else
+                    "↔️ Режим «Наоборот» выключен — отмеченные даты доступны"
+                )
             elif action == "start":
                 await _answer_callback(callback, "⏳ Запускаю опрос…")
                 async with readiness.service_lock(service_id):
@@ -6140,8 +6164,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     callback.message, service_id,
                     "🔢 Служений в месяц для всех в служении\n\n" + (
                         title or
-                        "Максимум — даже если человек отметил все даты; "
-                        "минимум — бот старается дать не меньше. Личный "
+                        "Максимум — желательный, при необходимости может "
+                        "быть превышен; минимум — бот старается дать не "
+                        "меньше. Личный "
                         "лимит — в карточке человека, он главнее."
                     ),
                     options, "lim",
@@ -6395,11 +6420,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         service, registry.readiness_people(service_id),
                         year, month, deadline, tz, settings["intro_template"],
                         readiness.phrase(settings, "own_days"),
+                        settings["reverse_poll"],
                     )
                     where = "в чате служения перед опросом"
                 elif arg == "q":
                     body = readiness.question_text(
-                        service, year, month, settings["question_template"]
+                        service, year, month, settings["question_template"],
+                        settings["reverse_poll"],
                     )
                     where = "вопрос над вариантами опроса"
                 elif arg in {"rem", "chat"}:
@@ -6665,15 +6692,21 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     )
                 # Фактический день каждого — для интервалов следующего
                 # месяца (как снимок при публикации).
+                people = registry.readiness_people(service_id)
                 offsets = schedule_plan.served_offsets(
                     {**loaded, "service_id": service_id},
-                    registry.readiness_people(service_id),
+                    people,
+                )
+                approved_days = schedule_plan.approved_slot_days(
+                    {**loaded, "service_id": service_id},
+                    people,
                 )
                 registry.import_excel_plan(
                     actor_id, service_id, pending["month"],
                     dates=loaded["dates"], tasks=loaded["tasks"],
                     slots=loaded["slots"], days=loaded["days"],
                     served_offsets=offsets,
+                    approved_slot_days=approved_days,
                 )
             year, month = map(int, pending["month"].split("-"))
             await show_excel_schedule(
@@ -11338,7 +11371,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 registry.record_readiness_answer(
                     poll_answer.poll_id, user.id, user.username or "",
                     full_name,
-                    readiness.answer_dates(poll_answer.option_ids, run["dates"]),
+                    readiness.answer_dates(
+                        poll_answer.option_ids,
+                        run.get("options") or run["dates"],
+                        reverse_poll=run.get("reverse_poll", False),
+                    ),
                 )
                 return
         except (ValueError, sqlite3.Error):
